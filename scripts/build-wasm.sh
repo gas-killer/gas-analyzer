@@ -15,7 +15,7 @@ fi
 # Build for web target
 # Use --no-default-features to exclude foundry-evm-traces, opcode-tracer, and tokio
 # The WASM module has its own implementation that doesn't need these
-wasm-pack build --target web --out-dir pkg --no-default-features
+wasm-pack build --target web --out-dir pkg -- --no-default-features
 
 # Update package.json with scoped name and GitHub Packages configuration
 cd pkg

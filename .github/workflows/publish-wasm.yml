@@ -47,7 +47,7 @@ jobs:
       - name: Build WASM package
         run: |
           # Build for web target with no-default-features to exclude incompatible dependencies
-          wasm-pack build --target web --out-dir pkg --no-default-features
+          wasm-pack build --target web --out-dir pkg -- --no-default-features
 
           # Verify build output
           if [ ! -f "pkg/gas_analyzer_rs_bg.wasm" ]; then
