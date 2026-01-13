@@ -301,16 +301,18 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
                 if !data_inner.starts_with(&selector_hex) {
                     Err(None)
                 } else {
-                #[cfg(feature = "foundry-evm-traces")]
-                {
-                    Self::process_reverting_context_error(data_inner)
-                        .await
-                        .map_err(Some)
-                }
-                #[cfg(not(feature = "foundry-evm-traces"))]
-                {
-                    Err(Some(anyhow!("RevertingContext error detected but foundry-evm-traces feature not enabled")))
-                }
+                    #[cfg(feature = "foundry-evm-traces")]
+                    {
+                        Self::process_reverting_context_error(data_inner)
+                            .await
+                            .map_err(Some)
+                    }
+                    #[cfg(not(feature = "foundry-evm-traces"))]
+                    {
+                        Err(Some(anyhow!(
+                            "RevertingContext error detected but foundry-evm-traces feature not enabled"
+                        )))
+                    }
                 }
             }
             _ => Err(None),
