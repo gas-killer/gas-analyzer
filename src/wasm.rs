@@ -436,6 +436,6 @@ fn copy_memory_wasm(memory: &[u8], offset: usize, length: usize) -> Vec<u8> {
     } else {
         let mut result = memory.to_vec();
         result.resize(offset + length, 0);
-        result[offset..offset + length].to_vec()
+        result.split_off(offset)
     }
 }
