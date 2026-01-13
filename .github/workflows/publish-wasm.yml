@@ -4,14 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Package version (e.g., 0.1.0)'
+        description: "Package version (e.g., 0.1.0)"
         required: true
         type: string
       publish:
-        description: 'Publish to GitHub Packages'
+        description: "Publish to GitHub Packages"
         required: false
         default: true
         type: boolean
+  push:
+    branches:
+      - feat/publish-wasm
+    paths-ignore:
+      - "**.md"
+      - ".gitignore"
+      - ".wasmignore"
 
 env:
   REGISTRY: npm.pkg.github.com
@@ -40,28 +47,42 @@ jobs:
         run: |
           # Build for web target with no-default-features to exclude incompatible dependencies
           wasm-pack build --target web --out-dir pkg --no-default-features
-          
+
           # Verify build output
           if [ ! -f "pkg/gas_analyzer_rs_bg.wasm" ]; then
             echo "Error: WASM build failed - output file not found"
             exit 1
           fi
-          
+
           echo "WASM build successful"
           ls -lh pkg/
+
+      - name: Set version
+        id: set_version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            # For push events, use a test version with branch and commit SHA
+            BRANCH_NAME="${{ github.ref_name }}"
+            BRANCH_NAME="${BRANCH_NAME//\//-}"  # Replace / with -
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            echo "version=0.0.0-test-${BRANCH_NAME}-${SHORT_SHA}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Update package.json with version and scope
         run: |
           cd pkg
           # Update package name to scoped format and version
           npm pkg set name="${{ env.PACKAGE_NAME }}"
-          npm pkg set version="${{ github.event.inputs.version }}"
+          npm pkg set version="${{ steps.set_version.outputs.version }}"
           # Ensure publishConfig is set for GitHub Packages
           npm pkg set publishConfig.registry="https://${{ env.REGISTRY }}"
           npm pkg set publishConfig."@breadcoop:registry"="https://${{ env.REGISTRY }}"
-          
+
           echo "Updated package.json:"
           cat package.json
+          echo "Version: ${{ steps.set_version.outputs.version }}"
 
       - name: Configure npm for GitHub Packages
         run: |
@@ -69,11 +90,17 @@ jobs:
           echo "//${{ env.REGISTRY }}/:_authToken=${{ secrets.GITHUB_TOKEN }}" >> .npmrc
 
       - name: Publish to GitHub Packages
-        if: ${{ github.event.inputs.publish == 'true' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' }}
         working-directory: pkg
         run: |
           npm publish
           echo "Published ${{ env.PACKAGE_NAME }}@${{ github.event.inputs.version }} to GitHub Packages"
+
+      - name: Skip publish (test run)
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          echo "Skipping publish - this is a test run on feature branch"
+          echo "To publish, use workflow_dispatch from main branch"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
