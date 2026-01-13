@@ -223,8 +223,7 @@ pub fn analyze_trace(trace_json: &str) -> Result<String, JsValue> {
 /// Heuristic gas estimation based on state update types.
 /// This is a rough approximation - actual gas costs depend on many factors.
 fn estimate_gas_heuristic(state_updates: &[StateUpdate]) -> u64 {
-    const TURETZKY_UPPER_GAS_LIMIT: u64 = 250000;
-    let mut gas = TURETZKY_UPPER_GAS_LIMIT;
+    let mut gas = crate::constants::TURETZKY_UPPER_GAS_LIMIT;
 
     for update in state_updates {
         match update {

@@ -1,22 +1,68 @@
+//! Constants used throughout the gas analyzer library.
+//!
+//! This module contains:
+//! - Gas limit thresholds
+//! - Test contract addresses and transaction hashes (used in integration tests)
+
 use alloy::primitives::{Address, FixedBytes, address, b256};
 
+// =============================================================================
+// Gas Limits
+// =============================================================================
+
+/// Upper gas limit threshold (Turetzky Upper Gas Limit).
+/// Transactions below this limit are typically not worth optimizing.
+pub const TURETZKY_UPPER_GAS_LIMIT: u64 = 250000u64;
+
+// =============================================================================
+// Test Contract Addresses
+// =============================================================================
+
+/// SimpleStorage test contract address
 pub const SIMPLE_STORAGE_ADDRESS: Address = address!("0xd682Fe2ee8bdd59fdcCc5a4962FD98c20Ef47290");
-pub const SIMPLE_STORAGE_SET_TX_HASH: FixedBytes<32> =
-    b256!("0xccd4b5a1d020bfc69fb44452f942cdef29996fc6d822f127d9a5a6108e95c3f9");
-pub const SIMPLE_STORAGE_DEPOSIT_TX_HASH: FixedBytes<32> =
-    b256!("0xa787da2025d8e9943cb175559aa91ab38cff62dde3fd09b6da117a38c4ccd431");
-pub const SIMPLE_STORAGE_CALL_EXTERNAL_TX_HASH: FixedBytes<32> =
-    b256!("0xc48dfdc874d62df779a0a351c05d0d07302f801522fe9a80289d6f6b9a836579");
+
+/// DelegateCall main contract address
 pub const DELEGATECALL_CONTRACT_MAIN_ADDRESS: Address =
     address!("0xE4a072d6453B9a9be46F5919e29172e5FEeb9520");
+
+/// DelegateCall contract A address (called by main contract)
 pub const DELEGATE_CONTRACT_A_ADDRESS: Address =
     address!("0xAd4ab9955d18feF34d94bb276Dd81adb73D2057d");
-pub const DELEGATECALL_CONTRACT_MAIN_RUN_TX_HASH: FixedBytes<32> =
-    b256!("0x71aa01e28adbb015d0d4003fb3e770b4344a00a112704fa2e05014f846532d43");
+
+/// AccessControl main contract address
 pub const ACCESS_CONTROL_MAIN_ADDRESS: Address =
     address!("0x70eE40CF5A32e791cE2B0af6e535a3dbed11A206");
-pub const ACCESS_CONTROL_MAIN_RUN_TX_HASH: FixedBytes<32> =
-    b256!("0x3fe223c8aabc4e5e6b918d65dd76d7f7bd8e93f6012a0e183ff0a299260b2f60");
+
+/// Fake address used for testing error cases (e.g., invalid contract)
+pub const FAKE_ADDRESS: Address = address!("0xc76a6477c12dcb8554b1493482D85AB720b2A322");
+
+// =============================================================================
+// Test Transaction Hashes
+// =============================================================================
+
+// SimpleStorage contract transactions
+/// SimpleStorage: SET transaction hash
+pub const SIMPLE_STORAGE_SET_TX_HASH: FixedBytes<32> =
+    b256!("0xccd4b5a1d020bfc69fb44452f942cdef29996fc6d822f127d9a5a6108e95c3f9");
+
+/// SimpleStorage: DEPOSIT transaction hash
+pub const SIMPLE_STORAGE_DEPOSIT_TX_HASH: FixedBytes<32> =
+    b256!("0xa787da2025d8e9943cb175559aa91ab38cff62dde3fd09b6da117a38c4ccd431");
+
+/// SimpleStorage: CALL_EXTERNAL transaction hash
+pub const SIMPLE_STORAGE_CALL_EXTERNAL_TX_HASH: FixedBytes<32> =
+    b256!("0xc48dfdc874d62df779a0a351c05d0d07302f801522fe9a80289d6f6b9a836579");
+
+/// SimpleStorage: Array iteration transaction hash
 pub const SIMPLE_ARRAY_ITERATION_TX_HASH: FixedBytes<32> =
     b256!("0xcbc329edbbce7d52b47197988bae076678f5ad9f02d591a7b24737b464778a1d");
-pub const FAKE_ADDRESS: Address = address!("0xc76a6477c12dcb8554b1493482D85AB720b2A322");
+
+// DelegateCall contract transactions
+/// DelegateCall main contract: RUN transaction hash
+pub const DELEGATECALL_CONTRACT_MAIN_RUN_TX_HASH: FixedBytes<32> =
+    b256!("0x71aa01e28adbb015d0d4003fb3e770b4344a00a112704fa2e05014f846532d43");
+
+// AccessControl contract transactions
+/// AccessControl main contract: RUN transaction hash
+pub const ACCESS_CONTROL_MAIN_RUN_TX_HASH: FixedBytes<32> =
+    b256!("0x3fe223c8aabc4e5e6b918d65dd76d7f7bd8e93f6012a0e183ff0a299260b2f60");

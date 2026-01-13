@@ -29,10 +29,9 @@ use alloy::{
 
 use alloy_rpc_types::TransactionTrait;
 use anyhow::{Result, anyhow, bail};
+use constants::TURETZKY_UPPER_GAS_LIMIT;
 use gk::GasKillerDefault;
 use sol_types::{StateUpdate, StateUpdateType};
-
-const TURETZKY_UPPER_GAS_LIMIT: u64 = 250000u64;
 
 pub fn parse_trace_memory(memory: Vec<String>) -> Vec<u8> {
     memory
