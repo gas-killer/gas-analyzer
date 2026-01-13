@@ -62,8 +62,8 @@ getrandom = { version = "0.2", features = ["js"] }
 serde_json = "1.0"
 
 [[example]]
-name = "tx_extractor_example"
-path = "examples/tx_extractor_example.rs"
+name = "run_tx_extractor_example"
+path = "examples/tx-extractor/run_tx_extractor_example.rs"
 
 [profile.release]
 opt-level = "z"     # Optimize for size

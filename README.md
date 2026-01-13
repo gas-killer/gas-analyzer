@@ -46,3 +46,28 @@ cargo run -- r path/to/file.json
 
 The analysis report is written to the `OUTPUT_FILE`.
 
+## WebAssembly Build
+
+This library can be compiled to WebAssembly for use in frontend applications.
+
+### Quick Start
+
+1. Install `wasm-pack`: `cargo install wasm-pack`
+2. Build: `./scripts/build-wasm.sh`
+3. See [`examples/frontend/README.md`](./examples/frontend/README.md) for detailed usage instructions and examples
+
+### Publishing to GitHub Packages
+
+The WASM package is automatically built on pushes to `main` and can be published manually via GitHub Actions workflow. See [`.github/workflows/publish-wasm.yml`](./.github/workflows/publish-wasm.yml) for details.
+
+The published package is available as `@breadcoop/gas-analyzer-rs` on GitHub Packages.
+
+### Documentation
+
+For complete documentation on:
+- Building and using the WASM module
+- Available functions and API
+- Troubleshooting
+- Integration examples
+
+See the [Frontend Example README](./examples/frontend/README.md).

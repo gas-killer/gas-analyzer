@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gas Analyzer - Frontend Example</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 500;
+        }
+        input {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+        #result {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+        }
+        pre {
+            background-color: #f1f1f1;
+            padding: 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+        }
+    </style>
+</head>
+<body>
+    <h1>Gas Analyzer</h1>
+    <p>Enter a transaction hash to analyze gas usage and state updates.</p>
+
+    <form id="gas-analysis-form">
+        <div class="form-group">
+            <label for="rpc-url">RPC URL:</label>
+            <input 
+                type="text" 
+                id="rpc-url" 
+                placeholder="https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY"
+                value=""
+                required
+            />
+        </div>
+
+        <div class="form-group">
+            <label for="tx-hash">Transaction Hash:</label>
+            <input 
+                type="text" 
+                id="tx-hash" 
+                placeholder="0x..."
+                value=""
+                required
+            />
+        </div>
+
+        <button type="submit" id="analyze-btn">Analyze Transaction</button>
+    </form>
+
+    <div id="result"></div>
+
+    <script type="module">
+        // Import the WASM module
+        // Note: This must be served over HTTP (not file://) due to CORS restrictions
+        // Use: python -m http.server 8000 or similar
+        import init, { analyze_trace } from '../pkg/gas_analyzer_rs.js';
+
+        // Initialize WASM on page load
+        await init();
+        console.log('WASM module initialized');
+
+        /**
+         * Fetch a transaction trace from an RPC endpoint
+         */
+        async function fetchTransactionTrace(rpcUrl, txHash) {
+            const response = await fetch(rpcUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    method: 'debug_traceTransaction',
+                    params: [
+                        txHash,
+                        {
+                            enableMemory: true,
+                            // Use default tracer to get struct_logs format
+                        }
+                    ],
+                    id: 1,
+                }),
+            });
+
+            if (!response.ok) {
+                throw new Error(`RPC request failed: ${response.statusText}`);
+            }
+
+            const data = await response.json();
+            if (data.error) {
+                throw new Error(`RPC error: ${data.error.message}`);
+            }
+
+            return data.result;
+        }
+
+        /**
+         * Fetch a transaction receipt from an RPC endpoint
+         */
+        async function fetchTransactionReceipt(rpcUrl, txHash) {
+            const response = await fetch(rpcUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    method: 'eth_getTransactionReceipt',
+                    params: [txHash],
+                    id: 2,
+                }),
+            });
+
+            if (!response.ok) {
+                throw new Error(`RPC request failed: ${response.statusText}`);
+            }
+
+            const data = await response.json();
+            if (data.error) {
+                throw new Error(`RPC error: ${data.error.message}`);
+            }
+
+            if (!data.result) {
+                throw new Error('Transaction receipt not found');
+            }
+
+            return data.result;
+        }
+
+        // Setup form handler
+        const form = document.getElementById('gas-analysis-form');
+        const resultDiv = document.getElementById('result');
+        const analyzeBtn = document.getElementById('analyze-btn');
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const rpcUrl = document.getElementById('rpc-url').value;
+            const txHash = document.getElementById('tx-hash').value;
+
+            if (!rpcUrl || !txHash) {
+                resultDiv.innerHTML = '<p style="color: red;">Please fill in all fields</p>';
+                return;
+            }
+
+            analyzeBtn.disabled = true;
+            analyzeBtn.textContent = 'Analyzing...';
+            resultDiv.innerHTML = '<p>Fetching transaction trace...</p>';
+
+            try {
+                // Fetch both trace and receipt in parallel
+                resultDiv.innerHTML = '<p>Fetching transaction data...</p>';
+                const [trace, receipt] = await Promise.all([
+                    fetchTransactionTrace(rpcUrl, txHash),
+                    fetchTransactionReceipt(rpcUrl, txHash)
+                ]);
+                
+                // Analyze the trace using WASM
+                resultDiv.innerHTML = '<p>Analyzing trace...</p>';
+                const traceJson = JSON.stringify(trace);
+                const analysisJson = analyze_trace(traceJson);
+                const analysis = JSON.parse(analysisJson);
+
+                // Parse receipt data
+                const actualGasUsed = parseInt(receipt.gasUsed, 16);
+                const effectiveGasPrice = receipt.effectiveGasPrice ? parseInt(receipt.effectiveGasPrice, 16) : null;
+                const gasCost = effectiveGasPrice ? (actualGasUsed * effectiveGasPrice) : null;
+                
+                // Calculate savings (heuristic estimate vs actual)
+                // Note: The heuristic estimate is rough - real savings require backend GasKiller simulation
+                const heuristicEstimate = analysis.estimated_gas;
+                const potentialSavings = actualGasUsed > heuristicEstimate 
+                    ? actualGasUsed - heuristicEstimate 
+                    : 0;
+                const savingsPercent = actualGasUsed > 0 
+                    ? ((potentialSavings / actualGasUsed) * 100).toFixed(2)
+                    : '0.00';
+
+                // Display results
+                resultDiv.innerHTML = `
+                    <h3>Analysis Results</h3>
+                    <p><strong>Transaction:</strong> <code>${txHash}</code></p>
+                    
+                    <h4>Gas Analysis</h4>
+                    <table style="width: 100%; border-collapse: collapse; margin: 10px 0;">
+                        <tr>
+                            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Actual Gas Used:</strong></td>
+                            <td style="padding: 8px; border: 1px solid #ddd;">${actualGasUsed.toLocaleString()}</td>
+                        </tr>
+                        ${gasCost ? `
+                        <tr>
+                            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Gas Cost:</strong></td>
+                            <td style="padding: 8px; border: 1px solid #ddd;">${(gasCost / 1e18).toFixed(6)} ETH</td>
+                        </tr>
+                        ` : ''}
+                        <tr>
+                            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Heuristic Estimate:</strong></td>
+                            <td style="padding: 8px; border: 1px solid #ddd;">${heuristicEstimate.toLocaleString()}</td>
+                        </tr>
+                        <tr style="background-color: ${potentialSavings > 0 ? '#d4edda' : '#f8d7da'};">
+                            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Potential Savings:</strong></td>
+                            <td style="padding: 8px; border: 1px solid #ddd;">
+                                ${potentialSavings.toLocaleString()} gas (${savingsPercent}%)
+                                ${potentialSavings > 0 && gasCost ? `≈ ${((potentialSavings * effectiveGasPrice) / 1e18).toFixed(6)} ETH` : ''}
+                            </td>
+                        </tr>
+                    </table>
+                    <p style="font-size: 0.9em; color: #666; margin-top: 10px;">
+                        <em>Note: Heuristic estimate is approximate. For accurate gas estimation, use the backend GasKiller service with Anvil simulation.</em>
+                    </p>
+
+                    <h4>State Updates</h4>
+                    <p><strong>Total State Updates:</strong> ${analysis.state_update_count}</p>
+                    <p><strong>Breakdown:</strong></p>
+                    <ul>
+                        <li><strong>SSTOREs:</strong> ${analysis.state_update_breakdown.stores}</li>
+                        <li><strong>CALLs:</strong> ${analysis.state_update_breakdown.calls}</li>
+                        <li><strong>LOG0:</strong> ${analysis.state_update_breakdown.log0}</li>
+                        <li><strong>LOG1:</strong> ${analysis.state_update_breakdown.log1}</li>
+                        <li><strong>LOG2:</strong> ${analysis.state_update_breakdown.log2}</li>
+                        <li><strong>LOG3:</strong> ${analysis.state_update_breakdown.log3}</li>
+                        <li><strong>LOG4:</strong> ${analysis.state_update_breakdown.log4}</li>
+                    </ul>
+                    ${analysis.skipped_opcodes.length > 0 
+                        ? `<p><strong>Skipped Opcodes:</strong> ${analysis.skipped_opcodes.join(', ')}</p>`
+                        : ''
+                    }
+                    <details>
+                        <summary>Encoded ABI (for state update handler)</summary>
+                        <pre style="word-break: break-all; font-size: 12px;">${analysis.encoded_abi}</pre>
+                    </details>
+                `;
+            } catch (error) {
+                resultDiv.innerHTML = `<p style="color: red;"><strong>Error:</strong> ${error.message}</p>`;
+                console.error('Analysis error:', error);
+            } finally {
+                analyzeBtn.disabled = false;
+                analyzeBtn.textContent = 'Analyze Transaction';
+            }
+        });
+    </script>
+</body>
+</html>
