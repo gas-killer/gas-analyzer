@@ -1,2 +1,17 @@
-/target
+# Git ignore file for gas-analyzer-rs
+
+# Environment variables
 .env
+
+# Build artifacts
+/target
+
+# Test outputs
+test.csv
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# WASM build output
+/pkg

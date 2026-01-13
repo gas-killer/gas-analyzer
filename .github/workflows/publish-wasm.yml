@@ -1,0 +1,83 @@
+name: Publish WASM to GitHub Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Package version (e.g., 0.1.0)'
+        required: true
+        type: string
+      publish:
+        description: 'Publish to GitHub Packages'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  REGISTRY: npm.pkg.github.com
+  PACKAGE_NAME: "@breadcoop/gas-analyzer-rs"
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+
+      - name: Build WASM package
+        run: |
+          # Build for web target with no-default-features to exclude incompatible dependencies
+          wasm-pack build --target web --out-dir pkg --no-default-features
+          
+          # Verify build output
+          if [ ! -f "pkg/gas_analyzer_rs_bg.wasm" ]; then
+            echo "Error: WASM build failed - output file not found"
+            exit 1
+          fi
+          
+          echo "WASM build successful"
+          ls -lh pkg/
+
+      - name: Update package.json with version and scope
+        run: |
+          cd pkg
+          # Update package name to scoped format and version
+          npm pkg set name="${{ env.PACKAGE_NAME }}"
+          npm pkg set version="${{ github.event.inputs.version }}"
+          # Ensure publishConfig is set for GitHub Packages
+          npm pkg set publishConfig.registry="https://${{ env.REGISTRY }}"
+          npm pkg set publishConfig."@breadcoop:registry"="https://${{ env.REGISTRY }}"
+          
+          echo "Updated package.json:"
+          cat package.json
+
+      - name: Configure npm for GitHub Packages
+        run: |
+          echo "@breadcoop:registry=https://${{ env.REGISTRY }}" >> .npmrc
+          echo "//${{ env.REGISTRY }}/:_authToken=${{ secrets.GITHUB_TOKEN }}" >> .npmrc
+
+      - name: Publish to GitHub Packages
+        if: ${{ github.event.inputs.publish == 'true' }}
+        working-directory: pkg
+        run: |
+          npm publish
+          echo "Published ${{ env.PACKAGE_NAME }}@${{ github.event.inputs.version }} to GitHub Packages"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-package
+          path: pkg/
+          retention-days: 30

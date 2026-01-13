@@ -33,6 +33,7 @@ use alloy_provider::{Provider, ext::AnvilApi};
 use anyhow::{Context, Error, Result, anyhow, bail};
 use url::Url;
 
+#[cfg(feature = "foundry-evm-traces")]
 use foundry_evm_traces::identifier::SignaturesIdentifier;
 
 sol!(
@@ -300,9 +301,16 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
                 if !data_inner.starts_with(&selector_hex) {
                     Err(None)
                 } else {
+                #[cfg(feature = "foundry-evm-traces")]
+                {
                     Self::process_reverting_context_error(data_inner)
                         .await
                         .map_err(Some)
+                }
+                #[cfg(not(feature = "foundry-evm-traces"))]
+                {
+                    Err(Some(anyhow!("RevertingContext error detected but foundry-evm-traces feature not enabled")))
+                }
                 }
             }
             _ => Err(None),
@@ -317,6 +325,7 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
         }
     }
 
+    #[cfg(feature = "foundry-evm-traces")]
     async fn process_reverting_context_error(data: &str) -> Result<anyhow::Error> {
         let reverting_context_error_hex = hex::decode(data)
             .context("something went incredibly wrong, rpc error contained invalid hex value")?;

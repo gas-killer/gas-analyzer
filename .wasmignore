@@ -1,0 +1,23 @@
+# Files and directories to exclude from wasm-pack builds
+# This file tells wasm-pack what to ignore when packaging the WASM module
+
+# Build artifacts
+target/
+Cargo.lock
+
+# Development and CI files
+.github/
+.env
+.env.*
+
+# Documentation
+*.md
+
+# Example code (not needed in WASM package)
+examples/
+
+# Foundry/Solidity adapter (not needed for WASM)
+gk-alloy-adapter/
+
+# Git configuration
+.gitignore

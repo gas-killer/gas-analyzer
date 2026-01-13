@@ -7,6 +7,8 @@ pub mod opcode_tracer;
 pub mod sol_types;
 pub mod structs;
 pub mod tx_extractor;
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
 
 use chrono::Utc;
 use std::{collections::HashSet, str::FromStr};
@@ -46,9 +48,25 @@ pub fn parse_trace_memory(memory: Vec<String>) -> Vec<u8> {
 /// Compute state updates from a Geth trace.
 /// This converts the trace to the opcode-tracer format and uses the unified implementation.
 pub fn compute_state_updates(trace: DefaultFrame) -> Result<(Vec<StateUpdate>, HashSet<Opcode>)> {
-    eprintln!("[gas-analyzer] Using opcode-tracer-compare branch");
-    let opcode_trace = opcode_tracer::convert_geth_trace_to_result(&trace);
-    opcode_tracer::compute_state_updates_from_trace(&opcode_trace)
+    #[cfg(feature = "opcode-tracer")]
+    {
+        eprintln!("[gas-analyzer] Using \"sp1-cc\" library");
+        let opcode_trace = opcode_tracer::convert_geth_trace_to_result(&trace);
+        opcode_tracer::compute_state_updates_from_trace(&opcode_trace)
+    }
+    #[cfg(not(feature = "opcode-tracer"))]
+    {
+        // For WASM builds, use the WASM implementation
+        #[cfg(target_arch = "wasm32")]
+        {
+            crate::wasm::compute_state_updates_wasm(trace)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Fallback to legacy implementation when opcode-tracer is not available
+            compute_state_updates_legacy(trace)
+        }
+    }
 }
 
 // =============================================================================
@@ -56,7 +74,6 @@ pub fn compute_state_updates(trace: DefaultFrame) -> Result<(Vec<StateUpdate>, H
 // =============================================================================
 
 /// Copy memory with bounds checking (legacy helper).
-#[cfg(test)]
 fn copy_memory_legacy(memory: &[u8], offset: usize, length: usize) -> Vec<u8> {
     if memory.len() >= offset + length {
         memory[offset..offset + length].to_vec()
@@ -68,7 +85,6 @@ fn copy_memory_legacy(memory: &[u8], offset: usize, length: usize) -> Vec<u8> {
 }
 
 /// Legacy implementation: append state update from a struct log.
-#[cfg(test)]
 fn append_to_state_updates_legacy(
     state_updates: &mut Vec<StateUpdate>,
     struct_log: alloy::rpc::types::trace::geth::StructLog,
@@ -168,7 +184,6 @@ fn append_to_state_updates_legacy(
 
 /// Legacy implementation: compute state updates from a Geth trace.
 /// This is the original implementation before the opcode-tracer refactor.
-#[cfg(test)]
 pub fn compute_state_updates_legacy(
     trace: DefaultFrame,
 ) -> Result<(Vec<StateUpdate>, HashSet<Opcode>)> {
@@ -252,7 +267,7 @@ fn encode_state_updates_to_sol(
     (state_update_types, datas)
 }
 
-fn encode_state_updates_to_abi(state_updates: &[StateUpdate]) -> Bytes {
+pub fn encode_state_updates_to_abi(state_updates: &[StateUpdate]) -> Bytes {
     let (state_update_types, datas) = encode_state_updates_to_sol(state_updates);
 
     // Encode as tuple (StateUpdateType[], bytes[])
