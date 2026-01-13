@@ -14,6 +14,7 @@ on:
         type: boolean
   push:
     branches:
+      - main
       - feat/publish-wasm
     paths-ignore:
       - "**.md"
@@ -96,11 +97,11 @@ jobs:
           npm publish
           echo "Published ${{ env.PACKAGE_NAME }}@${{ github.event.inputs.version }} to GitHub Packages"
 
-      - name: Skip publish (test run)
+      - name: Skip publish (automatic build)
         if: ${{ github.event_name == 'push' }}
         run: |
-          echo "Skipping publish - this is a test run on feature branch"
-          echo "To publish, use workflow_dispatch from main branch"
+          echo "Skipping publish - this is an automatic build on push"
+          echo "To publish, use workflow_dispatch with publish=true"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
