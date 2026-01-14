@@ -608,7 +608,7 @@ fn append_to_state_updates_wasm(
             if stack.len() >= 5 && is_target_depth {
                 let args_offset: usize = stack[3].try_into().unwrap_or(0);
                 let args_length: usize = stack[4].try_into().unwrap_or(0);
-                let args = copy_memory_wasm(&memory, args_offset, args_length);
+                let args = crate::copy_memory(&memory, args_offset, args_length);
                 state_updates.push(StateUpdate::Call(IStateUpdateTypes::Call {
                     target: Address::from_word(stack[1].into()),
                     value: stack[2],
@@ -623,7 +623,7 @@ fn append_to_state_updates_wasm(
                 // STATICCALL: gas, addr, argsOffset, argsSize, retOffset, retSize
                 let args_offset: usize = stack[2].try_into().unwrap_or(0);
                 let args_length: usize = stack[3].try_into().unwrap_or(0);
-                let args = copy_memory_wasm(&memory, args_offset, args_length);
+                let args = crate::copy_memory(&memory, args_offset, args_length);
                 state_updates.push(StateUpdate::Call(IStateUpdateTypes::Call {
                     target: Address::from_word(stack[1].into()),
                     value: alloy::primitives::U256::ZERO, // STATICCALL has no value
@@ -635,7 +635,7 @@ fn append_to_state_updates_wasm(
             if stack.len() >= 2 && is_target_depth {
                 let data_offset: usize = stack[0].try_into().unwrap_or(0);
                 let data_length: usize = stack[1].try_into().unwrap_or(0);
-                let data = copy_memory_wasm(&memory, data_offset, data_length);
+                let data = crate::copy_memory(&memory, data_offset, data_length);
                 state_updates.push(StateUpdate::Log0(IStateUpdateTypes::Log0 {
                     data: data.into(),
                 }));
@@ -645,7 +645,7 @@ fn append_to_state_updates_wasm(
             if stack.len() >= 3 && is_target_depth {
                 let data_offset: usize = stack[0].try_into().unwrap_or(0);
                 let data_length: usize = stack[1].try_into().unwrap_or(0);
-                let data = copy_memory_wasm(&memory, data_offset, data_length);
+                let data = crate::copy_memory(&memory, data_offset, data_length);
                 state_updates.push(StateUpdate::Log1(IStateUpdateTypes::Log1 {
                     data: data.into(),
                     topic1: stack[2].into(),
@@ -656,7 +656,7 @@ fn append_to_state_updates_wasm(
             if stack.len() >= 4 && is_target_depth {
                 let data_offset: usize = stack[0].try_into().unwrap_or(0);
                 let data_length: usize = stack[1].try_into().unwrap_or(0);
-                let data = copy_memory_wasm(&memory, data_offset, data_length);
+                let data = crate::copy_memory(&memory, data_offset, data_length);
                 state_updates.push(StateUpdate::Log2(IStateUpdateTypes::Log2 {
                     data: data.into(),
                     topic1: stack[2].into(),
@@ -668,7 +668,7 @@ fn append_to_state_updates_wasm(
             if stack.len() >= 5 && is_target_depth {
                 let data_offset: usize = stack[0].try_into().unwrap_or(0);
                 let data_length: usize = stack[1].try_into().unwrap_or(0);
-                let data = copy_memory_wasm(&memory, data_offset, data_length);
+                let data = crate::copy_memory(&memory, data_offset, data_length);
                 state_updates.push(StateUpdate::Log3(IStateUpdateTypes::Log3 {
                     data: data.into(),
                     topic1: stack[2].into(),
@@ -681,7 +681,7 @@ fn append_to_state_updates_wasm(
             if stack.len() >= 6 && is_target_depth {
                 let data_offset: usize = stack[0].try_into().unwrap_or(0);
                 let data_length: usize = stack[1].try_into().unwrap_or(0);
-                let data = copy_memory_wasm(&memory, data_offset, data_length);
+                let data = crate::copy_memory(&memory, data_offset, data_length);
                 state_updates.push(StateUpdate::Log4(IStateUpdateTypes::Log4 {
                     data: data.into(),
                     topic1: stack[2].into(),
@@ -694,15 +694,4 @@ fn append_to_state_updates_wasm(
         _ => {}
     }
     Ok(None)
-}
-
-/// Copy memory with bounds checking (WASM helper)
-fn copy_memory_wasm(memory: &[u8], offset: usize, length: usize) -> Vec<u8> {
-    if memory.len() >= offset + length {
-        memory[offset..offset + length].to_vec()
-    } else {
-        let mut result = memory.to_vec();
-        result.resize(offset + length, 0);
-        result.split_off(offset)
-    }
 }

@@ -50,17 +50,6 @@ mod opcode_tracer_impl {
         Ok((state_updates, skipped_opcodes))
     }
 
-    /// Copy memory with bounds checking.
-    fn copy_memory(memory: &[u8], offset: usize, length: usize) -> Vec<u8> {
-        if memory.len() >= offset + length {
-            memory[offset..offset + length].to_vec()
-        } else {
-            let mut result = memory.to_vec();
-            result.resize(offset + length, 0);
-            result[offset..offset + length].to_vec()
-        }
-    }
-
     /// Append a state update from an opcode execution step.
     fn append_state_update_from_step(
         state_updates: &mut Vec<StateUpdate>,
@@ -92,7 +81,7 @@ mod opcode_tracer_impl {
                 if stack.len() >= 5 && depth == 1 {
                     let args_offset: usize = stack[3].try_into().unwrap_or(0);
                     let args_length: usize = stack[4].try_into().unwrap_or(0);
-                    let args = copy_memory(memory, args_offset, args_length);
+                    let args = crate::copy_memory(memory, args_offset, args_length);
                     state_updates.push(StateUpdate::Call(IStateUpdateTypes::Call {
                         target: Address::from_word(stack[1].into()),
                         value: stack[2],
@@ -104,7 +93,7 @@ mod opcode_tracer_impl {
                 if stack.len() >= 2 && depth == 1 {
                     let data_offset: usize = stack[0].try_into().unwrap_or(0);
                     let data_length: usize = stack[1].try_into().unwrap_or(0);
-                    let data = copy_memory(memory, data_offset, data_length);
+                    let data = crate::copy_memory(memory, data_offset, data_length);
                     state_updates.push(StateUpdate::Log0(IStateUpdateTypes::Log0 {
                         data: data.into(),
                     }));
@@ -114,7 +103,7 @@ mod opcode_tracer_impl {
                 if stack.len() >= 3 && depth == 1 {
                     let data_offset: usize = stack[0].try_into().unwrap_or(0);
                     let data_length: usize = stack[1].try_into().unwrap_or(0);
-                    let data = copy_memory(memory, data_offset, data_length);
+                    let data = crate::copy_memory(memory, data_offset, data_length);
                     state_updates.push(StateUpdate::Log1(IStateUpdateTypes::Log1 {
                         data: data.into(),
                         topic1: stack[2].into(),
@@ -125,7 +114,7 @@ mod opcode_tracer_impl {
                 if stack.len() >= 4 && depth == 1 {
                     let data_offset: usize = stack[0].try_into().unwrap_or(0);
                     let data_length: usize = stack[1].try_into().unwrap_or(0);
-                    let data = copy_memory(memory, data_offset, data_length);
+                    let data = crate::copy_memory(memory, data_offset, data_length);
                     state_updates.push(StateUpdate::Log2(IStateUpdateTypes::Log2 {
                         data: data.into(),
                         topic1: stack[2].into(),
@@ -137,7 +126,7 @@ mod opcode_tracer_impl {
                 if stack.len() >= 5 && depth == 1 {
                     let data_offset: usize = stack[0].try_into().unwrap_or(0);
                     let data_length: usize = stack[1].try_into().unwrap_or(0);
-                    let data = copy_memory(memory, data_offset, data_length);
+                    let data = crate::copy_memory(memory, data_offset, data_length);
                     state_updates.push(StateUpdate::Log3(IStateUpdateTypes::Log3 {
                         data: data.into(),
                         topic1: stack[2].into(),
@@ -150,7 +139,7 @@ mod opcode_tracer_impl {
                 if stack.len() >= 6 && depth == 1 {
                     let data_offset: usize = stack[0].try_into().unwrap_or(0);
                     let data_length: usize = stack[1].try_into().unwrap_or(0);
-                    let data = copy_memory(memory, data_offset, data_length);
+                    let data = crate::copy_memory(memory, data_offset, data_length);
                     state_updates.push(StateUpdate::Log4(IStateUpdateTypes::Log4 {
                         data: data.into(),
                         topic1: stack[2].into(),

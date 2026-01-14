@@ -65,19 +65,23 @@ pub fn compute_state_updates(trace: DefaultFrame) -> Result<(Vec<StateUpdate>, H
 }
 
 // =============================================================================
-// Legacy Implementation (kept for comparison tests)
+// Shared Utilities
 // =============================================================================
 
-/// Copy memory with bounds checking (legacy helper).
-fn copy_memory_legacy(memory: &[u8], offset: usize, length: usize) -> Vec<u8> {
+/// Copy memory with bounds checking.
+pub(crate) fn copy_memory(memory: &[u8], offset: usize, length: usize) -> Vec<u8> {
     if memory.len() >= offset + length {
         memory[offset..offset + length].to_vec()
     } else {
-        let mut memory = memory.to_vec();
-        memory.resize(offset + length, 0);
-        memory[offset..offset + length].to_vec()
+        let mut result = memory.to_vec();
+        result.resize(offset + length, 0);
+        result[offset..offset + length].to_vec()
     }
 }
+
+// =============================================================================
+// Legacy Implementation (kept for comparison tests)
+// =============================================================================
 
 /// Legacy implementation: append state update from a struct log.
 fn append_to_state_updates_legacy(
@@ -115,7 +119,7 @@ fn append_to_state_updates_legacy(
         "CALL" => {
             let args_offset: usize = stack[3].try_into().expect("invalid args offset");
             let args_length: usize = stack[4].try_into().expect("invalid args length");
-            let args = copy_memory_legacy(&memory, args_offset, args_length);
+            let args = copy_memory(&memory, args_offset, args_length);
             state_updates.push(StateUpdate::Call(IStateUpdateTypes::Call {
                 target: Address::from_word(stack[1].into()),
                 value: stack[2],
@@ -125,7 +129,7 @@ fn append_to_state_updates_legacy(
         "LOG0" => {
             let data_offset: usize = stack[0].try_into().expect("invalid data offset");
             let data_length: usize = stack[1].try_into().expect("invalid data length");
-            let data = copy_memory_legacy(&memory, data_offset, data_length);
+            let data = copy_memory(&memory, data_offset, data_length);
             state_updates.push(StateUpdate::Log0(IStateUpdateTypes::Log0 {
                 data: data.into(),
             }));
@@ -133,7 +137,7 @@ fn append_to_state_updates_legacy(
         "LOG1" => {
             let data_offset: usize = stack[0].try_into().expect("invalid data offset");
             let data_length: usize = stack[1].try_into().expect("invalid data length");
-            let data = copy_memory_legacy(&memory, data_offset, data_length);
+            let data = copy_memory(&memory, data_offset, data_length);
             state_updates.push(StateUpdate::Log1(IStateUpdateTypes::Log1 {
                 data: data.into(),
                 topic1: stack[2].into(),
@@ -142,7 +146,7 @@ fn append_to_state_updates_legacy(
         "LOG2" => {
             let data_offset: usize = stack[0].try_into().expect("invalid data offset");
             let data_length: usize = stack[1].try_into().expect("invalid data length");
-            let data = copy_memory_legacy(&memory, data_offset, data_length);
+            let data = copy_memory(&memory, data_offset, data_length);
             state_updates.push(StateUpdate::Log2(IStateUpdateTypes::Log2 {
                 data: data.into(),
                 topic1: stack[2].into(),
@@ -152,7 +156,7 @@ fn append_to_state_updates_legacy(
         "LOG3" => {
             let data_offset: usize = stack[0].try_into().expect("invalid data offset");
             let data_length: usize = stack[1].try_into().expect("invalid data length");
-            let data = copy_memory_legacy(&memory, data_offset, data_length);
+            let data = copy_memory(&memory, data_offset, data_length);
             state_updates.push(StateUpdate::Log3(IStateUpdateTypes::Log3 {
                 data: data.into(),
                 topic1: stack[2].into(),
@@ -163,7 +167,7 @@ fn append_to_state_updates_legacy(
         "LOG4" => {
             let data_offset: usize = stack[0].try_into().expect("invalid data offset");
             let data_length: usize = stack[1].try_into().expect("invalid data length");
-            let data = copy_memory_legacy(&memory, data_offset, data_length);
+            let data = copy_memory(&memory, data_offset, data_length);
             state_updates.push(StateUpdate::Log4(IStateUpdateTypes::Log4 {
                 data: data.into(),
                 topic1: stack[2].into(),
