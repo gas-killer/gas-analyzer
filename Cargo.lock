@@ -4653,7 +4653,6 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 [[package]]
 name = "opcode-tracer"
 version = "0.1.0"
-source = "git+https://github.com/BreadchainCoop/sp1-contract-call?branch=cancun-v1#ebc0b8d7f2d219688e69393e8c735520a8289418"
 dependencies = [
  "alloy-primitives",
  "alloy-provider",
@@ -7424,7 +7423,6 @@ dependencies = [
 [[package]]
 name = "sp1-cc-client-executor"
 version = "0.1.0"
-source = "git+https://github.com/BreadchainCoop/sp1-contract-call?branch=cancun-v1#ebc0b8d7f2d219688e69393e8c735520a8289418"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7459,7 +7457,6 @@ dependencies = [
 [[package]]
 name = "sp1-cc-host-executor"
 version = "0.1.0"
-source = "git+https://github.com/BreadchainCoop/sp1-contract-call?branch=cancun-v1#ebc0b8d7f2d219688e69393e8c735520a8289418"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",

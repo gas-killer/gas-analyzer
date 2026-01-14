@@ -45,26 +45,22 @@ pub fn parse_trace_memory(memory: Vec<String>) -> Vec<u8> {
 }
 
 /// Compute state updates from a Geth trace.
-/// This converts the trace to the opcode-tracer format and uses the unified implementation.
+/// Uses opcode-tracer when available, falls back to legacy or WASM implementation.
 pub fn compute_state_updates(trace: DefaultFrame) -> Result<(Vec<StateUpdate>, HashSet<Opcode>)> {
     #[cfg(feature = "opcode-tracer")]
     {
-        eprintln!("[gas-analyzer] Using \"sp1-cc\" library");
+        eprintln!("[gas-analyzer] Using sp1-cc opcode-tracer");
         let opcode_trace = opcode_tracer::convert_geth_trace_to_result(&trace);
         opcode_tracer::compute_state_updates_from_trace(&opcode_trace)
     }
-    #[cfg(not(feature = "opcode-tracer"))]
+    #[cfg(all(not(feature = "opcode-tracer"), target_arch = "wasm32"))]
     {
-        // For WASM builds, use the WASM implementation
-        #[cfg(target_arch = "wasm32")]
-        {
-            crate::wasm::compute_state_updates_wasm(trace)
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            // Fallback to legacy implementation when opcode-tracer is not available
-            compute_state_updates_legacy(trace)
-        }
+        crate::wasm::compute_state_updates_wasm(trace)
+    }
+    #[cfg(all(not(feature = "opcode-tracer"), not(target_arch = "wasm32")))]
+    {
+        eprintln!("[gas-analyzer] Using legacy Geth trace implementation");
+        compute_state_updates_legacy(trace)
     }
 }
 

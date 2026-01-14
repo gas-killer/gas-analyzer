@@ -369,6 +369,6 @@ mod opcode_tracer_impl {
     } // end tests module
 } // end opcode_tracer_impl module
 
-// Re-export when feature is enabled
+// Re-export when opcode-tracer feature is enabled
 #[cfg(feature = "opcode-tracer")]
 pub use opcode_tracer_impl::*;

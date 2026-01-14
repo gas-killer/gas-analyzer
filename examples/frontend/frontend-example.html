@@ -92,7 +92,7 @@
         // Import the WASM module
         // Note: This must be served over HTTP (not file://) due to CORS restrictions
         // Use: python -m http.server 8000 or similar
-        import init, { analyze_trace } from '../pkg/gas_analyzer_rs.js';
+        import init, { analyze_trace } from './pkg/gas_analyzer_rs.js';
 
         // Initialize WASM on page load
         await init();
@@ -205,15 +205,32 @@
                 const effectiveGasPrice = receipt.effectiveGasPrice ? parseInt(receipt.effectiveGasPrice, 16) : null;
                 const gasCost = effectiveGasPrice ? (actualGasUsed * effectiveGasPrice) : null;
                 
-                // Calculate savings (heuristic estimate vs actual)
-                // Note: The heuristic estimate is rough - real savings require backend GasKiller simulation
-                const heuristicEstimate = analysis.estimated_gas;
-                const potentialSavings = actualGasUsed > heuristicEstimate 
-                    ? actualGasUsed - heuristicEstimate 
-                    : 0;
-                const savingsPercent = actualGasUsed > 0 
-                    ? ((potentialSavings / actualGasUsed) * 100).toFixed(2)
-                    : '0.00';
+                // Gas estimates from analysis (best/average/worst case)
+                const estimates = analysis.gas_estimates;
+                const callGas = estimates.call_gas || 0;
+                
+                // Calculate savings for each scenario
+                const calcSavings = (estimate) => {
+                    const savings = actualGasUsed > estimate ? actualGasUsed - estimate : 0;
+                    const percent = actualGasUsed > 0 ? ((savings / actualGasUsed) * 100).toFixed(1) : '0.0';
+                    return { savings, percent };
+                };
+                
+                const bestSavings = calcSavings(estimates.best_case.total_gas);
+                const avgSavings = calcSavings(estimates.average_case.total_gas);
+                const worstSavings = calcSavings(estimates.worst_case.total_gas);
+
+                // Format call details
+                const callDetailsHtml = analysis.call_details && analysis.call_details.length > 0
+                    ? analysis.call_details.map((c, i) => `
+                        <tr>
+                            <td style="padding: 4px; border: 1px solid #ddd; font-size: 12px;">${i + 1}</td>
+                            <td style="padding: 4px; border: 1px solid #ddd; font-size: 11px; word-break: break-all;">${c.target}</td>
+                            <td style="padding: 4px; border: 1px solid #ddd; font-size: 12px;">${c.value}</td>
+                            <td style="padding: 4px; border: 1px solid #ddd; font-size: 12px;">${c.gas_used.toLocaleString()}</td>
+                        </tr>
+                    `).join('')
+                    : '';
 
                 // Display results
                 resultDiv.innerHTML = `
@@ -224,29 +241,90 @@
                     <table style="width: 100%; border-collapse: collapse; margin: 10px 0;">
                         <tr>
                             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Actual Gas Used:</strong></td>
-                            <td style="padding: 8px; border: 1px solid #ddd;">${actualGasUsed.toLocaleString()}</td>
+                            <td style="padding: 8px; border: 1px solid #ddd;" colspan="3">${actualGasUsed.toLocaleString()}</td>
                         </tr>
                         ${gasCost ? `
                         <tr>
                             <td style="padding: 8px; border: 1px solid #ddd;"><strong>Gas Cost:</strong></td>
-                            <td style="padding: 8px; border: 1px solid #ddd;">${(gasCost / 1e18).toFixed(6)} ETH</td>
+                            <td style="padding: 8px; border: 1px solid #ddd;" colspan="3">${(gasCost / 1e18).toFixed(6)} ETH</td>
                         </tr>
                         ` : ''}
-                        <tr>
-                            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Heuristic Estimate:</strong></td>
-                            <td style="padding: 8px; border: 1px solid #ddd;">${heuristicEstimate.toLocaleString()}</td>
+                    </table>
+                    
+                    <h4>GasKiller Estimates (SSTORE Scenarios)</h4>
+                    <p style="font-size: 0.9em; color: #666; margin-bottom: 10px;">
+                        SSTORE gas varies: <strong>2,900</strong> (warm slot) → <strong>5,000</strong> (avg) → <strong>20,000</strong> (cold slot, new value)
+                    </p>
+                    <table style="width: 100%; border-collapse: collapse; margin: 10px 0;">
+                        <tr style="background-color: #f5f5f5;">
+                            <th style="padding: 8px; border: 1px solid #ddd;">Scenario</th>
+                            <th style="padding: 8px; border: 1px solid #ddd;">SSTORE Gas</th>
+                            <th style="padding: 8px; border: 1px solid #ddd;">Total Estimate</th>
+                            <th style="padding: 8px; border: 1px solid #ddd;">Potential Savings</th>
                         </tr>
-                        <tr style="background-color: ${potentialSavings > 0 ? '#d4edda' : '#f8d7da'};">
-                            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Potential Savings:</strong></td>
-                            <td style="padding: 8px; border: 1px solid #ddd;">
-                                ${potentialSavings.toLocaleString()} gas (${savingsPercent}%)
-                                ${potentialSavings > 0 && gasCost ? `≈ ${((potentialSavings * effectiveGasPrice) / 1e18).toFixed(6)} ETH` : ''}
+                        <tr style="background-color: #e8f5e9;">
+                            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Best Case</strong><br><span style="font-size: 11px; color: #666;">Warm slots (2,900/store)</span></td>
+                            <td style="padding: 8px; border: 1px solid #ddd;">${estimates.best_case.sstore_gas.toLocaleString()}</td>
+                            <td style="padding: 8px; border: 1px solid #ddd;">${estimates.best_case.total_gas.toLocaleString()}</td>
+                            <td style="padding: 8px; border: 1px solid #ddd; color: #2e7d32;">
+                                ${bestSavings.savings.toLocaleString()} (${bestSavings.percent}%)
+                            </td>
+                        </tr>
+                        <tr style="background-color: #fff8e1;">
+                            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Average Case</strong><br><span style="font-size: 11px; color: #666;">Mixed warm/cold (5,000/store)</span></td>
+                            <td style="padding: 8px; border: 1px solid #ddd;">${estimates.average_case.sstore_gas.toLocaleString()}</td>
+                            <td style="padding: 8px; border: 1px solid #ddd;">${estimates.average_case.total_gas.toLocaleString()}</td>
+                            <td style="padding: 8px; border: 1px solid #ddd; color: #f57c00;">
+                                ${avgSavings.savings.toLocaleString()} (${avgSavings.percent}%)
+                            </td>
+                        </tr>
+                        <tr style="background-color: #ffebee;">
+                            <td style="padding: 8px; border: 1px solid #ddd;"><strong>Worst Case</strong><br><span style="font-size: 11px; color: #666;">Cold slots, new values (20,000/store)</span></td>
+                            <td style="padding: 8px; border: 1px solid #ddd;">${estimates.worst_case.sstore_gas.toLocaleString()}</td>
+                            <td style="padding: 8px; border: 1px solid #ddd;">${estimates.worst_case.total_gas.toLocaleString()}</td>
+                            <td style="padding: 8px; border: 1px solid #ddd; color: #c62828;">
+                                ${worstSavings.savings.toLocaleString()} (${worstSavings.percent}%)
                             </td>
                         </tr>
                     </table>
-                    <p style="font-size: 0.9em; color: #666; margin-top: 10px;">
-                        <em>Note: Heuristic estimate is approximate. For accurate gas estimation, use the backend GasKiller service with Anvil simulation.</em>
-                    </p>
+                    
+                    <h4>Gas Breakdown (Average Case)</h4>
+                    <table style="width: 100%; border-collapse: collapse; margin: 10px 0;">
+                        <tr>
+                            <td style="padding: 8px; border: 1px solid #ddd;">
+                                <span style="cursor: help; border-bottom: 1px dotted #666;" title="The fixed overhead gas cost for Gas Killer's state change handler contract. This covers the base transaction cost and state update processing.">
+                                    Turetzky Upper Gas Limit (TUGL)
+                                </span>
+                            </td>
+                            <td style="padding: 8px; border: 1px solid #ddd;">${estimates.average_case.base_overhead.toLocaleString()}</td>
+                        </tr>
+                        <tr style="background-color: #e8f5e9;">
+                            <td style="padding: 8px; border: 1px solid #ddd;">SSTOREs (${analysis.state_update_breakdown.stores}):</td>
+                            <td style="padding: 8px; border: 1px solid #ddd;">${estimates.average_case.sstore_gas.toLocaleString()} <span style="color: #4caf50;">✓ Batched</span></td>
+                        </tr>
+                        <tr style="background-color: #e8f5e9;">
+                            <td style="padding: 8px; border: 1px solid #ddd;">LOGs:</td>
+                            <td style="padding: 8px; border: 1px solid #ddd;">${estimates.average_case.log_gas.toLocaleString()} <span style="color: #4caf50;">✓ Batched</span></td>
+                        </tr>
+                        <tr style="background-color: #fff3e0;">
+                            <td style="padding: 8px; border: 1px solid #ddd;">External CALLs:</td>
+                            <td style="padding: 8px; border: 1px solid #ddd;">${callGas.toLocaleString()} <span style="color: #ff9800;">⚠ Not optimizable</span></td>
+                        </tr>
+                    </table>
+                    
+                    ${analysis.call_details && analysis.call_details.length > 0 ? `
+                    <h4>External CALL Details</h4>
+                    <p style="font-size: 0.9em; color: #666;">These external calls cannot be optimized - gas shown is actual execution cost.</p>
+                    <table style="width: 100%; border-collapse: collapse; margin: 10px 0;">
+                        <tr style="background-color: #f5f5f5;">
+                            <th style="padding: 8px; border: 1px solid #ddd;">#</th>
+                            <th style="padding: 8px; border: 1px solid #ddd;">Target</th>
+                            <th style="padding: 8px; border: 1px solid #ddd;">Value (wei)</th>
+                            <th style="padding: 8px; border: 1px solid #ddd;">Gas Used</th>
+                        </tr>
+                        ${callDetailsHtml}
+                    </table>
+                    ` : ''}
 
                     <h4>State Updates</h4>
                     <p><strong>Total State Updates:</strong> ${analysis.state_update_count}</p>
