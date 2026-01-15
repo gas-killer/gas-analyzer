@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 
 use alloy::primitives::FixedBytes;
 use alloy_rpc_types::TransactionReceipt;
-use serde_derive::Serialize;
+use serde::Serialize;
 
 pub(crate) type Opcode = String;
 

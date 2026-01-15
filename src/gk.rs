@@ -1,402 +1,435 @@
-use crate::sol_types::{RevertingContext, StateUpdate};
-use alloy::{
-    contract,
-    dyn_abi::DynSolValue,
-    hex,
-    network::EthereumWallet,
-    node_bindings::{Anvil, AnvilInstance},
-    primitives::{Address, Bytes, FixedBytes, Selector, U256},
-    providers::{
-        Identity, ProviderBuilder, RootProvider,
-        ext::DebugApi,
-        fillers::{
-            BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
-            WalletFiller,
+use crate::sol_types::StateUpdate;
+use alloy::rpc::types::eth::TransactionRequest;
+use anyhow::Result;
+use url::Url;
+
+// ============================================================================
+// Anvil-based GasKiller (legacy implementation)
+// ============================================================================
+
+#[cfg(feature = "anvil")]
+mod anvil_gk {
+    use super::*;
+    use crate::sol_types::RevertingContext;
+    use alloy::{
+        contract,
+        dyn_abi::DynSolValue,
+        hex,
+        network::EthereumWallet,
+        node_bindings::{Anvil, AnvilInstance},
+        primitives::{Address, Bytes, FixedBytes, Selector, U256},
+        providers::{
+            Identity, ProviderBuilder, RootProvider,
+            ext::DebugApi,
+            fillers::{
+                BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
+                WalletFiller,
+            },
         },
-    },
-    rpc::{
-        json_rpc::ErrorPayload,
-        types::{
-            eth::TransactionRequest,
-            trace::geth::{
+        rpc::{
+            json_rpc::ErrorPayload,
+            types::trace::geth::{
                 DefaultFrame, GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace,
             },
         },
-    },
-    signers::local::PrivateKeySigner,
-    sol,
-    sol_types::SolError,
-    transports::RpcError,
-};
-use alloy_dyn_abi::{ErrorExt, JsonAbiExt};
-use alloy_provider::{Provider, ext::AnvilApi};
-use anyhow::{Context, Error, Result, anyhow, bail};
-use url::Url;
+        signers::local::PrivateKeySigner,
+        sol_types::SolError,
+        transports::RpcError,
+    };
+    use alloy_dyn_abi::{ErrorExt, JsonAbiExt};
+    use alloy_provider::{Provider, ext::AnvilApi};
+    use anyhow::{Context, Error, anyhow, bail};
+    use foundry_evm_traces::identifier::SignaturesIdentifier;
 
-use foundry_evm_traces::identifier::SignaturesIdentifier;
+    alloy::sol!(
+        #[sol(rpc)]
+        StateChangeHandlerGasEstimator,
+        "res/abi/StateChangeHandlerGasEstimator.json"
+    );
 
-sol!(
-    #[sol(rpc)]
-    StateChangeHandlerGasEstimator,
-    "res/abi/StateChangeHandlerGasEstimator.json"
-);
-
-// I really fucking hate rust's type system sometimes
-type ConnectHTTPDefaultProvider = FillProvider<
-    JoinFill<
+    // I really fucking hate rust's type system sometimes
+    type ConnectHTTPDefaultProvider = FillProvider<
         JoinFill<
-            Identity,
-            JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
+            JoinFill<
+                Identity,
+                JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
+            >,
+            WalletFiller<EthereumWallet>,
         >,
-        WalletFiller<EthereumWallet>,
-    >,
-    RootProvider,
->;
-pub type GasKillerDefault = GasKiller<ConnectHTTPDefaultProvider>;
+        RootProvider,
+    >;
+    pub type GasKillerDefault = GasKiller<ConnectHTTPDefaultProvider>;
 
-/// Builder for configuring and creating a `GasKiller` instance.
-pub struct GasKillerBuilder {
-    fork_url: Url,
-    block_number: Option<u64>,
-    timestamp: Option<u64>,
-}
-
-impl GasKillerBuilder {
-    /// Create a new builder with the required fork URL.
-    pub fn new(fork_url: Url) -> Self {
-        Self {
-            fork_url,
-            block_number: None,
-            timestamp: None,
-        }
+    pub struct GasKiller<P> {
+        _anvil: AnvilInstance,
+        provider: P,
+        code: Bytes,
     }
 
-    /// Set the block number to fork from. If not set, forks from the latest block.
-    pub fn block_number(mut self, block_number: u64) -> Self {
-        self.block_number = Some(block_number);
-        self
-    }
+    impl GasKiller<ConnectHTTPDefaultProvider> {
+        pub async fn new(fork_url: Url, block_number: Option<u64>) -> Result<Self> {
+            let anvil_init = Anvil::new().fork(fork_url.as_str());
 
-    /// Set the timestamp for the next block. If not set, defaults to `fork_block_timestamp + 1`.
-    /// The timestamp must be >= the fork block timestamp to satisfy Ethereum's strictly
-    /// increasing timestamp requirement.
-    pub fn timestamp(mut self, timestamp: u64) -> Self {
-        self.timestamp = Some(timestamp);
-        self
-    }
+            let anvil = if let Some(number) = block_number {
+                anvil_init.fork_block_number(number).try_spawn()?
+            } else {
+                anvil_init.try_spawn()?
+            };
+            let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
+            let provider = ProviderBuilder::new()
+                .wallet(signer)
+                .connect_http(anvil.endpoint_url());
 
-    /// Build the `GasKiller` instance.
-    pub async fn build(self) -> Result<GasKillerDefault> {
-        // First, query the fork block's timestamp from the source RPC
-        // This ensures deterministic timestamps across all nodes
-        let source_provider = ProviderBuilder::new().connect_http(self.fork_url.clone());
+            let contract = StateChangeHandlerGasEstimator::deploy(provider.clone()).await?;
+            let address = *contract.address();
+            let code = provider.get_code_at(address).await?;
 
-        let fork_block_timestamp = if let Some(number) = self.block_number {
-            let block = source_provider
-                .get_block_by_number(number.into())
-                .await?
-                .ok_or_else(|| anyhow!("Fork block {} not found", number))?;
-            block.header.timestamp
-        } else {
-            let block = source_provider
-                .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
-                .await?
-                .ok_or_else(|| anyhow!("Latest block not found"))?;
-            block.header.timestamp
-        };
-
-        // Determine the timestamp to use for the next block
-        let deterministic_timestamp = if let Some(provided_timestamp) = self.timestamp {
-            // Validate that the provided timestamp satisfies Ethereum's requirements
-            // Ethereum requires block timestamps to be strictly increasing
-            if provided_timestamp < fork_block_timestamp {
-                bail!(
-                    "Provided timestamp {} is less than fork block timestamp {}. \
-                     Ethereum requires block timestamps to be strictly increasing.",
-                    provided_timestamp,
-                    fork_block_timestamp
-                );
-            }
-            provided_timestamp
-        } else {
-            // Default to fork block timestamp + 1 for deterministic execution
-            // This simulates the next block being mined immediately after the fork block
-            fork_block_timestamp + 1
-        };
-
-        let mut anvil_init = Anvil::new()
-            .fork(self.fork_url.as_str())
-            .arg("--steps-tracing")
-            .arg("--auto-impersonate");
-
-        if let Some(number) = self.block_number {
-            anvil_init = anvil_init.fork_block_number(number);
+            Ok(Self {
+                _anvil: anvil,
+                provider,
+                code,
+            })
         }
 
-        let anvil = anvil_init.try_spawn()?;
-        let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
-        let provider = ProviderBuilder::new()
-            .wallet(signer)
-            .connect_http(anvil.endpoint_url());
-
-        let contract = StateChangeHandlerGasEstimator::deploy(provider.clone()).await?;
-        // Alloy's sol macro generates a BYTECODE and DEPLOYED_BYTECODE fields for contracts,
-        // but I don't get how is it possible since deployed bytecode is dependant on constructor arguments
-        // so I'm just deploying a contract and getting the code from it
-        let address = *contract.address();
-
-        let code = provider.get_code_at(address).await?;
-
-        Ok(GasKiller {
-            _anvil: anvil,
-            provider,
-            code,
-            deterministic_timestamp,
-        })
-    }
-}
-
-pub struct GasKiller<P> {
-    _anvil: AnvilInstance,
-    provider: P,
-    code: Bytes,
-    /// Deterministic timestamp to use for all transactions (fork block timestamp + 1)
-    deterministic_timestamp: u64,
-}
-
-impl GasKiller<ConnectHTTPDefaultProvider> {
-    /// Creates a new `GasKillerBuilder` for configuring a `GasKiller` instance.
-    ///
-    /// # Example
-    /// ```no_run
-    /// use gas_analyzer_rs::gk::GasKillerDefault;
-    /// # async fn example() -> anyhow::Result<()> {
-    /// let gk = GasKillerDefault::builder(url::Url::parse("http://localhost:8545")?)
-    ///     .block_number(12345)
-    ///     .timestamp(1234567890)
-    ///     .build()
-    ///     .await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn builder(fork_url: Url) -> GasKillerBuilder {
-        GasKillerBuilder::new(fork_url)
-    }
-
-    /// Sends a transaction and returns the trace.
-    ///
-    /// Uses the same Anvil instance that will be used for gas estimation,
-    /// ensuring consistent blockchain state.
-    ///
-    /// Before sending, sets a deterministic block timestamp to ensure
-    /// all nodes produce identical results regardless of execution time.
-    pub async fn send_tx_and_get_trace(
-        &self,
-        tx_request: TransactionRequest,
-    ) -> Result<DefaultFrame> {
-        // Set deterministic timestamp for the next block
-        // This ensures all nodes get the same block.timestamp value
-        self.provider
-            .anvil_set_next_block_timestamp(self.deterministic_timestamp)
-            .await?;
-
-        let tx_receipt = self
-            .provider
-            .send_transaction(tx_request)
-            .await?
-            .get_receipt()
-            .await?;
-
-        if !tx_receipt.status() {
-            bail!("transaction failed");
-        }
-
-        let tx_hash = tx_receipt.transaction_hash;
-        self.get_tx_trace(tx_hash).await
-    }
-
-    /// Gets the trace for a transaction that was already executed.
-    pub async fn get_tx_trace(&self, tx_hash: FixedBytes<32>) -> Result<DefaultFrame> {
-        let options = GethDebugTracingOptions {
-            config: GethDefaultTracingOptions {
-                enable_memory: Some(true),
+        pub async fn get_tx_trace(&self, tx_hash: FixedBytes<32>) -> Result<DefaultFrame> {
+            let options = GethDebugTracingOptions {
+                config: GethDefaultTracingOptions {
+                    enable_memory: Some(true),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        };
+            };
 
-        let GethTrace::Default(trace) = self
-            .provider
-            .debug_trace_transaction(tx_hash, options)
-            .await?
-        else {
-            return Err(anyhow!("Expected default trace"));
-        };
-        Ok(trace)
-    }
-
-    pub async fn estimate_state_changes_gas(
-        &self,
-        contract_address: Address,
-        state_updates: &[StateUpdate],
-    ) -> Result<u64> {
-        let initial_block_number = self.provider.get_block_number().await?;
-        let snapshot_id: U256 = self.provider.raw_request("evm_snapshot".into(), ()).await?;
-        let original_code = self.provider.get_code_at(contract_address).await?;
-        self.provider
-            .anvil_set_code(contract_address, self.code.clone())
-            .await?;
-        let target_contract = StateChangeHandlerGasEstimator::new(contract_address, &self.provider);
-
-        self.provider
-            .anvil_set_balance(
-                contract_address,
-                U256::from(100000000000000000000000000000u128),
-            )
-            .await?;
-
-        let (types, args) = crate::encode_state_updates_to_sol(state_updates);
-        let types = types.iter().map(|x| *x as u8).collect::<Vec<_>>();
-        let tx = target_contract
-            .runStateUpdatesCall(types, args)
-            .send()
-            .await;
-        // can't use map because of async
-        let tx = match tx {
-            Ok(tx) => tx,
-            Err(e) => return Err(Self::process_simulation_error(e).await),
-        };
-        let receipt = tx.get_receipt().await?;
-        if !receipt.status() {
-            bail!("Transaction failed");
+            let GethTrace::Default(trace) = self
+                .provider
+                .debug_trace_transaction(tx_hash, options)
+                .await?
+            else {
+                return Err(anyhow!("Expected default trace"));
+            };
+            Ok(trace)
         }
 
-        self.provider
-            .anvil_set_code(contract_address, original_code)
-            .await?;
+        pub async fn estimate_state_changes_gas(
+            &self,
+            contract_address: Address,
+            state_updates: &[StateUpdate],
+        ) -> Result<u64> {
+            let initial_block_number = self.provider.get_block_number().await?;
+            let snapshot_id: U256 = self.provider.raw_request("evm_snapshot".into(), ()).await?;
+            let original_code = self.provider.get_code_at(contract_address).await?;
+            self.provider
+                .anvil_set_code(contract_address, self.code.clone())
+                .await?;
+            let target_contract =
+                StateChangeHandlerGasEstimator::new(contract_address, &self.provider);
 
-        let reverted: bool = self
-            .provider
-            .raw_request("evm_revert".into(), (snapshot_id,))
-            .await?;
-        assert!(reverted);
-        let final_block_number = self.provider.get_block_number().await?;
-        assert_eq!(
-            initial_block_number, final_block_number,
-            "block number should revert to initial state"
-        );
-        Ok(receipt.gas_used)
-    }
+            self.provider
+                .anvil_set_balance(
+                    contract_address,
+                    U256::from(100000000000000000000000000000u128),
+                )
+                .await?;
 
-    async fn process_simulation_error(error: contract::Error) -> Error {
-        let processed_error = match &error {
-            contract::Error::TransportError(RpcError::ErrorResp(ErrorPayload {
-                code: 3,
-                data: Some(data),
-                ..
-            })) => {
-                let selector_hex = format!("0x{}", hex::encode(RevertingContext::SELECTOR));
-                let data_inner = data.get().trim_matches('"');
-                if !data_inner.starts_with(&selector_hex) {
-                    Err(None)
-                } else {
-                    Self::process_reverting_context_error(data_inner)
-                        .await
-                        .map_err(Some)
+            let (types, args) = crate::encode_state_updates_to_sol(state_updates);
+            let types = types.iter().map(|x| *x as u8).collect::<Vec<_>>();
+            let tx = target_contract
+                .runStateUpdatesCall(types, args)
+                .send()
+                .await;
+            let tx = match tx {
+                Ok(tx) => tx,
+                Err(e) => return Err(Self::process_simulation_error(e).await),
+            };
+            let receipt = tx.get_receipt().await?;
+            if !receipt.status() {
+                bail!("Transaction failed");
+            }
+
+            self.provider
+                .anvil_set_code(contract_address, original_code)
+                .await?;
+
+            let reverted: bool = self
+                .provider
+                .raw_request("evm_revert".into(), (snapshot_id,))
+                .await?;
+            assert!(reverted);
+            let final_block_number = self.provider.get_block_number().await?;
+            assert_eq!(
+                initial_block_number, final_block_number,
+                "block number should revert to initial state"
+            );
+            Ok(receipt.gas_used)
+        }
+
+        async fn process_simulation_error(error: contract::Error) -> Error {
+            let processed_error = match &error {
+                contract::Error::TransportError(RpcError::ErrorResp(ErrorPayload {
+                    code: 3,
+                    data: Some(data),
+                    ..
+                })) => {
+                    let selector_hex = format!("0x{}", hex::encode(RevertingContext::SELECTOR));
+                    let data_inner = data.get().trim_matches('"');
+                    if !data_inner.starts_with(&selector_hex) {
+                        Err(None)
+                    } else {
+                        Self::process_reverting_context_error(data_inner)
+                            .await
+                            .map_err(Some)
+                    }
                 }
-            }
-            _ => Err(None),
-        };
+                _ => Err(None),
+            };
 
-        match processed_error {
-            Ok(processed_error) => processed_error,
-            Err(Some(processing_error)) => Err::<(), _>(processing_error)
-                .context(format!("error processing error, original error: {}", error))
-                .unwrap_err(),
-            Err(None) => error.into(),
+            match processed_error {
+                Ok(processed_error) => processed_error,
+                Err(Some(processing_error)) => Err::<(), _>(processing_error)
+                    .context(format!("error processing error, original error: {}", error))
+                    .unwrap_err(),
+                Err(None) => error.into(),
+            }
+        }
+
+        async fn process_reverting_context_error(data: &str) -> Result<anyhow::Error> {
+            let reverting_context_error_hex = hex::decode(data).context(
+                "something went incredibly wrong, rpc error contained invalid hex value",
+            )?;
+            let reverting_context = RevertingContext::abi_decode(&reverting_context_error_hex)
+                .context("something went incredibly wrong, RevertingContext rpc error wasn't valid abi encoded")?;
+
+            let signatures_identifier = SignaturesIdentifier::new(false).map_err(|e| anyhow!("detected RevertingContext error, but could not access SignaturesIdentifier service. error: {}", e))?;
+            let revert_selector = reverting_context
+                .revertData
+                .get(0..4)
+                .map(|bytes| Selector::try_from(bytes).unwrap());
+            let error = (match revert_selector {
+                Some(revert_selector) => {
+                    signatures_identifier.identify_error(revert_selector).await
+                }
+                None => None,
+            })
+            .and_then(|identified_error| {
+                match identified_error.decode_error(&reverting_context.revertData) {
+                    Ok(decoded_error) => Some((identified_error, decoded_error)),
+                    _ => None,
+                }
+            });
+
+            let function_selector = reverting_context
+                .callargs
+                .get(0..4)
+                .map(|bytes| Selector::try_from(bytes).unwrap());
+            let function = (match function_selector {
+                Some(function_selector) => {
+                    signatures_identifier
+                        .identify_function(function_selector)
+                        .await
+                }
+                None => None,
+            })
+            .and_then(|identified_function| {
+                match identified_function.abi_decode_input(&reverting_context.callargs) {
+                    Ok(decoded_input) => Some((identified_function, decoded_input)),
+                    _ => None,
+                }
+            });
+            let target = reverting_context.target;
+            let state_update_index = reverting_context.index;
+
+            let function_string = match function {
+                Some((identified_function, decoded_input)) => {
+                    format!(
+                        "{} with values ({})",
+                        identified_function.signature(),
+                        format_decoded_values(&decoded_input[..])
+                    )
+                }
+                None => format!("Unrecognized function: {:?}", reverting_context.callargs),
+            };
+
+            let error_string = match error {
+                Some((identified_error, decoded_error)) => {
+                    format!(
+                        "{} with values ({})",
+                        identified_error.signature(),
+                        format_decoded_values(&decoded_error.body)
+                    )
+                }
+                None => format!("Unrecognized error: {:?}", reverting_context.revertData),
+            };
+
+            Ok(anyhow!(
+                "Simulation subcontext reverted. State Update Index: {} Target Address: {}, Called {} Got error: {}",
+                state_update_index,
+                target,
+                function_string,
+                error_string
+            ))
         }
     }
 
-    async fn process_reverting_context_error(data: &str) -> Result<anyhow::Error> {
-        let reverting_context_error_hex = hex::decode(data)
-            .context("something went incredibly wrong, rpc error contained invalid hex value")?;
-        let reverting_context = RevertingContext::abi_decode(&reverting_context_error_hex)
-            .context("something went incredibly wrong, RevertingContext rpc error wasn't valid abi encoded")?;
-
-        let signatures_identifier = SignaturesIdentifier::new(false).map_err(|e| anyhow!("detected RevertingContext error, but could not access SignaturesIdentifier service. error: {}", e))?;
-        // TODO: possible to parallelize requests to signatures_identifier
-        let revert_selector = reverting_context
-            .revertData
-            .get(0..4)
-            .map(|bytes| Selector::try_from(bytes).unwrap());
-        let error = (match revert_selector {
-            Some(revert_selector) => signatures_identifier.identify_error(revert_selector).await,
-            None => None,
-        })
-        .and_then(|identified_error| {
-            match identified_error.decode_error(&reverting_context.revertData) {
-                Ok(decoded_error) => Some((identified_error, decoded_error)),
-                _ => None,
-            }
-        });
-
-        let function_selector = reverting_context
-            .callargs
-            .get(0..4)
-            .map(|bytes| Selector::try_from(bytes).unwrap());
-        let function = (match function_selector {
-            Some(function_selector) => {
-                signatures_identifier
-                    .identify_function(function_selector)
-                    .await
-            }
-            None => None,
-        })
-        .and_then(|identified_function| {
-            match identified_function.abi_decode_input(&reverting_context.callargs) {
-                Ok(decoded_input) => Some((identified_function, decoded_input)),
-                _ => None,
-            }
-        });
-        let target = reverting_context.target;
-        let state_update_index = reverting_context.index;
-
-        let function_string = match function {
-            Some((identified_function, decoded_input)) => {
-                format!(
-                    "{} with values ({})",
-                    identified_function.signature(),
-                    format_decoded_values(&decoded_input[..])
-                )
-            }
-            None => format!("Unrecognized function: {:?}", reverting_context.callargs),
-        };
-
-        let error_string = match error {
-            Some((identified_error, decoded_error)) => {
-                format!(
-                    "{} with values ({})",
-                    identified_error.signature(),
-                    format_decoded_values(&decoded_error.body)
-                )
-            }
-            None => format!("Unrecognized error: {:?}", reverting_context.revertData),
-        };
-
-        Ok(anyhow!(
-            "Simulation subcontext reverted. State Update Index: {} Target Address: {}, Called {} Got error: {}",
-            state_update_index,
-            target,
-            function_string,
-            error_string
-        ))
+    fn format_decoded_values(values: &[DynSolValue]) -> String {
+        values
+            .iter()
+            .map(|v| format!("{:?}", v))
+            .collect::<Vec<String>>()
+            .join(", ")
     }
 }
 
-fn format_decoded_values(values: &[DynSolValue]) -> String {
-    values
-        .iter()
-        .map(|v| format!("{:?}", v))
-        .collect::<Vec<String>>()
-        .join(", ")
+#[cfg(feature = "anvil")]
+pub use anvil_gk::*;
+
+// ============================================================================
+// EvmSketch-based GasKiller (Anvil-free implementation)
+// ============================================================================
+
+#[cfg(feature = "evmsketch")]
+pub mod evmsketch_gk {
+    use super::*;
+    use crate::evmsketch_executor::{EvmSketchExecutor, EvmSketchExecutorBuilder};
+    use crate::opcode_tracer::compute_state_updates_from_call_trace;
+    use alloy_eips::BlockNumberOrTag;
+    use sp1_cc_client_executor::CallTraceArena;
+    use std::collections::HashSet;
+
+    // Import EthPrimitives
+    use reth_primitives::EthPrimitives;
+
+    /// Type alias for the default EvmSketch-based GasKiller
+    pub type GasKillerEvmSketchDefault = GasKillerEvmSketch<
+        alloy_provider::RootProvider<alloy_provider::network::AnyNetwork>,
+        EthPrimitives,
+    >;
+
+    /// Builder for GasKillerEvmSketch
+    pub struct GasKillerEvmSketchBuilder {
+        rpc_url: Url,
+        block: BlockNumberOrTag,
+    }
+
+    impl GasKillerEvmSketchBuilder {
+        /// Create a new builder with the required RPC URL.
+        pub fn new(rpc_url: Url) -> Self {
+            Self {
+                rpc_url,
+                block: BlockNumberOrTag::Latest,
+            }
+        }
+
+        /// Set the block to execute at.
+        pub fn at_block(mut self, block: BlockNumberOrTag) -> Self {
+            self.block = block;
+            self
+        }
+
+        /// Build the GasKillerEvmSketch instance.
+        pub async fn build(self) -> Result<GasKillerEvmSketchDefault> {
+            let executor = EvmSketchExecutorBuilder::new()
+                .rpc_url(self.rpc_url)
+                .at_block(self.block)
+                .build()
+                .await?;
+
+            Ok(GasKillerEvmSketch { executor })
+        }
+    }
+
+    /// EvmSketch-based GasKiller that doesn't require Anvil.
+    ///
+    /// This implementation uses sp1-contract-call's EvmSketch to simulate
+    /// transactions directly against RPC-backed state.
+    pub struct GasKillerEvmSketch<P, PT> {
+        executor: EvmSketchExecutor<P, PT>,
+    }
+
+    impl GasKillerEvmSketchDefault {
+        /// Create a new builder for GasKillerEvmSketch.
+        ///
+        /// # Example
+        /// ```ignore
+        /// use gas_analyzer_rs::gk::evmsketch_gk::GasKillerEvmSketchDefault;
+        /// # async fn example() -> anyhow::Result<()> {
+        /// let gk = GasKillerEvmSketchDefault::builder(url::Url::parse("http://localhost:8545")?)
+        ///     .at_block(alloy_eips::BlockNumberOrTag::Number(12345))
+        ///     .build()
+        ///     .await?;
+        /// # Ok(())
+        /// # }
+        /// ```
+        pub fn builder(rpc_url: Url) -> GasKillerEvmSketchBuilder {
+            GasKillerEvmSketchBuilder::new(rpc_url)
+        }
+
+        /// Execute a transaction and get the execution trace.
+        pub async fn execute_tx_and_get_trace(
+            &self,
+            tx_request: TransactionRequest,
+        ) -> Result<CallTraceArena> {
+            let (_output, trace) = self.executor.execute_with_trace(&tx_request).await?;
+            Ok(trace)
+        }
+
+        /// Execute a transaction and compute state updates from the trace.
+        ///
+        /// Returns: (state_updates, skipped_opcodes, external_call_gas)
+        pub async fn execute_and_compute_state_updates(
+            &self,
+            tx_request: TransactionRequest,
+        ) -> Result<(Vec<StateUpdate>, HashSet<String>, u64)> {
+            let trace = self.execute_tx_and_get_trace(tx_request).await?;
+            compute_state_updates_from_call_trace(&trace)
+        }
+
+        /// Estimate gas for state changes using a heuristic approach.
+        ///
+        /// This provides a rough estimate based on known gas costs for each
+        /// operation type, PLUS the actual gas used by external calls
+        /// (which cannot be optimized).
+        ///
+        /// # Heuristic gas costs (approximate):
+        /// - SSTORE (cold): ~20,000 gas
+        /// - CALL: actual gas used (from trace) - cannot optimize external calls
+        /// - LOG0-LOG4: ~375 + 375*topics + 8*data_len
+        pub fn estimate_state_changes_gas_heuristic(
+            &self,
+            state_updates: &[StateUpdate],
+            external_call_gas: u64,
+        ) -> u64 {
+            let mut gas = 21000u64; // Base transaction cost
+
+            // Add actual gas used by external calls (cannot be optimized)
+            gas += external_call_gas;
+
+            for update in state_updates {
+                gas += match update {
+                    StateUpdate::Store(_) => 20000, // Cold SSTORE
+                    // CALL gas is already included in external_call_gas from the trace
+                    StateUpdate::Call(_) => 0,
+                    StateUpdate::Log0(log) => 375 + log.data.len() as u64 * 8,
+                    StateUpdate::Log1(log) => 375 + 375 + log.data.len() as u64 * 8,
+                    StateUpdate::Log2(log) => 375 + 375 * 2 + log.data.len() as u64 * 8,
+                    StateUpdate::Log3(log) => 375 + 375 * 3 + log.data.len() as u64 * 8,
+                    StateUpdate::Log4(log) => 375 + 375 * 4 + log.data.len() as u64 * 8,
+                };
+            }
+
+            gas
+        }
+
+        /// Get the block number the executor is anchored to.
+        pub fn anchor_block_number(&self) -> u64 {
+            self.executor.anchor_block_number()
+        }
+
+        /// Get the block hash the executor is anchored to.
+        pub fn anchor_block_hash(&self) -> alloy::primitives::B256 {
+            self.executor.anchor_block_hash()
+        }
+    }
 }
+
+#[cfg(feature = "evmsketch")]
+pub use evmsketch_gk::*;
