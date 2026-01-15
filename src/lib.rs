@@ -1,38 +1,73 @@
 #[allow(dead_code)]
 mod constants;
 pub mod gk;
-#[cfg(test)]
-mod legacy_compare_tests;
-pub mod opcode_tracer;
 pub mod sol_types;
 pub mod structs;
+
+#[cfg(feature = "anvil")]
 pub mod tx_extractor;
 
-use chrono::Utc;
-use std::{collections::HashSet, str::FromStr};
-use structs::{GasKillerReport, Opcode, ReportDetails};
+#[cfg(feature = "evmsketch")]
+pub mod evmsketch_executor;
+
+#[cfg(feature = "evmsketch")]
+pub mod opcode_tracer;
+
+use std::collections::HashSet;
+use structs::Opcode;
 
 use alloy::{
-    primitives::{Bytes, FixedBytes, TxKind, U256},
-    providers::{Provider, ext::DebugApi},
-    rpc::types::{
-        TransactionReceipt,
-        eth::TransactionRequest,
-        trace::geth::{
-            DefaultFrame, GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace,
-        },
-    },
+    primitives::{Bytes, U256},
+    rpc::types::eth::TransactionRequest,
     sol_types::SolValue,
 };
 
-use alloy_rpc_types::TransactionTrait;
-use anyhow::{Result, anyhow, bail};
-use gk::GasKillerDefault;
+use anyhow::{Result, bail};
 use sol_types::{StateUpdate, StateUpdateType};
+use url::Url;
 
+// Anvil-specific imports
+#[cfg(feature = "anvil")]
+use {
+    alloy::{
+        primitives::{Address, FixedBytes, TxKind},
+        providers::{Provider, ProviderBuilder, ext::DebugApi},
+        rpc::types::{
+            TransactionReceipt,
+            trace::geth::{
+                DefaultFrame, GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace,
+                StructLog,
+            },
+        },
+    },
+    alloy_rpc_types::TransactionTrait,
+    anyhow::anyhow,
+    chrono::Utc,
+    gk::GasKillerDefault,
+    sol_types::IStateUpdateTypes,
+    structs::{GasKillerReport, ReportDetails},
+};
+
+#[cfg(feature = "anvil")]
 const TURETZKY_UPPER_GAS_LIMIT: u64 = 250000u64;
 
-pub fn parse_trace_memory(memory: Vec<String>) -> Vec<u8> {
+// ============================================================================
+// Anvil-based trace functions (legacy)
+// ============================================================================
+
+#[cfg(feature = "anvil")]
+fn copy_memory(memory: &[u8], offset: usize, length: usize) -> Vec<u8> {
+    if memory.len() >= offset + length {
+        memory[offset..offset + length].to_vec()
+    } else {
+        let mut memory = memory.to_vec();
+        memory.resize(offset + length, 0);
+        memory[offset..offset + length].to_vec()
+    }
+}
+
+#[cfg(feature = "anvil")]
+fn parse_trace_memory(memory: Vec<String>) -> Vec<u8> {
     memory
         .join("")
         .chars()
@@ -43,39 +78,11 @@ pub fn parse_trace_memory(memory: Vec<String>) -> Vec<u8> {
         .collect::<Vec<u8>>()
 }
 
-/// Compute state updates from a Geth trace.
-/// This converts the trace to the opcode-tracer format and uses the unified implementation.
-pub fn compute_state_updates(trace: DefaultFrame) -> Result<(Vec<StateUpdate>, HashSet<Opcode>)> {
-    eprintln!("[gas-analyzer] Using opcode-tracer-compare branch");
-    let opcode_trace = opcode_tracer::convert_geth_trace_to_result(&trace);
-    opcode_tracer::compute_state_updates_from_trace(&opcode_trace)
-}
-
-// =============================================================================
-// Legacy Implementation (kept for comparison tests)
-// =============================================================================
-
-/// Copy memory with bounds checking (legacy helper).
-#[cfg(test)]
-fn copy_memory_legacy(memory: &[u8], offset: usize, length: usize) -> Vec<u8> {
-    if memory.len() >= offset + length {
-        memory[offset..offset + length].to_vec()
-    } else {
-        let mut memory = memory.to_vec();
-        memory.resize(offset + length, 0);
-        memory[offset..offset + length].to_vec()
-    }
-}
-
-/// Legacy implementation: append state update from a struct log.
-#[cfg(test)]
-fn append_to_state_updates_legacy(
+#[cfg(feature = "anvil")]
+fn append_to_state_updates(
     state_updates: &mut Vec<StateUpdate>,
-    struct_log: alloy::rpc::types::trace::geth::StructLog,
+    struct_log: StructLog,
 ) -> Result<Option<Opcode>> {
-    use alloy::primitives::Address;
-    use sol_types::IStateUpdateTypes;
-
     let mut stack = struct_log.stack.expect("stack is empty");
     stack.reverse();
     let memory = match struct_log.memory {
@@ -104,7 +111,7 @@ fn append_to_state_updates_legacy(
         "CALL" => {
             let args_offset: usize = stack[3].try_into().expect("invalid args offset");
             let args_length: usize = stack[4].try_into().expect("invalid args length");
-            let args = copy_memory_legacy(&memory, args_offset, args_length);
+            let args = copy_memory(&memory, args_offset, args_length);
             state_updates.push(StateUpdate::Call(IStateUpdateTypes::Call {
                 target: Address::from_word(stack[1].into()),
                 value: stack[2],
@@ -114,7 +121,7 @@ fn append_to_state_updates_legacy(
         "LOG0" => {
             let data_offset: usize = stack[0].try_into().expect("invalid data offset");
             let data_length: usize = stack[1].try_into().expect("invalid data length");
-            let data = copy_memory_legacy(&memory, data_offset, data_length);
+            let data = copy_memory(&memory, data_offset, data_length);
             state_updates.push(StateUpdate::Log0(IStateUpdateTypes::Log0 {
                 data: data.into(),
             }));
@@ -122,7 +129,7 @@ fn append_to_state_updates_legacy(
         "LOG1" => {
             let data_offset: usize = stack[0].try_into().expect("invalid data offset");
             let data_length: usize = stack[1].try_into().expect("invalid data length");
-            let data = copy_memory_legacy(&memory, data_offset, data_length);
+            let data = copy_memory(&memory, data_offset, data_length);
             state_updates.push(StateUpdate::Log1(IStateUpdateTypes::Log1 {
                 data: data.into(),
                 topic1: stack[2].into(),
@@ -131,7 +138,7 @@ fn append_to_state_updates_legacy(
         "LOG2" => {
             let data_offset: usize = stack[0].try_into().expect("invalid data offset");
             let data_length: usize = stack[1].try_into().expect("invalid data length");
-            let data = copy_memory_legacy(&memory, data_offset, data_length);
+            let data = copy_memory(&memory, data_offset, data_length);
             state_updates.push(StateUpdate::Log2(IStateUpdateTypes::Log2 {
                 data: data.into(),
                 topic1: stack[2].into(),
@@ -141,7 +148,7 @@ fn append_to_state_updates_legacy(
         "LOG3" => {
             let data_offset: usize = stack[0].try_into().expect("invalid data offset");
             let data_length: usize = stack[1].try_into().expect("invalid data length");
-            let data = copy_memory_legacy(&memory, data_offset, data_length);
+            let data = copy_memory(&memory, data_offset, data_length);
             state_updates.push(StateUpdate::Log3(IStateUpdateTypes::Log3 {
                 data: data.into(),
                 topic1: stack[2].into(),
@@ -152,7 +159,7 @@ fn append_to_state_updates_legacy(
         "LOG4" => {
             let data_offset: usize = stack[0].try_into().expect("invalid data offset");
             let data_length: usize = stack[1].try_into().expect("invalid data length");
-            let data = copy_memory_legacy(&memory, data_offset, data_length);
+            let data = copy_memory(&memory, data_offset, data_length);
             state_updates.push(StateUpdate::Log4(IStateUpdateTypes::Log4 {
                 data: data.into(),
                 topic1: stack[2].into(),
@@ -166,24 +173,24 @@ fn append_to_state_updates_legacy(
     Ok(None)
 }
 
-/// Legacy implementation: compute state updates from a Geth trace.
-/// This is the original implementation before the opcode-tracer refactor.
-#[cfg(test)]
-pub fn compute_state_updates_legacy(
+#[cfg(feature = "anvil")]
+pub async fn compute_state_updates(
     trace: DefaultFrame,
 ) -> Result<(Vec<StateUpdate>, HashSet<Opcode>)> {
     let mut state_updates: Vec<StateUpdate> = Vec::new();
+    // depth for which we care about state updates happening in
     let mut target_depth = 1;
     let mut skipped_opcodes = HashSet::new();
     for struct_log in trace.struct_logs {
+        // Whenever stepping up (leaving a CALL/CALLCODE/DELEGATECALL) reset the target depth
         if struct_log.depth < target_depth {
             target_depth = struct_log.depth;
         } else if struct_log.depth == target_depth {
+            // If we're going to step into a new execution context, increase the target depth
+            // else, try to add the state update
             if &*struct_log.op == "DELEGATECALL" || &*struct_log.op == "CALLCODE" {
                 target_depth = struct_log.depth + 1;
-            } else if let Some(opcode) =
-                append_to_state_updates_legacy(&mut state_updates, struct_log)?
-            {
+            } else if let Some(opcode) = append_to_state_updates(&mut state_updates, struct_log)? {
                 skipped_opcodes.insert(opcode);
             }
         }
@@ -191,6 +198,7 @@ pub fn compute_state_updates_legacy(
     Ok((state_updates, skipped_opcodes))
 }
 
+#[cfg(feature = "anvil")]
 pub async fn get_tx_trace<P: Provider>(
     provider: &P,
     tx_hash: FixedBytes<32>,
@@ -217,6 +225,35 @@ pub async fn get_tx_trace<P: Provider>(
         return Err(anyhow::anyhow!("Expected default trace"));
     };
     Ok(trace)
+}
+
+#[cfg(feature = "anvil")]
+pub async fn get_trace_from_call(
+    rpc_url: Url,
+    tx_request: TransactionRequest,
+    block_height: Option<u64>,
+) -> Result<DefaultFrame> {
+    let provider = ProviderBuilder::new().connect_anvil_with_wallet_and_config(|config| {
+        let config = config
+            .fork(rpc_url)
+            .arg("--steps-tracing")
+            .arg("--auto-impersonate");
+        if let Some(height) = block_height {
+            config.arg("--fork-block-number").arg(height.to_string())
+        } else {
+            config
+        }
+    })?;
+    let tx_receipt = provider
+        .send_transaction(tx_request)
+        .await?
+        .get_receipt()
+        .await?;
+    if !tx_receipt.status() {
+        bail!("transaction failed");
+    }
+    let tx_hash = tx_receipt.transaction_hash;
+    get_tx_trace(&provider, tx_hash).await
 }
 
 fn encode_state_updates_to_sol(
@@ -366,6 +403,11 @@ fn decode_state_updates_tuple(data: &[u8]) -> Result<(Vec<U256>, Vec<Bytes>)> {
     Ok((types, out))
 }
 
+// ============================================================================
+// Anvil-based public API functions (legacy)
+// ============================================================================
+
+#[cfg(feature = "anvil")]
 pub async fn invokes_smart_contract(
     provider: impl Provider,
     receipt: &TransactionReceipt,
@@ -375,16 +417,13 @@ pub async fn invokes_smart_contract(
         None => Ok(false),
         Some(address) => {
             let code = provider.get_code_at(address).await?;
-            if code == Bytes::from_str("0x")? {
-                Ok(false)
-            } else {
-                Ok(true)
-            }
+            Ok(!code.is_empty())
         }
     }
 }
 
-// computes state updates and estimates for each transaction one by one, nicer for CLI
+/// Computes state updates and estimates for each transaction one by one, nicer for CLI
+#[cfg(feature = "anvil")]
 pub async fn gas_estimate_block(
     provider: impl Provider,
     all_receipts: Vec<TransactionReceipt>,
@@ -393,7 +432,6 @@ pub async fn gas_estimate_block(
     let block_number = all_receipts[0]
         .block_number
         .expect("couldn't find block number in receipt");
-    //TODO: filter out non-smart-contract tx
     let receipts: Vec<_> = all_receipts
         .into_iter()
         .filter(|x| x.gas_used > TURETZKY_UPPER_GAS_LIMIT && x.to.is_some())
@@ -413,6 +451,7 @@ pub async fn gas_estimate_block(
     Ok(reports)
 }
 
+#[cfg(feature = "anvil")]
 pub async fn gas_estimate_tx(
     provider: impl Provider,
     tx_hash: FixedBytes<32>,
@@ -436,6 +475,7 @@ pub async fn gas_estimate_tx(
     get_report(&provider, tx_hash, &receipt, gk).await
 }
 
+#[cfg(feature = "anvil")]
 pub async fn get_report(
     provider: impl Provider,
     tx_hash: FixedBytes<32>,
@@ -450,6 +490,7 @@ pub async fn get_report(
     Ok(GasKillerReport::from(Utc::now(), receipt, details.unwrap()))
 }
 
+#[cfg(feature = "anvil")]
 pub async fn gaskiller_reporter(
     provider: impl Provider,
     tx_hash: FixedBytes<32>,
@@ -461,7 +502,7 @@ pub async fn gaskiller_reporter(
         .await?
         .ok_or_else(|| anyhow!("could not get receipt for tx {}", tx_hash))?;
     let trace = get_tx_trace(&provider, tx_hash).await?;
-    let (state_updates, opcodes) = compute_state_updates(trace)?;
+    let (state_updates, opcodes) = compute_state_updates(trace).await?;
     let skipped_opcodes = opcodes.into_iter().collect::<Vec<_>>().join(", ");
     let gaskiller_gas_estimate = gk
         .estimate_state_changes_gas(
@@ -488,17 +529,12 @@ pub async fn gaskiller_reporter(
     })
 }
 
-/// Computes state updates and gas estimate for a transaction using a SINGLE Anvil instance.
-///
-/// This function uses the provided `GasKiller` instance for BOTH:
-/// 1. Sending the transaction and getting the trace
-/// 2. Estimating the gas cost of the state updates
-///
-/// This ensures consistent blockchain state between tracing and gas estimation.
-/// The `GasKiller` must be created with the desired fork URL and block height.
+#[cfg(feature = "anvil")]
 pub async fn call_to_encoded_state_updates_with_gas_estimate(
+    url: Url,
     tx_request: TransactionRequest,
     gk: GasKillerDefault,
+    block_height: Option<u64>,
 ) -> Result<(Bytes, u64, HashSet<Opcode>)> {
     let contract_address = tx_request
         .to
@@ -507,11 +543,8 @@ pub async fn call_to_encoded_state_updates_with_gas_estimate(
             TxKind::Create => None,
         })
         .ok_or_else(|| anyhow!("receipt does not have to address"))?;
-
-    // Use the GasKiller's internal Anvil instance for tracing
-    // This ensures both tracing and gas estimation use the same blockchain state
-    let trace = gk.send_tx_and_get_trace(tx_request).await?;
-    let (state_updates, skipped_opcodes) = compute_state_updates(trace)?;
+    let trace = get_trace_from_call(url, tx_request, block_height).await?;
+    let (state_updates, skipped_opcodes) = compute_state_updates(trace).await?;
     let gas_estimate = gk
         .estimate_state_changes_gas(contract_address, &state_updates)
         .await?;
@@ -522,14 +555,70 @@ pub async fn call_to_encoded_state_updates_with_gas_estimate(
     ))
 }
 
-#[cfg(test)]
+// ============================================================================
+// EvmSketch-based public API functions (Anvil-free)
+// ============================================================================
+
+/// Compute state updates from a transaction using EvmSketch (no Anvil required).
+///
+/// Returns: (state_updates, skipped_opcodes, external_call_gas)
+#[cfg(feature = "evmsketch")]
+pub async fn compute_state_updates_with_evmsketch(
+    rpc_url: Url,
+    tx_request: TransactionRequest,
+    block: alloy_eips::BlockNumberOrTag,
+) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64)> {
+    use gk::evmsketch_gk::GasKillerEvmSketchDefault;
+
+    let gk = GasKillerEvmSketchDefault::builder(rpc_url)
+        .at_block(block)
+        .build()
+        .await?;
+
+    gk.execute_and_compute_state_updates(tx_request).await
+}
+
+/// Compute state updates and ABI-encode them, with a heuristic gas estimate.
+///
+/// This is the Anvil-free equivalent of `call_to_encoded_state_updates_with_gas_estimate`.
+/// The gas estimate is heuristic-based (not measured via Anvil).
+///
+/// Returns: (encoded_state_updates, heuristic_gas_estimate, external_call_gas, skipped_opcodes)
+#[cfg(feature = "evmsketch")]
+pub async fn call_to_encoded_state_updates_with_evmsketch(
+    rpc_url: Url,
+    tx_request: TransactionRequest,
+    block: alloy_eips::BlockNumberOrTag,
+) -> Result<(Bytes, u64, u64, HashSet<Opcode>)> {
+    use gk::evmsketch_gk::GasKillerEvmSketchDefault;
+
+    let gk = GasKillerEvmSketchDefault::builder(rpc_url)
+        .at_block(block)
+        .build()
+        .await?;
+
+    let (state_updates, skipped_opcodes, external_call_gas) =
+        gk.execute_and_compute_state_updates(tx_request).await?;
+    let gas_estimate = gk.estimate_state_changes_gas_heuristic(&state_updates, external_call_gas);
+
+    Ok((
+        encode_state_updates_to_abi(&state_updates),
+        gas_estimate,
+        external_call_gas,
+        skipped_opcodes,
+    ))
+}
+
+#[cfg(all(test, feature = "anvil"))]
 mod tests {
     use std::fs::File;
 
     use super::*;
     use alloy::primitives::{U256, address, b256, bytes};
+    use alloy::providers::ProviderBuilder;
     use constants::*;
     use csv::Writer;
+    use gk::GasKillerDefault;
     use sol_types::{IStateUpdateTypes, SimpleStorage};
 
     #[test]
@@ -605,14 +694,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires RPC_URL environment variable with working endpoint"]
     async fn test_csv_writer() -> Result<()> {
         dotenv::dotenv().ok();
 
-        let rpc_url: url::Url = std::env::var("RPC_URL")
+        let rpc_url: Url = std::env::var("RPC_URL")
             .expect("RPC_URL must be set")
             .parse()?;
-        let provider = alloy::providers::ProviderBuilder::new().connect_http(rpc_url.clone());
-        let gk = GasKillerDefault::builder(rpc_url).build().await?;
+        let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
+        let gk = GasKillerDefault::new(rpc_url, None).await?;
         let report = gas_estimate_tx(provider, SIMPLE_ARRAY_ITERATION_TX_HASH, &gk).await?;
 
         let _ = File::create("test.csv")?;
@@ -624,19 +714,20 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires RPC_URL environment variable with working endpoint"]
     async fn test_estimate_state_changes_gas_set() -> Result<()> {
         dotenv::dotenv().ok();
 
-        let rpc_url: url::Url = std::env::var("RPC_URL")
+        let rpc_url: Url = std::env::var("RPC_URL")
             .expect("RPC_URL must be set")
             .parse()?;
-        let provider = alloy::providers::ProviderBuilder::new().connect_http(rpc_url.clone());
+        let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
 
         let tx_hash = SIMPLE_STORAGE_SET_TX_HASH;
         let trace = get_tx_trace(&provider, tx_hash).await?;
-        let (state_updates, _) = compute_state_updates(trace)?;
+        let (state_updates, _) = compute_state_updates(trace).await?;
 
-        let gk = GasKillerDefault::builder(rpc_url).build().await?;
+        let gk = GasKillerDefault::new(rpc_url, None).await?;
         let gas_estimate = gk
             .estimate_state_changes_gas(SIMPLE_STORAGE_ADDRESS, &state_updates)
             .await?;
@@ -645,44 +736,42 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires RPC_URL environment variable with working endpoint"]
     async fn test_estimate_state_changes_gas_access_control() -> Result<()> {
         dotenv::dotenv().ok();
 
-        let rpc_url: url::Url = std::env::var("RPC_URL")
+        let rpc_url: Url = std::env::var("RPC_URL")
             .expect("RPC_URL must be set")
             .parse()?;
-        let provider = alloy::providers::ProviderBuilder::new().connect_http(rpc_url.clone());
+        let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
 
         let tx_hash = ACCESS_CONTROL_MAIN_RUN_TX_HASH;
         let trace = get_tx_trace(&provider, tx_hash).await?;
-        let (state_updates, _) = compute_state_updates(trace)?;
+        let (state_updates, _) = compute_state_updates(trace).await?;
 
-        let gk = GasKillerDefault::builder(rpc_url).build().await?;
+        let gk = GasKillerDefault::new(rpc_url, None).await?;
         let gas_estimate = gk
             .estimate_state_changes_gas(ACCESS_CONTROL_MAIN_ADDRESS, &state_updates)
             .await?;
-        assert!(
-            (37000..=38000).contains(&gas_estimate),
-            "gas estimate {} not in expected range (37000..=38000)",
-            gas_estimate
-        );
+        assert_eq!(gas_estimate, 37185);
         Ok(())
     }
 
     #[tokio::test]
+    #[ignore = "requires RPC_URL environment variable with working endpoint"]
     async fn test_estimate_state_changes_gas_access_control_failure() -> Result<()> {
         dotenv::dotenv().ok();
 
-        let rpc_url: url::Url = std::env::var("RPC_URL")
+        let rpc_url: Url = std::env::var("RPC_URL")
             .expect("RPC_URL must be set")
             .parse()?;
-        let provider = alloy::providers::ProviderBuilder::new().connect_http(rpc_url.clone());
+        let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
 
         let tx_hash = ACCESS_CONTROL_MAIN_RUN_TX_HASH;
         let trace = get_tx_trace(&provider, tx_hash).await?;
-        let (state_updates, _) = compute_state_updates(trace)?;
+        let (state_updates, _) = compute_state_updates(trace).await?;
 
-        let gk = GasKillerDefault::builder(rpc_url).build().await?;
+        let gk = GasKillerDefault::new(rpc_url, None).await?;
         let gas_estimate = gk
             .estimate_state_changes_gas(FAKE_ADDRESS, &state_updates)
             .await;
@@ -699,17 +788,18 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires RPC_URL environment variable with working endpoint"]
     async fn test_compute_state_updates_set() -> Result<()> {
         dotenv::dotenv().ok();
 
-        let rpc_url: url::Url = std::env::var("RPC_URL")
+        let rpc_url = std::env::var("RPC_URL")
             .expect("RPC_URL must be set")
             .parse()?;
-        let provider = alloy::providers::ProviderBuilder::new().connect_http(rpc_url);
+        let provider = ProviderBuilder::new().connect_http(rpc_url);
 
         let tx_hash = SIMPLE_STORAGE_SET_TX_HASH;
         let trace = get_tx_trace(&provider, tx_hash).await?;
-        let (state_updates, _) = compute_state_updates(trace)?;
+        let (state_updates, _) = compute_state_updates(trace).await?;
 
         assert_eq!(state_updates.len(), 2);
         assert!(matches!(state_updates[0], StateUpdate::Store(_)));
@@ -742,17 +832,18 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires RPC_URL environment variable with working endpoint"]
     async fn test_compute_state_updates_deposit() -> Result<()> {
         dotenv::dotenv().ok();
 
-        let rpc_url: url::Url = std::env::var("RPC_URL")
+        let rpc_url = std::env::var("RPC_URL")
             .expect("RPC_URL must be set")
             .parse()?;
-        let provider = alloy::providers::ProviderBuilder::new().connect_http(rpc_url);
+        let provider = ProviderBuilder::new().connect_http(rpc_url);
 
         let tx_hash = SIMPLE_STORAGE_DEPOSIT_TX_HASH;
         let trace = get_tx_trace(&provider, tx_hash).await?;
-        let (state_updates, _) = compute_state_updates(trace)?;
+        let (state_updates, _) = compute_state_updates(trace).await?;
 
         assert_eq!(state_updates.len(), 2);
         assert!(matches!(state_updates[0], StateUpdate::Store(_)));
@@ -762,11 +853,11 @@ mod tests {
 
         assert_eq!(
             store.slot,
-            b256!("0xd39f411965777aebc20f6582612fc3429023e1f0775535ae437442d61471d6fc")
+            b256!("0x440be2d9467c2219d5dbcccf352e669f171177c1a3ff408399184565c5a56cca")
         );
         assert_eq!(
             store.value,
-            b256!("0x0000000000000000000000000000000000000000000000000de0b6b3a7640000")
+            b256!("0x00000000000000000000000000000000000000000000000000005af3107a4000")
         );
 
         assert!(matches!(state_updates[1], StateUpdate::Log2(_)));
@@ -775,7 +866,7 @@ mod tests {
         };
         assert_eq!(
             log.data,
-            bytes!("0x0000000000000000000000000000000000000000000000000de0b6b3a7640000")
+            bytes!("0x00000000000000000000000000000000000000000000000000005af3107a4000")
         );
         assert_eq!(
             log.topic1,
@@ -783,23 +874,24 @@ mod tests {
         );
         assert_eq!(
             log.topic2,
-            b256!("0x000000000000000000000000ff467a85932cf543df50255f00a8a829c12a3a11")
+            b256!("0x000000000000000000000000cb7c611933f1697f6e56929f4eee39af8f5b313e")
         );
         Ok(())
     }
 
     #[tokio::test]
+    #[ignore = "requires RPC_URL environment variable with working endpoint"]
     async fn test_compute_state_updates_delegatecall() -> Result<()> {
         dotenv::dotenv().ok();
 
-        let rpc_url: url::Url = std::env::var("RPC_URL")
+        let rpc_url = std::env::var("RPC_URL")
             .expect("RPC_URL must be set")
             .parse()?;
-        let provider = alloy::providers::ProviderBuilder::new().connect_http(rpc_url);
+        let provider = ProviderBuilder::new().connect_http(rpc_url);
 
         let tx_hash = DELEGATECALL_CONTRACT_MAIN_RUN_TX_HASH;
         let trace = get_tx_trace(&provider, tx_hash).await?;
-        let (state_updates, _) = compute_state_updates(trace)?;
+        let (state_updates, _) = compute_state_updates(trace).await?;
 
         assert_eq!(state_updates.len(), 4);
         let StateUpdate::Store(IStateUpdateTypes::Store { slot, value }) = &state_updates[0] else {
@@ -854,17 +946,18 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires RPC_URL environment variable with working endpoint"]
     async fn test_compute_state_updates_call_external() -> Result<()> {
         dotenv::dotenv().ok();
 
-        let rpc_url: url::Url = std::env::var("RPC_URL")
+        let rpc_url = std::env::var("RPC_URL")
             .expect("RPC_URL must be set")
             .parse()?;
-        let provider = alloy::providers::ProviderBuilder::new().connect_http(rpc_url);
+        let provider = ProviderBuilder::new().connect_http(rpc_url);
 
         let tx_hash = SIMPLE_STORAGE_CALL_EXTERNAL_TX_HASH;
         let trace = get_tx_trace(&provider, tx_hash).await?;
-        let (state_updates, _) = compute_state_updates(trace)?;
+        let (state_updates, _) = compute_state_updates(trace).await?;
 
         assert_eq!(state_updates.len(), 1);
         assert!(matches!(state_updates[0], StateUpdate::Call(_)));
@@ -874,7 +967,7 @@ mod tests {
 
         assert_eq!(
             call.target,
-            address!("0x60141225789a7fe3048a289bfaef289f1d7a484e")
+            address!("0x523a103bb468a26295d7dbcb37ad919b0afbf294")
         );
         assert_eq!(call.value, U256::from(0));
         assert_eq!(call.callargs, bytes!("0x3a32b549"));
@@ -883,24 +976,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires RPC_URL environment variable with working endpoint"]
     async fn test_compute_state_update_simulate_call() -> Result<()> {
         dotenv::dotenv().ok();
 
-        let rpc_url: url::Url = std::env::var("RPC_URL")
+        let rpc_url: Url = std::env::var("RPC_URL")
             .expect("RPC_URL must be set")
             .parse()?;
 
-        // Use GasKillerDefault so tracing and gas estimation share the same Anvil instance
-        let gk = GasKillerDefault::builder(rpc_url.clone()).build().await?;
+        let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
 
-        // Build a tx request against the forked provider used by GasKiller
-        let provider = alloy::providers::ProviderBuilder::new().connect_http(rpc_url.clone());
         let simple_storage =
             SimpleStorage::SimpleStorageInstance::new(SIMPLE_STORAGE_ADDRESS, &provider);
         let tx_request = simple_storage.set(U256::from(1)).into_transaction_request();
 
-        let trace = gk.send_tx_and_get_trace(tx_request).await?;
-        let (state_updates, _) = compute_state_updates(trace)?;
+        let trace = get_trace_from_call(rpc_url, tx_request, None).await?;
+        let (state_updates, _) = compute_state_updates(trace).await?;
 
         assert_eq!(state_updates.len(), 2);
         assert!(matches!(state_updates[0], StateUpdate::Store(_)));
