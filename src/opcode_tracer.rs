@@ -1,8 +1,7 @@
 //! Opcode Tracer Integration Module
 //!
-//! This module integrates the opcode-tracer crate from sp1-contract-call
-//! and provides utilities to compare state updates from both the Geth trace
-//! approach and the opcode tracer approach.
+//! This module provides utilities for processing execution traces from
+//! sp1-contract-call's CallTraceArena and extracting state updates.
 
 use alloy::primitives::Address;
 use anyhow::{Result, bail};
@@ -11,11 +10,8 @@ use std::collections::HashSet;
 use crate::sol_types::{IStateUpdateTypes, StateUpdate};
 use crate::structs::Opcode;
 
-// Re-export the opcode-tracer crate types for external use
-pub use opcode_tracer::{
-    CallTraceArena, CallTraceNode, CallTraceStep, OpcodeExecution, StorageChange, TraceConfig,
-    TraceResult, trace_call, trace_function,
-};
+// Re-export types from sp1-cc-client-executor for external use
+pub use sp1_cc_client_executor::CallTraceArena;
 
 /// Copy memory with bounds checking.
 fn copy_memory(memory: &[u8], offset: usize, length: usize) -> Vec<u8> {
@@ -53,7 +49,7 @@ pub fn compute_state_updates_from_call_trace(
 
     for node in nodes {
         // Call depth: 0-indexed in trace, we use 1-indexed (1 = top level)
-        let depth = node.trace.depth as usize + 1;
+        let depth = node.trace.depth + 1;
 
         // Track gas used by external calls (depth 1 = direct calls from the entry point)
         // These are calls we can't optimize, so we add their gas to the estimate
