@@ -26,7 +26,7 @@ cargo test
 
 
 ## CLI (unstable)
-The CLI supports analyzing single transactions and transaction requests. By default, it uses EvmSketch (Anvil-free) for analysis.
+The CLI supports analyzing single transactions and transaction requests. By default, it uses EvmSketch for analysis.
 
 ### Analyze a transaction
 ```bash

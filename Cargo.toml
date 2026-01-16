@@ -45,13 +45,13 @@ reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1
 revm = { version = "31.0.1", optional = true }
 
 [features]
-# Default: EvmSketch-based (Anvil-free)
+# Default: EvmSketch-based
 default = ["evmsketch"]
 
 # Anvil-based implementation (legacy, requires foundry)
 anvil = ["foundry-evm-traces", "tokio"]
 
-# EvmSketch-based implementation (Anvil-free)
+# EvmSketch-based implementation
 evmsketch = [
     "sp1-cc-host-executor",
     "sp1-cc-client-executor",

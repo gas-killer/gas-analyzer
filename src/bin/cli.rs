@@ -154,7 +154,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             // Default: Use EvmSketch
             #[cfg(feature = "evmsketch")]
             {
-                println!("Using EvmSketch (Anvil-free) implementation...");
+                println!("Using EvmSketch implementation...");
 
                 // Get the transaction to reconstruct the request
                 let tx = provider
@@ -242,7 +242,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
         Some(Commands::Request(file)) => {
             #[cfg(feature = "evmsketch")]
             {
-                println!("Using EvmSketch (Anvil-free) implementation...");
+                println!("Using EvmSketch implementation...");
 
                 let mut file = File::open(file).expect("couldn't find file");
                 let mut contents = String::new();
