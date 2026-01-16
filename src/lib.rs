@@ -22,7 +22,7 @@ use alloy::{
     sol_types::SolValue,
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use sol_types::{StateUpdate, StateUpdateType};
 use url::Url;
 
@@ -41,14 +41,14 @@ use {
         },
     },
     alloy_rpc_types::TransactionTrait,
-    anyhow::anyhow,
     chrono::Utc,
     gk::GasKillerDefault,
     sol_types::IStateUpdateTypes,
     structs::{GasKillerReport, ReportDetails},
 };
 
-#[cfg(feature = "anvil")]
+/// The Turetzky upper gas limit - the floor gas cost for executing a GasKiller transaction.
+/// This represents the minimum overhead for the StateChangeHandler execution.
 const TURETZKY_UPPER_GAS_LIMIT: u64 = 250000u64;
 
 // ============================================================================
@@ -578,19 +578,31 @@ pub async fn compute_state_updates_with_evmsketch(
     gk.execute_and_compute_state_updates(tx_request).await
 }
 
-/// Compute state updates and ABI-encode them, with a heuristic gas estimate.
+/// Compute state updates and ABI-encode them, with gas estimation.
 ///
 /// This is the Anvil-free equivalent of `call_to_encoded_state_updates_with_gas_estimate`.
-/// The gas estimate is heuristic-based (not measured via Anvil).
+/// First attempts measured gas estimation via StateChangeHandlerGasEstimator.
+/// Falls back to heuristic estimation if measured estimation fails (e.g., due to CALL reverts).
 ///
-/// Returns: (encoded_state_updates, heuristic_gas_estimate, external_call_gas, skipped_opcodes)
+/// Returns: (encoded_state_updates, gas_estimate, is_heuristic, skipped_opcodes)
+/// - `is_heuristic`: true if heuristic was used, false if measured
 #[cfg(feature = "evmsketch")]
 pub async fn call_to_encoded_state_updates_with_evmsketch(
     rpc_url: Url,
     tx_request: TransactionRequest,
     block: alloy_eips::BlockNumberOrTag,
-) -> Result<(Bytes, u64, u64, HashSet<Opcode>)> {
+) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
+    use alloy::primitives::TxKind;
     use gk::evmsketch_gk::GasKillerEvmSketchDefault;
+
+    // Extract contract address for gas estimation
+    let contract_address = tx_request
+        .to
+        .and_then(|x| match x {
+            TxKind::Call(address) => Some(address),
+            TxKind::Create => None,
+        })
+        .ok_or_else(|| anyhow!("Transaction must have a 'to' address for gas estimation"))?;
 
     let gk = GasKillerEvmSketchDefault::builder(rpc_url)
         .at_block(block)
@@ -599,12 +611,26 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 
     let (state_updates, skipped_opcodes, external_call_gas) =
         gk.execute_and_compute_state_updates(tx_request).await?;
-    let gas_estimate = gk.estimate_state_changes_gas_heuristic(&state_updates, external_call_gas);
+
+    // Try measured gas estimation first, fall back to heuristic if it fails
+    let (gas_estimate, is_heuristic) =
+        match gk.estimate_state_changes_gas(contract_address, &state_updates) {
+            Ok(gas) => (gas, false),
+            Err(_) => {
+                // Fall back to heuristic estimation
+                let heuristic =
+                    gk.estimate_state_changes_gas_heuristic(&state_updates, external_call_gas);
+                (heuristic, true)
+            }
+        };
+
+    // Add the Turetzky upper gas limit floor cost (same as Anvil implementation)
+    let gas_estimate = gas_estimate + TURETZKY_UPPER_GAS_LIMIT;
 
     Ok((
         encode_state_updates_to_abi(&state_updates),
         gas_estimate,
-        external_call_gas,
+        is_heuristic,
         skipped_opcodes,
     ))
 }
@@ -694,7 +720,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires RPC_URL environment variable with working endpoint"]
     async fn test_csv_writer() -> Result<()> {
         dotenv::dotenv().ok();
 
@@ -714,7 +739,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires RPC_URL environment variable with working endpoint"]
     async fn test_estimate_state_changes_gas_set() -> Result<()> {
         dotenv::dotenv().ok();
 
@@ -736,7 +760,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires RPC_URL environment variable with working endpoint"]
     async fn test_estimate_state_changes_gas_access_control() -> Result<()> {
         dotenv::dotenv().ok();
 
@@ -758,7 +781,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires RPC_URL environment variable with working endpoint"]
     async fn test_estimate_state_changes_gas_access_control_failure() -> Result<()> {
         dotenv::dotenv().ok();
 
@@ -788,7 +810,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires RPC_URL environment variable with working endpoint"]
     async fn test_compute_state_updates_set() -> Result<()> {
         dotenv::dotenv().ok();
 
@@ -832,7 +853,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires RPC_URL environment variable with working endpoint"]
     async fn test_compute_state_updates_deposit() -> Result<()> {
         dotenv::dotenv().ok();
 
@@ -853,11 +873,11 @@ mod tests {
 
         assert_eq!(
             store.slot,
-            b256!("0x440be2d9467c2219d5dbcccf352e669f171177c1a3ff408399184565c5a56cca")
+            b256!("0xd39f411965777aebc20f6582612fc3429023e1f0775535ae437442d61471d6fc")
         );
         assert_eq!(
             store.value,
-            b256!("0x00000000000000000000000000000000000000000000000000005af3107a4000")
+            b256!("0x0000000000000000000000000000000000000000000000000de0b6b3a7640000")
         );
 
         assert!(matches!(state_updates[1], StateUpdate::Log2(_)));
@@ -866,7 +886,7 @@ mod tests {
         };
         assert_eq!(
             log.data,
-            bytes!("0x00000000000000000000000000000000000000000000000000005af3107a4000")
+            bytes!("0x0000000000000000000000000000000000000000000000000de0b6b3a7640000")
         );
         assert_eq!(
             log.topic1,
@@ -874,13 +894,12 @@ mod tests {
         );
         assert_eq!(
             log.topic2,
-            b256!("0x000000000000000000000000cb7c611933f1697f6e56929f4eee39af8f5b313e")
+            b256!("0x000000000000000000000000ff467a85932cf543df50255f00a8a829c12a3a11")
         );
         Ok(())
     }
 
     #[tokio::test]
-    #[ignore = "requires RPC_URL environment variable with working endpoint"]
     async fn test_compute_state_updates_delegatecall() -> Result<()> {
         dotenv::dotenv().ok();
 
@@ -946,7 +965,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires RPC_URL environment variable with working endpoint"]
     async fn test_compute_state_updates_call_external() -> Result<()> {
         dotenv::dotenv().ok();
 
@@ -967,7 +985,7 @@ mod tests {
 
         assert_eq!(
             call.target,
-            address!("0x523a103bb468a26295d7dbcb37ad919b0afbf294")
+            address!("0x60141225789a7fe3048a289bfaef289f1d7a484e")
         );
         assert_eq!(call.value, U256::from(0));
         assert_eq!(call.callargs, bytes!("0x3a32b549"));
@@ -976,7 +994,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires RPC_URL environment variable with working endpoint"]
     async fn test_compute_state_update_simulate_call() -> Result<()> {
         dotenv::dotenv().ok();
 

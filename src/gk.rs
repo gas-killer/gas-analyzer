@@ -292,7 +292,6 @@ pub mod evmsketch_gk {
     use crate::evmsketch_executor::{EvmSketchExecutor, EvmSketchExecutorBuilder};
     use crate::opcode_tracer::compute_state_updates_from_call_trace;
     use alloy_eips::BlockNumberOrTag;
-    use sp1_cc_client_executor::CallTraceArena;
     use std::collections::HashSet;
 
     // Import EthPrimitives
@@ -363,13 +362,12 @@ pub mod evmsketch_gk {
             GasKillerEvmSketchBuilder::new(rpc_url)
         }
 
-        /// Execute a transaction and get the execution trace.
+        /// Execute a transaction and get the execution result with trace and gas.
         pub async fn execute_tx_and_get_trace(
             &self,
             tx_request: TransactionRequest,
-        ) -> Result<CallTraceArena> {
-            let (_output, trace) = self.executor.execute_with_trace(&tx_request).await?;
-            Ok(trace)
+        ) -> Result<crate::evmsketch_executor::EvmExecutionResult> {
+            self.executor.execute_with_trace(&tx_request).await
         }
 
         /// Execute a transaction and compute state updates from the trace.
@@ -379,8 +377,71 @@ pub mod evmsketch_gk {
             &self,
             tx_request: TransactionRequest,
         ) -> Result<(Vec<StateUpdate>, HashSet<String>, u64)> {
-            let trace = self.execute_tx_and_get_trace(tx_request).await?;
-            compute_state_updates_from_call_trace(&trace)
+            let result = self.execute_tx_and_get_trace(tx_request).await?;
+            compute_state_updates_from_call_trace(&result.trace)
+        }
+
+        /// Estimate gas for state changes by actually executing them.
+        ///
+        /// This injects the StateChangeHandlerGasEstimator contract and
+        /// executes the state updates to measure actual gas consumption.
+        /// This provides accurate gas measurement similar to the Anvil approach.
+        ///
+        /// # Arguments
+        /// * `contract_address` - The address to inject the estimator contract at
+        /// * `state_updates` - The state updates to estimate gas for
+        ///
+        /// # Returns
+        /// The actual gas used by the execution
+        pub fn estimate_state_changes_gas(
+            &self,
+            contract_address: alloy::primitives::Address,
+            state_updates: &[StateUpdate],
+        ) -> Result<u64> {
+            use alloy::dyn_abi::DynSolValue;
+            use alloy::primitives::Bytes;
+
+            // Encode the state updates as calldata for runStateUpdatesCall
+            let (types, args) = crate::encode_state_updates_to_sol(state_updates);
+
+            // Convert types to DynSolValue::Array of Uint(8) for proper uint8[] encoding
+            // Vec<u8> encodes as `bytes`, but we need `uint8[]` (array of 32-byte padded values)
+            let types_array = DynSolValue::Array(
+                types
+                    .iter()
+                    .map(|x| DynSolValue::Uint(alloy::primitives::U256::from(*x as u8), 8))
+                    .collect(),
+            );
+
+            // Convert args to DynSolValue::Array of Bytes
+            let args_array = DynSolValue::Array(
+                args.iter()
+                    .map(|b| DynSolValue::Bytes(b.to_vec()))
+                    .collect(),
+            );
+
+            // Function selector for runStateUpdatesCall(uint8[],bytes[])
+            // keccak256("runStateUpdatesCall(uint8[],bytes[])")[0:4] = 0x7a888dbc
+            let selector: [u8; 4] = [0x7a, 0x88, 0x8d, 0xbc];
+
+            // Encode the arguments as a tuple
+            let tuple = DynSolValue::Tuple(vec![types_array, args_array]);
+            let encoded_args = tuple.abi_encode_params();
+
+            // Build the full calldata
+            let mut calldata = Vec::with_capacity(4 + encoded_args.len());
+            calldata.extend_from_slice(&selector);
+            calldata.extend_from_slice(&encoded_args);
+
+            // Use a default caller address
+            let caller_address =
+                alloy::primitives::address!("0x0000000000000000000000000000000000000001");
+
+            self.executor.estimate_state_changes_gas(
+                contract_address,
+                caller_address,
+                Bytes::from(calldata),
+            )
         }
 
         /// Estimate gas for state changes using a heuristic approach.
