@@ -1,15 +1,18 @@
 use alloy::{hex, providers::ProviderBuilder};
-use alloy_eips::BlockNumberOrTag;
 use alloy_provider::Provider;
-use alloy_rpc_types::TransactionRequest;
 use anyhow::Result;
 use colored::Colorize;
-use std::{env, fs::File, io::Read};
+use std::env;
 use url::Url;
 
 #[cfg(feature = "evmsketch")]
-use gas_analyzer_rs::{
-    call_to_encoded_state_updates_with_evmsketch, compute_state_updates_with_evmsketch,
+use {
+    alloy_eips::BlockNumberOrTag,
+    alloy_rpc_types::TransactionRequest,
+    gas_analyzer_rs::{
+        call_to_encoded_state_updates_with_evmsketch, compute_state_updates_with_evmsketch,
+    },
+    std::{fs::File, io::Read},
 };
 
 enum Commands {
@@ -85,7 +88,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 println!("Using Anvil-based implementation...");
 
                 use gas_analyzer_rs::{
-                    compute_state_updates, gas_estimate_tx, get_tx_trace, gk::GasKillerDefault,
+                    GasKillerDefault, compute_state_updates, gas_estimate_tx, get_tx_trace,
                 };
 
                 // Initialize GasKiller with Anvil
