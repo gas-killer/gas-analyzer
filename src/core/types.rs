@@ -1,3 +1,8 @@
+//! Core types for state updates and ABI definitions.
+//!
+//! This module contains the shared type definitions used by both
+//! Anvil and EvmSketch implementations.
+
 use alloy::sol;
 
 sol! {
@@ -114,6 +119,10 @@ sol! {
     error RevertingContext(uint256 index, address target, bytes revertData, bytes callargs);
 }
 
+/// Opcode type alias
+pub type Opcode = String;
+
+/// Enum representing different types of state updates
 #[allow(warnings)]
 #[derive(Debug)]
 pub enum StateUpdate {
