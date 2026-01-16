@@ -179,8 +179,8 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     )
                     .await?;
 
-                // Get heuristic gas estimate
-                let (_encoded, gas_estimate, external_call_gas, _) =
+                // Get gas estimate (measured or heuristic fallback)
+                let (_encoded, gas_estimate, is_heuristic, _) =
                     call_to_encoded_state_updates_with_evmsketch(
                         rpc_url,
                         tx_request,
@@ -218,15 +218,12 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     receipt.block_hash.unwrap_or_default()
                 );
                 println!("Gas used: {}", gas_used);
-                println!(
-                    "GasKiller gas estimate: {} {}",
-                    gas_estimate,
-                    "(heuristic + actual external call gas)".yellow()
-                );
-                println!(
-                    "  └─ External call gas (non-optimizable): {}",
-                    external_call_gas
-                );
+                let estimate_type = if is_heuristic {
+                    "(heuristic - measured estimation failed)".yellow()
+                } else {
+                    "(measured via StateChangeHandler)".cyan()
+                };
+                println!("GasKiller gas estimate: {} {}", gas_estimate, estimate_type);
                 println!("Gas savings: {} ({:.2}%)", gas_savings, percent_savings);
             }
 
@@ -258,11 +255,13 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 )
                 .await
                 {
-                    Ok((_, estimate, external_call_gas, _)) => {
-                        println!(
-                            "GasKiller estimate: {} (heuristic + {} external call gas)",
-                            estimate, external_call_gas
-                        );
+                    Ok((_, estimate, is_heuristic, _)) => {
+                        let estimate_type = if is_heuristic {
+                            "heuristic"
+                        } else {
+                            "measured"
+                        };
+                        println!("GasKiller estimate: {} ({})", estimate, estimate_type);
                     }
                     Err(e) => {
                         println!("{}", format!("Estimation failed: {:?}", e).red());

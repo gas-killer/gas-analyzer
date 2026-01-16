@@ -3274,7 +3274,6 @@ dependencies = [
  "hex",
  "js-sys",
  "log",
- "opcode-tracer",
  "reth-evm",
  "reth-evm-ethereum",
  "reth-primitives",
@@ -4655,28 +4654,6 @@ name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
-
-[[package]]
-name = "opcode-tracer"
-version = "0.1.0"
-source = "git+https://github.com/BreadchainCoop/sp1-contract-call?branch=cancun-v1#ebc0b8d7f2d219688e69393e8c735520a8289418"
-dependencies = [
- "alloy-primitives",
- "alloy-provider",
- "alloy-rpc-types",
- "alloy-sol-macro",
- "alloy-sol-types",
- "eyre",
- "hex",
- "reth-primitives",
- "revm 31.0.2",
- "serde",
- "serde_json",
- "sp1-cc-client-executor",
- "sp1-cc-host-executor",
- "tokio",
- "url",
-]
 
 [[package]]
 name = "openssl"
