@@ -226,7 +226,10 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     use gas_analyzer_rs::core::TURETZKY_UPPER_GAS_LIMIT;
                     use gas_analyzer_rs::evmsketch::GasKillerEvmSketchDefault;
 
-                    let gk: gas_analyzer_rs::GasKillerEvmSketch<alloy_provider::RootProvider<alloy::network::AnyNetwork>, reth_primitives::EthPrimitives> = GasKillerEvmSketchDefault::builder(rpc_url.clone())
+                    let gk: gas_analyzer_rs::GasKillerEvmSketch<
+                        alloy_provider::RootProvider<alloy::network::AnyNetwork>,
+                        reth_primitives::EthPrimitives,
+                    > = GasKillerEvmSketchDefault::builder(rpc_url.clone())
                         .at_block(BlockNumberOrTag::Number(block_number))
                         .build()
                         .await?;
