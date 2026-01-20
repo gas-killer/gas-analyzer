@@ -806,6 +806,11 @@ pub async fn compute_state_updates_with_evmsketch(
 /// First attempts measured gas estimation via StateChangeHandlerGasEstimator.
 /// Falls back to heuristic estimation if measured estimation fails (e.g., due to CALL reverts).
 ///
+/// The gas estimate includes:
+/// - Gas for executing state updates via StateChangeHandler
+/// - Gas used by external calls (cannot be optimized, must be included)
+/// - Turetzky upper gas limit floor cost
+///
 /// Returns: (encoded_state_updates, gas_estimate, is_heuristic, skipped_opcodes)
 /// - `is_heuristic`: true if heuristic was used, false if measured
 pub async fn call_to_encoded_state_updates_with_evmsketch(
@@ -833,7 +838,10 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
     // Try measured gas estimation first, fall back to heuristic if it fails
     let (gas_estimate, is_heuristic) =
         match gk.estimate_state_changes_gas(contract_address, &state_updates) {
-            Ok(gas) => (gas, false),
+            Ok(gas) => {
+                // Add external call gas - these calls can't be optimized, so their cost must be included
+                (gas + external_call_gas, false)
+            }
             Err(_) => {
                 // Fall back to heuristic estimation
                 let heuristic =
