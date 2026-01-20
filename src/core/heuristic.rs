@@ -174,17 +174,15 @@ pub fn extract_operation_counts_from_trace(
 
     // Handle case where we're still in an external call at the end
     // (shouldn't happen in a valid trace, but handle gracefully)
-    if in_external_call {
-        if let Some(gas_after_opcode) = gas_after_call_opcode {
-            // Use the last gas value as gas_after
-            if let Some(last_log) = trace.struct_logs.last() {
-                // Gas remaining after the sub-call returns
-                // struct_log.gas is u64 (remaining gas after opcode executes)
-                let gas_after_subcall = last_log.gas;
-                let gas_used = gas_after_opcode.saturating_sub(gas_after_subcall);
-                operations.external_call_gas += gas_used;
-            }
-        }
+    if in_external_call
+        && let Some(gas_after_opcode) = gas_after_call_opcode
+        && let Some(last_log) = trace.struct_logs.last()
+    {
+        // Gas remaining after the sub-call returns
+        // struct_log.gas is u64 (remaining gas after opcode executes)
+        let gas_after_subcall = last_log.gas;
+        let gas_used = gas_after_opcode.saturating_sub(gas_after_subcall);
+        operations.external_call_gas += gas_used;
     }
 
     operations
