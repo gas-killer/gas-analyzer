@@ -9,7 +9,9 @@ use alloy::hex;
 use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy_eips::BlockNumberOrTag;
+use alloy_provider::Provider;
 use alloy_provider::RootProvider;
+use alloy_provider::ext::DebugApi;
 use alloy_provider::network::AnyNetwork;
 use anyhow::{Result, anyhow, bail};
 use reth_primitives::EthPrimitives;
@@ -20,7 +22,8 @@ use url::Url;
 
 use crate::core::{
     IStateUpdateTypes, Opcode, StateUpdate, TURETZKY_UPPER_GAS_LIMIT, encode_state_updates_to_abi,
-    encode_state_updates_to_sol,
+    encode_state_updates_to_sol, estimate_gas_from_operations, estimate_gas_from_state_updates,
+    extract_operation_counts_from_trace,
 };
 
 // Re-export types for external use
@@ -223,10 +226,27 @@ impl DefaultEvmSketchExecutor {
             revm::context::result::ExecutionResult::Revert {
                 output, gas_used, ..
             } => {
+                // Try to decode the revert reason
+                let output_slice = output.as_ref();
+                let error_msg = if output_slice.len() >= 4 {
+                    let selector = hex::encode(&output_slice[..4]);
+                    if output_slice.len() == 4 {
+                        format!("Error selector: 0x{} (no additional data)", selector)
+                    } else {
+                        format!(
+                            "Error selector: 0x{} (data: 0x{})",
+                            selector,
+                            hex::encode(output_slice)
+                        )
+                    }
+                } else {
+                    format!("Revert data: 0x{}", hex::encode(output_slice))
+                };
+
                 return Err(anyhow!(
-                    "Execution reverted (gas: {}): {}",
+                    "Execution reverted (gas used: {}). {}",
                     gas_used,
-                    output
+                    error_msg
                 ));
             }
             revm::context::result::ExecutionResult::Halt {
@@ -733,40 +753,45 @@ impl GasKillerEvmSketchDefault {
         )
     }
 
-    /// Estimate gas for state changes using a heuristic approach.
+    /// Estimate gas using a fallback heuristic based on the original transaction trace.
     ///
-    /// This provides a rough estimate based on known gas costs for each
-    /// operation type, PLUS the actual gas used by external calls
-    /// (which cannot be optimized).
+    /// This extracts operations (SSTORE, LOG, CALL) from the original transaction trace
+    /// and applies heuristic costs, providing a more accurate estimate than guessing.
     ///
-    /// # Heuristic gas costs (approximate):
-    /// - SSTORE (cold): ~20,000 gas
-    /// - CALL: actual gas used (from trace) - cannot optimize external calls
-    /// - LOG0-LOG4: ~375 + 375*topics + 8*data_len
-    pub fn estimate_state_changes_gas_heuristic(
+    /// # Arguments
+    /// * `provider` - The provider to fetch the trace from
+    /// * `tx_hash` - The transaction hash to analyze
+    ///
+    /// # Returns
+    /// A gas estimate based on extracted operations
+    pub async fn estimate_gas_from_trace<P: Provider + DebugApi>(
         &self,
-        state_updates: &[StateUpdate],
-        external_call_gas: u64,
-    ) -> u64 {
-        let mut gas = 21000u64; // Base transaction cost
+        provider: &P,
+        tx_hash: alloy::primitives::FixedBytes<32>,
+    ) -> Result<u64> {
+        use alloy_rpc_types::trace::geth::{
+            GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace,
+        };
 
-        // Add actual gas used by external calls (cannot be optimized)
-        gas += external_call_gas;
+        // Get the trace from the original transaction
+        let options = GethDebugTracingOptions {
+            config: GethDefaultTracingOptions {
+                enable_memory: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
-        for update in state_updates {
-            gas += match update {
-                StateUpdate::Store(_) => 20000, // Cold SSTORE
-                // CALL gas is already included in external_call_gas from the trace
-                StateUpdate::Call(_) => 0,
-                StateUpdate::Log0(log) => 375 + log.data.len() as u64 * 8,
-                StateUpdate::Log1(log) => 375 + 375 + log.data.len() as u64 * 8,
-                StateUpdate::Log2(log) => 375 + 375 * 2 + log.data.len() as u64 * 8,
-                StateUpdate::Log3(log) => 375 + 375 * 3 + log.data.len() as u64 * 8,
-                StateUpdate::Log4(log) => 375 + 375 * 4 + log.data.len() as u64 * 8,
-            };
-        }
+        let GethTrace::Default(trace) = provider.debug_trace_transaction(tx_hash, options).await?
+        else {
+            return Err(anyhow!("Expected default trace"));
+        };
 
-        gas
+        // Extract operations from trace using core function
+        let operations = extract_operation_counts_from_trace(&trace);
+
+        // Estimate gas from trace operations
+        Ok(estimate_gas_from_operations(&operations))
     }
 
     /// Get the block number the executor is anchored to.
@@ -844,8 +869,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
             }
             Err(_) => {
                 // Fall back to heuristic estimation
-                let heuristic =
-                    gk.estimate_state_changes_gas_heuristic(&state_updates, external_call_gas);
+                let heuristic = estimate_gas_from_state_updates(&state_updates, external_call_gas);
                 (heuristic, true)
             }
         };
