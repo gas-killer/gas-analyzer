@@ -27,7 +27,6 @@ use alloy::{
             eth::TransactionRequest,
             trace::geth::{
                 DefaultFrame, GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace,
-                StructLog,
             },
         },
     },
@@ -46,7 +45,8 @@ use url::Url;
 
 use crate::core::{
     IStateUpdateTypes, Opcode, RevertingContext, StateUpdate, TURETZKY_UPPER_GAS_LIMIT,
-    encode_state_updates_to_abi, encode_state_updates_to_sol,
+    compute_state_updates, copy_memory, encode_state_updates_to_abi, encode_state_updates_to_sol,
+    get_tx_trace,
 };
 
 // ============================================================================
@@ -212,6 +212,8 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
     }
 
     pub async fn get_tx_trace(&self, tx_hash: FixedBytes<32>) -> Result<DefaultFrame> {
+        // Uses the shared trace function but without the status check
+        // (GasKiller may want to trace failed transactions)
         let options = GethDebugTracingOptions {
             config: GethDefaultTracingOptions {
                 enable_memory: Some(true),
@@ -395,177 +397,11 @@ fn format_decoded_values(values: &[DynSolValue]) -> String {
 }
 
 // ============================================================================
-// Trace Functions
+// Trace Functions (shared implementation in core::trace)
 // ============================================================================
 
-fn copy_memory(memory: &[u8], offset: usize, length: usize) -> Vec<u8> {
-    if memory.len() >= offset + length {
-        memory[offset..offset + length].to_vec()
-    } else {
-        let mut memory = memory.to_vec();
-        memory.resize(offset + length, 0);
-        memory[offset..offset + length].to_vec()
-    }
-}
-
-fn parse_trace_memory(memory: Vec<String>) -> Vec<u8> {
-    memory
-        .join("")
-        .chars()
-        .collect::<Vec<char>>()
-        .chunks(2)
-        .map(|c| c.iter().collect::<String>())
-        .map(|s| u8::from_str_radix(&s, 16).expect("invalid hex"))
-        .collect::<Vec<u8>>()
-}
-
-fn append_to_state_updates(
-    state_updates: &mut Vec<StateUpdate>,
-    struct_log: StructLog,
-) -> Result<Option<Opcode>> {
-    let mut stack = struct_log.stack.expect("stack is empty");
-    stack.reverse();
-    let memory = match struct_log.memory {
-        Some(memory) => parse_trace_memory(memory),
-        None => match struct_log.op.as_ref() {
-            "CALL" | "LOG0" | "LOG1" | "LOG2" | "LOG3" | "LOG4" if struct_log.depth == 1 => {
-                bail!("There is no memory for {:?} in depth 1", struct_log.op)
-            }
-            _ => return Ok(None),
-        },
-    };
-    match struct_log.op.as_ref() {
-        "CREATE" | "CREATE2" | "SELFDESTRUCT" => {
-            return Ok(Some(struct_log.op.to_string()));
-        }
-        "DELEGATECALL" | "CALLCODE" => {
-            bail!(
-                "Calling opcode {:?}, this shouldn't even happen!",
-                struct_log.op
-            );
-        }
-        "SSTORE" => state_updates.push(StateUpdate::Store(IStateUpdateTypes::Store {
-            slot: stack[0].into(),
-            value: stack[1].into(),
-        })),
-        "CALL" => {
-            let args_offset: usize = stack[3].try_into().expect("invalid args offset");
-            let args_length: usize = stack[4].try_into().expect("invalid args length");
-            let args = copy_memory(&memory, args_offset, args_length);
-            state_updates.push(StateUpdate::Call(IStateUpdateTypes::Call {
-                target: Address::from_word(stack[1].into()),
-                value: stack[2],
-                callargs: args.into(),
-            }));
-        }
-        "LOG0" => {
-            let data_offset: usize = stack[0].try_into().expect("invalid data offset");
-            let data_length: usize = stack[1].try_into().expect("invalid data length");
-            let data = copy_memory(&memory, data_offset, data_length);
-            state_updates.push(StateUpdate::Log0(IStateUpdateTypes::Log0 {
-                data: data.into(),
-            }));
-        }
-        "LOG1" => {
-            let data_offset: usize = stack[0].try_into().expect("invalid data offset");
-            let data_length: usize = stack[1].try_into().expect("invalid data length");
-            let data = copy_memory(&memory, data_offset, data_length);
-            state_updates.push(StateUpdate::Log1(IStateUpdateTypes::Log1 {
-                data: data.into(),
-                topic1: stack[2].into(),
-            }));
-        }
-        "LOG2" => {
-            let data_offset: usize = stack[0].try_into().expect("invalid data offset");
-            let data_length: usize = stack[1].try_into().expect("invalid data length");
-            let data = copy_memory(&memory, data_offset, data_length);
-            state_updates.push(StateUpdate::Log2(IStateUpdateTypes::Log2 {
-                data: data.into(),
-                topic1: stack[2].into(),
-                topic2: stack[3].into(),
-            }));
-        }
-        "LOG3" => {
-            let data_offset: usize = stack[0].try_into().expect("invalid data offset");
-            let data_length: usize = stack[1].try_into().expect("invalid data length");
-            let data = copy_memory(&memory, data_offset, data_length);
-            state_updates.push(StateUpdate::Log3(IStateUpdateTypes::Log3 {
-                data: data.into(),
-                topic1: stack[2].into(),
-                topic2: stack[3].into(),
-                topic3: stack[4].into(),
-            }));
-        }
-        "LOG4" => {
-            let data_offset: usize = stack[0].try_into().expect("invalid data offset");
-            let data_length: usize = stack[1].try_into().expect("invalid data length");
-            let data = copy_memory(&memory, data_offset, data_length);
-            state_updates.push(StateUpdate::Log4(IStateUpdateTypes::Log4 {
-                data: data.into(),
-                topic1: stack[2].into(),
-                topic2: stack[3].into(),
-                topic3: stack[4].into(),
-                topic4: stack[5].into(),
-            }));
-        }
-        _ => {}
-    }
-    Ok(None)
-}
-
-/// Compute state updates from a Geth trace
-pub async fn compute_state_updates(
-    trace: DefaultFrame,
-) -> Result<(Vec<StateUpdate>, HashSet<Opcode>)> {
-    let mut state_updates: Vec<StateUpdate> = Vec::new();
-    // depth for which we care about state updates happening in
-    let mut target_depth = 1;
-    let mut skipped_opcodes = HashSet::new();
-    for struct_log in trace.struct_logs {
-        // Whenever stepping up (leaving a CALL/CALLCODE/DELEGATECALL) reset the target depth
-        if struct_log.depth < target_depth {
-            target_depth = struct_log.depth;
-        } else if struct_log.depth == target_depth {
-            // If we're going to step into a new execution context, increase the target depth
-            // else, try to add the state update
-            if &*struct_log.op == "DELEGATECALL" || &*struct_log.op == "CALLCODE" {
-                target_depth = struct_log.depth + 1;
-            } else if let Some(opcode) = append_to_state_updates(&mut state_updates, struct_log)? {
-                skipped_opcodes.insert(opcode);
-            }
-        }
-    }
-    Ok((state_updates, skipped_opcodes))
-}
-
-/// Get transaction trace from a provider
-pub async fn get_tx_trace<P: Provider>(
-    provider: &P,
-    tx_hash: FixedBytes<32>,
-) -> Result<DefaultFrame> {
-    let tx_receipt = provider
-        .get_transaction_receipt(tx_hash)
-        .await?
-        .ok_or_else(|| anyhow!("could not get receipt for tx {}", tx_hash))?;
-
-    if !tx_receipt.status() {
-        bail!("transaction failed");
-    }
-
-    let options = GethDebugTracingOptions {
-        config: GethDefaultTracingOptions {
-            enable_memory: Some(true),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    let GethTrace::Default(trace) = provider.debug_trace_transaction(tx_hash, options).await?
-    else {
-        return Err(anyhow::anyhow!("Expected default trace"));
-    };
-    Ok(trace)
-}
+// Re-export for backwards compatibility - compute_state_updates and get_tx_trace
+// are now provided by crate::core::trace
 
 /// Get trace from a simulated call using Anvil
 pub async fn get_trace_from_call(
