@@ -6,14 +6,7 @@ use std::env;
 use url::Url;
 
 #[cfg(feature = "evmsketch")]
-use {
-    alloy_eips::BlockNumberOrTag,
-    alloy_rpc_types::TransactionRequest,
-    gas_analyzer_rs::{
-        call_to_encoded_state_updates_with_evmsketch, compute_state_updates_with_evmsketch,
-    },
-    std::{fs::File, io::Read},
-};
+use alloy_eips::BlockNumberOrTag;
 
 enum Commands {
     Transaction(String),
@@ -157,52 +150,29 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             {
                 println!("Using EvmSketch implementation...");
 
-                // Get the transaction to reconstruct the request
-                let tx = provider
-                    .get_transaction_by_hash(bytes.into())
-                    .await?
-                    .expect("couldn't fetch transaction");
+                // Use shared trace function from core
+                use gas_analyzer_rs::compute_state_updates_from_tx;
 
-                use alloy::network::TransactionResponse;
-                use alloy::primitives::Address;
-                use alloy_rpc_types::TransactionTrait;
-
-                let to_addr = tx.to().expect("transaction has no 'to' address");
-                let tx_request = TransactionRequest::default()
-                    .from(tx.from())
-                    .to(Address::from(*to_addr))
-                    .input(alloy::rpc::types::TransactionInput::new(tx.input().clone()))
-                    .value(tx.value());
-
-                // EvmSketch will use the state at the beginning of block N (which is the end of block N-1)
-                // before any transactions in block N executed.
-                let state_updates_result = compute_state_updates_with_evmsketch(
-                    rpc_url.clone(),
-                    tx_request.clone(),
-                    BlockNumberOrTag::Number(block_number - 1),
-                )
-                .await;
+                let state_updates_result =
+                    compute_state_updates_from_tx(&provider, bytes.into()).await;
 
                 let (state_updates, skipped_opcodes, use_fallback) = match state_updates_result {
                     Ok(result) => (result.0, result.1, false),
                     Err(e) => {
                         if original_status {
-                            // Transaction succeeded originally but reverts on replay
+                            // Transaction succeeded originally but trace extraction failed
                             // Fall back to heuristic estimation
                             println!(
-                                    "{}",
-                                    "⚠️  Warning: Transaction replay failed, using fallback heuristic estimation"
-                                        .yellow()
-                                );
+                                "{}",
+                                "⚠️  Warning: Trace extraction failed, using fallback heuristic estimation"
+                                    .yellow()
+                            );
                             println!(
                                 "   Reason: {}",
                                 format!("{}", e)
                                     .split('\n')
                                     .next()
                                     .unwrap_or("Unknown error")
-                            );
-                            println!(
-                                "   This typically happens when the transaction depends on state changes\n   from earlier transactions in the same block.\n"
                             );
 
                             // Return empty state updates and use fallback heuristic
@@ -219,22 +189,21 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     }
                 };
 
-                // Get gas estimate (measured or heuristic fallback)
-                let (_encoded, gas_estimate, is_heuristic, _) = if use_fallback {
-                    // Use fallback heuristic when replay failed
-                    // Try to extract operations from the original transaction trace first
-                    use gas_analyzer_rs::core::TURETZKY_UPPER_GAS_LIMIT;
-                    use gas_analyzer_rs::evmsketch::GasKillerEvmSketchDefault;
+                // Get gas estimate using the state updates extracted from the actual trace
+                use gas_analyzer_rs::core::{
+                    TURETZKY_UPPER_GAS_LIMIT, encode_state_updates_to_abi,
+                    estimate_gas_from_state_updates,
+                };
+                use gas_analyzer_rs::evmsketch::GasKillerEvmSketchDefault;
 
-                    let gk: gas_analyzer_rs::GasKillerEvmSketch<
-                        alloy_provider::RootProvider<alloy::network::AnyNetwork>,
-                        reth_primitives::EthPrimitives,
-                    > = GasKillerEvmSketchDefault::builder(rpc_url.clone())
+                let (gas_estimate, is_heuristic) = if use_fallback || state_updates.is_empty() {
+                    // Use heuristic estimation when trace extraction failed or no state updates
+                    let gk = GasKillerEvmSketchDefault::builder(rpc_url.clone())
                         .at_block(BlockNumberOrTag::Number(block_number))
                         .build()
                         .await?;
 
-                    // Try trace-based estimation first (more accurate)
+                    // Try trace-based heuristic estimation
                     let fallback_estimate = match gk
                         .estimate_gas_from_trace(&provider, bytes.into())
                         .await
@@ -246,15 +215,9 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                             estimate
                         }
                         Err(e) => {
-                            // Trace extraction failed - we cannot provide a reliable estimate
                             let msg = format!(
                                 "Cannot analyze transaction: Failed to extract operations from trace.\n\
-                                 Original error: {}\n\
-                                 \n\
-                                 This typically happens when:\n\
-                                 - Your RPC provider doesn't support debug_traceTransaction\n\
-                                 - The provider rate-limits or times out on trace requests\n\
-                                 - Archive node access is required but unavailable\n\
+                                 Error: {}\n\
                                  \n\
                                  Please ensure your RPC provider supports debug_traceTransaction.",
                                 e
@@ -262,90 +225,38 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                             return Err(anyhow::Error::msg(msg));
                         }
                     };
-                    let gas_estimate_with_floor = fallback_estimate + TURETZKY_UPPER_GAS_LIMIT;
-
-                    // Return empty encoded state updates
-                    (
-                        alloy::primitives::Bytes::new(),
-                        gas_estimate_with_floor,
-                        true,
-                        std::collections::HashSet::new(),
-                    )
+                    (fallback_estimate + TURETZKY_UPPER_GAS_LIMIT, true)
                 } else {
-                    // Normal path: try to get gas estimate
-                    // Clone rpc_url before moving it, in case we need it for fallback
-                    let rpc_url_for_fallback = rpc_url.clone();
-                    let gas_estimate_result = call_to_encoded_state_updates_with_evmsketch(
-                        rpc_url,
-                        tx_request,
-                        BlockNumberOrTag::Number(block_number - 1),
-                    )
-                    .await;
+                    // Normal path: try measured gas estimation using extracted state updates
+                    // Get the contract address from the receipt
+                    let contract_address = receipt
+                        .to
+                        .ok_or_else(|| anyhow::Error::msg("Transaction has no 'to' address"))?;
 
-                    match gas_estimate_result {
-                        Ok(result) => result,
-                        Err(e) => {
-                            if original_status {
-                                // If gas estimation also fails, use fallback heuristic
-                                println!(
-                                    "{}",
-                                    "⚠️  Warning: Gas estimation failed, using fallback heuristic"
-                                        .yellow()
-                                );
-                                println!("   Error: {}", e);
+                    // Build EvmSketch for gas estimation (injecting StateChangeHandler contract)
+                    let gk = GasKillerEvmSketchDefault::builder(rpc_url.clone())
+                        .at_block(BlockNumberOrTag::Number(block_number - 1))
+                        .build()
+                        .await?;
 
-                                use gas_analyzer_rs::core::TURETZKY_UPPER_GAS_LIMIT;
-                                use gas_analyzer_rs::evmsketch::GasKillerEvmSketchDefault;
-
-                                let gk = GasKillerEvmSketchDefault::builder(rpc_url_for_fallback)
-                                    .at_block(BlockNumberOrTag::Number(block_number))
-                                    .build()
-                                    .await?;
-
-                                // Try trace-based estimation as fallback
-                                let fallback_estimate = match gk
-                                    .estimate_gas_from_trace(&provider, bytes.into())
-                                    .await
-                                {
-                                    Ok(estimate) => {
-                                        println!(
-                                            "   Using trace-based heuristic (extracted operations from original transaction)"
-                                        );
-                                        estimate
-                                    }
-                                    Err(trace_err) => {
-                                        // Trace extraction also failed - cannot provide reliable estimate
-                                        let msg = format!(
-                                            "Cannot analyze transaction: Both gas estimation and trace extraction failed.\n\
-                                             Gas estimation error: {}\n\
-                                             Trace extraction error: {}\n\
-                                             \n\
-                                             Please ensure your RPC provider supports debug_traceTransaction.",
-                                            e, trace_err
-                                        );
-                                        return Err(anyhow::Error::msg(msg));
-                                    }
-                                };
-                                let gas_estimate_with_floor =
-                                    fallback_estimate + TURETZKY_UPPER_GAS_LIMIT;
-
-                                (
-                                    alloy::primitives::Bytes::new(),
-                                    gas_estimate_with_floor,
-                                    true,
-                                    std::collections::HashSet::new(),
-                                )
-                            } else {
-                                let msg = format!(
-                                    "Gas estimation failed for reverted transaction.\n\
-                                Error: {}",
-                                    e
-                                );
-                                return Err(anyhow::Error::msg(msg));
-                            }
+                    // Try measured gas estimation first
+                    match gk.estimate_state_changes_gas(contract_address, &state_updates) {
+                        Ok(gas) => (gas + TURETZKY_UPPER_GAS_LIMIT, false),
+                        Err(_) => {
+                            // Fall back to heuristic estimation
+                            println!(
+                                "{}",
+                                "⚠️  Warning: Measured gas estimation failed, using heuristic"
+                                    .yellow()
+                            );
+                            let heuristic = estimate_gas_from_state_updates(&state_updates, 0);
+                            (heuristic + TURETZKY_UPPER_GAS_LIMIT, true)
                         }
                     }
                 };
+
+                // Encode the state updates
+                let _encoded = encode_state_updates_to_abi(&state_updates);
 
                 // Print state updates
                 println!("\n{}", "=== State Updates ===".green().bold());
@@ -397,47 +308,15 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             }
         }
 
-        Some(Commands::Request(file)) => {
-            #[cfg(feature = "evmsketch")]
-            {
-                println!("Using EvmSketch implementation...");
-
-                let mut file = File::open(file).expect("couldn't find file");
-                let mut contents = String::new();
-                file.read_to_string(&mut contents)
-                    .expect("unable to read file contents");
-                let request = serde_json::from_str::<TransactionRequest>(contents.as_ref())
-                    .expect("unable to read json data");
-
-                match call_to_encoded_state_updates_with_evmsketch(
-                    rpc_url,
-                    request,
-                    BlockNumberOrTag::Latest,
-                )
-                .await
-                {
-                    Ok((_, estimate, is_heuristic, _)) => {
-                        let estimate_type = if is_heuristic {
-                            "heuristic"
-                        } else {
-                            "measured"
-                        };
-                        println!("GasKiller estimate: {} ({})", estimate, estimate_type);
-                    }
-                    Err(e) => {
-                        println!("{}", format!("Estimation failed: {:?}", e).red());
-                    }
-                }
-            }
-
-            #[cfg(not(feature = "evmsketch"))]
-            {
-                let _ = file; // suppress unused warning
-                println!(
-                    "{}",
-                    "Error: EvmSketch feature required for request mode. Rebuild with --features evmsketch".red()
-                );
-            }
+        Some(Commands::Request(_file)) => {
+            // Note: The request command (for simulating unexecuted transactions) has been removed.
+            // Use the transaction command to analyze existing transactions via their tx hash.
+            println!(
+                "{}",
+                "Error: The request command is no longer supported.\n\
+                Use the transaction command to analyze existing transactions: cli t <tx_hash>"
+                    .red()
+            );
         }
 
         None => {
