@@ -4,7 +4,7 @@
 //! Geth-format transaction traces (`DefaultFrame`). Used by both
 //! Anvil and EvmSketch implementations.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use alloy::primitives::{Address, FixedBytes};
 use alloy::rpc::types::trace::geth::{
@@ -156,34 +156,122 @@ pub fn append_state_update_from_struct_log(
 // Trace Processing
 // ============================================================================
 
+/// Parent index for nesting: `parent_indices[i]` is `Some(j)` if state update `i` occurred
+/// inside the execution of the CALL at index `j` (1-based in display).
+pub type ParentIndices = Vec<Option<usize>>;
+
 /// Compute state updates from a Geth DefaultFrame trace.
 ///
 /// This extracts SSTORE, CALL, and LOG operations from an existing transaction's trace,
 /// handling DELEGATECALL and CALLCODE depth tracking correctly.
 ///
-/// Returns: (state_updates, skipped_opcodes)
-pub fn compute_state_updates(trace: DefaultFrame) -> Result<(Vec<StateUpdate>, HashSet<Opcode>)> {
+/// Returns: (state_updates, parent_indices, skipped_opcodes, call_gas_total)
+/// - `parent_indices[i]` is `Some(j)` if state update `i` occurred inside the CALL at
+///   index `j` (1-based). `None` means top-level.
+/// - `call_gas_total` is the total gas cost of all CALL operations in state_updates
+pub fn compute_state_updates(
+    trace: DefaultFrame,
+) -> Result<(Vec<StateUpdate>, ParentIndices, HashSet<Opcode>, u64)> {
     let mut state_updates: Vec<StateUpdate> = Vec::new();
-    let mut target_depth = 1;
+    let mut parent_indices: ParentIndices = Vec::new();
+    let mut target_depth = 1u64;
     let mut skipped_opcodes = HashSet::new();
+    // Stack of (depth, call_index) for CALLs we're inside. Call index is 1-based for display.
+    let mut call_stack: Vec<(u64, usize)> = Vec::new();
+    // Track what type of call brought us to each depth (for filtering nested CALLs)
+    // "CALL" = regular CALL, "DELEGATECALL" = DELEGATECALL/CALLCODE
+    let mut call_type_at_depth: HashMap<u64, &str> = HashMap::new();
+    // Track gas for each CALL we extract: map from call_index to gas_after_call_opcode
+    let mut call_gas_tracking: HashMap<usize, u64> = HashMap::new();
+    let mut total_call_gas = 0u64;
+
+    // Store the last log before consuming trace.struct_logs in the loop
+    let last_log_gas = trace.struct_logs.last().map(|log| log.gas);
 
     for struct_log in trace.struct_logs {
+        let depth = struct_log.depth;
+        let op = struct_log.op.as_ref().to_string();
+
         // Whenever stepping up (leaving a CALL/CALLCODE/DELEGATECALL) reset the target depth
-        if struct_log.depth < target_depth {
-            target_depth = struct_log.depth;
-        } else if struct_log.depth == target_depth {
-            // If we're going to step into a new execution context, increase the target depth
-            // else, try to add the state update
-            if &*struct_log.op == "DELEGATECALL" || &*struct_log.op == "CALLCODE" {
-                target_depth = struct_log.depth + 1;
-            } else if let Some(opcode) =
-                append_state_update_from_struct_log(&mut state_updates, struct_log)?
-            {
-                skipped_opcodes.insert(opcode);
+        // and pop call stack for any CALLs we've exited.
+        if depth < target_depth {
+            while let Some(&(d, idx)) = call_stack.last() {
+                if d >= depth {
+                    // We're exiting this CALL. Calculate its gas cost.
+                    if let Some(gas_after_opcode) = call_gas_tracking.remove(&idx) {
+                        // Gas remaining after the CALL returns
+                        let gas_after_call = struct_log.gas;
+                        // Gas used by the CALL = gas after CALL opcode - gas after CALL returns
+                        let gas_used = gas_after_opcode.saturating_sub(gas_after_call);
+                        total_call_gas += gas_used;
+                    }
+                    call_stack.pop();
+                } else {
+                    break;
+                }
+            }
+            call_type_at_depth.remove(&target_depth);
+            target_depth = depth;
+        }
+
+        if depth == target_depth {
+            if op == "DELEGATECALL" || op == "CALLCODE" {
+                target_depth = depth + 1;
+                call_type_at_depth.insert(depth + 1, "DELEGATECALL");
+            } else if matches!(
+                op.as_str(),
+                "CALL" | "SSTORE" | "LOG0" | "LOG1" | "LOG2" | "LOG3" | "LOG4"
+            ) {
+                // Filter out all state-changing operations (CALL, SSTORE, LOG*) that are nested within any CALL
+                // (they'll be executed as part of the outer CALL, so we can't optimize them)
+                // Keep operations at depth 1 (top-level) and operations directly within DELEGATECALL (not nested within a CALL)
+                if !call_stack.is_empty() {
+                    // We're nested within a CALL - filter it out
+                    // Nested operations will be executed as part of the parent CALL, so we can't optimize them separately.
+                    continue;
+                }
+
+                // Now add the state update (if not filtered)
+                // Read gas before moving struct_log
+                let gas_after_opcode = struct_log.gas;
+                if let Some(skipped) =
+                    append_state_update_from_struct_log(&mut state_updates, struct_log)?
+                {
+                    skipped_opcodes.insert(skipped);
+                } else {
+                    // We added a state update.
+                    let parent = call_stack.last().map(|&(_, idx)| idx);
+                    parent_indices.push(parent);
+
+                    if op == "CALL" {
+                        let call_index_1based = state_updates.len();
+                        call_stack.push((depth, call_index_1based));
+                        // Track the gas remaining after the CALL opcode executes
+                        // This will be used to calculate gas used when the CALL exits
+                        call_gas_tracking.insert(call_index_1based, gas_after_opcode);
+                        // Increase target_depth to track when we exit this CALL
+                        // This allows us to detect when the CALL returns and pop from call_stack
+                        target_depth = depth + 1;
+                    }
+                }
             }
         }
     }
-    Ok((state_updates, skipped_opcodes))
+
+    // Handle any remaining CALLs that didn't exit (shouldn't happen, but handle gracefully)
+    if let Some(gas_after_call) = last_log_gas {
+        for (_, gas_after_opcode) in call_gas_tracking {
+            let gas_used = gas_after_opcode.saturating_sub(gas_after_call);
+            total_call_gas += gas_used;
+        }
+    }
+
+    Ok((
+        state_updates,
+        parent_indices,
+        skipped_opcodes,
+        total_call_gas,
+    ))
 }
 
 // ============================================================================
@@ -226,11 +314,11 @@ pub async fn get_tx_trace<P: Provider + DebugApi>(
 ///
 /// This is a convenience function that combines `get_tx_trace` and `compute_state_updates`.
 ///
-/// Returns: (state_updates, skipped_opcodes)
+/// Returns: (state_updates, parent_indices, skipped_opcodes, call_gas_total)
 pub async fn compute_state_updates_from_tx<P: Provider + DebugApi>(
     provider: &P,
     tx_hash: FixedBytes<32>,
-) -> Result<(Vec<StateUpdate>, HashSet<Opcode>)> {
+) -> Result<(Vec<StateUpdate>, ParentIndices, HashSet<Opcode>, u64)> {
     let trace = get_tx_trace(provider, tx_hash).await?;
     compute_state_updates(trace)
 }

@@ -3,6 +3,8 @@
 //! This module provides shared functions for estimating gas costs heuristically
 //! when exact measurement is not possible. Used by both Anvil and EvmSketch implementations.
 
+use std::collections::HashMap;
+
 use crate::core::StateUpdate;
 
 /// Heuristic gas costs for different operations
@@ -119,9 +121,17 @@ pub fn extract_operation_counts_from_trace(
     // When depth increases to 2, we've entered the external call
     // When depth decreases back to 1, we've exited the external call
     // Gas used by sub-call = gas_after_call_opcode - gas_after_subcall_returns
+    //
+    // Important: We track CALL gas at depth 1 (outer calls include inner calls).
+    // For DELEGATECALL/CALLCODE: we don't track their gas, but we DO track
+    // CALL gas at depth 2 when within a DELEGATECALL context (since those
+    // external calls can't be optimized and aren't included in DELEGATECALL gas).
     let mut gas_after_call_opcode: Option<u64> = None;
     let mut previous_depth = 0;
     let mut in_external_call = false;
+    // Track what type of call brought us to each depth
+    let mut call_type_at_depth: HashMap<u64, &str> = HashMap::new();
+    let mut current_call_type: Option<&str> = None;
 
     for struct_log in &trace.struct_logs {
         let op = &*struct_log.op;
@@ -132,28 +142,61 @@ pub fn extract_operation_counts_from_trace(
             // We've exited an external call (depth went from 2 to 1)
             if in_external_call {
                 if let Some(gas_after_opcode) = gas_after_call_opcode {
-                    // Gas remaining after the sub-call returns
-                    // struct_log.gas is u64 (remaining gas after opcode executes)
-                    let gas_after_subcall = struct_log.gas;
+                    let call_type_at_depth_2 = call_type_at_depth.get(&2);
 
-                    // Gas used by the sub-call = gas after CALL opcode - gas after sub-call returns
-                    let gas_used = gas_after_opcode.saturating_sub(gas_after_subcall);
-                    operations.external_call_gas += gas_used;
+                    // Account gas for:
+                    // 1. CALL at depth 1 (outer calls include inner calls, so track total gas)
+                    // 2. CALL at depth 2 within DELEGATECALL (these external calls can't be optimized)
+                    if call_type_at_depth_2 == Some(&"CALL")
+                        || call_type_at_depth_2 == Some(&"DELEGATECALL")
+                    {
+                        // Gas remaining after the sub-call returns
+                        // struct_log.gas is u64 (remaining gas after opcode executes)
+                        let gas_after_subcall = struct_log.gas;
+
+                        // Gas used by the sub-call = gas after CALL opcode - gas after sub-call returns
+                        let gas_used = gas_after_opcode.saturating_sub(gas_after_subcall);
+                        operations.external_call_gas += gas_used;
+                    }
                 }
                 in_external_call = false;
                 gas_after_call_opcode = None;
+                call_type_at_depth.remove(&2);
+                current_call_type = None;
             }
         } else if depth == 2 && previous_depth == 1 {
             // We've entered an external call (depth went from 1 to 2)
+            // Record what call type brought us here
+            if let Some(call_type) = current_call_type {
+                call_type_at_depth.insert(2, call_type);
+            }
             in_external_call = true;
         }
 
         // Track CALL opcodes at depth 1 (external calls from the main contract)
+        // These outer calls include inner calls, so we track their total gas
         if op == "CALL" && depth == 1 {
             // Note the gas remaining AFTER the CALL opcode executes (before sub-call)
             // This is the gas available for the sub-call
             // struct_log.gas is u64 (remaining gas after opcode executes)
             gas_after_call_opcode = Some(struct_log.gas);
+            current_call_type = Some("CALL");
+        }
+
+        // Track DELEGATECALL/CALLCODE at depth 1 (but don't track their gas)
+        // We need to know when we're in a DELEGATECALL context to track CALLs within it
+        if (op == "DELEGATECALL" || op == "CALLCODE") && depth == 1 {
+            current_call_type = Some("DELEGATECALL");
+            // Don't set gas_after_call_opcode - we don't track DELEGATECALL gas itself
+        }
+
+        // Track CALL at depth 2 only if we're in a DELEGATECALL context
+        // Regular CALLs at depth 2 are already included in the outer CALL gas
+        if op == "CALL" && depth == 2 {
+            if call_type_at_depth.get(&2) == Some(&"DELEGATECALL") {
+                // This is a CALL within a DELEGATECALL - track its gas
+                gas_after_call_opcode = Some(struct_log.gas);
+            }
         }
 
         // Count operations
@@ -178,11 +221,15 @@ pub fn extract_operation_counts_from_trace(
         && let Some(gas_after_opcode) = gas_after_call_opcode
         && let Some(last_log) = trace.struct_logs.last()
     {
-        // Gas remaining after the sub-call returns
-        // struct_log.gas is u64 (remaining gas after opcode executes)
-        let gas_after_subcall = last_log.gas;
-        let gas_used = gas_after_opcode.saturating_sub(gas_after_subcall);
-        operations.external_call_gas += gas_used;
+        let call_type_at_depth_2 = call_type_at_depth.get(&2);
+        // Account gas for CALL at depth 1 or CALL at depth 2 within DELEGATECALL
+        if call_type_at_depth_2 == Some(&"CALL") || call_type_at_depth_2 == Some(&"DELEGATECALL") {
+            // Gas remaining after the sub-call returns
+            // struct_log.gas is u64 (remaining gas after opcode executes)
+            let gas_after_subcall = last_log.gas;
+            let gas_used = gas_after_opcode.saturating_sub(gas_after_subcall);
+            operations.external_call_gas += gas_used;
+        }
     }
 
     operations
