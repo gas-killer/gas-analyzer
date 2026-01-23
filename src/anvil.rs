@@ -211,8 +211,6 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
     }
 
     pub async fn get_tx_trace(&self, tx_hash: FixedBytes<32>) -> Result<DefaultFrame> {
-        // Uses the shared trace function but without the status check
-        // (GasKiller may want to trace failed transactions)
         let options = GethDebugTracingOptions {
             config: GethDefaultTracingOptions {
                 enable_memory: Some(true),
@@ -396,11 +394,8 @@ fn format_decoded_values(values: &[DynSolValue]) -> String {
 }
 
 // ============================================================================
-// Trace Functions (shared implementation in core::trace)
+// Trace Functions
 // ============================================================================
-
-// Re-export for backwards compatibility - compute_state_updates and get_tx_trace
-// are now provided by crate::core::trace
 
 /// Get trace from a simulated call using Anvil
 pub async fn get_trace_from_call(
