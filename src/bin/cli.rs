@@ -92,13 +92,19 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
 
                 // Get trace and compute state updates
                 let trace = get_tx_trace(&provider, bytes.into()).await?;
-                let (state_updates, skipped_opcodes) = compute_state_updates(trace).await?;
+                let (state_updates, parent_indices, skipped_opcodes, _call_gas_total) =
+                    compute_state_updates(trace)?;
 
                 // Print state updates
                 println!("\n{}", "=== State Updates ===".green().bold());
                 println!("Total state updates: {}", state_updates.len());
                 for (i, update) in state_updates.iter().enumerate() {
-                    println!("  {}: {:?}", i + 1, update);
+                    let suffix = parent_indices
+                        .get(i)
+                        .and_then(|p| *p)
+                        .map(|j| format!(" (nested within call {})", j))
+                        .unwrap_or_default();
+                    println!("  {}: {:?}{}", i + 1, update, suffix);
                 }
                 if !skipped_opcodes.is_empty() {
                     println!(
@@ -156,38 +162,45 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 let state_updates_result =
                     compute_state_updates_from_tx(&provider, bytes.into()).await;
 
-                let (state_updates, skipped_opcodes, use_fallback) = match state_updates_result {
-                    Ok(result) => (result.0, result.1, false),
-                    Err(e) => {
-                        if original_status {
-                            // Transaction succeeded originally but trace extraction failed
-                            // Fall back to heuristic estimation
-                            println!(
-                                "{}",
-                                "⚠️  Warning: Trace extraction failed, using fallback heuristic estimation"
-                                    .yellow()
-                            );
-                            println!(
-                                "   Reason: {}",
-                                format!("{}", e)
-                                    .split('\n')
-                                    .next()
-                                    .unwrap_or("Unknown error")
-                            );
+                let (state_updates, parent_indices, skipped_opcodes, call_gas_total, use_fallback) =
+                    match state_updates_result {
+                        Ok(result) => (result.0, result.1, result.2, result.3, false),
+                        Err(e) => {
+                            if original_status {
+                                // Transaction succeeded originally but trace extraction failed
+                                // Fall back to heuristic estimation
+                                println!(
+                                    "{}",
+                                    "⚠️  Warning: Trace extraction failed, using fallback heuristic estimation"
+                                        .yellow()
+                                );
+                                println!(
+                                    "   Reason: {}",
+                                    format!("{}", e)
+                                        .split('\n')
+                                        .next()
+                                        .unwrap_or("Unknown error")
+                                );
 
-                            // Return empty state updates and use fallback heuristic
-                            (Vec::new(), std::collections::HashSet::new(), true)
-                        } else {
-                            // Transaction originally failed, so this is expected
-                            let msg = format!(
-                                "Cannot analyze failed transaction. Original transaction reverted.\n\
-                                Error: {}",
-                                e
-                            );
-                            return Err(anyhow::Error::msg(msg));
+                                // Return empty state updates and use fallback heuristic
+                                (
+                                    Vec::new(),
+                                    Vec::new(),
+                                    std::collections::HashSet::new(),
+                                    0,
+                                    true,
+                                )
+                            } else {
+                                // Transaction originally failed, so this is expected
+                                let msg = format!(
+                                    "Cannot analyze failed transaction. Original transaction reverted.\n\
+                                    Error: {}",
+                                    e
+                                );
+                                return Err(anyhow::Error::msg(msg));
+                            }
                         }
-                    }
-                };
+                    };
 
                 // Get gas estimate using the state updates extracted from the actual trace
                 use gas_analyzer_rs::core::{
@@ -249,7 +262,8 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                                 "⚠️  Warning: Measured gas estimation failed, using heuristic"
                                     .yellow()
                             );
-                            let heuristic = estimate_gas_from_state_updates(&state_updates, 0);
+                            let heuristic =
+                                estimate_gas_from_state_updates(&state_updates, call_gas_total);
                             (heuristic + TURETZKY_UPPER_GAS_LIMIT, true)
                         }
                     }
@@ -262,7 +276,12 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 println!("\n{}", "=== State Updates ===".green().bold());
                 println!("Total state updates: {}", state_updates.len());
                 for (i, update) in state_updates.iter().enumerate() {
-                    println!("  {}: {:?}", i + 1, update);
+                    let suffix = parent_indices
+                        .get(i)
+                        .and_then(|p| *p)
+                        .map(|j| format!(" (nested within call {})", j))
+                        .unwrap_or_default();
+                    println!("  {}: {:?}{}", i + 1, update, suffix);
                 }
                 if !skipped_opcodes.is_empty() {
                     println!(
