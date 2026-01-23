@@ -192,9 +192,7 @@ pub fn extract_operation_counts_from_trace(
 
         // Track CALL at depth 2 only if we're in a DELEGATECALL context
         // Regular CALLs at depth 2 are already included in the outer CALL gas
-        if op == "CALL" && depth == 2
-            && call_type_at_depth.get(&2) == Some(&"DELEGATECALL")
-        {
+        if op == "CALL" && depth == 2 && call_type_at_depth.get(&2) == Some(&"DELEGATECALL") {
             // This is a CALL within a DELEGATECALL - track its gas
             gas_after_call_opcode = Some(struct_log.gas);
         }
