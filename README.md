@@ -30,7 +30,6 @@ The CLI supports analyzing single transactions and transaction requests. By defa
 
 > **Note:** Examples are mainnet transactions. Ensure `.env` has a mainnet RPC set or update to transactions on your target network.
 
-
 ### Analyze a transaction
 ```bash
 cargo run -- t 0x9add9d0f26bc6d867c1d6d41dda6287d9721a377cea42440250884f76d2a0fa7
