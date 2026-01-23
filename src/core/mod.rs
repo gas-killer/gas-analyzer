@@ -20,7 +20,7 @@ pub use heuristic::{
     extract_operation_counts_from_trace,
 };
 pub use trace::{
-    compute_state_updates, compute_state_updates_from_tx, copy_memory, get_tx_trace,
+    ParentIndices, compute_state_updates, compute_state_updates_from_tx, copy_memory, get_tx_trace,
     parse_trace_memory,
 };
 pub use types::{
