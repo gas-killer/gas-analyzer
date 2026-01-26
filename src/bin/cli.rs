@@ -25,13 +25,17 @@ fn parse_args() -> CliArgs {
     let use_anvil = args.iter().any(|a| a == "--anvil" || a == "--legacy");
 
     // Filter out flags to get positional args
-    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    let positional: Vec<&str> = args
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|a| !a.starts_with("--"))
+        .collect();
 
     let command = if positional.len() < 3 {
         None
     } else {
-        let input_type: &str = positional[1];
-        let value = positional[2].clone();
+        let input_type = positional[1];
+        let value = positional[2].to_string();
 
         match input_type {
             "t" | "tx" => Some(Commands::Transaction(value)),
