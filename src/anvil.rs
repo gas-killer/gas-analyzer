@@ -524,8 +524,7 @@ pub async fn gaskiller_reporter(
         .await?
         .ok_or_else(|| anyhow!("could not get receipt for tx {}", tx_hash))?;
     let trace = get_tx_trace(&provider, tx_hash).await?;
-    let (state_updates, _parent_indices, skipped_opcodes_set, _call_gas_total) =
-        compute_state_updates(trace)?;
+    let (state_updates, skipped_opcodes_set, _call_gas_total) = compute_state_updates(trace)?;
     let skipped_opcodes = skipped_opcodes_set
         .into_iter()
         .collect::<Vec<_>>()
@@ -570,8 +569,7 @@ pub async fn call_to_encoded_state_updates_with_gas_estimate(
         })
         .ok_or_else(|| anyhow!("receipt does not have to address"))?;
     let trace = get_trace_from_call(url, tx_request, block_height).await?;
-    let (state_updates, _parent_indices, skipped_opcodes, _call_gas_total) =
-        compute_state_updates(trace)?;
+    let (state_updates, skipped_opcodes, _call_gas_total) = compute_state_updates(trace)?;
     let gas_estimate = gk
         .estimate_state_changes_gas(contract_address, &state_updates)
         .await?;
@@ -603,8 +601,7 @@ impl<P: Provider + DebugApi> TxStateExtractor<P> {
         let trace = get_tx_trace(&self.provider, tx_hash).await?;
 
         // Use existing compute_state_updates function
-        let (state_updates, _parent_indices, _skipped, _call_gas_total) =
-            compute_state_updates(trace)?;
+        let (state_updates, _skipped, _call_gas_total) = compute_state_updates(trace)?;
 
         Ok(state_updates)
     }
@@ -631,8 +628,7 @@ impl<P: Provider + DebugApi> TxStateExtractor<P> {
         }
 
         let trace = get_tx_trace(&self.provider, tx_hash).await?;
-        let (state_updates, _parent_indices, _skipped, _call_gas_total) =
-            compute_state_updates(trace)?;
+        let (state_updates, _skipped, _call_gas_total) = compute_state_updates(trace)?;
 
         Ok(StateUpdateReport {
             tx_hash,

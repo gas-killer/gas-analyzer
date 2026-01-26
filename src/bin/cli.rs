@@ -92,19 +92,14 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
 
                 // Get trace and compute state updates
                 let trace = get_tx_trace(&provider, bytes.into()).await?;
-                let (state_updates, parent_indices, skipped_opcodes, _call_gas_total) =
+                let (state_updates, skipped_opcodes, _call_gas_total) =
                     compute_state_updates(trace)?;
 
                 // Print state updates
                 println!("\n{}", "=== State Updates ===".green().bold());
                 println!("Total state updates: {}", state_updates.len());
                 for (i, update) in state_updates.iter().enumerate() {
-                    let suffix = parent_indices
-                        .get(i)
-                        .and_then(|p| *p)
-                        .map(|j| format!(" (nested within call {})", j))
-                        .unwrap_or_default();
-                    println!("  {}: {:?}{}", i + 1, update, suffix);
+                    println!("  {}: {:?}", i + 1, update);
                 }
                 if !skipped_opcodes.is_empty() {
                     println!(
@@ -162,9 +157,9 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 let state_updates_result =
                     compute_state_updates_from_tx(&provider, bytes.into()).await;
 
-                let (state_updates, parent_indices, skipped_opcodes, call_gas_total, use_fallback) =
+                let (state_updates, skipped_opcodes, call_gas_total, use_fallback) =
                     match state_updates_result {
-                        Ok(result) => (result.0, result.1, result.2, result.3, false),
+                        Ok(result) => (result.0, result.1, result.2, false),
                         Err(e) => {
                             if original_status {
                                 // Transaction succeeded originally but trace extraction failed
@@ -184,7 +179,6 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
 
                                 // Return empty state updates and use fallback heuristic
                                 (
-                                    Vec::new(),
                                     Vec::new(),
                                     std::collections::HashSet::new(),
                                     0,
@@ -276,12 +270,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 println!("\n{}", "=== State Updates ===".green().bold());
                 println!("Total state updates: {}", state_updates.len());
                 for (i, update) in state_updates.iter().enumerate() {
-                    let suffix = parent_indices
-                        .get(i)
-                        .and_then(|p| *p)
-                        .map(|j| format!(" (nested within call {})", j))
-                        .unwrap_or_default();
-                    println!("  {}: {:?}{}", i + 1, update, suffix);
+                    println!("  {}: {:?}", i + 1, update);
                 }
                 if !skipped_opcodes.is_empty() {
                     println!(
