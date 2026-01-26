@@ -26,7 +26,6 @@ pub use core::{
     // Types
     IStateUpdateTypes,
     Opcode,
-    ParentIndices,
     RevertingContext,
     SimpleStorage,
     StateUpdate,

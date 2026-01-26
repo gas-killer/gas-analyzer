@@ -15,12 +15,12 @@ pub use encoding::{
     encode_state_updates_to_sol,
 };
 pub use heuristic::{
-    BASE_TX_COST, COLD_SSTORE_COST, LOG_BASE_COST, LOG_DATA_COST_PER_BYTE, LOG_TOPIC_COST,
-    TraceOperations, estimate_gas_from_operations, estimate_gas_from_state_updates,
+    BASE_TX_COST, LOG_BASE_COST, LOG_DATA_COST_PER_BYTE, LOG_TOPIC_COST, TraceOperations,
+    WARM_SSTORE_COST, estimate_gas_from_operations, estimate_gas_from_state_updates,
     extract_operation_counts_from_trace,
 };
 pub use trace::{
-    ParentIndices, compute_state_updates, compute_state_updates_from_tx, copy_memory, get_tx_trace,
+    compute_state_updates, compute_state_updates_from_tx, copy_memory, get_tx_trace,
     parse_trace_memory,
 };
 pub use types::{

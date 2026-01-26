@@ -156,24 +156,17 @@ pub fn append_state_update_from_struct_log(
 // Trace Processing
 // ============================================================================
 
-/// Parent index for nesting: `parent_indices[i]` is `Some(j)` if state update `i` occurred
-/// inside the execution of the CALL at index `j` (1-based in display).
-pub type ParentIndices = Vec<Option<usize>>;
-
 /// Compute state updates from a Geth DefaultFrame trace.
 ///
 /// This extracts SSTORE, CALL, and LOG operations from an existing transaction's trace,
 /// handling DELEGATECALL and CALLCODE depth tracking correctly.
 ///
-/// Returns: (state_updates, parent_indices, skipped_opcodes, call_gas_total)
-/// - `parent_indices[i]` is `Some(j)` if state update `i` occurred inside the CALL at
-///   index `j` (1-based). `None` means top-level.
+/// Returns: (state_updates, skipped_opcodes, call_gas_total)
 /// - `call_gas_total` is the total gas cost of all CALL operations in state_updates
 pub fn compute_state_updates(
     trace: DefaultFrame,
-) -> Result<(Vec<StateUpdate>, ParentIndices, HashSet<Opcode>, u64)> {
+) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64)> {
     let mut state_updates: Vec<StateUpdate> = Vec::new();
-    let mut parent_indices: ParentIndices = Vec::new();
     let mut target_depth = 1u64;
     let mut skipped_opcodes = HashSet::new();
     // Stack of (depth, call_index) for CALLs we're inside. Call index is 1-based for display.
@@ -184,9 +177,6 @@ pub fn compute_state_updates(
     // Track gas for each CALL we extract: map from call_index to gas_after_call_opcode
     let mut call_gas_tracking: HashMap<usize, u64> = HashMap::new();
     let mut total_call_gas = 0u64;
-
-    // Store the last log before consuming trace.struct_logs in the loop
-    let last_log_gas = trace.struct_logs.last().map(|log| log.gas);
 
     for struct_log in trace.struct_logs {
         let depth = struct_log.depth;
@@ -240,9 +230,6 @@ pub fn compute_state_updates(
                     skipped_opcodes.insert(skipped);
                 } else {
                     // We added a state update.
-                    let parent = call_stack.last().map(|&(_, idx)| idx);
-                    parent_indices.push(parent);
-
                     if op == "CALL" {
                         let call_index_1based = state_updates.len();
                         call_stack.push((depth, call_index_1based));
@@ -258,20 +245,16 @@ pub fn compute_state_updates(
         }
     }
 
-    // Handle any remaining CALLs that didn't exit (shouldn't happen, but handle gracefully)
-    if let Some(gas_after_call) = last_log_gas {
-        for (_, gas_after_opcode) in call_gas_tracking {
-            let gas_used = gas_after_opcode.saturating_sub(gas_after_call);
-            total_call_gas += gas_used;
-        }
+    // Panic if there are any remaining CALLs that didn't exit (shouldn't happen)
+    if !call_gas_tracking.is_empty() {
+        panic!(
+            "Found {} remaining CALL(s) that didn't exit properly. Call indices: {:?}",
+            call_gas_tracking.len(),
+            call_gas_tracking.keys().collect::<Vec<_>>()
+        );
     }
 
-    Ok((
-        state_updates,
-        parent_indices,
-        skipped_opcodes,
-        total_call_gas,
-    ))
+    Ok((state_updates, skipped_opcodes, total_call_gas))
 }
 
 // ============================================================================
@@ -314,11 +297,11 @@ pub async fn get_tx_trace<P: Provider + DebugApi>(
 ///
 /// This is a convenience function that combines `get_tx_trace` and `compute_state_updates`.
 ///
-/// Returns: (state_updates, parent_indices, skipped_opcodes, call_gas_total)
+/// Returns: (state_updates, skipped_opcodes, call_gas_total)
 pub async fn compute_state_updates_from_tx<P: Provider + DebugApi>(
     provider: &P,
     tx_hash: FixedBytes<32>,
-) -> Result<(Vec<StateUpdate>, ParentIndices, HashSet<Opcode>, u64)> {
+) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64)> {
     let trace = get_tx_trace(provider, tx_hash).await?;
     compute_state_updates(trace)
 }
