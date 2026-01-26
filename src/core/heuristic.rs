@@ -9,7 +9,7 @@ use crate::core::StateUpdate;
 
 /// Heuristic gas costs for different operations
 pub const BASE_TX_COST: u64 = 21_000;
-pub const COLD_SSTORE_COST: u64 = 20_000;
+pub const WARM_SSTORE_COST: u64 = 5_000;
 pub const LOG_BASE_COST: u64 = 375;
 pub const LOG_TOPIC_COST: u64 = 375;
 pub const LOG_DATA_COST_PER_BYTE: u64 = 8;
@@ -43,7 +43,7 @@ pub fn estimate_gas_from_state_updates(
 
     for update in state_updates {
         gas += match update {
-            StateUpdate::Store(_) => COLD_SSTORE_COST,
+            StateUpdate::Store(_) => WARM_SSTORE_COST,
             // CALL gas is already included in external_call_gas from the trace
             StateUpdate::Call(_) => 0,
             StateUpdate::Log0(log) => {
@@ -81,7 +81,7 @@ pub fn estimate_gas_from_operations(operations: &TraceOperations) -> u64 {
     let mut gas = BASE_TX_COST;
 
     // Add SSTORE costs (cold SSTORE)
-    gas += operations.sstore_count * COLD_SSTORE_COST;
+    gas += operations.sstore_count * WARM_SSTORE_COST;
 
     // Add LOG costs
     // LOG0: base cost only (we don't have data length in operations)
