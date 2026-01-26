@@ -178,12 +178,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                                 );
 
                                 // Return empty state updates and use fallback heuristic
-                                (
-                                    Vec::new(),
-                                    std::collections::HashSet::new(),
-                                    0,
-                                    true,
-                                )
+                                (Vec::new(), std::collections::HashSet::new(), 0, true)
                             } else {
                                 // Transaction originally failed, so this is expected
                                 let msg = format!(
