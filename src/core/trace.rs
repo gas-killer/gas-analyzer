@@ -247,10 +247,11 @@ pub fn compute_state_updates(
 
     // Panic if there are any remaining CALLs that didn't exit (shouldn't happen)
     if !call_gas_tracking.is_empty() {
+        let call_indices: Vec<_> = call_gas_tracking.keys().copied().collect();
         panic!(
             "Found {} remaining CALL(s) that didn't exit properly. Call indices: {:?}",
             call_gas_tracking.len(),
-            call_gas_tracking.keys().collect::<Vec<_>>()
+            call_indices
         );
     }
 
