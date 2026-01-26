@@ -781,7 +781,7 @@ mod tests {
 
         let tx_hash = SIMPLE_STORAGE_SET_TX_HASH;
         let trace = get_tx_trace(&provider, tx_hash).await?;
-        let (state_updates, _parent, _, _) = compute_state_updates(trace)?;
+        let (state_updates, _, _) = compute_state_updates(trace)?;
 
         let gk = GasKillerDefault::new(rpc_url, None).await?;
         let gas_estimate = gk
@@ -802,7 +802,7 @@ mod tests {
 
         let tx_hash = ACCESS_CONTROL_MAIN_RUN_TX_HASH;
         let trace = get_tx_trace(&provider, tx_hash).await?;
-        let (state_updates, _parent, _, _) = compute_state_updates(trace)?;
+        let (state_updates, _, _) = compute_state_updates(trace)?;
 
         let gk = GasKillerDefault::new(rpc_url, None).await?;
         let gas_estimate = gk
@@ -823,7 +823,7 @@ mod tests {
 
         let tx_hash = ACCESS_CONTROL_MAIN_RUN_TX_HASH;
         let trace = get_tx_trace(&provider, tx_hash).await?;
-        let (state_updates, _parent, _, _) = compute_state_updates(trace)?;
+        let (state_updates, _, _) = compute_state_updates(trace)?;
 
         let gk = GasKillerDefault::new(rpc_url, None).await?;
         let gas_estimate = gk
@@ -852,7 +852,7 @@ mod tests {
 
         let tx_hash = SIMPLE_STORAGE_SET_TX_HASH;
         let trace = get_tx_trace(&provider, tx_hash).await?;
-        let (state_updates, _parent, _, _) = compute_state_updates(trace)?;
+        let (state_updates, _, _) = compute_state_updates(trace)?;
 
         assert_eq!(state_updates.len(), 2);
         assert!(matches!(state_updates[0], StateUpdate::Store(_)));
@@ -895,7 +895,7 @@ mod tests {
 
         let tx_hash = SIMPLE_STORAGE_DEPOSIT_TX_HASH;
         let trace = get_tx_trace(&provider, tx_hash).await?;
-        let (state_updates, _parent, _, _) = compute_state_updates(trace)?;
+        let (state_updates, _, _) = compute_state_updates(trace)?;
 
         assert_eq!(state_updates.len(), 2);
         assert!(matches!(state_updates[0], StateUpdate::Store(_)));
@@ -942,19 +942,19 @@ mod tests {
 
         let tx_hash = DELEGATECALL_CONTRACT_MAIN_RUN_TX_HASH;
         let trace = get_tx_trace(&provider, tx_hash).await?;
-        let (state_updates, _parent, _, _) = compute_state_updates(trace)?;
+        let (state_updates, _, _) = compute_state_updates(trace)?;
 
         assert_eq!(state_updates.len(), 4);
         let StateUpdate::Store(IStateUpdateTypes::Store { slot, value }) = &state_updates[0] else {
             bail!("Expected Store, got {:?}", state_updates[0]);
         };
         assert_eq!(
-            slot,
-            &b256!("0x0000000000000000000000000000000000000000000000000000000000000003")
+            *slot,
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000003")
         );
         assert_eq!(
-            value,
-            &b256!("0x0000000000000000000000000000000000000000000000000000000000000001")
+            *value,
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000001")
         );
 
         let StateUpdate::Call(IStateUpdateTypes::Call {
@@ -965,32 +965,32 @@ mod tests {
         else {
             bail!("Expected Call, got {:?}", state_updates[1]);
         };
-        assert_eq!(target, &DELEGATE_CONTRACT_A_ADDRESS);
-        assert_eq!(value, &U256::from(0));
-        assert_eq!(callargs, &bytes!("0xaea01afc"));
+        assert_eq!(*target, DELEGATE_CONTRACT_A_ADDRESS);
+        assert_eq!(*value, U256::from(0));
+        assert_eq!(*callargs, bytes!("0xaea01afc"));
 
         let StateUpdate::Store(IStateUpdateTypes::Store { slot, value }) = &state_updates[2] else {
             bail!("Expected Store, got {:?}", state_updates[2]);
         };
         assert_eq!(
-            slot,
-            &b256!("0x0000000000000000000000000000000000000000000000000000000000000002")
+            *slot,
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000002")
         );
         assert_eq!(
-            value,
-            &b256!("0x0000000000000000000000000000000000000000000000000de0b6b3a7640000")
+            *value,
+            b256!("0x0000000000000000000000000000000000000000000000000de0b6b3a7640000")
         ); // 1 ether (use cast to-dec)
 
         let StateUpdate::Store(IStateUpdateTypes::Store { slot, value }) = &state_updates[3] else {
             bail!("Expected Store, got {:?}", state_updates[3]);
         };
         assert_eq!(
-            slot,
-            &b256!("0x0000000000000000000000000000000000000000000000000000000000000002")
+            *slot,
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000002")
         );
         assert_eq!(
-            value,
-            &b256!("0x00000000000000000000000000000000000000000000000029a2241af62c0000")
+            *value,
+            b256!("0x00000000000000000000000000000000000000000000000029a2241af62c0000")
         ); // 3 ether (use cast to-dec)
 
         Ok(())
@@ -1007,7 +1007,7 @@ mod tests {
 
         let tx_hash = SIMPLE_STORAGE_CALL_EXTERNAL_TX_HASH;
         let trace = get_tx_trace(&provider, tx_hash).await?;
-        let (state_updates, _parent, _, _) = compute_state_updates(trace)?;
+        let (state_updates, _, _) = compute_state_updates(trace)?;
 
         assert_eq!(state_updates.len(), 1);
         assert!(matches!(state_updates[0], StateUpdate::Call(_)));
@@ -1040,7 +1040,7 @@ mod tests {
         let tx_request = simple_storage.set(U256::from(1)).into_transaction_request();
 
         let trace = get_trace_from_call(rpc_url, tx_request, None).await?;
-        let (state_updates, _parent, _, _) = compute_state_updates(trace)?;
+        let (state_updates, _, _) = compute_state_updates(trace)?;
 
         assert_eq!(state_updates.len(), 2);
         assert!(matches!(state_updates[0], StateUpdate::Store(_)));
