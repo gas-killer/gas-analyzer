@@ -8,8 +8,10 @@ use std::collections::{HashMap, HashSet};
 
 use alloy::primitives::{Address, FixedBytes};
 use alloy::rpc::types::trace::geth::{
-    DefaultFrame, GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace, StructLog,
+    DefaultFrame, GethDebugTracingCallOptions, GethDebugTracingOptions, GethDefaultTracingOptions,
+    GethTrace, StructLog,
 };
+use alloy_eips::BlockId;
 use alloy_provider::Provider;
 use alloy_provider::ext::DebugApi;
 use anyhow::{Result, anyhow, bail};
@@ -290,6 +292,39 @@ pub async fn get_tx_trace<P: Provider + DebugApi>(
     let GethTrace::Default(trace) = provider.debug_trace_transaction(tx_hash, options).await?
     else {
         return Err(anyhow!("Expected default trace"));
+    };
+    Ok(trace)
+}
+
+/// Get trace from a simulated call using debug_traceCall.
+///
+/// This simulates the call at the given block and returns the default-format trace.
+/// Requires an RPC that supports debug_traceCall (e.g. Geth, Erigon).
+pub async fn get_trace_from_call<P, Req>(
+    provider: &P,
+    tx_request: Req,
+    block: BlockId,
+) -> Result<DefaultFrame>
+where
+    P: Provider + DebugApi,
+    Req: Into<alloy::rpc::types::eth::TransactionRequest>,
+{
+    let tx_request = tx_request.into();
+    let options = GethDebugTracingCallOptions {
+        tracing_options: GethDebugTracingOptions {
+            config: GethDefaultTracingOptions {
+                enable_memory: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let GethTrace::Default(trace) = provider
+        .debug_trace_call(tx_request, block, options)
+        .await
+        .map_err(|e| anyhow!("debug_trace_call failed: {}", e))? else {
+        return Err(anyhow!("Expected default trace from debug_trace_call"));
     };
     Ok(trace)
 }
