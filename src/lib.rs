@@ -23,9 +23,25 @@ pub mod evmsketch;
 
 // Re-export core types (always available)
 pub use core::{
-    IStateUpdateTypes, Opcode, RevertingContext, SimpleStorage, StateUpdate, StateUpdateType,
-    StateUpdates, TURETZKY_UPPER_GAS_LIMIT, decode_state_updates_tuple,
-    encode_state_updates_to_abi, encode_state_updates_to_sol,
+    // Types
+    IStateUpdateTypes,
+    Opcode,
+    RevertingContext,
+    SimpleStorage,
+    StateUpdate,
+    StateUpdateType,
+    StateUpdates,
+    // Encoding
+    TURETZKY_UPPER_GAS_LIMIT,
+    // Trace functions (shared by anvil and evmsketch)
+    compute_state_updates,
+    compute_state_updates_from_tx,
+    decode_state_updates_tuple,
+    encode_state_updates_to_abi,
+    encode_state_updates_to_sol,
+    // Heuristics
+    estimate_gas_from_state_updates,
+    get_tx_trace,
 };
 
 // Re-export Anvil types and functions
@@ -42,14 +58,11 @@ pub use anvil::{
     TxStateExtractor,
     // Public API
     call_to_encoded_state_updates_with_gas_estimate,
-    // Trace functions
-    compute_state_updates,
     gas_estimate_block,
     gas_estimate_tx,
     gaskiller_reporter,
     get_report,
     get_trace_from_call,
-    get_tx_trace,
     invokes_smart_contract,
     tx_extractor_from_rpc_url,
 };
@@ -59,16 +72,10 @@ pub use anvil::{
 pub use evmsketch::{
     // Executor
     DefaultEvmSketchExecutor,
-    EvmExecutionResult,
     EvmSketchExecutor,
     EvmSketchExecutorBuilder,
     // GasKiller
     GasKillerEvmSketch,
     GasKillerEvmSketchBuilder,
     GasKillerEvmSketchDefault,
-    // Public API
-    call_to_encoded_state_updates_with_evmsketch,
-    // Trace functions
-    compute_state_updates_from_call_trace,
-    compute_state_updates_with_evmsketch,
 };
