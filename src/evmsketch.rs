@@ -9,7 +9,9 @@
 
 use alloy::hex;
 use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
+use alloy::providers::ProviderBuilder;
 use alloy::rpc::types::eth::TransactionRequest;
+use alloy_eips::BlockId;
 use alloy_eips::BlockNumberOrTag;
 use alloy_provider::Provider;
 use alloy_provider::RootProvider;
@@ -21,13 +23,15 @@ use serde_json::Value;
 use sp1_cc_client_executor::io::Primitives;
 use sp1_cc_client_executor::{ContractCalldata, ContractInput};
 use sp1_cc_host_executor::EvmSketch;
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use url::Url;
 
 use crate::core::{
-    StateUpdate, encode_state_updates_to_sol, estimate_gas_from_operations,
-    extract_operation_counts_from_trace,
+    Opcode, StateUpdate, compute_state_updates, encode_state_updates_to_abi,
+    encode_state_updates_to_sol, estimate_gas_from_operations,
+    extract_operation_counts_from_trace, get_trace_from_call,
 };
 
 // ============================================================================
@@ -410,6 +414,50 @@ impl GasKillerEvmSketchDefault {
     pub fn anchor_block_hash(&self) -> B256 {
         self.executor.anchor_block_hash()
     }
+}
+
+// ============================================================================
+// call_to_encoded_state_updates_with_evmsketch
+// ============================================================================
+
+/// Compute encoded state updates and gas estimate for a transaction call using EvmSketch.
+///
+/// Simulates the call via `debug_traceCall` at the given block, extracts state updates,
+/// encodes them to ABI, and estimates gas using EvmSketch. Use this for validator-style
+/// analysis without Anvil.
+///
+/// # Returns
+/// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`
+pub async fn call_to_encoded_state_updates_with_evmsketch(
+    rpc_url: impl AsRef<str>,
+    tx_request: TransactionRequest,
+    block: BlockNumberOrTag,
+) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
+    let rpc_url = rpc_url.as_ref();
+    let url = Url::parse(rpc_url).map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+
+    let contract_address = tx_request
+        .to
+        .and_then(|t| match t {
+            TxKind::Call(addr) => Some(addr),
+            TxKind::Create => None,
+        })
+        .ok_or_else(|| anyhow!("Transaction must have a 'to' address"))?;
+
+    let provider = ProviderBuilder::new().connect_http(url.clone());
+    let block_id = BlockId::Number(block);
+    let trace = get_trace_from_call(&provider, tx_request, block_id).await?;
+    let (state_updates, skipped_opcodes, _call_gas_total) = compute_state_updates(trace)?;
+
+    let storage_updates = encode_state_updates_to_abi(&state_updates);
+
+    let gk = GasKillerEvmSketchDefault::builder(url)
+        .at_block(block)
+        .build()
+        .await?;
+    let gas_estimate = gk.estimate_state_changes_gas(contract_address, &state_updates)?;
+
+    Ok((storage_updates, gas_estimate, false, skipped_opcodes))
 }
 
 // ============================================================================
