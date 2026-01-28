@@ -78,4 +78,6 @@ pub use evmsketch::{
     GasKillerEvmSketch,
     GasKillerEvmSketchBuilder,
     GasKillerEvmSketchDefault,
+    // Public API
+    call_to_encoded_state_updates_with_evmsketch,
 };
