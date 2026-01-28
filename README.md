@@ -28,9 +28,11 @@ cargo test
 ## CLI (unstable)
 The CLI supports analyzing single transactions and transaction requests. By default, it uses EvmSketch for analysis.
 
+> **Note:** Examples are mainnet transactions. Ensure `.env` has a mainnet RPC set or update to transactions on your target network.
+
 ### Analyze a transaction
 ```bash
-cargo run -- t aecc4a9d20d48a84989bca3ffaf1001c8965d86d90ba688020deb958ddf9ed12
+cargo run -- t 0x9add9d0f26bc6d867c1d6d41dda6287d9721a377cea42440250884f76d2a0fa7
 ```
 
 ### Analyze a transaction request
@@ -47,7 +49,7 @@ To use the legacy Anvil-based implementation (requires running Anvil, provides p
 cargo build --features anvil
 
 # Run with --anvil flag
-cargo run --features anvil -- --anvil t aecc4a9d20d48a84989bca3ffaf1001c8965d86d90ba688020deb958ddf9ed12
+cargo run --features anvil -- --anvil t 0x9add9d0f26bc6d867c1d6d41dda6287d9721a377cea42440250884f76d2a0fa7
 ```
 
 ### Block Analysis (Anvil only)
