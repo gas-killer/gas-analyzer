@@ -24,8 +24,6 @@ use sp1_cc_client_executor::io::Primitives;
 use sp1_cc_client_executor::{ContractCalldata, ContractInput};
 use sp1_cc_host_executor::EvmSketch;
 use std::collections::HashSet;
-use std::fs;
-use std::path::PathBuf;
 use url::Url;
 
 use crate::core::{
@@ -158,14 +156,14 @@ impl DefaultEvmSketchExecutor {
     /// # Returns
     /// The deployed bytecode as a hex string (without 0x prefix)
     fn load_estimator_bytecode() -> Result<String> {
-        // Load from abis/StateChangeHandlerGasEstimator.json (relative to workspace root)
-        let json_path = PathBuf::from("abis/StateChangeHandlerGasEstimator.json");
-        gk_dbg(format!("loading estimator bytecode from {:?}", json_path));
-        let json_content = fs::read_to_string(&json_path)
-            .map_err(|e| anyhow!("Failed to read JSON file at {:?}: {}", json_path, e))?;
+        /// Embedded ABI JSON for StateChangeHandlerGasEstimator - loaded at compile time
+        const ESTIMATOR_ABI_JSON: &str =
+            include_str!("../abis/StateChangeHandlerGasEstimator.json");
 
-        let json: Value = serde_json::from_str(&json_content)
-            .map_err(|e| anyhow!("Failed to parse JSON: {}", e))?;
+        gk_dbg("loading estimator bytecode from embedded ABI");
+
+        let json: Value = serde_json::from_str(ESTIMATOR_ABI_JSON)
+            .map_err(|e| anyhow!("Failed to parse embedded JSON: {}", e))?;
 
         // Extract the deployed bytecode from deployedBytecode.object
         let bytecode = json
