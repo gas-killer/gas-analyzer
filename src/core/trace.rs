@@ -412,17 +412,18 @@ pub async fn compute_state_updates_from_tx<P: Provider + DebugApi>(
 
     // Build a TransactionRequest for debug_traceCall.
     // We include the critical execution fields: from, to, value, calldata, gas, and fee fields when present.
-    let mut req = alloy::rpc::types::eth::TransactionRequest::default();
-    req.from = Some(receipt.from);
-    req.to = receipt.to.map(TxKind::Call);
-    req.value = Some(tx.inner.value());
-    req.input = tx.inner.input().clone().into();
-    req.gas = Some(tx.inner.gas_limit());
-    // Fee fields (optional / typed-tx dependent)
-    req.gas_price = tx.inner.gas_price();
-    req.max_fee_per_gas = Some(tx.inner.max_fee_per_gas());
-    req.max_priority_fee_per_gas = tx.inner.max_priority_fee_per_gas();
-    req.nonce = Some(tx.inner.nonce());
+    let req = alloy::rpc::types::eth::TransactionRequest {
+        from: Some(receipt.from),
+        to: receipt.to.map(TxKind::Call),
+        value: Some(tx.inner.value()),
+        input: tx.inner.input().clone().into(),
+        gas: Some(tx.inner.gas_limit()),
+        gas_price: tx.inner.gas_price(),
+        max_fee_per_gas: Some(tx.inner.max_fee_per_gas()),
+        max_priority_fee_per_gas: tx.inner.max_priority_fee_per_gas(),
+        nonce: Some(tx.inner.nonce()),
+        ..Default::default()
+    };
 
     let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number.saturating_sub(1)));
     let trace = get_trace_from_call(provider, req, block_id).await?;
