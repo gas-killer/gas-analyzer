@@ -6,15 +6,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use alloy::primitives::{Address, FixedBytes, TxKind};
+use alloy::primitives::{Address, FixedBytes};
 use alloy::rpc::types::trace::geth::{
     DefaultFrame, GethDebugTracingCallOptions, GethDebugTracingOptions, GethDefaultTracingOptions,
     GethTrace, StructLog,
 };
-use alloy_eips::{BlockId, BlockNumberOrTag};
+use alloy_eips::BlockId;
 use alloy_provider::Provider;
 use alloy_provider::ext::DebugApi;
-use alloy_rpc_types::TransactionTrait;
 use anyhow::{Result, anyhow, bail};
 
 use super::types::{IStateUpdateTypes, Opcode, StateUpdate};
