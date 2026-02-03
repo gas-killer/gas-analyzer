@@ -32,21 +32,6 @@ use crate::core::{
     get_trace_from_call,
 };
 
-fn gk_debug_enabled() -> bool {
-    std::env::var("GK_DEBUG")
-        .map(|v| {
-            let v = v.to_ascii_lowercase();
-            v == "1" || v == "true" || v == "yes" || v == "on"
-        })
-        .unwrap_or(false)
-}
-
-fn gk_dbg(msg: impl AsRef<str>) {
-    if gk_debug_enabled() {
-        eprintln!("[gk][evmsketch] {}", msg.as_ref());
-    }
-}
-
 // ============================================================================
 // Executor Types
 // ============================================================================
@@ -130,10 +115,6 @@ impl EvmSketchExecutorBuilder {
     pub async fn build(self) -> Result<DefaultEvmSketchExecutor> {
         let rpc_url = self.rpc_url.ok_or_else(|| anyhow!("RPC URL is required"))?;
 
-        gk_dbg(format!(
-            "EvmSketch::builder at_block={:?} el_rpc_url={}",
-            self.block, rpc_url
-        ));
         let sketch = EvmSketch::builder()
             .at_block(self.block)
             .el_rpc_url(rpc_url)
@@ -141,11 +122,6 @@ impl EvmSketchExecutorBuilder {
             .await
             .map_err(|e| anyhow!("Failed to build EvmSketch: {}", e))?;
 
-        gk_dbg(format!(
-            "EvmSketch built anchor_block_number={} anchor_block_hash={:?}",
-            sketch.anchor.header().number,
-            sketch.anchor.resolve().hash
-        ));
         Ok(EvmSketchExecutor { sketch })
     }
 }
@@ -160,8 +136,6 @@ impl DefaultEvmSketchExecutor {
         const ESTIMATOR_ABI_JSON: &str =
             include_str!("../abis/StateChangeHandlerGasEstimator.json");
 
-        gk_dbg("loading estimator bytecode from embedded ABI");
-
         let json: Value = serde_json::from_str(ESTIMATOR_ABI_JSON)
             .map_err(|e| anyhow!("Failed to parse embedded JSON: {}", e))?;
 
@@ -175,10 +149,6 @@ impl DefaultEvmSketchExecutor {
         // Remove 0x prefix if present
         let bytecode = bytecode.strip_prefix("0x").unwrap_or(bytecode);
 
-        gk_dbg(format!(
-            "estimator deployed bytecode hex_len={}",
-            bytecode.len()
-        ));
         Ok(bytecode.to_string())
     }
 
@@ -215,14 +185,6 @@ impl DefaultEvmSketchExecutor {
         let bytecode_bytes = hex::decode(&estimator_bytecode)
             .map_err(|e| anyhow!("Failed to decode estimator bytecode: {}", e))?;
 
-        gk_dbg(format!(
-            "estimate_state_changes_gas_raw contract={} caller={} calldata_len={} bytecode_len={}",
-            contract_address,
-            caller_address,
-            calldata.len(),
-            bytecode_bytes.len()
-        ));
-
         let mut cache_db = CacheDB::new(&self.sketch.rpc_db);
 
         // Inject the contract bytecode at the target address
@@ -248,14 +210,6 @@ impl DefaultEvmSketchExecutor {
             .map_err(|e| anyhow!("Failed to build chain spec: {:?}", e))?;
 
         let header = self.sketch.anchor.header();
-        gk_dbg(format!(
-            "anchor header number={} gas_limit={} timestamp={} base_fee_per_gas={:?} parent_hash={:?}",
-            header.number,
-            header.gas_limit,
-            header.timestamp,
-            header.base_fee_per_gas,
-            header.parent_hash
-        ));
 
         // Build EVM environment
         let evm_env = EthEvmConfig::new(chain_spec)
@@ -269,16 +223,6 @@ impl DefaultEvmSketchExecutor {
         if block_env.prevrandao.is_none() || block_env.prevrandao == Some(B256::ZERO) {
             block_env.prevrandao = Some(header.parent_hash);
         }
-
-        gk_dbg(format!(
-            "env tweaks prevrandao={:?} basefee={} difficulty={} disable_nonce_check={} disable_balance_check={} disable_fee_charge={}",
-            block_env.prevrandao,
-            block_env.basefee,
-            block_env.difficulty,
-            cfg_env.disable_nonce_check,
-            cfg_env.disable_balance_check,
-            cfg_env.disable_fee_charge
-        ));
 
         block_env.basefee = 0;
         block_env.difficulty = U256::ZERO;
@@ -309,7 +253,6 @@ impl DefaultEvmSketchExecutor {
             .transact(&input)
             .map_err(|e| anyhow!("Gas estimation failed: {}", e))?;
 
-        gk_dbg("revm transact completed");
         match result.result {
             revm::context::result::ExecutionResult::Success { gas_used, .. } => Ok(gas_used),
             revm::context::result::ExecutionResult::Revert {
@@ -489,10 +432,6 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 ) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
     let rpc_url = rpc_url.as_ref();
     let url = Url::parse(rpc_url).map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
-    gk_dbg(format!(
-        "call_to_encoded_state_updates_with_evmsketch rpc_url={} block={:?}",
-        url, block
-    ));
 
     let contract_address = tx_request
         .to
