@@ -1,7 +1,6 @@
 use alloy::primitives::FixedBytes;
 use anyhow::Result;
-use gas_analyzer_rs::sol_types::StateUpdate;
-use gas_analyzer_rs::tx_extractor::{StateUpdateReport, from_rpc_url};
+use gas_analyzer_rs::{StateUpdate, StateUpdateReport, tx_extractor_from_rpc_url};
 use std::env;
 
 #[tokio::main]
@@ -23,7 +22,7 @@ async fn main() -> Result<()> {
     let tx_hash: FixedBytes<32> = tx_hash_str.parse()?;
 
     // Create extractor from RPC URL
-    let extractor = from_rpc_url(&rpc_url)?;
+    let extractor = tx_extractor_from_rpc_url(&rpc_url)?;
 
     // Extract state updates with metadata
     match extractor.extract_with_metadata(tx_hash).await {

@@ -1787,6 +1787,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "console_log"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be8aed40e4edbf4d3b4431ab260b63fdc40f5780a4766824329ea0f1eefe3c0f"
+dependencies = [
+ "log",
+ "web-sys",
+]
+
+[[package]]
 name = "const-hex"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3244,16 +3264,29 @@ dependencies = [
  "clap",
  "clap_derive",
  "colored",
+ "console_error_panic_hook",
+ "console_log",
  "csv",
  "dotenv",
  "env",
  "foundry-evm-traces",
- "opcode-tracer",
+ "getrandom 0.2.16",
+ "hex",
+ "js-sys",
+ "log",
+ "reth-evm",
+ "reth-evm-ethereum",
+ "reth-primitives",
+ "revm 31.0.2",
  "serde",
- "serde_derive",
  "serde_json",
+ "sp1-cc-client-executor",
+ "sp1-cc-host-executor",
  "tokio",
  "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
@@ -4623,28 +4656,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
-name = "opcode-tracer"
-version = "0.1.0"
-source = "git+https://github.com/BreadchainCoop/sp1-contract-call?branch=cancun-v1#ebc0b8d7f2d219688e69393e8c735520a8289418"
-dependencies = [
- "alloy-primitives",
- "alloy-provider",
- "alloy-rpc-types",
- "alloy-sol-macro",
- "alloy-sol-types",
- "eyre",
- "hex",
- "reth-primitives",
- "revm 31.0.2",
- "serde",
- "serde_json",
- "sp1-cc-client-executor",
- "sp1-cc-host-executor",
- "tokio",
- "url",
-]
-
-[[package]]
 name = "openssl"
 version = "0.10.75"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5725,6 +5736,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-rpc-types-eth",
  "alloy-serde",
+ "modular-bitfield",
  "reth-codecs 1.9.1",
  "reth-primitives-traits 1.9.1",
  "reth-zstd-compressors 1.9.1",
@@ -5840,6 +5852,7 @@ version = "1.9.1"
 source = "git+https://github.com/paradigmxyz/reth?tag=v1.9.1#3afe69a5738459a7cb5f46c598c7f541a1510f32"
 dependencies = [
  "alloy-consensus",
+ "c-kzg",
  "once_cell",
  "reth-ethereum-forks",
  "reth-ethereum-primitives 1.9.1",
@@ -5860,8 +5873,10 @@ dependencies = [
  "alloy-rpc-types-eth",
  "alloy-trie",
  "auto_impl",
+ "byteorder",
  "bytes",
  "derive_more",
+ "modular-bitfield",
  "once_cell",
  "op-alloy-consensus 0.22.4",
  "reth-codecs 1.9.1",
@@ -6341,6 +6356,7 @@ dependencies = [
  "ark-serialize 0.5.0",
  "arrayref",
  "aurora-engine-modexp",
+ "blst",
  "c-kzg",
  "cfg-if",
  "k256 0.13.4",

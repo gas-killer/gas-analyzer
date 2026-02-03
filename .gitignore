@@ -1,2 +1,19 @@
+# Ignore compiled Rust artifacts
 /target
+
+# Ignore dotenv environment variable files
 .env
+
+# Ignore IDE/editor config files
+.idea/
+.vscode/
+
+# Ignore OS metadata files
+.DS_Store
+Thumbs.db
+
+# Ignore log/output files
+*.log
+
+# Ignore test files
+test.csv
