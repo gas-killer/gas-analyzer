@@ -19,21 +19,6 @@ use anyhow::{Result, anyhow, bail};
 
 use super::types::{IStateUpdateTypes, Opcode, StateUpdate};
 
-fn gk_debug_enabled() -> bool {
-    std::env::var("GK_DEBUG")
-        .map(|v| {
-            let v = v.to_ascii_lowercase();
-            v == "1" || v == "true" || v == "yes" || v == "on"
-        })
-        .unwrap_or(false)
-}
-
-fn gk_dbg(msg: impl AsRef<str>) {
-    if gk_debug_enabled() {
-        eprintln!("[gk][trace] {}", msg.as_ref());
-    }
-}
-
 // ============================================================================
 // Memory Utilities
 // ============================================================================
@@ -288,10 +273,6 @@ pub async fn get_tx_trace<P: Provider + DebugApi>(
     provider: &P,
     tx_hash: FixedBytes<32>,
 ) -> Result<DefaultFrame> {
-    gk_dbg(format!(
-        "get_tx_trace tx_hash=0x{}",
-        alloy::hex::encode(tx_hash)
-    ));
     let tx_receipt = provider
         .get_transaction_receipt(tx_hash)
         .await?
@@ -300,14 +281,6 @@ pub async fn get_tx_trace<P: Provider + DebugApi>(
     if !tx_receipt.status() {
         bail!("transaction failed");
     }
-
-    gk_dbg(format!(
-        "receipt block_number={:?} block_hash={:?} gas_used={} status={}",
-        tx_receipt.block_number,
-        tx_receipt.block_hash,
-        tx_receipt.gas_used,
-        tx_receipt.status()
-    ));
 
     let options = GethDebugTracingOptions {
         config: GethDefaultTracingOptions {
@@ -321,12 +294,7 @@ pub async fn get_tx_trace<P: Provider + DebugApi>(
     else {
         return Err(anyhow!("Expected default trace"));
     };
-    gk_dbg(format!(
-        "debug_trace_transaction ok struct_logs_len={} failed={:?} gas={}",
-        trace.struct_logs.len(),
-        trace.failed,
-        trace.gas
-    ));
+
     Ok(trace)
 }
 
@@ -344,10 +312,6 @@ where
     Req: Into<alloy::rpc::types::eth::TransactionRequest>,
 {
     let tx_request = tx_request.into();
-    gk_dbg(format!(
-        "get_trace_from_call block={:?} to={:?} from={:?}",
-        block, tx_request.to, tx_request.from
-    ));
     let options = GethDebugTracingCallOptions {
         tracing_options: GethDebugTracingOptions {
             config: GethDefaultTracingOptions {
@@ -358,6 +322,7 @@ where
         },
         ..Default::default()
     };
+
     let GethTrace::Default(trace) = provider
         .debug_trace_call(tx_request, block, options)
         .await
@@ -365,12 +330,7 @@ where
     else {
         return Err(anyhow!("Expected default trace from debug_trace_call"));
     };
-    gk_dbg(format!(
-        "debug_trace_call ok struct_logs_len={} failed={:?} gas={}",
-        trace.struct_logs.len(),
-        trace.failed,
-        trace.gas
-    ));
+
     Ok(trace)
 }
 
@@ -390,42 +350,10 @@ pub async fn compute_state_updates_from_tx<P: Provider + DebugApi>(
         return compute_state_updates(trace);
     }
 
-    // Fallback: Some RPCs (notably Anvil unless started with --steps-tracing) can return an empty
-    // trace for debug_traceTransaction. In that case, try simulating the call with debug_traceCall.
-    //
-    // NOTE: This is best-effort: debug_traceCall re-executes at a block state, which should match
-    // the original tx when executed at block_number-1, but may differ if it depends on tx ordering.
-    gk_dbg("debug_traceTransaction returned 0 struct logs; attempting debug_traceCall fallback");
-
-    let receipt = provider
-        .get_transaction_receipt(tx_hash)
-        .await?
-        .ok_or_else(|| anyhow!("could not get receipt for tx {}", tx_hash))?;
-    let block_number = receipt
-        .block_number
-        .ok_or_else(|| anyhow!("missing block_number in receipt for tx {}", tx_hash))?;
-
-    let tx = provider
-        .get_transaction_by_hash(tx_hash)
-        .await?
-        .ok_or_else(|| anyhow!("could not get tx for tx {}", tx_hash))?;
-
-    // Build a TransactionRequest for debug_traceCall.
-    // We include the critical execution fields: from, to, value, calldata, gas, and fee fields when present.
-    let req = alloy::rpc::types::eth::TransactionRequest {
-        from: Some(receipt.from),
-        to: receipt.to.map(TxKind::Call),
-        value: Some(tx.inner.value()),
-        input: tx.inner.input().clone().into(),
-        gas: Some(tx.inner.gas_limit()),
-        gas_price: tx.inner.gas_price(),
-        max_fee_per_gas: Some(tx.inner.max_fee_per_gas()),
-        max_priority_fee_per_gas: tx.inner.max_priority_fee_per_gas(),
-        nonce: Some(tx.inner.nonce()),
-        ..Default::default()
-    };
-
-    let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number.saturating_sub(1)));
-    let trace = get_trace_from_call(provider, req, block_id).await?;
-    compute_state_updates(trace)
+    bail!(
+        "debug_traceTransaction returned an empty trace for tx {}. \
+         Some RPCs (notably Anvil) omit step-level tracing by default. \
+         When using Anvil, start it with --steps-tracing to enable debug_traceTransaction support.",
+        tx_hash
+    )
 }
