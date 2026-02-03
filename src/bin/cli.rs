@@ -8,21 +8,6 @@ use url::Url;
 #[cfg(feature = "evmsketch")]
 use alloy_eips::BlockNumberOrTag;
 
-fn gk_debug_enabled() -> bool {
-    std::env::var("GK_DEBUG")
-        .map(|v| {
-            let v = v.to_ascii_lowercase();
-            v == "1" || v == "true" || v == "yes" || v == "on"
-        })
-        .unwrap_or(false)
-}
-
-fn gk_dbg(msg: impl AsRef<str>) {
-    if gk_debug_enabled() {
-        eprintln!("[gk][cli] {}", msg.as_ref());
-    }
-}
-
 enum Commands {
     Transaction(String),
     Request(String),
@@ -78,15 +63,12 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
         .expect("RPC_URL must be set")
         .parse()
         .expect("unable to parse rpc url");
-    gk_dbg(format!("RPC_URL={}", rpc_url));
-    gk_dbg(format!("use_anvil_flag={}", cli_args.use_anvil));
 
     match cli_args.command {
         Some(Commands::Transaction(hash)) => {
             let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
             let bytes: [u8; 32] = hex::const_decode_to_array(hash.as_bytes())
                 .expect("failed to decode transaction hash");
-            gk_dbg(format!("tx_hash=0x{}", hex::encode(bytes)));
 
             // Get the receipt to find the block and gas used
             let receipt = provider
@@ -98,15 +80,6 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 .expect("couldn't retrieve block number");
             let gas_used = receipt.gas_used;
             let original_status = receipt.status();
-            gk_dbg(format!(
-                "receipt block_number={} block_hash={:?} to={:?} from={} gas_used={} status={}",
-                block_number,
-                receipt.block_hash,
-                receipt.to,
-                receipt.from,
-                gas_used,
-                original_status
-            ));
 
             #[cfg(feature = "anvil")]
             if cli_args.use_anvil {
@@ -117,16 +90,11 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 };
 
                 // Initialize GasKiller with Anvil
-                gk_dbg(format!(
-                    "anvil backend init fork_block={}",
-                    block_number - 1
-                ));
                 let gk = GasKillerDefault::new(rpc_url.clone(), Some(block_number - 1))
                     .await
                     .expect("Failed to initialize GasKiller");
 
                 // Get trace and compute state updates
-                gk_dbg("anvil backend fetching tx trace (debug_traceTransaction)");
                 let trace = get_tx_trace(&provider, bytes.into()).await?;
                 let (state_updates, skipped_opcodes, _call_gas_total) =
                     compute_state_updates(trace)?;
@@ -239,10 +207,6 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
 
                 let (gas_estimate, is_heuristic) = if use_fallback || state_updates.is_empty() {
                     // Use heuristic estimation when trace extraction failed or no state updates
-                    gk_dbg(format!(
-                        "evmsketch backend building executor at_block={}",
-                        block_number
-                    ));
                     let gk = GasKillerEvmSketchDefault::builder(rpc_url.clone())
                         .at_block(BlockNumberOrTag::Number(block_number))
                         .build()
@@ -279,10 +243,6 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                         .ok_or_else(|| anyhow::Error::msg("Transaction has no 'to' address"))?;
 
                     // Build EvmSketch for gas estimation (injecting StateChangeHandler contract)
-                    gk_dbg(format!(
-                        "evmsketch backend building executor at_block={}",
-                        block_number - 1
-                    ));
                     let gk = GasKillerEvmSketchDefault::builder(rpc_url.clone())
                         .at_block(BlockNumberOrTag::Number(block_number - 1))
                         .build()
