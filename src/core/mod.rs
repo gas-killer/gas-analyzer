@@ -20,8 +20,8 @@ pub use heuristic::{
     extract_operation_counts_from_trace,
 };
 pub use trace::{
-    compute_state_updates, compute_state_updates_from_tx, copy_memory, get_tx_trace,
-    parse_trace_memory,
+    compute_state_updates, compute_state_updates_from_tx, copy_memory, get_trace_from_call,
+    get_tx_trace, parse_trace_memory,
 };
 pub use types::{
     DummyExternal, IStateUpdateTypes, Opcode, RevertingContext, SimpleStorage, StateUpdate,
