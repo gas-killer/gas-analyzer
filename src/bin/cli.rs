@@ -158,9 +158,6 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 // Use shared trace function from core
                 use gas_analyzer_rs::compute_state_updates_from_tx;
 
-                gk_dbg(
-                    "evmsketch backend extracting state updates from tx trace (debug_traceTransaction)",
-                );
                 let state_updates_result =
                     compute_state_updates_from_tx(&provider, bytes.into()).await;
 
