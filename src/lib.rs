@@ -49,6 +49,7 @@ pub use core::{
 pub use anvil::{
     // GasKiller
     GasKiller,
+    GasKillerBuilder,
     GasKillerDefault,
     // Reports
     GasKillerReport,

@@ -35,6 +35,7 @@ use alloy::{
     transports::RpcError,
 };
 use alloy_dyn_abi::{ErrorExt, JsonAbiExt};
+use alloy_eips::BlockNumberOrTag;
 use alloy_provider::ext::AnvilApi;
 use alloy_rpc_types::TransactionTrait;
 use anyhow::{Context, Error, Result, anyhow, bail};
@@ -183,6 +184,7 @@ pub struct GasKiller<P> {
     _anvil: AnvilInstance,
     provider: P,
     code: Bytes,
+    deterministic_timestamp: Option<u64>,
 }
 
 impl GasKiller<ConnectHTTPDefaultProvider> {
@@ -207,7 +209,17 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
             _anvil: anvil,
             provider,
             code,
+            deterministic_timestamp: None,
         })
+    }
+
+    /// Create a builder for configuring a GasKiller with deterministic timestamps
+    /// and tracing support.
+    pub fn builder(fork_url: Url) -> GasKillerBuilder {
+        GasKillerBuilder {
+            fork_url,
+            block_number: None,
+        }
     }
 
     pub async fn get_tx_trace(&self, tx_hash: FixedBytes<32>) -> Result<DefaultFrame> {
@@ -227,6 +239,40 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
             return Err(anyhow!("Expected default trace"));
         };
         Ok(trace)
+    }
+
+    /// Send a transaction on the GasKiller's own Anvil instance and return the trace.
+    ///
+    /// If a deterministic timestamp was configured via the builder, it is set
+    /// as the next block's timestamp before sending the transaction. This ensures
+    /// all validator nodes produce identical traces for the same input.
+    pub async fn send_tx_and_get_trace(
+        &self,
+        tx_request: TransactionRequest,
+    ) -> Result<DefaultFrame> {
+        if let Some(timestamp) = self.deterministic_timestamp {
+            let _: serde_json::Value = self
+                .provider
+                .raw_request(
+                    "evm_setNextBlockTimestamp".into(),
+                    (U256::from(timestamp),),
+                )
+                .await?;
+        }
+
+        let tx_receipt = self
+            .provider
+            .send_transaction(tx_request)
+            .await?
+            .get_receipt()
+            .await?;
+
+        if !tx_receipt.status() {
+            bail!("transaction failed");
+        }
+
+        let tx_hash = tx_receipt.transaction_hash;
+        self.get_tx_trace(tx_hash).await
     }
 
     pub async fn estimate_state_changes_gas(
@@ -394,6 +440,72 @@ fn format_decoded_values(values: &[DynSolValue]) -> String {
 }
 
 // ============================================================================
+// GasKiller Builder
+// ============================================================================
+
+/// Builder for constructing a GasKiller with deterministic timestamp and
+/// tracing support.
+pub struct GasKillerBuilder {
+    fork_url: Url,
+    block_number: Option<u64>,
+}
+
+impl GasKillerBuilder {
+    /// Set the block number to fork from.
+    pub fn block_number(mut self, block_number: u64) -> Self {
+        self.block_number = Some(block_number);
+        self
+    }
+
+    /// Build the GasKiller instance.
+    ///
+    /// This queries the fork block's timestamp from the source RPC, spawns an
+    /// inner Anvil instance with `--steps-tracing` and `--auto-impersonate`,
+    /// and deploys the `StateChangeHandlerGasEstimator` contract.
+    pub async fn build(self) -> Result<GasKillerDefault> {
+        // Query fork block timestamp from source RPC
+        let source_provider = ProviderBuilder::new().connect_http(self.fork_url.clone());
+        let block_tag = match self.block_number {
+            Some(n) => BlockNumberOrTag::Number(n),
+            None => BlockNumberOrTag::Latest,
+        };
+        let block = source_provider
+            .get_block_by_number(block_tag)
+            .await?
+            .ok_or_else(|| anyhow!("could not get block for deterministic timestamp"))?;
+        let fork_block_timestamp = block.header.timestamp;
+        let deterministic_timestamp = fork_block_timestamp + 1;
+
+        // Spawn inner Anvil with tracing and impersonation support
+        let mut anvil_init = Anvil::new()
+            .fork(self.fork_url.as_str())
+            .arg("--steps-tracing")
+            .arg("--auto-impersonate");
+        if let Some(number) = self.block_number {
+            anvil_init = anvil_init.fork_block_number(number);
+        }
+        let anvil = anvil_init.try_spawn()?;
+
+        let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
+        let provider = ProviderBuilder::new()
+            .wallet(signer)
+            .connect_http(anvil.endpoint_url());
+
+        // Deploy StateChangeHandlerGasEstimator and cache its bytecode
+        let contract = StateChangeHandlerGasEstimator::deploy(provider.clone()).await?;
+        let address = *contract.address();
+        let code = provider.get_code_at(address).await?;
+
+        Ok(GasKiller {
+            _anvil: anvil,
+            provider,
+            code,
+            deterministic_timestamp: Some(deterministic_timestamp),
+        })
+    }
+}
+
+// ============================================================================
 // Trace Functions
 // ============================================================================
 
@@ -554,12 +666,15 @@ pub async fn gaskiller_reporter(
     })
 }
 
-/// Compute state updates and encode with gas estimate
+/// Compute state updates and encode with gas estimate.
+///
+/// Uses the GasKiller's own Anvil instance for both tracing and gas estimation.
+/// An EVM snapshot is taken before the trace step and reverted before gas
+/// estimation, so that non-idempotent operations (e.g. `claimYield()`) succeed
+/// during the replay on clean state.
 pub async fn call_to_encoded_state_updates_with_gas_estimate(
-    url: Url,
     tx_request: TransactionRequest,
-    gk: GasKillerDefault,
-    block_height: Option<u64>,
+    gk: &GasKillerDefault,
 ) -> Result<(Bytes, u64, HashSet<Opcode>)> {
     let contract_address = tx_request
         .to
@@ -567,12 +682,33 @@ pub async fn call_to_encoded_state_updates_with_gas_estimate(
             TxKind::Call(address) => Some(address),
             TxKind::Create => None,
         })
-        .ok_or_else(|| anyhow!("receipt does not have to address"))?;
-    let trace = get_trace_from_call(url, tx_request, block_height).await?;
+        .ok_or_else(|| anyhow!("transaction request does not have to address"))?;
+
+    // Snapshot BEFORE tracing to preserve clean fork state
+    let snapshot_id: U256 = gk.provider.raw_request("evm_snapshot".into(), ()).await?;
+
+    // Step A: Execute the transaction on the Anvil fork and capture the trace.
+    // This dirties the state (e.g. yield gets consumed).
+    let trace = gk.send_tx_and_get_trace(tx_request).await?;
+
+    // Step B: Extract state updates (SSTOREs, CALLs, LOGs) from the trace
     let (state_updates, skipped_opcodes, _call_gas_total) = compute_state_updates(trace)?;
+
+    // Revert to clean state BEFORE gas estimation so that non-idempotent
+    // operations (e.g. BREAD.claimYield) can succeed during replay.
+    let reverted: bool = gk
+        .provider
+        .raw_request("evm_revert".into(), (snapshot_id,))
+        .await?;
+    if !reverted {
+        bail!("failed to revert Anvil state after tracing");
+    }
+
+    // Step C: Estimate gas by replaying extracted state updates on clean state
     let gas_estimate = gk
         .estimate_state_changes_gas(contract_address, &state_updates)
         .await?;
+
     Ok((
         encode_state_updates_to_abi(&state_updates),
         gas_estimate,
