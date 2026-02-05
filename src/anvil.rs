@@ -253,10 +253,7 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
         if let Some(timestamp) = self.deterministic_timestamp {
             let _: serde_json::Value = self
                 .provider
-                .raw_request(
-                    "evm_setNextBlockTimestamp".into(),
-                    (U256::from(timestamp),),
-                )
+                .raw_request("evm_setNextBlockTimestamp".into(), (U256::from(timestamp),))
                 .await?;
         }
 
