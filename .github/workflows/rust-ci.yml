@@ -6,7 +6,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RPC_URL: ${{ vars.RPC_URL }}
+  RPC_URL: ${{ secrets.RPC_URL }}
 
 jobs:
   build:
