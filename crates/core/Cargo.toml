@@ -1,0 +1,13 @@
+[package]
+name = "gas-analyzer-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alloy-primitives = "1.0.37"
+alloy-sol-types = "1.0.37"
+alloy-rpc-types = { version = "1.0.37", features = ["trace"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0"
+hex = "0.4"
+anyhow = "1.0.98"

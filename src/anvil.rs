@@ -45,8 +45,9 @@ use url::Url;
 
 use crate::core::{
     Opcode, RevertingContext, StateUpdate, TURETZKY_UPPER_GAS_LIMIT, compute_state_updates,
-    encode_state_updates_to_abi, encode_state_updates_to_sol, get_tx_trace,
+    encode_state_updates_to_abi, encode_state_updates_to_sol,
 };
+use crate::rpc::get_tx_trace;
 
 // ============================================================================
 // Report Types
@@ -672,9 +673,15 @@ pub struct StateUpdateReport {
 mod tests {
     use super::*;
     use crate::core::constants::*;
-    use crate::core::{
-        IStateUpdateTypes, SimpleStorage, StateUpdateType, decode_state_updates_tuple,
-    };
+    use crate::core::{IStateUpdateTypes, StateUpdateType, decode_state_updates_tuple};
+
+    // Local sol! with #[sol(rpc)] for test that needs SimpleStorageInstance
+    alloy::sol! {
+        #[sol(rpc)]
+        contract SimpleStorage {
+            function set(uint256 x) public;
+        }
+    }
     use alloy::primitives::{U256, address, b256, bytes};
     use csv::Writer;
     use std::fs::File;
