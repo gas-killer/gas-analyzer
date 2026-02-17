@@ -9,18 +9,17 @@
 //! No reth-evm, no sp1-contract-call, no async, no I/O.
 
 use alloy_dyn_abi::DynSolValue;
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use anyhow::{Result, anyhow};
 use revm::context::result::ExecutionResult;
 use revm::database::CacheDB;
 use revm::state::{AccountInfo, Bytecode};
 
-use gas_analyzer_core::types::StateUpdate;
 use gas_analyzer_core::encoding::encode_state_updates_to_sol;
+use gas_analyzer_core::types::StateUpdate;
 
 /// Embedded ABI JSON for StateChangeHandlerGasEstimator - loaded at compile time
-const ESTIMATOR_ABI_JSON: &str =
-    include_str!("../../../abis/StateChangeHandlerGasEstimator.json");
+const ESTIMATOR_ABI_JSON: &str = include_str!("../../../abis/StateChangeHandlerGasEstimator.json");
 
 /// Load the StateChangeHandlerGasEstimator deployed bytecode from the embedded JSON.
 fn load_estimator_bytecode() -> Result<Vec<u8>> {
@@ -35,8 +34,7 @@ fn load_estimator_bytecode() -> Result<Vec<u8>> {
 
     let bytecode_hex = bytecode_hex.strip_prefix("0x").unwrap_or(bytecode_hex);
 
-    hex::decode(bytecode_hex)
-        .map_err(|e| anyhow!("Failed to decode estimator bytecode: {}", e))
+    hex::decode(bytecode_hex).map_err(|e| anyhow!("Failed to decode estimator bytecode: {}", e))
 }
 
 /// Build the calldata for `runStateUpdatesCall(uint8[], bytes[])` from state updates.
@@ -143,7 +141,8 @@ where
         .build()
         .map_err(|e| anyhow!("Failed to build tx env: {:?}", e))?;
 
-    let result = evm.transact(tx)
+    let result = evm
+        .transact(tx)
         .map_err(|e| anyhow!("Gas estimation failed: {:?}", e))?;
 
     match result.result {
@@ -188,5 +187,11 @@ where
     let calldata = build_gas_estimation_calldata(state_updates)?;
     let caller_address = Address::from_word(B256::from(U256::from(1)));
 
-    estimate_gas_raw(cache_db, contract_address, caller_address, calldata, gas_limit)
+    estimate_gas_raw(
+        cache_db,
+        contract_address,
+        caller_address,
+        calldata,
+        gas_limit,
+    )
 }
