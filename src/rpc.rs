@@ -16,8 +16,8 @@ use alloy_provider::Provider;
 use alloy_provider::ext::DebugApi;
 use anyhow::{Result, anyhow, bail};
 
-use gas_analyzer_core::types::{Opcode, StateUpdate};
 use gas_analyzer_core::trace::compute_state_updates;
+use gas_analyzer_core::types::{Opcode, StateUpdate};
 
 /// Get transaction trace from a provider using debug_traceTransaction.
 ///
