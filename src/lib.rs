@@ -10,9 +10,18 @@
 //!
 //! - `anvil`: Enable the Anvil-based implementation (requires Foundry)
 //! - `evmsketch`: Enable the EvmSketch-based implementation (default, no external deps)
+//!
+//! # WASM-compatible crates
+//!
+//! The core computation is split into WASM-safe crates:
+//! - `gas-analyzer-core`: Trace parsing, encoding, heuristics
+//! - `gas-analyzer-estimator`: revm-based gas estimation
 
-// Core module - always available
+// Core module - thin re-export of gas_analyzer_core
 pub mod core;
+
+// RPC functions - async, requires alloy-provider
+pub mod rpc;
 
 // Feature-gated implementations
 #[cfg(feature = "anvil")]
@@ -21,8 +30,8 @@ pub mod anvil;
 #[cfg(feature = "evmsketch")]
 pub mod evmsketch;
 
-// Re-export core types (always available)
-pub use core::{
+// Re-export core types (always available, backward compat)
+pub use gas_analyzer_core::{
     // Types
     IStateUpdateTypes,
     Opcode,
@@ -33,16 +42,16 @@ pub use core::{
     StateUpdates,
     // Encoding
     TURETZKY_UPPER_GAS_LIMIT,
-    // Trace functions (shared by anvil and evmsketch)
     compute_state_updates,
-    compute_state_updates_from_tx,
     decode_state_updates_tuple,
     encode_state_updates_to_abi,
     encode_state_updates_to_sol,
     // Heuristics
     estimate_gas_from_state_updates,
-    get_tx_trace,
 };
+
+// Re-export RPC functions at top level (backward compat)
+pub use rpc::{compute_state_updates_from_tx, get_tx_trace};
 
 // Re-export Anvil types and functions
 #[cfg(feature = "anvil")]

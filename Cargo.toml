@@ -1,12 +1,19 @@
+[workspace]
+members = [".", "crates/core", "crates/gas-estimator"]
+
 [package]
 name = "gas-analyzer-rs"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
+# Internal WASM-safe crates
+gas-analyzer-core = { path = "crates/core" }
+gas-analyzer-estimator = { path = "crates/gas-estimator" }
+
 alloy = { version = "1.0.37", features = [
     "sol-types",
     "contract",
@@ -39,8 +46,6 @@ hex = "0.4"
 sp1-cc-host-executor = { git = "https://github.com/BreadchainCoop/sp1-contract-call", branch = "cancun-v1", package = "sp1-cc-host-executor", optional = true }
 sp1-cc-client-executor = { git = "https://github.com/BreadchainCoop/sp1-contract-call", branch = "cancun-v1", package = "sp1-cc-client-executor", optional = true }
 reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1", optional = true }
-reth-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1", optional = true }
-reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1", optional = true }
 # Must match the version used by sp1-cc-client-executor to avoid type conflicts
 revm = { version = "31.0.1", optional = true }
 
@@ -56,29 +61,9 @@ evmsketch = [
     "sp1-cc-host-executor",
     "sp1-cc-client-executor",
     "reth-primitives",
-    "reth-evm",
-    "reth-evm-ethereum",
     "revm",
     "tokio",
 ]
-
-# WASM dependencies
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-js-sys = "0.3"
-web-sys = { version = "0.3", features = [
-    "Request",
-    "RequestInit",
-    "RequestMode",
-    "Response",
-    "Window",
-    "Headers",
-] }
-console_error_panic_hook = "0.1"
-console_log = "1.0"
-log = "0.4"
-getrandom = { version = "0.2", features = ["js"] }
 
 [build-dependencies]
 serde_json = "1.0"
