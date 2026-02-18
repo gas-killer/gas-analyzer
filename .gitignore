@@ -2,7 +2,7 @@
 /target
 
 # Ignore wasm-pack output
-/pkg
+**/pkg
 
 # Ignore dotenv environment variable files
 .env

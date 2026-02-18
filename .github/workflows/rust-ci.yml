@@ -9,24 +9,29 @@ env:
   RPC_URL: ${{ secrets.RPC_URL }}
 
 jobs:
-  build:
+  lint:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Install foundry
-        uses: foundry-rs/foundry-toolchain@v1
-
-      # --- Native checks (excludes WASM crate) ---
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: cargo clippy (deny warnings)
+      - name: cargo clippy (native)
         run: cargo clippy --workspace --exclude gas-killer-wasm --all-targets --all-features -- -D warnings
 
-      - name: cargo check (all targets)
+      - name: cargo check (native)
         run: cargo check --workspace --exclude gas-killer-wasm --all-targets --all-features
+
+  test-native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install foundry
+        uses: foundry-rs/foundry-toolchain@v1
 
       - name: cargo test (evmsketch - default)
         run: cargo test
@@ -34,7 +39,12 @@ jobs:
       - name: cargo test (anvil)
         run: cargo test --features anvil --no-default-features
 
-      # --- WASM crate ---
+  test-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
       - name: Install wasm32 target
         run: rustup target add wasm32-unknown-unknown
 
