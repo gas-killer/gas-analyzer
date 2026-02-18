@@ -205,7 +205,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 let (gas_estimate, is_heuristic) = if use_fallback || state_updates.is_empty() {
                     // Use heuristic estimation when trace extraction failed or no state updates
                     let gk = GasKillerEvmSketchDefault::builder(rpc_url.clone())
-                        .at_block(BlockNumberOrTag::Number(block_number))
+                        .at_block(BlockNumberOrTag::Number(block_number - 1))
                         .build()
                         .await?;
 
