@@ -1,0 +1,30 @@
+[package]
+name = "gas-analyzer-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "gas-analyzer-cli"
+path = "src/main.rs"
+
+[dependencies]
+gas-analyzer-core = { path = "../core" }
+gas-analyzer-rpc = { path = "../rpc" }
+alloy = { version = "1.0.37", features = ["rpc", "rpc-types"] }
+alloy-eips = "1.0.37"
+alloy-provider = { version = "1.0.37", features = ["debug-api"] }
+anyhow = "1.0.98"
+colored = "3.0.0"
+dotenv = "0.15.0"
+hex = "0.4"
+tokio = { version = "1.45.1", features = ["rt-multi-thread"] }
+url = "2.5.4"
+
+# Feature-gated backends
+gas-analyzer-anvil = { path = "../anvil", optional = true }
+gas-analyzer-evmsketch = { path = "../evmsketch", optional = true }
+
+[features]
+default = ["evmsketch"]
+anvil = ["gas-analyzer-anvil"]
+evmsketch = ["gas-analyzer-evmsketch"]

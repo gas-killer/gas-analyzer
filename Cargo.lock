@@ -2474,15 +2474,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "env"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc95de49ad098572c02d3fbf368c9a020bfff5ae78483685b77f51d8a7e9486d"
-dependencies = [
- "num_threads",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3246,6 +3237,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42012b0f064e01aa58b545fe3727f90f7dd4020f4a3ea735b50344965f5a57e9"
 
 [[package]]
+name = "gas-analyzer-anvil"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "alloy-dyn-abi",
+ "alloy-provider",
+ "alloy-rpc-types",
+ "anyhow",
+ "chrono",
+ "csv",
+ "dotenv",
+ "foundry-evm-traces",
+ "gas-analyzer-core",
+ "gas-analyzer-rpc",
+ "hex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "gas-analyzer-cli"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "alloy-eips",
+ "alloy-provider",
+ "anyhow",
+ "colored",
+ "dotenv",
+ "gas-analyzer-anvil",
+ "gas-analyzer-core",
+ "gas-analyzer-evmsketch",
+ "gas-analyzer-rpc",
+ "hex",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "gas-analyzer-core"
 version = "0.1.0"
 dependencies = [
@@ -3273,35 +3305,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "gas-analyzer-rs"
+name = "gas-analyzer-evmsketch"
 version = "0.1.0"
 dependencies = [
  "alloy",
- "alloy-dyn-abi",
  "alloy-eips",
  "alloy-provider",
- "alloy-rpc-types",
- "alloy-sol-types",
  "anyhow",
- "chrono",
- "clap",
- "clap_derive",
- "colored",
- "csv",
- "dotenv",
- "env",
- "foundry-evm-traces",
  "gas-analyzer-core",
  "gas-analyzer-estimator",
- "hex",
+ "gas-analyzer-rpc",
  "reth-primitives",
  "revm 31.0.2",
- "serde",
- "serde_json",
  "sp1-cc-client-executor",
  "sp1-cc-host-executor",
- "tokio",
  "url",
+]
+
+[[package]]
+name = "gas-analyzer-rpc"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "alloy-eips",
+ "alloy-provider",
+ "anyhow",
+ "gas-analyzer-core",
 ]
 
 [[package]]
