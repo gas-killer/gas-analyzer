@@ -1,6 +1,9 @@
 # Ignore compiled Rust artifacts
 /target
 
+# Ignore wasm-pack output
+**/pkg
+
 # Ignore dotenv environment variable files
 .env
 

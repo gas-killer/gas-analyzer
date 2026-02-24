@@ -2,33 +2,71 @@ name: Rust
 
 on:
   push:
-  pull_request:
 
 env:
   CARGO_TERM_COLOR: always
   RPC_URL: ${{ secrets.RPC_URL }}
 
 jobs:
-  build:
+  lint:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install foundry
-        uses: foundry-rs/foundry-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: cargo clippy (deny warnings)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: cargo clippy (default workspace)
+        run: cargo clippy --workspace --exclude gas-killer-wasm --exclude gas-analyzer-anvil --all-targets -- -D warnings
 
-      - name: cargo check (all targets)
-        run: cargo check --all-targets --all-features
+      - name: cargo check (default workspace)
+        run: cargo check --workspace --exclude gas-killer-wasm --exclude gas-analyzer-anvil --all-targets
+
+  test-native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install foundry
+        uses: foundry-rs/foundry-toolchain@v1
 
       - name: cargo test (evmsketch - default)
         run: cargo test
 
       - name: cargo test (anvil)
-        run: cargo test --features anvil --no-default-features
+        run: cargo test -p gas-analyzer-anvil -p gas-analyzer-cli --features gas-analyzer-cli/anvil --no-default-features
+
+  test-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: cargo clippy (wasm crate)
+        run: cargo clippy -p gas-killer-wasm --lib --tests -- -D warnings
+
+      - name: cargo test (wasm crate, native unit tests)
+        run: cargo test -p gas-killer-wasm --lib
+
+      - name: wasm-pack test (node)
+        run: wasm-pack test --node crates/wasm
+
+      - name: cargo test --ignored (wasm RPC integration)
+        if: env.RPC_URL != ''
+        run: cargo test -p gas-killer-wasm -- --ignored
+
+      - name: Build WASM package (for JS RPC test)
+        if: env.RPC_URL != ''
+        run: wasm-pack build crates/wasm --target web
+
+      - name: Run WASM RPC integration test (Node.js)
+        if: env.RPC_URL != ''
+        run: node crates/wasm/tests/rpc_wasm.mjs

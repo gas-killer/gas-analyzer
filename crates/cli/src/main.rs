@@ -85,9 +85,9 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             if cli_args.use_anvil {
                 println!("Using Anvil-based implementation...");
 
-                use gas_analyzer_rs::{
-                    GasKillerDefault, compute_state_updates, gas_estimate_tx, get_tx_trace,
-                };
+                use gas_analyzer_anvil::{GasKillerDefault, gas_estimate_tx};
+                use gas_analyzer_core::compute_state_updates;
+                use gas_analyzer_rpc::get_tx_trace;
 
                 // Initialize GasKiller with Anvil
                 let gk = GasKillerDefault::new(rpc_url.clone(), Some(block_number - 1))
@@ -155,8 +155,8 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             {
                 println!("Using EvmSketch implementation...");
 
-                // Use shared trace function from core
-                use gas_analyzer_rs::compute_state_updates_from_tx;
+                // Use shared trace function from rpc crate
+                use gas_analyzer_rpc::compute_state_updates_from_tx;
 
                 let state_updates_result =
                     compute_state_updates_from_tx(&provider, bytes.into()).await;
@@ -170,7 +170,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                                 // Fall back to heuristic estimation
                                 println!(
                                     "{}",
-                                    "⚠️  Warning: Trace extraction failed, using fallback heuristic estimation"
+                                    "Warning: Trace extraction failed, using fallback heuristic estimation"
                                         .yellow()
                                 );
                                 println!(
@@ -196,11 +196,11 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     };
 
                 // Get gas estimate using the state updates extracted from the actual trace
-                use gas_analyzer_rs::core::{
+                use gas_analyzer_core::{
                     TURETZKY_UPPER_GAS_LIMIT, encode_state_updates_to_abi,
                     estimate_gas_from_state_updates,
                 };
-                use gas_analyzer_rs::evmsketch::GasKillerEvmSketchDefault;
+                use gas_analyzer_evmsketch::GasKillerEvmSketchDefault;
 
                 let (gas_estimate, is_heuristic) = if use_fallback || state_updates.is_empty() {
                     // Use heuristic estimation when trace extraction failed or no state updates
@@ -252,8 +252,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                             // Fall back to heuristic estimation
                             println!(
                                 "{}",
-                                "⚠️  Warning: Measured gas estimation failed, using heuristic"
-                                    .yellow()
+                                "Warning: Measured gas estimation failed, using heuristic".yellow()
                             );
                             let heuristic =
                                 estimate_gas_from_state_updates(&state_updates, call_gas_total);

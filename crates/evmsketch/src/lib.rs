@@ -24,11 +24,11 @@ use sp1_cc_host_executor::EvmSketch;
 use std::collections::HashSet;
 use url::Url;
 
-use crate::core::{
+use gas_analyzer_core::{
     Opcode, StateUpdate, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_operations, extract_operation_counts_from_trace,
 };
-use crate::rpc::get_trace_from_call;
+use gas_analyzer_rpc::get_trace_from_call;
 
 // ============================================================================
 // Executor Types
@@ -240,7 +240,7 @@ impl GasKillerEvmSketchDefault {
         provider: &P,
         tx_hash: alloy::primitives::FixedBytes<32>,
     ) -> Result<u64> {
-        use crate::rpc::get_tx_trace;
+        use gas_analyzer_rpc::get_tx_trace;
 
         let trace = get_tx_trace(provider, tx_hash).await?;
         let operations = extract_operation_counts_from_trace(&trace);
