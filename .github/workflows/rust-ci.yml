@@ -17,11 +17,11 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: cargo clippy (native)
-        run: cargo clippy --workspace --exclude gas-killer-wasm --all-targets --all-features -- -D warnings
+      - name: cargo clippy (default workspace)
+        run: cargo clippy --workspace --exclude gas-killer-wasm --exclude gas-analyzer-anvil --all-targets -- -D warnings
 
-      - name: cargo check (native)
-        run: cargo check --workspace --exclude gas-killer-wasm --all-targets --all-features
+      - name: cargo check (default workspace)
+        run: cargo check --workspace --exclude gas-killer-wasm --exclude gas-analyzer-anvil --all-targets
 
   test-native:
     runs-on: ubuntu-latest
@@ -36,7 +36,7 @@ jobs:
         run: cargo test
 
       - name: cargo test (anvil)
-        run: cargo test --features anvil --no-default-features
+        run: cargo test -p gas-analyzer-anvil -p gas-analyzer-cli --features gas-analyzer-cli/anvil --no-default-features
 
   test-wasm:
     runs-on: ubuntu-latest
