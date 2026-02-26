@@ -1,0 +1,11 @@
+[package]
+name = "gas-analyzer-rpc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gas-analyzer-core = { path = "../core" }
+alloy = { version = "1.0.37", features = ["rpc", "rpc-types"] }
+alloy-eips = "1.0.37"
+alloy-provider = { version = "1.0.37", features = ["debug-api"] }
+anyhow = "1.0.98"

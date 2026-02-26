@@ -1,6 +1,6 @@
 //! Test constants - transaction hashes and addresses used in tests.
 
-use alloy::primitives::{Address, FixedBytes, address, b256};
+use alloy_primitives::{Address, FixedBytes, address, b256};
 
 pub const SIMPLE_STORAGE_ADDRESS: Address = address!("0xd682Fe2ee8bdd59fdcCc5a4962FD98c20Ef47290");
 pub const SIMPLE_STORAGE_SET_TX_HASH: FixedBytes<32> =

@@ -4,11 +4,10 @@
 //! EvmSketch for simulating StateChangeHandler execution.
 //!
 //! State updates are extracted using the shared `core::trace` module
-//! via `debug_traceTransaction`, and this module handles the gas estimation
-//! by injecting and executing the StateChangeHandlerGasEstimator contract.
+//! via `debug_traceTransaction`, and gas estimation is delegated to the
+//! `gas-analyzer-estimator` crate which uses revm directly.
 
-use alloy::hex;
-use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
+use alloy::primitives::{Address, B256, Bytes, TxKind};
 use alloy::providers::ProviderBuilder;
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy_eips::BlockId;
@@ -19,18 +18,17 @@ use alloy_provider::ext::DebugApi;
 use alloy_provider::network::AnyNetwork;
 use anyhow::{Result, anyhow};
 use reth_primitives::EthPrimitives;
-use serde_json::Value;
-use sp1_cc_client_executor::io::Primitives;
+use revm::database::CacheDB;
 use sp1_cc_client_executor::{ContractCalldata, ContractInput};
 use sp1_cc_host_executor::EvmSketch;
 use std::collections::HashSet;
 use url::Url;
 
-use crate::core::{
+use gas_analyzer_core::{
     Opcode, StateUpdate, compute_state_updates, encode_state_updates_to_abi,
-    encode_state_updates_to_sol, estimate_gas_from_operations, extract_operation_counts_from_trace,
-    get_trace_from_call,
+    estimate_gas_from_operations, extract_operation_counts_from_trace,
 };
+use gas_analyzer_rpc::get_trace_from_call;
 
 // ============================================================================
 // Executor Types
@@ -38,7 +36,7 @@ use crate::core::{
 
 /// The default provider type for EvmSketchExecutor
 pub type DefaultProvider = RootProvider<AnyNetwork>;
-/// The default primitives type  
+/// The default primitives type
 pub type DefaultPrimitives = EthPrimitives;
 /// The default executor type
 pub type DefaultEvmSketchExecutor = EvmSketchExecutor<DefaultProvider, DefaultPrimitives>;
@@ -127,149 +125,24 @@ impl EvmSketchExecutorBuilder {
 }
 
 impl DefaultEvmSketchExecutor {
-    /// Load the StateChangeHandlerGasEstimator bytecode from the JSON file.
+    /// Estimate gas for executing a set of state updates using pre-built calldata.
     ///
-    /// # Returns
-    /// The deployed bytecode as a hex string (without 0x prefix)
-    fn load_estimator_bytecode() -> Result<String> {
-        /// Embedded ABI JSON for StateChangeHandlerGasEstimator - loaded at compile time
-        const ESTIMATOR_ABI_JSON: &str =
-            include_str!("../abis/StateChangeHandlerGasEstimator.json");
-
-        let json: Value = serde_json::from_str(ESTIMATOR_ABI_JSON)
-            .map_err(|e| anyhow!("Failed to parse embedded JSON: {}", e))?;
-
-        // Extract the deployed bytecode from deployedBytecode.object
-        let bytecode = json
-            .get("deployedBytecode")
-            .and_then(|v| v.get("object"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("Missing 'deployedBytecode.object' in JSON"))?;
-
-        // Remove 0x prefix if present
-        let bytecode = bytecode.strip_prefix("0x").unwrap_or(bytecode);
-
-        Ok(bytecode.to_string())
-    }
-
-    /// Estimate gas for executing a set of state updates.
-    ///
-    /// This injects the StateChangeHandlerGasEstimator contract into a cached
-    /// database and executes the `runStateUpdatesCall` function to measure
-    /// the actual gas consumption.
-    ///
-    /// # Arguments
-    /// * `contract_address` - The address to inject the estimator contract at
-    /// * `caller_address` - The address to use as the caller
-    /// * `calldata` - The encoded calldata for `runStateUpdatesCall(uint8[], bytes[])`
-    ///
-    /// # Returns
-    /// The gas used by the execution
+    /// Delegates to the shared gas-analyzer-estimator crate which uses revm directly.
     pub fn estimate_state_changes_gas_raw(
         &self,
         contract_address: Address,
         caller_address: Address,
         calldata: Bytes,
     ) -> Result<u64> {
-        use reth_evm::{ConfigureEvm, EthEvm, Evm};
-        use reth_evm_ethereum::EthEvmConfig;
-        use revm::context::Context;
-        use revm::database::CacheDB;
-        use revm::state::{AccountInfo, Bytecode};
-        use revm::{MainBuilder, MainContext};
-
-        // Load StateChangeHandlerGasEstimator deployed bytecode from JSON file
-        let estimator_bytecode = Self::load_estimator_bytecode()?;
-
-        // Decode the bytecode from hex
-        let bytecode_bytes = hex::decode(&estimator_bytecode)
-            .map_err(|e| anyhow!("Failed to decode estimator bytecode: {}", e))?;
-
         let mut cache_db = CacheDB::new(&self.sketch.rpc_db);
-
-        // Inject the contract bytecode at the target address
-        let account_info = AccountInfo {
-            balance: U256::from(1_000_000_000_000_000_000_000_000u128), // 1M ETH
-            nonce: 0,
-            code_hash: B256::ZERO,
-            code: Some(Bytecode::new_raw(bytecode_bytes.into())),
-        };
-        cache_db.insert_account_info(contract_address, account_info);
-
-        // Also give the caller plenty of balance
-        let caller_info = AccountInfo {
-            balance: U256::from(1_000_000_000_000_000_000_000_000u128),
-            nonce: 0,
-            code_hash: B256::ZERO,
-            code: None,
-        };
-        cache_db.insert_account_info(caller_address, caller_info);
-
-        // Build chain spec
-        let chain_spec = EthPrimitives::build_spec(&self.sketch.genesis)
-            .map_err(|e| anyhow!("Failed to build chain spec: {:?}", e))?;
-
-        let header = self.sketch.anchor.header();
-
-        // Build EVM environment
-        let evm_env = EthEvmConfig::new(chain_spec)
-            .evm_env(header)
-            .map_err(|e| anyhow!("Failed to build EVM env: {:?}", e))?;
-
-        let mut cfg_env = evm_env.cfg_env;
-        let mut block_env = evm_env.block_env;
-
-        // Fix prevrandao for post-merge blocks
-        if block_env.prevrandao.is_none() || block_env.prevrandao == Some(B256::ZERO) {
-            block_env.prevrandao = Some(header.parent_hash);
-        }
-
-        block_env.basefee = 0;
-        block_env.difficulty = U256::ZERO;
-        cfg_env.disable_nonce_check = true;
-        cfg_env.disable_balance_check = true;
-        cfg_env.disable_fee_charge = true;
-
-        let input = ContractInput {
+        let gas_limit = self.sketch.anchor.header().gas_limit;
+        gas_analyzer_estimator::estimate_gas_raw(
+            &mut cache_db,
             contract_address,
             caller_address,
-            calldata: ContractCalldata::Call(calldata),
-        };
-
-        use revm::inspector::NoOpInspector;
-
-        let evm = Context::mainnet()
-            .with_db(cache_db)
-            .with_cfg(cfg_env)
-            .with_block(block_env)
-            .modify_tx_chained(|tx_env| {
-                tx_env.gas_limit = header.gas_limit;
-            })
-            .build_mainnet_with_inspector(NoOpInspector {});
-
-        let mut evm = EthEvm::new(evm, false);
-
-        let result = evm
-            .transact(&input)
-            .map_err(|e| anyhow!("Gas estimation failed: {}", e))?;
-
-        match result.result {
-            revm::context::result::ExecutionResult::Success { gas_used, .. } => Ok(gas_used),
-            revm::context::result::ExecutionResult::Revert {
-                output, gas_used, ..
-            } => Err(anyhow!(
-                "Gas estimation reverted (gas: {}): {}",
-                gas_used,
-                output
-            )),
-            revm::context::result::ExecutionResult::Halt {
-                reason, gas_used, ..
-            } => Err(anyhow!(
-                "Gas estimation halted (gas: {}): {:?}",
-                gas_used,
-                reason
-            )),
-        }
+            calldata,
+            gas_limit,
+        )
     }
 
     /// Get the block hash that the executor is anchored to.
@@ -342,47 +215,19 @@ impl GasKillerEvmSketchDefault {
 
     /// Estimate gas for state changes by actually executing them.
     ///
-    /// This injects the StateChangeHandlerGasEstimator contract and
-    /// executes the state updates to measure actual gas consumption.
+    /// Delegates to the shared gas-analyzer-estimator crate.
     pub fn estimate_state_changes_gas(
         &self,
         contract_address: Address,
         state_updates: &[StateUpdate],
     ) -> Result<u64> {
-        use alloy::dyn_abi::DynSolValue;
-
-        let (types, args) = encode_state_updates_to_sol(state_updates);
-
-        let types_array = DynSolValue::Array(
-            types
-                .iter()
-                .map(|x| DynSolValue::Uint(U256::from(*x as u8), 8))
-                .collect(),
-        );
-
-        let args_array = DynSolValue::Array(
-            args.iter()
-                .map(|b| DynSolValue::Bytes(b.to_vec()))
-                .collect(),
-        );
-
-        // Function selector for runStateUpdatesCall(uint8[],bytes[])
-        let selector: [u8; 4] = [0x7a, 0x88, 0x8d, 0xbc];
-
-        let tuple = DynSolValue::Tuple(vec![types_array, args_array]);
-        let encoded_args = tuple.abi_encode_params();
-
-        let mut calldata = Vec::with_capacity(4 + encoded_args.len());
-        calldata.extend_from_slice(&selector);
-        calldata.extend_from_slice(&encoded_args);
-
-        let caller_address =
-            alloy::primitives::address!("0x0000000000000000000000000000000000000001");
-
-        self.executor.estimate_state_changes_gas_raw(
+        let mut cache_db = CacheDB::new(&self.executor.sketch.rpc_db);
+        let gas_limit = self.executor.sketch.anchor.header().gas_limit;
+        gas_analyzer_estimator::estimate_state_changes_gas(
+            &mut cache_db,
             contract_address,
-            caller_address,
-            Bytes::from(calldata),
+            state_updates,
+            gas_limit,
         )
     }
 
@@ -395,7 +240,7 @@ impl GasKillerEvmSketchDefault {
         provider: &P,
         tx_hash: alloy::primitives::FixedBytes<32>,
     ) -> Result<u64> {
-        use crate::core::get_tx_trace;
+        use gas_analyzer_rpc::get_tx_trace;
 
         let trace = get_tx_trace(provider, tx_hash).await?;
         let operations = extract_operation_counts_from_trace(&trace);

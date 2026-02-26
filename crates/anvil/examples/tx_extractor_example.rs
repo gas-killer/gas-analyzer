@@ -1,6 +1,7 @@
 use alloy::primitives::FixedBytes;
 use anyhow::Result;
-use gas_analyzer_rs::{StateUpdate, StateUpdateReport, tx_extractor_from_rpc_url};
+use gas_analyzer_anvil::{StateUpdateReport, tx_extractor_from_rpc_url};
+use gas_analyzer_core::types::StateUpdate;
 use std::env;
 
 #[tokio::main]

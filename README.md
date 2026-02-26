@@ -62,3 +62,7 @@ cargo run --features anvil -- b latest
 ```
 
 The analysis report is written to the `OUTPUT_FILE`.
+
+## Solidity Contracts
+
+The [`contracts/`](contracts/README.md) directory contains the Solidity contracts used for on-chain gas estimation and integration testing.

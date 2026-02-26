@@ -3,11 +3,11 @@
 //! This module provides functions for ABI-encoding state updates
 //! for transport to the StateChangeHandler contract.
 
-use alloy::primitives::{Bytes, U256};
-use alloy::sol_types::SolValue;
+use alloy_primitives::{Bytes, U256};
+use alloy_sol_types::SolValue;
 use anyhow::{Result, bail};
 
-use super::types::{StateUpdate, StateUpdateType};
+use crate::types::{StateUpdate, StateUpdateType};
 
 /// The Turetzky upper gas limit - the floor gas cost for executing a GasKiller transaction.
 /// This represents the minimum overhead for the StateChangeHandler execution.
