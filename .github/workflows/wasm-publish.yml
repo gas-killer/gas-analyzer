@@ -1,0 +1,51 @@
+name: Publish WASM Package
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/core/**'
+      - 'crates/gas-estimator/**'
+      - 'crates/wasm/**'
+      - 'abis/**'
+      - 'Cargo.lock'
+      - '.github/workflows/wasm-publish.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build WASM package
+        run: wasm-pack build crates/wasm --target web --release --scope breadchaincoop
+
+      - name: Set up npm auth
+        run: echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" >> ~/.npmrc
+
+      - name: Configure package for GitHub Packages
+        run: |
+          cd crates/wasm/pkg
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          jq --arg sha "$SHORT_SHA" '.version = .version + "-" + $sha | . + {"publishConfig": {"registry": "https://npm.pkg.github.com"}, "repository": {"type": "git", "url": "https://github.com/BreadchainCoop/gas-killer-analyzer.git"}}' package.json > package.tmp.json
+          mv package.tmp.json package.json
+
+      - name: Publish to GitHub Packages
+        run: npm publish ./crates/wasm/pkg
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
