@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use crate::core::StateUpdate;
+use crate::types::StateUpdate;
 
 /// Heuristic gas costs for different operations
 pub const BASE_TX_COST: u64 = 21_000;
