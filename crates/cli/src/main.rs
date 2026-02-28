@@ -78,6 +78,9 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             let block_number = receipt
                 .block_number
                 .expect("couldn't retrieve block number");
+            let tx_index = receipt
+                .transaction_index
+                .expect("couldn't retrieve transaction index");
             let gas_used = receipt.gas_used;
             let original_status = receipt.status();
 
@@ -245,8 +248,38 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                         .build()
                         .await?;
 
-                    // Try measured gas estimation first
-                    match gk.estimate_state_changes_gas(contract_address, &state_updates) {
+                    // Fetch preceding transactions for mid-block state accuracy
+                    let preceding_txs = gas_analyzer_rpc::get_preceding_transactions(
+                        &provider,
+                        block_number,
+                        tx_index,
+                    )
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                "Warning: Failed to fetch preceding transactions: {}. \
+                                 Estimating with block N-1 state.",
+                                e
+                            )
+                        );
+                        Vec::new()
+                    });
+
+                    if !preceding_txs.is_empty() {
+                        println!(
+                            "Replaying {} preceding transaction(s) for accurate mid-block state...",
+                            preceding_txs.len()
+                        );
+                    }
+
+                    // Try measured gas estimation with preceding tx replay
+                    match gk.estimate_state_changes_gas_with_preceding(
+                        contract_address,
+                        &state_updates,
+                        &preceding_txs,
+                    ) {
                         Ok(gas) => (gas + TURETZKY_UPPER_GAS_LIMIT, false),
                         Err(_) => {
                             // Fall back to heuristic estimation
@@ -289,9 +322,10 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 println!("\n{}", "=== Gas Analysis ===".blue().bold());
                 println!("Transaction: 0x{}", hex::encode(bytes));
                 println!(
-                    "Block: {} ({})",
+                    "Block: {} ({}) | Tx Index: {}",
                     block_number,
-                    receipt.block_hash.unwrap_or_default()
+                    receipt.block_hash.unwrap_or_default(),
+                    tx_index
                 );
                 println!("Gas used: {}", gas_used);
                 let estimate_type = if use_fallback {
