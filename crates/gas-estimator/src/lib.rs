@@ -239,21 +239,21 @@ where
     use revm::context::{Context, TxEnv};
     use revm::{ExecuteCommitEvm, MainBuilder, MainContext};
 
-    for (i, tx) in preceding_txs.iter().enumerate() {
-        let mut evm = Context::mainnet()
-            .with_db(&mut *cache_db)
-            .modify_cfg_chained(|cfg| {
-                cfg.disable_nonce_check = true;
-                cfg.disable_balance_check = true;
-                cfg.disable_base_fee = true;
-                cfg.disable_fee_charge = true;
-            })
-            .modify_block_chained(|block| {
-                block.basefee = 0;
-                block.gas_limit = block_gas_limit;
-            })
-            .build_mainnet();
+    let mut evm = Context::mainnet()
+        .with_db(&mut *cache_db)
+        .modify_cfg_chained(|cfg| {
+            cfg.disable_nonce_check = true;
+            cfg.disable_balance_check = true;
+            cfg.disable_base_fee = true;
+            cfg.disable_fee_charge = true;
+        })
+        .modify_block_chained(|block| {
+            block.basefee = 0;
+            block.gas_limit = block_gas_limit;
+        })
+        .build_mainnet();
 
+    for (i, tx) in preceding_txs.iter().enumerate() {
         let revm_tx = TxEnv::builder()
             .caller(tx.from)
             .kind(tx.kind)
