@@ -257,12 +257,9 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     .await
                     .unwrap_or_else(|e| {
                         eprintln!(
-                            "{}",
-                            format!(
-                                "Warning: Failed to fetch preceding transactions: {}. \
-                                 Estimating with block N-1 state.",
-                                e
-                            )
+                            "Warning: Failed to fetch preceding transactions: {}. \
+                             Estimating with block N-1 state.",
+                            e
                         );
                         Vec::new()
                     });
