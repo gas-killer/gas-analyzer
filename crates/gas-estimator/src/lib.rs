@@ -81,12 +81,14 @@ pub fn build_gas_estimation_calldata(state_updates: &[StateUpdate]) -> Result<By
 /// * `caller_address` - The address to use as the caller
 /// * `calldata` - The encoded calldata for `runStateUpdatesCall(uint8[], bytes[])`
 /// * `gas_limit` - The gas limit for the execution
+/// * `block_number` - The block number to set in the EVM context
 pub fn estimate_gas_raw<DB>(
     cache_db: &mut CacheDB<DB>,
     contract_address: Address,
     caller_address: Address,
     calldata: Bytes,
     gas_limit: u64,
+    block_number: u64,
 ) -> Result<u64>
 where
     DB: revm::database_interface::DatabaseRef,
@@ -125,6 +127,7 @@ where
             cfg.disable_fee_charge = true;
         })
         .modify_block_chained(|block| {
+            block.number = block_number;
             block.basefee = 0;
             block.difficulty = U256::ZERO;
             block.prevrandao = Some(B256::ZERO);
@@ -174,11 +177,13 @@ where
 /// * `contract_address` - The address to inject the estimator contract at
 /// * `state_updates` - The state updates to estimate gas for
 /// * `gas_limit` - The gas limit for the execution
+/// * `block_number` - The block number to set in the EVM context
 pub fn estimate_state_changes_gas<DB>(
     cache_db: &mut CacheDB<DB>,
     contract_address: Address,
     state_updates: &[StateUpdate],
     gas_limit: u64,
+    block_number: u64,
 ) -> Result<u64>
 where
     DB: revm::database_interface::DatabaseRef,
@@ -193,5 +198,6 @@ where
         caller_address,
         calldata,
         gas_limit,
+        block_number,
     )
 }
