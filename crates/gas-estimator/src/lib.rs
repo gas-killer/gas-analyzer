@@ -127,7 +127,7 @@ where
             cfg.disable_fee_charge = true;
         })
         .modify_block_chained(|block| {
-            block.number = block_number;
+            block.number = U256::from(block_number);
             block.basefee = 0;
             block.difficulty = U256::ZERO;
             block.prevrandao = Some(B256::ZERO);
