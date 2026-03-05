@@ -11,7 +11,7 @@ use common::{test_estimator_address, valid_sstore_trace};
 
 #[wasm_bindgen_test]
 fn test_wasm_analyze_trace_returns_jsvalue() {
-    let result = analyze_trace(&valid_sstore_trace(), &test_estimator_address());
+    let result = analyze_trace(&valid_sstore_trace(), &test_estimator_address(), None);
     assert!(
         result.is_ok(),
         "analyze_trace should succeed: {:?}",
@@ -24,13 +24,13 @@ fn test_wasm_analyze_trace_returns_jsvalue() {
 
 #[wasm_bindgen_test]
 fn test_wasm_analyze_trace_invalid_json_returns_error() {
-    let result = analyze_trace("bad json", &test_estimator_address());
+    let result = analyze_trace("bad json", &test_estimator_address(), None);
     assert!(result.is_err());
 }
 
 #[wasm_bindgen_test]
 fn test_wasm_analyze_trace_invalid_address_returns_error() {
-    let result = analyze_trace(&valid_sstore_trace(), "not-an-address");
+    let result = analyze_trace(&valid_sstore_trace(), "not-an-address", None);
     assert!(result.is_err());
 }
 
@@ -72,7 +72,7 @@ fn test_wasm_encode_trace_invalid_json_returns_error() {
 
 #[wasm_bindgen_test]
 fn test_wasm_analyze_trace_response_fields() {
-    let result = analyze_trace(&valid_sstore_trace(), &test_estimator_address()).unwrap();
+    let result = analyze_trace(&valid_sstore_trace(), &test_estimator_address(), None).unwrap();
     let json: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
     let obj = json.as_object().unwrap();
 
