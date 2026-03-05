@@ -136,12 +136,14 @@ impl DefaultEvmSketchExecutor {
     ) -> Result<u64> {
         let mut cache_db = CacheDB::new(&self.sketch.rpc_db);
         let gas_limit = self.sketch.anchor.header().gas_limit;
+        let block_number = self.anchor_block_number();
         gas_analyzer_estimator::estimate_gas_raw(
             &mut cache_db,
             contract_address,
             caller_address,
             calldata,
             gas_limit,
+            block_number,
         )
     }
 
@@ -223,11 +225,13 @@ impl GasKillerEvmSketchDefault {
     ) -> Result<u64> {
         let mut cache_db = CacheDB::new(&self.executor.sketch.rpc_db);
         let gas_limit = self.executor.sketch.anchor.header().gas_limit;
+        let block_number = self.executor.anchor_block_number();
         gas_analyzer_estimator::estimate_state_changes_gas(
             &mut cache_db,
             contract_address,
             state_updates,
             gas_limit,
+            block_number,
         )
     }
 
