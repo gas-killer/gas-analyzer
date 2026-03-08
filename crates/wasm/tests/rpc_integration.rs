@@ -27,6 +27,7 @@ const DELEGATECALL_CONTRACT_MAIN_RUN_TX: &str =
     "0x71aa01e28adbb015d0d4003fb3e770b4344a00a112704fa2e05014f846532d43";
 const ACCESS_CONTROL_MAIN_RUN_TX: &str =
     "0x3fe223c8aabc4e5e6b918d65dd76d7f7bd8e93f6012a0e183ff0a299260b2f60";
+const TEST_CALLER: &str = "0x0000000000000000000000000000000000000001";
 
 /// Per-process trace cache — avoids re-fetching the same TX across tests.
 static TRACE_CACHE: LazyLock<Mutex<HashMap<&'static str, String>>> =
@@ -80,7 +81,7 @@ fn fetch_trace(tx_hash: &'static str) -> String {
 #[ignore]
 fn test_simple_storage_set() {
     let trace = fetch_trace(SIMPLE_STORAGE_SET_TX);
-    let result = analyze_trace_inner(&trace, ESTIMATOR_ADDRESS, None).unwrap();
+    let result = analyze_trace_inner(&trace, ESTIMATOR_ADDRESS, TEST_CALLER, None).unwrap();
 
     // Pinned: deterministic Sepolia TX produces exactly 2 state updates
     assert_eq!(result.state_update_count, 2);
@@ -100,7 +101,7 @@ fn test_simple_storage_set() {
 #[ignore]
 fn test_simple_storage_deposit() {
     let trace = fetch_trace(SIMPLE_STORAGE_DEPOSIT_TX);
-    let result = analyze_trace_inner(&trace, ESTIMATOR_ADDRESS, None).unwrap();
+    let result = analyze_trace_inner(&trace, ESTIMATOR_ADDRESS, TEST_CALLER, None).unwrap();
 
     // Pinned: deterministic Sepolia TX produces exactly 2 state updates (SSTORE + LOG)
     assert_eq!(result.state_update_count, 2);
@@ -120,7 +121,7 @@ fn test_simple_storage_deposit() {
 #[ignore]
 fn test_simple_storage_call_external() {
     let trace = fetch_trace(SIMPLE_STORAGE_CALL_EXTERNAL_TX);
-    let result = analyze_trace_inner(&trace, ESTIMATOR_ADDRESS, None).unwrap();
+    let result = analyze_trace_inner(&trace, ESTIMATOR_ADDRESS, TEST_CALLER, None).unwrap();
 
     // Pinned: deterministic Sepolia TX produces exactly 1 state update
     assert_eq!(result.state_update_count, 1);
@@ -140,7 +141,7 @@ fn test_simple_storage_call_external() {
 #[ignore]
 fn test_delegatecall() {
     let trace = fetch_trace(DELEGATECALL_CONTRACT_MAIN_RUN_TX);
-    let result = analyze_trace_inner(&trace, ESTIMATOR_ADDRESS, None).unwrap();
+    let result = analyze_trace_inner(&trace, ESTIMATOR_ADDRESS, TEST_CALLER, None).unwrap();
 
     // Pinned: deterministic Sepolia TX produces exactly 4 state updates
     assert_eq!(result.state_update_count, 4);
@@ -160,7 +161,7 @@ fn test_delegatecall() {
 #[ignore]
 fn test_access_control() {
     let trace = fetch_trace(ACCESS_CONTROL_MAIN_RUN_TX);
-    let result = analyze_trace_inner(&trace, ESTIMATOR_ADDRESS, None).unwrap();
+    let result = analyze_trace_inner(&trace, ESTIMATOR_ADDRESS, TEST_CALLER, None).unwrap();
 
     // Pinned: deterministic Sepolia TX produces exactly 1 state update
     assert_eq!(result.state_update_count, 1);
@@ -181,7 +182,7 @@ fn test_access_control() {
 fn test_all_paths_agree_on_simple_storage_set() {
     let trace = fetch_trace(SIMPLE_STORAGE_SET_TX);
 
-    let analyze = analyze_trace_inner(&trace, ESTIMATOR_ADDRESS, None).unwrap();
+    let analyze = analyze_trace_inner(&trace, ESTIMATOR_ADDRESS, TEST_CALLER, None).unwrap();
     let encode = encode_trace_inner(&trace).unwrap();
     let heuristic = estimate_gas_heuristic_inner(&trace).unwrap();
 
