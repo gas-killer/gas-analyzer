@@ -181,6 +181,7 @@ where
 pub fn estimate_state_changes_gas<DB>(
     cache_db: &mut CacheDB<DB>,
     contract_address: Address,
+    caller_address: Address,
     state_updates: &[StateUpdate],
     gas_limit: u64,
     block_number: u64,
@@ -190,7 +191,6 @@ where
     <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
 {
     let calldata = build_gas_estimation_calldata(state_updates)?;
-    let caller_address = Address::from_word(B256::from(U256::from(1)));
 
     estimate_gas_raw(
         cache_db,

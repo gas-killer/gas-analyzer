@@ -221,6 +221,7 @@ impl GasKillerEvmSketchDefault {
     pub fn estimate_state_changes_gas(
         &self,
         contract_address: Address,
+        caller_address: Address,
         state_updates: &[StateUpdate],
     ) -> Result<u64> {
         let mut cache_db = CacheDB::new(&self.executor.sketch.rpc_db);
@@ -229,6 +230,7 @@ impl GasKillerEvmSketchDefault {
         gas_analyzer_estimator::estimate_state_changes_gas(
             &mut cache_db,
             contract_address,
+            caller_address,
             state_updates,
             gas_limit,
             block_number,
@@ -290,6 +292,8 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
         })
         .ok_or_else(|| anyhow!("Transaction must have a 'to' address"))?;
 
+    let caller_address = tx_request.from.unwrap_or_default();
+
     let provider = ProviderBuilder::new().connect_http(url.clone());
     let block_id = BlockId::Number(block);
     let trace = get_trace_from_call(&provider, tx_request, block_id).await?;
@@ -301,7 +305,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
         .at_block(block)
         .build()
         .await?;
-    let gas_estimate = gk.estimate_state_changes_gas(contract_address, &state_updates)?;
+    let gas_estimate = gk.estimate_state_changes_gas(contract_address, caller_address, &state_updates)?;
 
     Ok((storage_updates, gas_estimate, false, skipped_opcodes))
 }
