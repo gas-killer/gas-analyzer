@@ -150,7 +150,7 @@ impl DefaultEvmSketchExecutor {
     pub fn sim_block_env(&self) -> SimBlockEnv {
         let header = self.sketch.anchor.header();
         SimBlockEnv {
-            number: header.number - 1,
+            number: header.number,
             timestamp: header.timestamp,
             gas_limit: header.gas_limit,
             coinbase: header.beneficiary,
