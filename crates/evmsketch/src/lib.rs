@@ -28,6 +28,7 @@ use gas_analyzer_core::{
     Opcode, StateUpdate, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_operations, extract_operation_counts_from_trace,
 };
+use gas_analyzer_estimator::SimBlockEnv;
 use gas_analyzer_rpc::get_trace_from_call;
 
 // ============================================================================
@@ -135,16 +136,25 @@ impl DefaultEvmSketchExecutor {
         calldata: Bytes,
     ) -> Result<u64> {
         let mut cache_db = CacheDB::new(&self.sketch.rpc_db);
-        let gas_limit = self.sketch.anchor.header().gas_limit;
-        let block_number = self.anchor_block_number();
+        let block_env = self.sim_block_env();
         gas_analyzer_estimator::estimate_gas_raw(
             &mut cache_db,
             contract_address,
             caller_address,
             calldata,
-            gas_limit,
-            block_number,
+            &block_env,
         )
+    }
+
+    /// Build a `SimBlockEnv` from the anchored block header.
+    pub fn sim_block_env(&self) -> SimBlockEnv {
+        let header = self.sketch.anchor.header();
+        SimBlockEnv {
+            number: header.number,
+            timestamp: header.timestamp,
+            gas_limit: header.gas_limit,
+            coinbase: header.beneficiary,
+        }
     }
 
     /// Get the block hash that the executor is anchored to.
@@ -225,15 +235,13 @@ impl GasKillerEvmSketchDefault {
         state_updates: &[StateUpdate],
     ) -> Result<u64> {
         let mut cache_db = CacheDB::new(&self.executor.sketch.rpc_db);
-        let gas_limit = self.executor.sketch.anchor.header().gas_limit;
-        let block_number = self.executor.anchor_block_number();
+        let block_env = self.executor.sim_block_env();
         gas_analyzer_estimator::estimate_state_changes_gas(
             &mut cache_db,
             contract_address,
             caller_address,
             state_updates,
-            gas_limit,
-            block_number,
+            &block_env,
         )
     }
 
