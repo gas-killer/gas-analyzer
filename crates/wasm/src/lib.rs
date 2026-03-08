@@ -4,7 +4,7 @@ use gas_analyzer_core::{
     StateUpdate, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_state_updates,
 };
-use gas_analyzer_estimator::estimate_state_changes_gas;
+use gas_analyzer_estimator::{SimBlockEnv, estimate_state_changes_gas};
 use revm::database::{CacheDB, EmptyDB};
 use serde::Serialize;
 use std::collections::HashSet;
@@ -85,17 +85,20 @@ pub fn analyze_trace_inner(
         .parse()
         .map_err(|e| format!("Invalid caller address: {}", e))?;
 
-    let gas_limit = 30_000_000u64;
     let mut cache_db = CacheDB::new(EmptyDB::default());
-    let block_number = estimate_state_changes_block_number.unwrap_or(0);
+    let block_env = SimBlockEnv {
+        number: estimate_state_changes_block_number.unwrap_or(0),
+        timestamp: 0,
+        gas_limit: 30_000_000,
+        coinbase: Address::ZERO,
+    };
 
     let (gas_estimate, is_heuristic) = match estimate_state_changes_gas(
         &mut cache_db,
         addr,
         caller,
         &state_updates,
-        gas_limit,
-        block_number,
+        &block_env,
     ) {
         Ok(gas) => (gas, false),
         Err(_) => (
