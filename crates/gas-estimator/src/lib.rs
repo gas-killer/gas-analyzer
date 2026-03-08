@@ -18,6 +18,18 @@ use revm::state::{AccountInfo, Bytecode};
 use gas_analyzer_core::encoding::encode_state_updates_to_sol;
 use gas_analyzer_core::types::StateUpdate;
 
+/// Block environment fields for the gas estimation simulation.
+///
+/// These are set on revm's `BlockEnv` so that contracts reading
+/// COINBASE, TIMESTAMP, NUMBER, or GASLIMIT see realistic values.
+#[derive(Clone, Debug)]
+pub struct SimBlockEnv {
+    pub number: u64,
+    pub timestamp: u64,
+    pub gas_limit: u64,
+    pub coinbase: Address,
+}
+
 /// Embedded ABI JSON for StateChangeHandlerGasEstimator - loaded at compile time
 const ESTIMATOR_ABI_JSON: &str = include_str!("../../../abis/StateChangeHandlerGasEstimator.json");
 
@@ -78,17 +90,15 @@ pub fn build_gas_estimation_calldata(state_updates: &[StateUpdate]) -> Result<By
 /// # Arguments
 /// * `cache_db` - A CacheDB wrapping any database backend
 /// * `contract_address` - The address to inject the estimator contract at
-/// * `caller_address` - The address to use as the caller
+/// * `caller_address` - The address to use as the caller (also used as tx.origin)
 /// * `calldata` - The encoded calldata for `runStateUpdatesCall(uint8[], bytes[])`
-/// * `gas_limit` - The gas limit for the execution
-/// * `block_number` - The block number to set in the EVM context
+/// * `block_env` - Block environment fields (number, timestamp, gas_limit, coinbase)
 pub fn estimate_gas_raw<DB>(
     cache_db: &mut CacheDB<DB>,
     contract_address: Address,
     caller_address: Address,
     calldata: Bytes,
-    gas_limit: u64,
-    block_number: u64,
+    block_env: &SimBlockEnv,
 ) -> Result<u64>
 where
     DB: revm::database_interface::DatabaseRef,
@@ -127,7 +137,10 @@ where
             cfg.disable_fee_charge = true;
         })
         .modify_block_chained(|block| {
-            block.number = U256::from(block_number);
+            block.number = U256::from(block_env.number);
+            block.timestamp = U256::from(block_env.timestamp);
+            block.gas_limit = block_env.gas_limit;
+            block.beneficiary = block_env.coinbase;
             block.basefee = 0;
             block.difficulty = U256::ZERO;
             block.prevrandao = Some(B256::ZERO);
@@ -140,7 +153,7 @@ where
         .kind(revm::primitives::TxKind::Call(contract_address))
         .data(calldata)
         .value(U256::ZERO)
-        .gas_limit(gas_limit)
+        .gas_limit(block_env.gas_limit)
         .build()
         .map_err(|e| anyhow!("Failed to build tx env: {:?}", e))?;
 
@@ -175,16 +188,15 @@ where
 /// # Arguments
 /// * `cache_db` - A CacheDB wrapping any database backend
 /// * `contract_address` - The address to inject the estimator contract at
+/// * `caller_address` - The address to use as the caller (also used as tx.origin)
 /// * `state_updates` - The state updates to estimate gas for
-/// * `gas_limit` - The gas limit for the execution
-/// * `block_number` - The block number to set in the EVM context
+/// * `block_env` - Block environment fields (number, timestamp, gas_limit, coinbase)
 pub fn estimate_state_changes_gas<DB>(
     cache_db: &mut CacheDB<DB>,
     contract_address: Address,
     caller_address: Address,
     state_updates: &[StateUpdate],
-    gas_limit: u64,
-    block_number: u64,
+    block_env: &SimBlockEnv,
 ) -> Result<u64>
 where
     DB: revm::database_interface::DatabaseRef,
@@ -197,7 +209,6 @@ where
         contract_address,
         caller_address,
         calldata,
-        gas_limit,
-        block_number,
+        block_env,
     )
 }
