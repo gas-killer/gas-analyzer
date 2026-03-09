@@ -277,15 +277,14 @@ mod tests {
         }
 
         // Try decoding as RevertingContext first (outer error from estimator)
-        if let Ok(ctx) = RevertingContext::abi_decode(&bytes) {
-            if ctx.revertData.len() >= 4 {
-                if let Ok(env_err) = EnvironmentMismatch::abi_decode(&ctx.revertData) {
-                    return format!(
-                        "EnvironmentMismatch: {}\n  expected: {:?}\n  actual:   {:?}",
-                        env_err.explanation, env_err.expected, env_err.actual
-                    );
-                }
-            }
+        if let Ok(ctx) = RevertingContext::abi_decode(&bytes)
+            && ctx.revertData.len() >= 4
+            && let Ok(env_err) = EnvironmentMismatch::abi_decode(&ctx.revertData)
+        {
+            return format!(
+                "EnvironmentMismatch: {}\n  expected: {:?}\n  actual:   {:?}",
+                env_err.explanation, env_err.expected, env_err.actual
+            );
         }
 
         // Try decoding as EnvironmentMismatch directly
