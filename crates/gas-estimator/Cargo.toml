@@ -18,6 +18,9 @@ revm = { version = "31.0.1", default-features = false, features = [
     "optional_fee_charge",
 ] }
 
+[dev-dependencies]
+alloy-sol-types = "1"
+
 # For WASM builds, the consumer must enable getrandom/js.
 # This feature enables it from this crate for testing.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
