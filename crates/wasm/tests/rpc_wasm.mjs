@@ -24,6 +24,7 @@ if (!RPC_URL) {
 
 // Same TX hashes and addresses used in gas-killer-analyzer (crates/core/src/constants.rs)
 const ESTIMATOR_ADDRESS = "0xd682Fe2ee8bdd59fdcCc5a4962FD98c20Ef47290";
+const CALLER_ADDRESS = "0x0000000000000000000000000000000000000001";
 const SIMPLE_STORAGE_SET_TX = "0xccd4b5a1d020bfc69fb44452f942cdef29996fc6d822f127d9a5a6108e95c3f9";
 const SIMPLE_STORAGE_DEPOSIT_TX = "0xa787da2025d8e9943cb175559aa91ab38cff62dde3fd09b6da117a38c4ccd431";
 
@@ -65,7 +66,7 @@ let failures = 0;
 
 // Test 1: analyze_trace with SimpleStorage.set()
 try {
-  const result = wasmJs.analyze_trace(traces[SIMPLE_STORAGE_SET_TX], ESTIMATOR_ADDRESS);
+  const result = wasmJs.analyze_trace(traces[SIMPLE_STORAGE_SET_TX], ESTIMATOR_ADDRESS, CALLER_ADDRESS);
   console.log("analyze_trace (SimpleStorage.set):");
   console.log(`  gas_estimate:      ${result.gas_estimate}`);
   console.log(`  is_heuristic:      ${result.is_heuristic}`);
@@ -83,7 +84,7 @@ try {
 
 // Test 2: analyze_trace with SimpleStorage.deposit() (SSTOREs + LOGs)
 try {
-  const result = wasmJs.analyze_trace(traces[SIMPLE_STORAGE_DEPOSIT_TX], ESTIMATOR_ADDRESS);
+  const result = wasmJs.analyze_trace(traces[SIMPLE_STORAGE_DEPOSIT_TX], ESTIMATOR_ADDRESS, CALLER_ADDRESS);
   console.log("analyze_trace (SimpleStorage.deposit):");
   console.log(`  gas_estimate:      ${result.gas_estimate}`);
   console.log(`  is_heuristic:      ${result.is_heuristic}`);
@@ -130,7 +131,7 @@ try {
 // Test 5: all 3 paths agree on state_update_count
 try {
   const trace = traces[SIMPLE_STORAGE_SET_TX];
-  const analyze = wasmJs.analyze_trace(trace, ESTIMATOR_ADDRESS);
+  const analyze = wasmJs.analyze_trace(trace, ESTIMATOR_ADDRESS, CALLER_ADDRESS);
   const encode = wasmJs.encode_trace(trace);
   const heuristic = wasmJs.estimate_gas_heuristic(trace);
 
