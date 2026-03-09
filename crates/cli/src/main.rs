@@ -247,7 +247,8 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                         .await?;
 
                     // Try measured gas estimation first
-                    match gk.estimate_state_changes_gas(contract_address, tx_sender, &state_updates) {
+                    match gk.estimate_state_changes_gas(contract_address, tx_sender, &state_updates)
+                    {
                         Ok(gas) => (gas + TURETZKY_UPPER_GAS_LIMIT, false),
                         Err(_) => {
                             // Fall back to heuristic estimation

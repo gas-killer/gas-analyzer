@@ -320,7 +320,8 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
         .at_block(block)
         .build()
         .await?;
-    let gas_estimate = gk.estimate_state_changes_gas(contract_address, caller_address, &state_updates)?;
+    let gas_estimate =
+        gk.estimate_state_changes_gas(contract_address, caller_address, &state_updates)?;
 
     Ok((storage_updates, gas_estimate, false, skipped_opcodes))
 }

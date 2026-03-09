@@ -95,19 +95,14 @@ pub fn analyze_trace_inner(
         gas_price: 0,
     };
 
-    let (gas_estimate, is_heuristic) = match estimate_state_changes_gas(
-        &mut cache_db,
-        addr,
-        caller,
-        &state_updates,
-        &sim_env,
-    ) {
-        Ok(gas) => (gas, false),
-        Err(_) => (
-            estimate_gas_from_state_updates(&state_updates, call_gas_total),
-            true,
-        ),
-    };
+    let (gas_estimate, is_heuristic) =
+        match estimate_state_changes_gas(&mut cache_db, addr, caller, &state_updates, &sim_env) {
+            Ok(gas) => (gas, false),
+            Err(_) => (
+                estimate_gas_from_state_updates(&state_updates, call_gas_total),
+                true,
+            ),
+        };
 
     let mut skipped = skipped_opcodes.into_iter().collect::<Vec<_>>();
     skipped.sort();
@@ -400,7 +395,12 @@ mod tests {
     #[test]
     fn test_parse_valid_address() {
         let trace = make_trace(vec![]);
-        let result = analyze_trace_inner(&trace, &test_estimator_address(), &test_caller_address(), None);
+        let result = analyze_trace_inner(
+            &trace,
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+        );
         assert!(result.is_ok());
     }
 
@@ -507,7 +507,13 @@ mod tests {
     #[test]
     fn test_revm_sstore_only_succeeds() {
         let trace = make_trace(vec![make_sstore_log("1", "ff", 90000)]);
-        let result = analyze_trace_inner(&trace, &test_estimator_address(), &test_caller_address(), None).unwrap();
+        let result = analyze_trace_inner(
+            &trace,
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+        )
+        .unwrap();
         assert!(!result.is_heuristic);
         assert!(result.gas_estimate > 0);
     }
@@ -519,12 +525,23 @@ mod tests {
             make_sstore_log("2", "bb", 85000),
             make_sstore_log("3", "cc", 80000),
         ]);
-        let result = analyze_trace_inner(&trace, &test_estimator_address(), &test_caller_address(), None).unwrap();
+        let result = analyze_trace_inner(
+            &trace,
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+        )
+        .unwrap();
         assert!(!result.is_heuristic);
         // Gas for 3 stores should be meaningfully more than for 1
         let single_trace = make_trace(vec![make_sstore_log("1", "ff", 90000)]);
-        let single_result =
-            analyze_trace_inner(&single_trace, &test_estimator_address(), &test_caller_address(), None).unwrap();
+        let single_result = analyze_trace_inner(
+            &single_trace,
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+        )
+        .unwrap();
         assert!(result.gas_estimate > single_result.gas_estimate);
     }
 
@@ -535,7 +552,13 @@ mod tests {
         // so revm doesn't revert and is_heuristic stays false.
         let trace =
             make_call_trace_with_depth("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "aabbccdd");
-        let result = analyze_trace_inner(&trace, &test_estimator_address(), &test_caller_address(), None).unwrap();
+        let result = analyze_trace_inner(
+            &trace,
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+        )
+        .unwrap();
         assert!(!result.is_heuristic);
         assert!(result.gas_estimate > 0);
     }
@@ -543,7 +566,13 @@ mod tests {
     #[test]
     fn test_revm_gas_estimate_is_reasonable() {
         let trace = make_trace(vec![make_sstore_log("1", "ff", 90000)]);
-        let result = analyze_trace_inner(&trace, &test_estimator_address(), &test_caller_address(), None).unwrap();
+        let result = analyze_trace_inner(
+            &trace,
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+        )
+        .unwrap();
         // Should be between 21k (base) and 500k for a single SSTORE
         assert!(
             result.gas_estimate > 21_000 && result.gas_estimate < 500_000,
@@ -607,7 +636,13 @@ mod tests {
     #[test]
     fn test_revm_and_heuristic_both_produce_positive_gas() {
         let trace_json = make_trace(vec![make_sstore_log("1", "ff", 90000)]);
-        let analyze = analyze_trace_inner(&trace_json, &test_estimator_address(), &test_caller_address(), None).unwrap();
+        let analyze = analyze_trace_inner(
+            &trace_json,
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+        )
+        .unwrap();
         let heuristic = estimate_gas_heuristic_inner(&trace_json).unwrap();
 
         assert!(analyze.gas_estimate > 0);

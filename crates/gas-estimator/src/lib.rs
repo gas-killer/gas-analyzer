@@ -279,9 +279,7 @@ mod tests {
         // Try decoding as RevertingContext first (outer error from estimator)
         if let Ok(ctx) = RevertingContext::abi_decode(&bytes) {
             if ctx.revertData.len() >= 4 {
-                if let Ok(env_err) =
-                    EnvironmentMismatch::abi_decode(&ctx.revertData)
-                {
+                if let Ok(env_err) = EnvironmentMismatch::abi_decode(&ctx.revertData) {
                     return format!(
                         "EnvironmentMismatch: {}\n  expected: {:?}\n  actual:   {:?}",
                         env_err.explanation, env_err.expected, env_err.actual
@@ -301,8 +299,7 @@ mod tests {
         msg
     }
 
-    const SIM_ENV_TEST_MAIN_JSON: &str =
-        include_str!("../../../abis/SimEnvTestMain.json");
+    const SIM_ENV_TEST_MAIN_JSON: &str = include_str!("../../../abis/SimEnvTestMain.json");
 
     fn load_creation_bytecode(json_str: &str) -> Vec<u8> {
         let json: serde_json::Value = serde_json::from_str(json_str).unwrap();
@@ -315,10 +312,7 @@ mod tests {
     ///
     /// SimEnvTestMain's constructor deploys SimEnvCallee with the expected env values.
     /// The SimEnvCallee address is stored in SimEnvTestMain's storage slot 0.
-    fn deploy_sim_env_test(
-        caller: Address,
-        sim_env: &SimEnv,
-    ) -> (CacheDB<EmptyDB>, Address) {
+    fn deploy_sim_env_test(caller: Address, sim_env: &SimEnv) -> (CacheDB<EmptyDB>, Address) {
         let constructor_args = DynSolValue::Tuple(vec![
             DynSolValue::Address(caller),
             DynSolValue::Uint(U256::from(sim_env.gas_price), 256),
