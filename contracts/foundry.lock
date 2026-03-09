@@ -1,0 +1,8 @@
+{
+  "lib/forge-std": {
+    "rev": "77041d2ce690e692d6e03cc812b57d1ddaa4d505"
+  },
+  "lib/gas-killer-avs-sol": {
+    "rev": "33ef63ec63dccf6f7de98778de1cbbf2754489a6"
+  }
+}

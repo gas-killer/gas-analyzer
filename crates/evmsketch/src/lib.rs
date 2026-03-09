@@ -28,7 +28,7 @@ use gas_analyzer_core::{
     Opcode, StateUpdate, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_operations, extract_operation_counts_from_trace,
 };
-use gas_analyzer_estimator::SimBlockEnv;
+use gas_analyzer_estimator::SimEnv;
 use gas_analyzer_rpc::get_trace_from_call;
 
 // ============================================================================
@@ -134,26 +134,33 @@ impl DefaultEvmSketchExecutor {
         contract_address: Address,
         caller_address: Address,
         calldata: Bytes,
+        gas_price: u128,
     ) -> Result<u64> {
         let mut cache_db = CacheDB::new(&self.sketch.rpc_db);
-        let block_env = self.sim_block_env();
+        let mut sim_env = self.sim_env();
+        sim_env.gas_price = gas_price;
         gas_analyzer_estimator::estimate_gas_raw(
             &mut cache_db,
             contract_address,
             caller_address,
             calldata,
-            &block_env,
+            &sim_env,
         )
     }
 
-    /// Build a `SimBlockEnv` from the anchored block header.
-    pub fn sim_block_env(&self) -> SimBlockEnv {
+    /// Build a `SimEnv` from the anchored block header.
+    ///
+    /// `gas_price` defaults to 0 since it is a transaction-level field;
+    /// callers with access to the original transaction can override it.
+    pub fn sim_env(&self) -> SimEnv {
         let header = self.sketch.anchor.header();
-        SimBlockEnv {
+        SimEnv {
             number: header.number,
             timestamp: header.timestamp,
             gas_limit: header.gas_limit,
             coinbase: header.beneficiary,
+            prevrandao: header.mix_hash,
+            gas_price: 0,
         }
     }
 
@@ -235,13 +242,13 @@ impl GasKillerEvmSketchDefault {
         state_updates: &[StateUpdate],
     ) -> Result<u64> {
         let mut cache_db = CacheDB::new(&self.executor.sketch.rpc_db);
-        let block_env = self.executor.sim_block_env();
+        let sim_env = self.executor.sim_env();
         gas_analyzer_estimator::estimate_state_changes_gas(
             &mut cache_db,
             contract_address,
             caller_address,
             state_updates,
-            &block_env,
+            &sim_env,
         )
     }
 
