@@ -1,10 +1,10 @@
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use alloy_rpc_types::trace::geth::DefaultFrame;
 use gas_analyzer_core::{
     StateUpdate, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_state_updates,
 };
-use gas_analyzer_estimator::{SimBlockEnv, estimate_state_changes_gas};
+use gas_analyzer_estimator::{SimEnv, estimate_state_changes_gas};
 use revm::database::{CacheDB, EmptyDB};
 use serde::Serialize;
 use std::collections::HashSet;
@@ -86,11 +86,13 @@ pub fn analyze_trace_inner(
         .map_err(|e| format!("Invalid caller address: {}", e))?;
 
     let mut cache_db = CacheDB::new(EmptyDB::default());
-    let block_env = SimBlockEnv {
+    let sim_env = SimEnv {
         number: estimate_state_changes_block_number.unwrap_or(0),
         timestamp: 0,
         gas_limit: 30_000_000,
         coinbase: Address::ZERO,
+        prevrandao: B256::ZERO,
+        gas_price: 0,
     };
 
     let (gas_estimate, is_heuristic) = match estimate_state_changes_gas(
@@ -98,7 +100,7 @@ pub fn analyze_trace_inner(
         addr,
         caller,
         &state_updates,
-        &block_env,
+        &sim_env,
     ) {
         Ok(gas) => (gas, false),
         Err(_) => (
