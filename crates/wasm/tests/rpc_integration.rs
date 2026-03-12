@@ -84,7 +84,7 @@ fn test_simple_storage_set() {
     let result = analyze_trace_inner(
         &trace,
         &test_estimator_address(),
-        &test_estimator_address(),
+        &test_caller_address(),
         None,
     )
     .unwrap();
@@ -110,7 +110,7 @@ fn test_simple_storage_deposit() {
     let result = analyze_trace_inner(
         &trace,
         &test_estimator_address(),
-        &test_estimator_address(),
+        &test_caller_address(),
         None,
     )
     .unwrap();
@@ -136,7 +136,7 @@ fn test_simple_storage_call_external() {
     let result = analyze_trace_inner(
         &trace,
         &test_estimator_address(),
-        &test_estimator_address(),
+        &test_caller_address(),
         None,
     )
     .unwrap();
@@ -162,7 +162,7 @@ fn test_delegatecall() {
     let result = analyze_trace_inner(
         &trace,
         &test_estimator_address(),
-        &test_estimator_address(),
+        &test_caller_address(),
         None,
     )
     .unwrap();
@@ -188,7 +188,7 @@ fn test_access_control() {
     let result = analyze_trace_inner(
         &trace,
         &test_estimator_address(),
-        &test_estimator_address(),
+        &test_caller_address(),
         None,
     )
     .unwrap();
@@ -215,7 +215,7 @@ fn test_all_paths_agree_on_simple_storage_set() {
     let analyze = analyze_trace_inner(
         &trace,
         &test_estimator_address(),
-        &test_estimator_address(),
+        &test_caller_address(),
         None,
     )
     .unwrap();
