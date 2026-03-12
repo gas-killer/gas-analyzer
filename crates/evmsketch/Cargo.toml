@@ -16,8 +16,3 @@ reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1" 
 revm = { version = "31.0.1" }
 sp1-cc-host-executor = { git = "https://github.com/BreadchainCoop/sp1-contract-call", branch = "cancun-v1", package = "sp1-cc-host-executor" }
 sp1-cc-client-executor = { git = "https://github.com/BreadchainCoop/sp1-contract-call", branch = "cancun-v1", package = "sp1-cc-client-executor" }
-
-[dev-dependencies]
-hex = "0.4"
-serde_json = "1"
-alloy-dyn-abi = "1"
