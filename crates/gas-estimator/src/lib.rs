@@ -230,21 +230,20 @@ mod tests {
     use revm::database::{CacheDB, EmptyDB};
     use revm::{ExecuteEvm, MainBuilder, MainContext};
 
-    sol! {
+    sol!(
         #[derive(Debug)]
-        struct SimEnvSol {
-            address txOrigin;
-            uint256 txGasPrice;
-            address blockCoinbase;
-            uint256 blockNumber;
-            uint256 blockTimestamp;
-            uint256 blockGasLimit;
-            uint256 blockPrevRandao;
-        }
+        SimEnvOptsStructs,
+        "../../abis/SimEnvOptsStructs.json"
+    );
 
-        error EnvironmentMismatch(SimEnvSol expected, SimEnvSol actual, string explanation);
-        error RevertingContext(address target, bytes revertData);
-    }
+    sol!(
+        #[derive(Debug)]
+        StateChangeHandlerGasEstimator,
+        "../../abis/StateChangeHandlerGasEstimator.json"
+    );
+
+    use SimEnvOptsStructs::EnvironmentMismatch;
+    use StateChangeHandlerGasEstimator::RevertingContext;
 
     /// Try to decode an EnvironmentMismatch from a gas estimation error.
     ///
@@ -298,7 +297,7 @@ mod tests {
         msg
     }
 
-    const SIM_ENV_TEST_MAIN_JSON: &str = include_str!("../../../abis/SimEnvTestMain.json");
+    const SIM_ENV_TEST_MAIN_JSON: &str = include_str!("../../../abis/SimEnvOptsTestMain.json");
 
     fn load_creation_bytecode(json_str: &str) -> Vec<u8> {
         let json: serde_json::Value = serde_json::from_str(json_str).unwrap();
