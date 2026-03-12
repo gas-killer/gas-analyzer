@@ -4,7 +4,7 @@ use gas_analyzer_core::{
     StateUpdate, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_state_updates,
 };
-use gas_analyzer_estimator::{SimEnv, estimate_state_changes_gas};
+use gas_analyzer_estimator::{SimEnvOpts, estimate_state_changes_gas};
 use revm::database::{CacheDB, EmptyDB};
 use serde::Serialize;
 use std::collections::HashSet;
@@ -86,7 +86,7 @@ pub fn analyze_trace_inner(
         .map_err(|e| format!("Invalid caller address: {}", e))?;
 
     let mut cache_db = CacheDB::new(EmptyDB::default());
-    let sim_env = SimEnv {
+    let sim_env = SimEnvOpts {
         number: estimate_state_changes_block_number.unwrap_or(0),
         timestamp: 0,
         gas_limit: 30_000_000,
