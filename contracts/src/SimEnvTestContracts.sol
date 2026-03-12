@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-interface SimEvnStructs {
-    struct SimEnv {
+interface SimEnvOptsStructs {
+    struct SimEnvOpts {
         // TX
         address txOrigin;
         uint256 txGasPrice;
@@ -13,14 +13,16 @@ interface SimEvnStructs {
         uint256 blockGasLimit;
         uint256 blockPrevRandao;
     }
+
+    error EnvironmentMismatch(SimEnvOpts expected, SimEnvOpts actual, string explanation);
 }
 
 
 /// @title Simulation Environment Test
 /// @author Rubydusa
 /// @notice Not covered: Blobs (BLOBHASH, BLOBBASEFEE), Block (BLOCKHASH). Possibly more
-contract SimEnvTestMain is SimEvnStructs {
-    SimEnvCallee simEvnCallee;
+contract SimEnvOptsTestMain is SimEnvOptsStructs {
+    SimEnvOptsCallee simEnvOptsCallee;
     
     constructor (
         address txOrigin,
@@ -31,7 +33,7 @@ contract SimEnvTestMain is SimEvnStructs {
         uint256 blockGasLimit,
         uint256 blockPrevRandao
     ) {
-        simEvnCallee = new SimEnvCallee(
+        simEnvOptsCallee = new SimEnvOptsCallee(
             txOrigin,
             txGasPrice,
             blockCoinbase,
@@ -43,12 +45,12 @@ contract SimEnvTestMain is SimEvnStructs {
     }
 
     function call() external {
-        simEvnCallee.test();
+        simEnvOptsCallee.test();
     }
 }
 
-contract SimEnvCallee is SimEvnStructs {
-    SimEnv simEnv;
+contract SimEnvOptsCallee is SimEnvOptsStructs {
+    SimEnvOpts simEnv;
     // never read, exists so test will be state changing function;
     uint256 nonce;
 
@@ -71,8 +73,8 @@ contract SimEnvCallee is SimEvnStructs {
     }
 
     function test() external {
-        SimEnv memory expected = simEnv;
-        SimEnv memory actual;
+        SimEnvOpts memory expected = simEnv;
+        SimEnvOpts memory actual;
         actual.txOrigin = tx.origin;
         actual.txGasPrice = tx.gasprice;
         actual.blockCoinbase = block.coinbase;
@@ -117,6 +119,4 @@ contract SimEnvCallee is SimEvnStructs {
         }
         nonce++;
     }
-
-    error EnvironmentMismatch(SimEnv expected, SimEnv actual, string explanation);
 }
