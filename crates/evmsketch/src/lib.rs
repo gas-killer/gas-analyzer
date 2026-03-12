@@ -28,7 +28,7 @@ use gas_analyzer_core::{
     Opcode, StateUpdate, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_operations, extract_operation_counts_from_trace,
 };
-use gas_analyzer_estimator::SimEnv;
+use gas_analyzer_estimator::SimEnvOpts;
 use gas_analyzer_rpc::get_trace_from_call;
 
 // ============================================================================
@@ -152,9 +152,9 @@ impl DefaultEvmSketchExecutor {
     ///
     /// `gas_price` defaults to 0 since it is a transaction-level field;
     /// callers with access to the original transaction can override it.
-    pub fn sim_env(&self) -> SimEnv {
+    pub fn sim_env(&self) -> SimEnvOpts {
         let header = self.sketch.anchor.header();
-        SimEnv {
+        SimEnvOpts {
             number: header.number,
             timestamp: header.timestamp,
             gas_limit: header.gas_limit,
