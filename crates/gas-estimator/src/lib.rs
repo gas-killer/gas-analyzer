@@ -24,7 +24,7 @@ use gas_analyzer_core::types::StateUpdate;
 /// opcodes like COINBASE, TIMESTAMP, NUMBER, GASLIMIT, GASPRICE, or
 /// PREVRANDAO see realistic values.
 #[derive(Clone, Debug)]
-pub struct SimEnv {
+pub struct SimEnvOpts {
     pub number: u64,
     pub timestamp: u64,
     pub gas_limit: u64,
@@ -101,7 +101,7 @@ pub fn estimate_gas_raw<DB>(
     contract_address: Address,
     caller_address: Address,
     calldata: Bytes,
-    sim_env: &SimEnv,
+    sim_env: &SimEnvOpts,
 ) -> Result<u64>
 where
     DB: revm::database_interface::DatabaseRef,
@@ -200,7 +200,7 @@ pub fn estimate_state_changes_gas<DB>(
     contract_address: Address,
     caller_address: Address,
     state_updates: &[StateUpdate],
-    sim_env: &SimEnv,
+    sim_env: &SimEnvOpts,
 ) -> Result<u64>
 where
     DB: revm::database_interface::DatabaseRef,
@@ -311,7 +311,7 @@ mod tests {
     ///
     /// SimEnvTestMain's constructor deploys SimEnvCallee with the expected env values.
     /// The SimEnvCallee address is stored in SimEnvTestMain's storage slot 0.
-    fn deploy_sim_env_test(caller: Address, sim_env: &SimEnv) -> (CacheDB<EmptyDB>, Address) {
+    fn deploy_sim_env_test(caller: Address, sim_env: &SimEnvOpts) -> (CacheDB<EmptyDB>, Address) {
         let constructor_args = DynSolValue::Tuple(vec![
             DynSolValue::Address(caller),
             DynSolValue::Uint(U256::from(sim_env.gas_price), 256),
@@ -393,7 +393,7 @@ mod tests {
     #[test]
     fn test_sim_env_correct_values() {
         let caller = address!("0x000000000000000000000000000000000000c411");
-        let sim_env = SimEnv {
+        let sim_env = SimEnvOpts {
             number: 42,
             timestamp: 1_700_000_000,
             gas_limit: 30_000_000,
@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn test_sim_env_wrong_timestamp_reverts() {
         let caller = address!("0x000000000000000000000000000000000000c411");
-        let sim_env = SimEnv {
+        let sim_env = SimEnvOpts {
             number: 42,
             timestamp: 1_700_000_000,
             gas_limit: 30_000_000,
@@ -458,7 +458,7 @@ mod tests {
         let estimator_address = address!("0x000000000000000000000000000000000000E570");
 
         // Use a wrong timestamp — SimEnvCallee.test() should revert
-        let wrong_env = SimEnv {
+        let wrong_env = SimEnvOpts {
             timestamp: 999,
             ..sim_env
         };
