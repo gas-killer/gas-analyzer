@@ -80,6 +80,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 .expect("couldn't retrieve block number");
             let gas_used = receipt.gas_used;
             let original_status = receipt.status();
+            let tx_sender = receipt.from;
 
             #[cfg(feature = "anvil")]
             if cli_args.use_anvil {
@@ -205,7 +206,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 let (gas_estimate, is_heuristic) = if use_fallback || state_updates.is_empty() {
                     // Use heuristic estimation when trace extraction failed or no state updates
                     let gk = GasKillerEvmSketchDefault::builder(rpc_url.clone())
-                        .at_block(BlockNumberOrTag::Number(block_number - 1))
+                        .at_block(BlockNumberOrTag::Number(block_number))
                         .build()
                         .await?;
 
@@ -241,12 +242,13 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
 
                     // Build EvmSketch for gas estimation (injecting StateChangeHandler contract)
                     let gk = GasKillerEvmSketchDefault::builder(rpc_url.clone())
-                        .at_block(BlockNumberOrTag::Number(block_number - 1))
+                        .at_block(BlockNumberOrTag::Number(block_number))
                         .build()
                         .await?;
 
                     // Try measured gas estimation first
-                    match gk.estimate_state_changes_gas(contract_address, &state_updates) {
+                    match gk.estimate_state_changes_gas(contract_address, tx_sender, &state_updates)
+                    {
                         Ok(gas) => (gas + TURETZKY_UPPER_GAS_LIMIT, false),
                         Err(_) => {
                             // Fall back to heuristic estimation
