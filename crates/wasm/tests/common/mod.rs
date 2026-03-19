@@ -31,6 +31,10 @@ pub fn test_estimator_address() -> String {
     "0xd682Fe2ee8bdd59fdcCc5a4962FD98c20Ef47290".to_string()
 }
 
+pub fn test_caller_address() -> String {
+    "0x0000000000000000000000000000000000000001".to_string()
+}
+
 pub fn valid_sstore_trace() -> String {
     make_trace(vec![make_sstore_log("1", "ff", 90000)])
 }
