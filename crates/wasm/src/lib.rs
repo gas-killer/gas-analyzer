@@ -1,10 +1,10 @@
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use alloy_rpc_types::trace::geth::DefaultFrame;
 use gas_analyzer_core::{
     StateUpdate, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_state_updates,
 };
-use gas_analyzer_estimator::estimate_state_changes_gas;
+use gas_analyzer_estimator::{SimEnvOpts, estimate_state_changes_gas};
 use revm::database::{CacheDB, EmptyDB};
 use serde::Serialize;
 use std::collections::HashSet;
@@ -70,6 +70,7 @@ fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsError> {
 pub fn analyze_trace_inner(
     trace_json: &str,
     estimator_address: &str,
+    caller_address: &str,
     estimate_state_changes_block_number: Option<u64>,
 ) -> Result<AnalyzeTraceResult, String> {
     let (state_updates, skipped_opcodes, call_gas_total) = parse_and_compute(trace_json)?;
@@ -78,25 +79,30 @@ pub fn analyze_trace_inner(
 
     let addr: Address = estimator_address
         .parse()
-        .map_err(|e| format!("Invalid address: {}", e))?;
+        .map_err(|e| format!("Invalid estimator address: {}", e))?;
 
-    let gas_limit = 30_000_000u64;
+    let caller: Address = caller_address
+        .parse()
+        .map_err(|e| format!("Invalid caller address: {}", e))?;
+
     let mut cache_db = CacheDB::new(EmptyDB::default());
-    let block_number = estimate_state_changes_block_number.unwrap_or(0);
-
-    let (gas_estimate, is_heuristic) = match estimate_state_changes_gas(
-        &mut cache_db,
-        addr,
-        &state_updates,
-        gas_limit,
-        block_number,
-    ) {
-        Ok(gas) => (gas, false),
-        Err(_) => (
-            estimate_gas_from_state_updates(&state_updates, call_gas_total),
-            true,
-        ),
+    let sim_env = SimEnvOpts {
+        number: estimate_state_changes_block_number.unwrap_or(0),
+        timestamp: 0,
+        gas_limit: 30_000_000,
+        coinbase: Address::ZERO,
+        prevrandao: B256::ZERO,
+        gas_price: 0,
     };
+
+    let (gas_estimate, is_heuristic) =
+        match estimate_state_changes_gas(&mut cache_db, addr, caller, &state_updates, &sim_env) {
+            Ok(gas) => (gas, false),
+            Err(_) => (
+                estimate_gas_from_state_updates(&state_updates, call_gas_total),
+                true,
+            ),
+        };
 
     let mut skipped = skipped_opcodes.into_iter().collect::<Vec<_>>();
     skipped.sort();
@@ -152,17 +158,22 @@ pub fn encode_trace_inner(trace_json: &str) -> Result<EncodeTraceResult, String>
 /// `estimator_address` is the hex address where the gas estimator contract will be
 /// deployed in the empty CacheDB, e.g. `"0x1234..."`.
 ///
+/// `caller_address` is the hex address of the original transaction sender, used as
+/// `tx.origin` during gas simulation.
+///
 /// Returns a JS object with: `encoded_updates`, `gas_estimate`, `is_heuristic`,
 /// `state_update_count`, `skipped_opcodes`.
 #[wasm_bindgen]
 pub fn analyze_trace(
     trace_json: &str,
     estimator_address: &str,
+    caller_address: &str,
     estimate_state_changes_block_number: Option<u64>,
 ) -> Result<JsValue, JsError> {
     let result = analyze_trace_inner(
         trace_json,
         estimator_address,
+        caller_address,
         estimate_state_changes_block_number,
     )
     .map_err(|e| JsError::new(&e))?;
@@ -347,6 +358,10 @@ mod tests {
         "0xd682Fe2ee8bdd59fdcCc5a4962FD98c20Ef47290".to_string()
     }
 
+    fn test_caller_address() -> String {
+        "0x0000000000000000000000000000000000000001".to_string()
+    }
+
     // ===== Parsing & deserialization tests =====
 
     #[test]
@@ -380,24 +395,29 @@ mod tests {
     #[test]
     fn test_parse_valid_address() {
         let trace = make_trace(vec![]);
-        let result = analyze_trace_inner(&trace, &test_estimator_address(), None);
+        let result = analyze_trace_inner(
+            &trace,
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+        );
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_parse_invalid_address() {
         let trace = make_trace(vec![]);
-        let result = analyze_trace_inner(&trace, "not-an-address", None);
+        let result = analyze_trace_inner(&trace, "not-an-address", &test_caller_address(), None);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Invalid address"));
+        assert!(result.unwrap_err().contains("Invalid estimator address"));
     }
 
     #[test]
     fn test_parse_address_too_short() {
         let trace = make_trace(vec![]);
-        let result = analyze_trace_inner(&trace, "0x1234", None);
+        let result = analyze_trace_inner(&trace, "0x1234", &test_caller_address(), None);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Invalid address"));
+        assert!(result.unwrap_err().contains("Invalid estimator address"));
     }
 
     // ===== State update extraction tests =====
@@ -487,7 +507,13 @@ mod tests {
     #[test]
     fn test_revm_sstore_only_succeeds() {
         let trace = make_trace(vec![make_sstore_log("1", "ff", 90000)]);
-        let result = analyze_trace_inner(&trace, &test_estimator_address(), None).unwrap();
+        let result = analyze_trace_inner(
+            &trace,
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+        )
+        .unwrap();
         assert!(!result.is_heuristic);
         assert!(result.gas_estimate > 0);
     }
@@ -499,12 +525,23 @@ mod tests {
             make_sstore_log("2", "bb", 85000),
             make_sstore_log("3", "cc", 80000),
         ]);
-        let result = analyze_trace_inner(&trace, &test_estimator_address(), None).unwrap();
+        let result = analyze_trace_inner(
+            &trace,
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+        )
+        .unwrap();
         assert!(!result.is_heuristic);
         // Gas for 3 stores should be meaningfully more than for 1
         let single_trace = make_trace(vec![make_sstore_log("1", "ff", 90000)]);
-        let single_result =
-            analyze_trace_inner(&single_trace, &test_estimator_address(), None).unwrap();
+        let single_result = analyze_trace_inner(
+            &single_trace,
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+        )
+        .unwrap();
         assert!(result.gas_estimate > single_result.gas_estimate);
     }
 
@@ -515,7 +552,13 @@ mod tests {
         // so revm doesn't revert and is_heuristic stays false.
         let trace =
             make_call_trace_with_depth("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "aabbccdd");
-        let result = analyze_trace_inner(&trace, &test_estimator_address(), None).unwrap();
+        let result = analyze_trace_inner(
+            &trace,
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+        )
+        .unwrap();
         assert!(!result.is_heuristic);
         assert!(result.gas_estimate > 0);
     }
@@ -523,7 +566,13 @@ mod tests {
     #[test]
     fn test_revm_gas_estimate_is_reasonable() {
         let trace = make_trace(vec![make_sstore_log("1", "ff", 90000)]);
-        let result = analyze_trace_inner(&trace, &test_estimator_address(), None).unwrap();
+        let result = analyze_trace_inner(
+            &trace,
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+        )
+        .unwrap();
         // Should be between 21k (base) and 500k for a single SSTORE
         assert!(
             result.gas_estimate > 21_000 && result.gas_estimate < 500_000,
@@ -587,7 +636,13 @@ mod tests {
     #[test]
     fn test_revm_and_heuristic_both_produce_positive_gas() {
         let trace_json = make_trace(vec![make_sstore_log("1", "ff", 90000)]);
-        let analyze = analyze_trace_inner(&trace_json, &test_estimator_address(), None).unwrap();
+        let analyze = analyze_trace_inner(
+            &trace_json,
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+        )
+        .unwrap();
         let heuristic = estimate_gas_heuristic_inner(&trace_json).unwrap();
 
         assert!(analyze.gas_estimate > 0);
@@ -720,8 +775,9 @@ mod tests {
             make_sstore_log("2", "cc", 85000),
         ]);
         let addr = test_estimator_address();
-        let result1 = analyze_trace_inner(&trace1, &addr, None).unwrap();
-        let result2 = analyze_trace_inner(&trace2, &addr, None).unwrap();
+        let caller = test_caller_address();
+        let result1 = analyze_trace_inner(&trace1, &addr, &caller, None).unwrap();
+        let result2 = analyze_trace_inner(&trace2, &addr, &caller, None).unwrap();
         // Each call uses a fresh CacheDB, so results should differ
         assert_eq!(result1.state_update_count, 1);
         assert_eq!(result2.state_update_count, 2);

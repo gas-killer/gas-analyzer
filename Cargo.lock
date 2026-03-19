@@ -3296,6 +3296,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-dyn-abi",
  "alloy-primitives",
+ "alloy-sol-types",
  "anyhow",
  "gas-analyzer-core",
  "getrandom 0.2.16",
