@@ -1,7 +1,7 @@
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
-use alloy_provider::network::AnyNetwork;
 use alloy_provider::RootProvider;
+use alloy_provider::network::AnyNetwork;
 use revm::database_interface::{DBErrorMarker, DatabaseRef};
 use revm::state::{AccountInfo, Bytecode};
 
@@ -63,14 +63,21 @@ impl DatabaseRef for SimpleRpcDb {
                     .map_err(|e| format!("get_code_at failed for {address}: {e}"))?;
                 let bytecode = Bytecode::new_raw(code_bytes);
                 let code_hash = bytecode.hash_slow();
-                Ok(Some(AccountInfo { balance, nonce, code_hash, code: Some(bytecode) }))
+                Ok(Some(AccountInfo {
+                    balance,
+                    nonce,
+                    code_hash,
+                    code: Some(bytecode),
+                }))
             })
         })
     }
 
     fn code_by_hash_ref(&self, _: B256) -> Result<Bytecode, Self::Error> {
         // Code is always inlined in basic_ref; this should never be called.
-        Err("code_by_hash_ref not supported by SimpleRpcDb".to_string().into())
+        Err("code_by_hash_ref not supported by SimpleRpcDb"
+            .to_string()
+            .into())
     }
 
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
