@@ -3320,6 +3320,7 @@ dependencies = [
  "revm 31.0.2",
  "sp1-cc-client-executor",
  "sp1-cc-host-executor",
+ "tokio",
  "url",
 ]
 
