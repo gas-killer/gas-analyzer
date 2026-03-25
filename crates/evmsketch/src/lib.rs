@@ -24,6 +24,9 @@ use sp1_cc_host_executor::EvmSketch;
 use std::collections::HashSet;
 use url::Url;
 
+pub mod simple_rpc_db;
+use simple_rpc_db::SimpleRpcDb;
+
 use gas_analyzer_core::{
     Opcode, StateUpdate, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_operations, extract_operation_counts_from_trace,
@@ -234,14 +237,23 @@ impl GasKillerEvmSketchDefault {
 
     /// Estimate gas for state changes by actually executing them.
     ///
-    /// Delegates to the shared gas-analyzer-estimator crate.
+    /// Delegates to the shared gas-analyzer-estimator crate using a `SimpleRpcDb`
+    /// backed by standard RPC calls (`eth_getStorageAt`, `eth_getBalance`, etc.)
+    /// instead of sp1-cc's `BasicRpcDb` which requires `eth_getProof`. This avoids
+    /// the "proof window" limitation on Reth and other nodes.
     pub fn estimate_state_changes_gas(
         &self,
         contract_address: Address,
         caller_address: Address,
         state_updates: &[StateUpdate],
     ) -> Result<u64> {
-        let mut cache_db = CacheDB::new(&self.executor.sketch.rpc_db);
+        // Use block_number - 1 (pre-transaction state), matching the Anvil path.
+        let state_block = self.executor.anchor_block_number().saturating_sub(1);
+        let simple_db = SimpleRpcDb {
+            provider: self.executor.sketch.provider.clone(),
+            block_number: state_block,
+        };
+        let mut cache_db = CacheDB::new(simple_db);
         let sim_env = self.executor.sim_env();
         gas_analyzer_estimator::estimate_state_changes_gas(
             &mut cache_db,

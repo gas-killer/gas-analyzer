@@ -11,6 +11,7 @@ alloy = { version = "1.0.37", features = ["rpc", "rpc-types"] }
 alloy-eips = "1.0.37"
 alloy-provider = { version = "1.0.37", features = ["debug-api"] }
 anyhow = "1.0.98"
+tokio = { version = "1", features = ["rt"] }
 url = "2.5.4"
 reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1" }
 revm = { version = "31.0.1" }
