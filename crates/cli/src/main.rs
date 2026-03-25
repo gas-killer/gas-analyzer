@@ -16,6 +16,7 @@ enum Commands {
 struct CliArgs {
     command: Option<Commands>,
     use_anvil: bool,
+    debug: bool,
 }
 
 fn parse_args() -> CliArgs {
@@ -23,6 +24,9 @@ fn parse_args() -> CliArgs {
 
     // Check for --anvil flag
     let use_anvil = args.iter().any(|a| a == "--anvil" || a == "--legacy");
+
+    // Check for --debug flag
+    let debug = args.iter().any(|a| a == "--debug");
 
     // Filter out flags to get positional args
     let positional: Vec<&str> = args
@@ -44,7 +48,11 @@ fn parse_args() -> CliArgs {
         }
     };
 
-    CliArgs { command, use_anvil }
+    CliArgs {
+        command,
+        use_anvil,
+        debug,
+    }
 }
 
 #[tokio::main]
@@ -52,9 +60,14 @@ async fn main() {
     dotenv::dotenv().ok();
     let cli_args = parse_args();
 
+    let debug = cli_args.debug;
     let result = execute_command(cli_args).await;
     if let Err(e) = result {
-        println!("{}", format!("{e:?}").red());
+        if debug {
+            println!("{}", format!("{e:?}").red());
+        } else {
+            println!("{}", format!("{e}").red());
+        }
     }
 }
 
@@ -174,13 +187,17 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                                     "Warning: Trace extraction failed, using fallback heuristic estimation"
                                         .yellow()
                                 );
-                                println!(
-                                    "   Reason: {}",
-                                    format!("{}", e)
-                                        .split('\n')
-                                        .next()
-                                        .unwrap_or("Unknown error")
-                                );
+                                if cli_args.debug {
+                                    println!("   Reason: {e:?}");
+                                } else {
+                                    println!(
+                                        "   Reason: {}",
+                                        format!("{e}")
+                                            .split('\n')
+                                            .next()
+                                            .unwrap_or("Unknown error")
+                                    );
+                                }
 
                                 // Return empty state updates and use fallback heuristic
                                 (Vec::new(), std::collections::HashSet::new(), 0, true)
@@ -250,12 +267,15 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     match gk.estimate_state_changes_gas(contract_address, tx_sender, &state_updates)
                     {
                         Ok(gas) => (gas + TURETZKY_UPPER_GAS_LIMIT, false),
-                        Err(_) => {
+                        Err(e) => {
                             // Fall back to heuristic estimation
                             println!(
                                 "{}",
                                 "Warning: Measured gas estimation failed, using heuristic".yellow()
                             );
+                            if cli_args.debug {
+                                println!("   Reason: {e:?}");
+                            }
                             let heuristic =
                                 estimate_gas_from_state_updates(&state_updates, call_gas_total);
                             (heuristic + TURETZKY_UPPER_GAS_LIMIT, true)
@@ -339,6 +359,10 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             println!(
                 "  {} Use Anvil-based implementation (requires --features anvil)",
                 "--anvil".bold()
+            );
+            println!(
+                "  {} Print full error details including RPC errors",
+                "--debug".bold()
             );
             println!("\nExamples:\n");
             println!("  # Default (EvmSketch - Anvil-free):");
