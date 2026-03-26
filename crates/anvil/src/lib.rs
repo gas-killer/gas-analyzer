@@ -46,8 +46,9 @@ use url::Url;
 /// Compute the isolated storage slot for the implementation address.
 /// Mirrors the Solidity constant: `keccak256("gas.estimator.implementation") - 1`
 fn impl_slot() -> U256 {
-    U256::from_be_bytes(*alloy::primitives::keccak256("gas.estimator.implementation"))
-        - U256::from(1)
+    U256::from_be_bytes(*alloy::primitives::keccak256(
+        "gas.estimator.implementation",
+    )) - U256::from(1)
 }
 
 use gas_analyzer_core::{
