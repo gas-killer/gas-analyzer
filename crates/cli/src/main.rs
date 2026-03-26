@@ -149,7 +149,15 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     report.gas_savings, report.percent_savings
                 );
                 if let Some(error) = &report.error_log {
-                    println!("{}: {}", "Error".red(), error);
+                    if cli_args.debug {
+                        println!("{}: {}", "Error".red(), error);
+                    } else {
+                        println!(
+                            "{}: {}",
+                            "Error".red(),
+                            error.split('\n').next().unwrap_or("Unknown error")
+                        );
+                    }
                 }
 
                 return Ok(());
