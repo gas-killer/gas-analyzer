@@ -13,7 +13,7 @@ use alloy_primitives::{Address, B256, Bytes, U256};
 use anyhow::{Result, anyhow};
 use revm::context::result::ExecutionResult;
 use revm::database::CacheDB;
-use revm::state::{AccountInfo, Bytecode};
+use revm::state::AccountInfo;
 
 use gas_analyzer_core::encoding::encode_state_updates_to_sol;
 use gas_analyzer_core::types::StateUpdate;
@@ -36,20 +36,26 @@ pub struct SimEnvOpts {
 /// Embedded ABI JSON for StateChangeHandlerGasEstimator - loaded at compile time
 const ESTIMATOR_ABI_JSON: &str = include_str!("../../../abis/StateChangeHandlerGasEstimator.json");
 
-/// Load the StateChangeHandlerGasEstimator deployed bytecode from the embedded JSON.
+/// Compute the isolated storage slot for the implementation address.
+/// Mirrors the Solidity constant: `keccak256("gas.estimator.implementation") - 1`
+fn impl_slot() -> U256 {
+    U256::from_be_bytes(*alloy_primitives::keccak256("gas.estimator.implementation"))
+        - U256::from(1)
+}
+
+/// Load the StateChangeHandlerGasEstimator deployed bytecode from the embedded artifact.
 fn load_estimator_bytecode() -> Result<Vec<u8>> {
     let json: serde_json::Value = serde_json::from_str(ESTIMATOR_ABI_JSON)
         .map_err(|e| anyhow!("Failed to parse embedded JSON: {}", e))?;
 
     let bytecode_hex = json
         .get("deployedBytecode")
-        .and_then(|v| v.get("object"))
+        .and_then(|d| d.get("object"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("Missing 'deployedBytecode.object' in JSON"))?;
 
     let bytecode_hex = bytecode_hex.strip_prefix("0x").unwrap_or(bytecode_hex);
-
-    hex::decode(bytecode_hex).map_err(|e| anyhow!("Failed to decode estimator bytecode: {}", e))
+    hex::decode(bytecode_hex).map_err(|e| anyhow!("Failed to decode bytecode: {}", e))
 }
 
 /// Build the calldata for `runStateUpdatesCall(uint8[], bytes[])` from state updates.
@@ -107,29 +113,59 @@ where
     DB: revm::database_interface::DatabaseRef,
     <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
 {
-    let bytecode_bytes = load_estimator_bytecode()?;
-
-    // Inject the contract bytecode at the target address
-    let account_info = AccountInfo {
-        balance: U256::from(1_000_000_000_000_000_000_000_000u128), // 1M ETH
-        nonce: 0,
-        code_hash: B256::ZERO,
-        code: Some(Bytecode::new_raw(bytecode_bytes.into())),
-    };
-    cache_db.insert_account_info(contract_address, account_info);
-
-    // Also give the caller plenty of balance
-    let caller_info = AccountInfo {
-        balance: U256::from(1_000_000_000_000_000_000_000_000u128),
-        nonce: 0,
-        code_hash: B256::ZERO,
-        code: None,
-    };
-    cache_db.insert_account_info(caller_address, caller_info);
-
     // Build and execute via revm directly
     use revm::context::{Context, TxEnv};
+    use revm::database_interface::DatabaseRef;
     use revm::{ExecuteEvm, MainBuilder, MainContext};
+
+    // ── Inject the proxy at contract_address ────────────────────────────────
+    //
+    // StateChangeHandlerGasEstimator routes:
+    //   runStateUpdatesCall → own logic
+    //   anything else       → DELEGATECALL to `implementation` (= backup_addr)
+    //
+    // We stash the original contract bytecode at a synthetic backup_addr so
+    // that external protocols (e.g. oracles) can callback into contract_address
+    // during a state-update CALL and get valid responses through the fallback().
+    //
+    // The implementation address is stored in an EIP-1967-style isolated storage
+    // slot (keccak256("gas.estimator.implementation") - 1), written directly via
+    // insert_account_storage — no constructor execution needed.
+    let backup_addr = Address::from([0xba; 20]);
+
+    let original_account = cache_db
+        .basic_ref(contract_address)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    if let Some(code) = original_account.code {
+        cache_db.insert_account_info(
+            backup_addr,
+            AccountInfo {
+                balance: U256::ZERO,
+                nonce: 0,
+                code_hash: B256::ZERO,
+                code: Some(code),
+            },
+        );
+    }
+
+    let proxy_bytes = load_estimator_bytecode()?;
+    cache_db.insert_account_info(
+        contract_address,
+        AccountInfo {
+            balance: original_account.balance,
+            nonce: 0,
+            code_hash: B256::ZERO,
+            code: Some(revm::state::Bytecode::new_raw(proxy_bytes.into())),
+        },
+    );
+
+    let backup_addr_u256 = U256::from_be_slice(backup_addr.as_slice());
+    cache_db
+        .insert_account_storage(contract_address, impl_slot(), backup_addr_u256)
+        .map_err(|e| anyhow!("Failed to write IMPL_SLOT: {:?}", e))?;
 
     let ctx = Context::mainnet()
         .with_db(&mut *cache_db)
