@@ -673,10 +673,7 @@ pub struct StateUpdateReport {
 mod tests {
     use super::*;
     use gas_analyzer_core::constants::*;
-    use gas_analyzer_core::{
-        IStateUpdateTypes, StateUpdateType, decode_state_updates_tuple,
-        encode_state_updates_to_sol,
-    };
+    use gas_analyzer_core::{IStateUpdateTypes, StateUpdateType, encode_state_updates_to_sol};
 
     // Local sol! with #[sol(rpc)] for test that needs SimpleStorageInstance
     alloy::sol! {
@@ -686,8 +683,50 @@ mod tests {
         }
     }
     use alloy::primitives::{U256, address, b256, bytes};
+    use anyhow::bail;
     use csv::Writer;
     use std::fs::File;
+
+    /// Decode (uint256[], bytes[]) ABI tuple used for state update transport
+    fn decode_state_updates_tuple(data: &[u8]) -> Result<(Vec<U256>, Vec<Bytes>)> {
+        fn read_u256_as_usize(word: &[u8]) -> usize {
+            let mut buf = [0u8; 16];
+            let copy_len = word.len().min(16);
+            buf[16 - copy_len..].copy_from_slice(&word[word.len() - copy_len..]);
+            u128::from_be_bytes(buf) as usize
+        }
+
+        fn get(data: &[u8], start: usize, len: usize) -> Result<&[u8]> {
+            if start + len > data.len() {
+                bail!("slice {}..{} of {}", start, start + len, data.len());
+            }
+            Ok(&data[start..start + len])
+        }
+
+        let types_offset = read_u256_as_usize(get(data, 0, 32)?);
+        let data_offset = read_u256_as_usize(get(data, 32, 32)?);
+
+        // types: uint256[]
+        let n_types = read_u256_as_usize(get(data, types_offset, 32)?);
+        let mut types = Vec::with_capacity(n_types);
+        for i in 0..n_types {
+            let word = get(data, types_offset + 32 + i * 32, 32)?;
+            types.push(U256::from_be_slice(word));
+        }
+
+        // data: bytes[]
+        let n_data = read_u256_as_usize(get(data, data_offset, 32)?);
+        let head = data_offset + 32;
+        let mut out = Vec::with_capacity(n_data);
+        for i in 0..n_data {
+            let rel = read_u256_as_usize(get(data, head + i * 32, 32)?);
+            let start = head + rel;
+            let len = read_u256_as_usize(get(data, start, 32)?);
+            out.push(Bytes::copy_from_slice(get(data, start + 32, len)?));
+        }
+
+        Ok((types, out))
+    }
 
     #[test]
     fn test_stateupdatetype_tuple_encoding() -> Result<()> {
