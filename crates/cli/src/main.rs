@@ -1,5 +1,5 @@
-use alloy::{hex, providers::ProviderBuilder};
 use alloy::sol_types::SolError;
+use alloy::{hex, providers::ProviderBuilder};
 use alloy_provider::Provider;
 use anyhow::Result;
 use colored::Colorize;
@@ -309,9 +309,15 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                                     );
                                     if cli_args.debug {
                                         if !ctx.revertData.is_empty() {
-                                            println!("   Revert data: 0x{}", hex::encode(&ctx.revertData));
+                                            println!(
+                                                "   Revert data: 0x{}",
+                                                hex::encode(&ctx.revertData)
+                                            );
                                         }
-                                        println!("   Call args:   0x{}", hex::encode(&ctx.callargs));
+                                        println!(
+                                            "   Call args:   0x{}",
+                                            hex::encode(&ctx.callargs)
+                                        );
                                     }
                                 }
                                 None => {
