@@ -66,7 +66,7 @@ pub fn append_state_update_from_struct_log(
     };
 
     match struct_log.op.as_ref() {
-        "CREATE" | "CREATE2" | "SELFDESTRUCT" => {
+        "CREATE" | "CREATE2" | "SELFDESTRUCT" | "TSTORE" => {
             return Ok(Some(struct_log.op.to_string()));
         }
         "DELEGATECALL" | "CALLCODE" => {
