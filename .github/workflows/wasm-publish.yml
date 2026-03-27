@@ -33,7 +33,7 @@ jobs:
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       - name: Build WASM package
-        run: wasm-pack build crates/wasm --target web --release --scope breadchaincoop
+        run: wasm-pack build crates/wasm --target web --release --scope ${{ github.repository_owner }}
 
       - name: Set up npm auth
         run: echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" >> ~/.npmrc
@@ -42,7 +42,9 @@ jobs:
         run: |
           cd crates/wasm/pkg
           SHORT_SHA=$(git rev-parse --short HEAD)
-          jq --arg sha "$SHORT_SHA" '.version = .version + "-" + $sha | . + {"publishConfig": {"registry": "https://npm.pkg.github.com"}, "repository": {"type": "git", "url": "https://github.com/BreadchainCoop/gas-killer-analyzer.git"}}' package.json > package.tmp.json
+          jq --arg sha "$SHORT_SHA" --arg repo "https://github.com/${{ github.repository }}.git" \
+            '.version = .version + "-" + $sha | . + {"publishConfig": {"registry": "https://npm.pkg.github.com"}, "repository": {"type": "git", "url": $repo}}' \
+            package.json > package.tmp.json
           mv package.tmp.json package.json
 
       - name: Publish to GitHub Packages
