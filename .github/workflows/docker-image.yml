@@ -49,8 +49,8 @@ jobs:
 
           echo "Building ${NAME}:${TAG} and ${NAME}:${TAG}-${SHORT}"
           docker build \
-            --label breadchaincoop.gas-analyzer.image.revision="${GITHUB_SHA}" \
-            --label breadchaincoop.gas-analyzer.image.source="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "${GITHUB_REPOSITORY_OWNER}.gas-analyzer.image.revision=${GITHUB_SHA}" \
+            --label "${GITHUB_REPOSITORY_OWNER}.gas-analyzer.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
             -t "${NAME}:${TAG}" \
             -t "${NAME}:${TAG}-${SHORT}" \
             .
