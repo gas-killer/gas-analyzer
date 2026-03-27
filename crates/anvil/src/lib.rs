@@ -43,6 +43,14 @@ use foundry_evm_traces::identifier::SignaturesIdentifier;
 use serde::Serialize;
 use url::Url;
 
+/// Compute the isolated storage slot for the implementation address.
+/// Mirrors the Solidity constant: `keccak256("gas.estimator.implementation") - 1`
+fn impl_slot() -> U256 {
+    U256::from_be_bytes(*alloy::primitives::keccak256(
+        "gas.estimator.implementation",
+    )) - U256::from(1)
+}
+
 use gas_analyzer_core::{
     Opcode, RevertingContext, StateUpdate, TURETZKY_UPPER_GAS_LIMIT, compute_state_updates,
     encode_state_updates_to_abi, encode_state_updates_to_sol,
@@ -200,7 +208,11 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
             .wallet(signer)
             .connect_http(anvil.endpoint_url());
 
-        let contract = StateChangeHandlerGasEstimator::deploy(provider.clone()).await?;
+        let contract = StateChangeHandlerGasEstimator::deploy(
+            provider.clone(),
+            alloy::primitives::Address::ZERO,
+        )
+        .await?;
         let address = *contract.address();
         let code = provider.get_code_at(address).await?;
 
@@ -238,17 +250,29 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
         let initial_block_number = self.provider.get_block_number().await?;
         let snapshot_id: U256 = self.provider.raw_request("evm_snapshot".into(), ()).await?;
         let original_code = self.provider.get_code_at(contract_address).await?;
+
+        // Stash the original bytecode at a synthetic backup address so the proxy's
+        // fallback can DELEGATECALL to it when external protocols (oracles, AMMs)
+        // callback into contract_address during a state-update CALL.
+        let backup_addr = Address::from([0xba; 20]);
+        self.provider
+            .anvil_set_code(backup_addr, original_code.clone())
+            .await?;
+
+        // Inject the proxy (estimator) at contract_address.
         self.provider
             .anvil_set_code(contract_address, self.code.clone())
             .await?;
-        let target_contract = StateChangeHandlerGasEstimator::new(contract_address, &self.provider);
 
+        // Write backup_addr into the isolated IMPL_SLOT so the proxy's fallback
+        // can find it. Slot = keccak256("gas.estimator.implementation") - 1.
+        let backup_addr_b256 =
+            alloy::primitives::B256::from(U256::from_be_slice(backup_addr.as_slice()));
         self.provider
-            .anvil_set_balance(
-                contract_address,
-                U256::from(100000000000000000000000000000u128),
-            )
+            .anvil_set_storage_at(contract_address, impl_slot(), backup_addr_b256)
             .await?;
+
+        let target_contract = StateChangeHandlerGasEstimator::new(contract_address, &self.provider);
 
         let (types, args) = encode_state_updates_to_sol(state_updates);
         let types = types.iter().map(|x| *x as u8).collect::<Vec<_>>();
@@ -842,8 +866,7 @@ mod tests {
             Err(e) => e.to_string(),
         };
 
-        // cast sig "RevertingContext(address,bytes)"
-        assert!(error_msg.contains("custom error 0xaa86ecee"));
+        assert!(error_msg.contains("Simulation subcontext reverted"));
 
         Ok(())
     }
