@@ -97,7 +97,7 @@ pub fn analyze_trace_inner(
 
     let (gas_estimate, is_heuristic) =
         match estimate_state_changes_gas(&mut cache_db, addr, caller, &state_updates, &sim_env) {
-            Ok(gas) => (gas, false),
+            Ok(result) => (result.gas_used, false),
             Err(_) => (
                 estimate_gas_from_state_updates(&state_updates, call_gas_total),
                 true,

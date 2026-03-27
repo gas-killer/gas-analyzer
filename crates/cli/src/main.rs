@@ -228,7 +228,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 };
                 use gas_analyzer_evmsketch::GasKillerEvmSketchDefault;
 
-                let (gas_estimate, is_heuristic) = if use_fallback || state_updates.is_empty() {
+                let (gas_estimate, is_heuristic, had_reentrancy) = if use_fallback || state_updates.is_empty() {
                     // Use heuristic estimation when trace extraction failed or no state updates
                     let gk = GasKillerEvmSketchDefault::builder(rpc_url.clone())
                         .at_block(BlockNumberOrTag::Number(block_number))
@@ -257,7 +257,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                             return Err(anyhow::Error::msg(msg));
                         }
                     };
-                    (fallback_estimate + TURETZKY_UPPER_GAS_LIMIT, true)
+                    (fallback_estimate + TURETZKY_UPPER_GAS_LIMIT, true, false)
                 } else {
                     // Normal path: try measured gas estimation using extracted state updates
                     // Get the contract address from the receipt
@@ -274,7 +274,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     // Try measured gas estimation first
                     match gk.estimate_state_changes_gas(contract_address, tx_sender, &state_updates)
                     {
-                        Ok(gas) => (gas + TURETZKY_UPPER_GAS_LIMIT, false),
+                        Ok(result) => (result.gas_used + TURETZKY_UPPER_GAS_LIMIT, false, result.had_reentrancy),
                         Err(e) => {
                             // Fall back to heuristic estimation
                             println!(
@@ -286,7 +286,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                             }
                             let heuristic =
                                 estimate_gas_from_state_updates(&state_updates, call_gas_total);
-                            (heuristic + TURETZKY_UPPER_GAS_LIMIT, true)
+                            (heuristic + TURETZKY_UPPER_GAS_LIMIT, true, false)
                         }
                     }
                 };
@@ -332,6 +332,12 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     "(measured via StateChangeHandler)".cyan()
                 };
                 println!("GasKiller gas estimate: {} {}", gas_estimate, estimate_type);
+                if had_reentrancy {
+                    println!(
+                        "Reentrancy detected: {}",
+                        "yes (contract was called back during state updates)".yellow()
+                    );
+                }
                 println!("Gas savings: {} ({:.2}%)", gas_savings, percent_savings);
             }
 

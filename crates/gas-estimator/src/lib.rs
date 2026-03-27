@@ -18,6 +18,15 @@ use revm::state::AccountInfo;
 use gas_analyzer_core::encoding::encode_state_updates_to_sol;
 use gas_analyzer_core::types::StateUpdate;
 
+/// Result of a gas estimation execution.
+#[derive(Clone, Debug)]
+pub struct GasEstimateResult {
+    pub gas_used: u64,
+    /// Whether the fallback was called during `runStateUpdatesCall`, indicating
+    /// that an external protocol called back into the contract (reentrancy).
+    pub had_reentrancy: bool,
+}
+
 /// Environment fields for the gas estimation simulation.
 ///
 /// These are set on revm's `BlockEnv` and `TxEnv` so that contracts reading
@@ -41,6 +50,12 @@ const ESTIMATOR_ABI_JSON: &str = include_str!("../../../abis/StateChangeHandlerG
 fn impl_slot() -> U256 {
     U256::from_be_bytes(*alloy_primitives::keccak256("gas.estimator.implementation"))
         - U256::from(1)
+}
+
+/// Compute the isolated storage slot for the reentrancy check flag.
+/// Mirrors the Solidity constant: `keccak256("gas.estimator.reentrancy") - 1`
+fn reentrancy_check_slot() -> U256 {
+    U256::from_be_bytes(*alloy_primitives::keccak256("gas.estimator.reentrancy")) - U256::from(1)
 }
 
 /// Load the StateChangeHandlerGasEstimator deployed bytecode from the embedded artifact.
@@ -108,7 +123,7 @@ pub fn estimate_gas_raw<DB>(
     caller_address: Address,
     calldata: Bytes,
     sim_env: &SimEnvOpts,
-) -> Result<u64>
+) -> Result<GasEstimateResult>
 where
     DB: revm::database_interface::DatabaseRef,
     <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
@@ -202,7 +217,21 @@ where
         .map_err(|e| anyhow!("Gas estimation failed: {:?}", e))?;
 
     match result.result {
-        ExecutionResult::Success { gas_used, .. } => Ok(gas_used),
+        ExecutionResult::Success { gas_used, .. } => {
+            // Check REENTRANCY_CHECK_SLOT in the execution state to determine
+            // if the fallback was called during runStateUpdatesCall
+            let had_reentrancy = result
+                .state
+                .get(&contract_address)
+                .and_then(|account| account.storage.get(&reentrancy_check_slot()))
+                .map(|slot| !slot.present_value.is_zero())
+                .unwrap_or(false);
+
+            Ok(GasEstimateResult {
+                gas_used,
+                had_reentrancy,
+            })
+        }
         ExecutionResult::Revert {
             output, gas_used, ..
         } => Err(anyhow!(
@@ -237,7 +266,7 @@ pub fn estimate_state_changes_gas<DB>(
     caller_address: Address,
     state_updates: &[StateUpdate],
     sim_env: &SimEnvOpts,
-) -> Result<u64>
+) -> Result<GasEstimateResult>
 where
     DB: revm::database_interface::DatabaseRef,
     <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,

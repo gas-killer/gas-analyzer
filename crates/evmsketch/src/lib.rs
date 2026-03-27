@@ -31,7 +31,7 @@ use gas_analyzer_core::{
     Opcode, StateUpdate, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_operations, extract_operation_counts_from_trace,
 };
-use gas_analyzer_estimator::SimEnvOpts;
+use gas_analyzer_estimator::{GasEstimateResult, SimEnvOpts};
 use gas_analyzer_rpc::get_trace_from_call;
 
 // ============================================================================
@@ -138,7 +138,7 @@ impl DefaultEvmSketchExecutor {
         caller_address: Address,
         calldata: Bytes,
         gas_price: u128,
-    ) -> Result<u64> {
+    ) -> Result<GasEstimateResult> {
         let mut cache_db = CacheDB::new(&self.sketch.rpc_db);
         let mut sim_env = self.sim_env();
         sim_env.gas_price = gas_price;
@@ -246,7 +246,7 @@ impl GasKillerEvmSketchDefault {
         contract_address: Address,
         caller_address: Address,
         state_updates: &[StateUpdate],
-    ) -> Result<u64> {
+    ) -> Result<GasEstimateResult> {
         // Use block_number - 1 (pre-transaction state), matching the Anvil path.
         let state_block = self.executor.anchor_block_number().saturating_sub(1);
         let simple_db = SimpleRpcDb {
@@ -302,12 +302,12 @@ impl GasKillerEvmSketchDefault {
 /// analysis without Anvil.
 ///
 /// # Returns
-/// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`
+/// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes, had_reentrancy)`
 pub async fn call_to_encoded_state_updates_with_evmsketch(
     rpc_url: impl AsRef<str>,
     tx_request: TransactionRequest,
     block: BlockNumberOrTag,
-) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
+) -> Result<(Bytes, u64, bool, HashSet<Opcode>, bool)> {
     let rpc_url = rpc_url.as_ref();
     let url = Url::parse(rpc_url).map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
 
@@ -332,10 +332,16 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
         .at_block(block)
         .build()
         .await?;
-    let gas_estimate =
+    let result =
         gk.estimate_state_changes_gas(contract_address, caller_address, &state_updates)?;
 
-    Ok((storage_updates, gas_estimate, false, skipped_opcodes))
+    Ok((
+        storage_updates,
+        result.gas_used,
+        false,
+        skipped_opcodes,
+        result.had_reentrancy,
+    ))
 }
 
 // ============================================================================
