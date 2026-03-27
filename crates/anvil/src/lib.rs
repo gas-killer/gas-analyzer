@@ -673,7 +673,10 @@ pub struct StateUpdateReport {
 mod tests {
     use super::*;
     use gas_analyzer_core::constants::*;
-    use gas_analyzer_core::{IStateUpdateTypes, StateUpdateType, decode_state_updates_tuple};
+    use gas_analyzer_core::{
+        IStateUpdateTypes, StateUpdateType, decode_state_updates_tuple,
+        encode_state_updates_to_sol,
+    };
 
     // Local sol! with #[sol(rpc)] for test that needs SimpleStorageInstance
     alloy::sol! {
@@ -709,7 +712,14 @@ mod tests {
             types,
             vec![U256::from(0u8), U256::from(2u8), U256::from(3u8),]
         );
-        assert_eq!(data.len(), 3);
+        let (_, expected_data) = encode_state_updates_to_sol(&state_updates);
+        assert_eq!(data.len(), expected_data.len());
+        for (i, (decoded, expected)) in data.iter().zip(expected_data.iter()).enumerate() {
+            assert_eq!(
+                decoded, expected,
+                "data[{i}] mismatch: decoded bytes don't match encoded input"
+            );
+        }
         Ok(())
     }
 
@@ -738,6 +748,15 @@ mod tests {
         assert_eq!(types[0], U256::from(StateUpdateType::STORE as u8));
         assert_eq!(types[1], U256::from(StateUpdateType::LOG0 as u8));
         assert_eq!(types[2], U256::from(StateUpdateType::LOG1 as u8));
+
+        // Verify decoded data matches the original ABI-encoded state updates
+        let (_, expected_data) = encode_state_updates_to_sol(&state_updates);
+        for (i, (decoded, expected)) in data.iter().zip(expected_data.iter()).enumerate() {
+            assert_eq!(
+                decoded, expected,
+                "data[{i}] mismatch: decoded bytes don't match encoded input"
+            );
+        }
 
         // Verify the encoding doesn't start with 0x20 (the extra wrapper)
         // The first 32 bytes should be 0x40 (offset to types[]), not 0x20
