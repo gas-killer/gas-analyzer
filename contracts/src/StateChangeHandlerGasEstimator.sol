@@ -60,7 +60,7 @@ contract StateChangeHandlerGasEstimator {
     /// @dev Forward any unknown selector to the original implementation via DELEGATECALL.
     fallback() external payable {
         assembly {
-            sload(REENTRANCY_CHECK_SLOT)  // load slot so in the end of `runStateUpdatesCall`
+            sload(REENTRANCY_CHECK_SLOT)  // load slot so in the end of `runStateUpdatesCall` gas introspection detects if it has been read
             let impl := sload(IMPL_SLOT)
             calldatacopy(0, 0, calldatasize())
             let success := delegatecall(gas(), impl, 0, calldatasize(), 0, 0)
