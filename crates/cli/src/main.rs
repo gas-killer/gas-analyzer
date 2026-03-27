@@ -62,9 +62,13 @@ fn parse_args() -> CliArgs {
         match input_type {
             "t" | "tx" => Some(Commands::Transaction(value)),
             "r" | "request" => Some(Commands::Request(value)),
+            "d" | "debug" => Some(Commands::Transaction(value)),
             _ => None,
         }
     };
+
+    // `debug <hash>` is an alias for `t <hash> --debug`
+    let debug = debug || positional.get(1).map_or(false, |s| *s == "debug");
 
     CliArgs {
         command,
@@ -411,6 +415,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             println!("Gas Killer Analyzer\n");
             println!("Usage:\n");
             println!("  {} for accepted transactions", "t/tx <HASH>".bold());
+            println!("  {} alias for t <HASH> --debug", "debug <HASH>".bold());
             println!(
                 "  {} for transaction requests",
                 "r/request <JSON_FILE>".bold()
