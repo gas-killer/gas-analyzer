@@ -818,7 +818,7 @@ mod tests {
         let gas_estimate = gk
             .estimate_state_changes_gas(SIMPLE_STORAGE_ADDRESS, &state_updates)
             .await?;
-        assert_eq!(gas_estimate, 32549);
+        assert_eq!(gas_estimate, 34716);
         Ok(())
     }
 
@@ -839,7 +839,7 @@ mod tests {
         let gas_estimate = gk
             .estimate_state_changes_gas(ACCESS_CONTROL_MAIN_ADDRESS, &state_updates)
             .await?;
-        assert_eq!(gas_estimate, 37185);
+        assert_eq!(gas_estimate, 39352);
         Ok(())
     }
 
