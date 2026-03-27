@@ -36,17 +36,17 @@ contract StateChangeHandlerGasEstimator {
     function runStateUpdatesCall(StateUpdateType[] memory types, bytes[] memory args) external {
         StateChangeHandlerLib._runStateUpdates(types, args);
 
-        // cold sload: 2000
-        // hot sload: 100
-        // if gas diff is less than 2000 than guaranteed it was a hot slot
-        uint256 gasBefore = gas();
+        // cold sload: 2100 gas, hot sload: 100 gas
+        // if gas diff is less than 2000 then guaranteed it was a hot slot,
+        // meaning the fallback already loaded it (reentrancy happened)
         assembly {
-            sload(REENTRANCY_CHECK_SLOT)
-        }
-        uint256 gasAfter = gas();
-        if (gasBefore - gasAfter < 2000) {
-            assembly {
-                sstore(REENTRANCY_CHECK_SLOT, 1)
+            let gasBefore := gas()
+            let val := sload(REENTRANCY_CHECK_SLOT)
+            let gasAfter := gas()
+            if lt(sub(gasBefore, gasAfter), 2000) {
+                // or(1, val) == 1 in practice, but referencing val prevents
+                // the optimizer from eliminating the sload above
+                sstore(REENTRANCY_CHECK_SLOT, or(1, val))
             }
         }
     }
@@ -60,7 +60,9 @@ contract StateChangeHandlerGasEstimator {
     /// @dev Forward any unknown selector to the original implementation via DELEGATECALL.
     fallback() external payable {
         assembly {
-            sload(REENTRANCY_CHECK_SLOT)  // load slot so in the end of `runStateUpdatesCall` gas introspection detects if it has been read
+            // Load REENTRANCY_CHECK_SLOT to warm it for gas introspection in runStateUpdatesCall.
+            // The result is written to scratch memory so the optimizer cannot remove the sload.
+            mstore(0x40, sload(REENTRANCY_CHECK_SLOT))
             let impl := sload(IMPL_SLOT)
             calldatacopy(0, 0, calldatasize())
             let success := delegatecall(gas(), impl, 0, calldatasize(), 0, 0)
