@@ -228,7 +228,9 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 };
                 use gas_analyzer_evmsketch::GasKillerEvmSketchDefault;
 
-                let (gas_estimate, is_heuristic, had_reentrancy) = if use_fallback || state_updates.is_empty() {
+                let (gas_estimate, is_heuristic, had_reentrancy) = if use_fallback
+                    || state_updates.is_empty()
+                {
                     // Use heuristic estimation when trace extraction failed or no state updates
                     let gk = GasKillerEvmSketchDefault::builder(rpc_url.clone())
                         .at_block(BlockNumberOrTag::Number(block_number))
@@ -274,7 +276,11 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     // Try measured gas estimation first
                     match gk.estimate_state_changes_gas(contract_address, tx_sender, &state_updates)
                     {
-                        Ok(result) => (result.gas_used + TURETZKY_UPPER_GAS_LIMIT, false, result.had_reentrancy),
+                        Ok(result) => (
+                            result.gas_used + TURETZKY_UPPER_GAS_LIMIT,
+                            false,
+                            result.had_reentrancy,
+                        ),
                         Err(e) => {
                             // Fall back to heuristic estimation
                             println!(
