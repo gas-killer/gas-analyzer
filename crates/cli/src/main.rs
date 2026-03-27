@@ -68,7 +68,10 @@ fn parse_args() -> CliArgs {
     };
 
     // `debug <hash>` is an alias for `t <hash> --debug`
-    let debug = debug || positional.get(1).map_or(false, |s| *s == "debug");
+    let debug = debug
+        || positional
+            .get(1)
+            .is_some_and(|s| *s == "debug" || *s == "d");
 
     CliArgs {
         command,
