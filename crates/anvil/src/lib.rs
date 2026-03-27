@@ -866,8 +866,7 @@ mod tests {
             Err(e) => e.to_string(),
         };
 
-        // cast sig "RevertingContext(address,bytes)"
-        assert!(error_msg.contains("custom error 0xaa86ecee"));
+        assert!(error_msg.contains("Simulation subcontext reverted"));
 
         Ok(())
     }
