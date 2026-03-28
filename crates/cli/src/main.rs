@@ -1,9 +1,27 @@
+use alloy::sol_types::SolError;
 use alloy::{hex, providers::ProviderBuilder};
 use alloy_provider::Provider;
 use anyhow::Result;
 use colored::Colorize;
+use gas_analyzer_core::RevertingContext;
 use std::env;
 use url::Url;
+
+/// Try to decode a `RevertingContext` error from an anyhow error.
+///
+/// Looks for hex-encoded revert data in the error message (the format revm
+/// produces: "Gas estimation reverted (gas: N): 0x...") and attempts to
+/// ABI-decode it as a `RevertingContext`.
+fn decode_reverting_context(e: &anyhow::Error) -> Option<RevertingContext> {
+    let msg = format!("{e:?}");
+    let hex_start = msg.rfind("0x")?;
+    let hex_body = &msg[hex_start + 2..];
+    let hex_end = hex_body
+        .find(|c: char| !c.is_ascii_hexdigit())
+        .unwrap_or(hex_body.len());
+    let bytes = hex::decode(&hex_body[..hex_end]).ok()?;
+    RevertingContext::abi_decode(&bytes).ok()
+}
 
 #[cfg(feature = "evmsketch")]
 use alloy_eips::BlockNumberOrTag;
@@ -44,9 +62,16 @@ fn parse_args() -> CliArgs {
         match input_type {
             "t" | "tx" => Some(Commands::Transaction(value)),
             "r" | "request" => Some(Commands::Request(value)),
+            "d" | "debug" => Some(Commands::Transaction(value)),
             _ => None,
         }
     };
+
+    // `debug <hash>` is an alias for `t <hash> --debug`
+    let debug = debug
+        || positional
+            .get(1)
+            .is_some_and(|s| *s == "debug" || *s == "d");
 
     CliArgs {
         command,
@@ -281,8 +306,40 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                                 "{}",
                                 "Warning: Measured gas estimation failed, using heuristic".yellow()
                             );
-                            if cli_args.debug {
-                                println!("   Reason: {e:?}");
+                            match decode_reverting_context(&e) {
+                                Some(ctx) => {
+                                    println!(
+                                        "   Reason: {} CALL #{} to {} reverted",
+                                        "RevertingContext".red(),
+                                        ctx.index,
+                                        ctx.target,
+                                    );
+                                    if cli_args.debug {
+                                        if !ctx.revertData.is_empty() {
+                                            println!(
+                                                "   Revert data: 0x{}",
+                                                hex::encode(&ctx.revertData)
+                                            );
+                                        }
+                                        println!(
+                                            "   Call args:   0x{}",
+                                            hex::encode(&ctx.callargs)
+                                        );
+                                    }
+                                }
+                                None => {
+                                    if cli_args.debug {
+                                        println!("   Reason: {e:?}");
+                                    } else {
+                                        println!(
+                                            "   Reason: {}",
+                                            format!("{e}")
+                                                .split('\n')
+                                                .next()
+                                                .unwrap_or("Unknown error")
+                                        );
+                                    }
+                                }
                             }
                             let heuristic =
                                 estimate_gas_from_state_updates(&state_updates, call_gas_total);
@@ -294,18 +351,20 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 // Encode the state updates
                 let _encoded = encode_state_updates_to_abi(&state_updates);
 
-                // Print state updates
-                println!("\n{}", "=== State Updates ===".green().bold());
-                println!("Total state updates: {}", state_updates.len());
-                for (i, update) in state_updates.iter().enumerate() {
-                    println!("  {}: {:?}", i + 1, update);
-                }
-                if !skipped_opcodes.is_empty() {
-                    println!(
-                        "\n{}: {}",
-                        "Skipped opcodes".yellow(),
-                        skipped_opcodes.into_iter().collect::<Vec<_>>().join(", ")
-                    );
+                // Print state updates (debug only)
+                if cli_args.debug {
+                    println!("\n{}", "=== State Updates ===".green().bold());
+                    println!("Total state updates: {}", state_updates.len());
+                    for (i, update) in state_updates.iter().enumerate() {
+                        println!("  {}: {:?}", i + 1, update);
+                    }
+                    if !skipped_opcodes.is_empty() {
+                        println!(
+                            "\n{}: {}",
+                            "Skipped opcodes".yellow(),
+                            skipped_opcodes.into_iter().collect::<Vec<_>>().join(", ")
+                        );
+                    }
                 }
 
                 // Print gas analysis
@@ -359,6 +418,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             println!("Gas Killer Analyzer\n");
             println!("Usage:\n");
             println!("  {} for accepted transactions", "t/tx <HASH>".bold());
+            println!("  {} alias for t <HASH> --debug", "debug <HASH>".bold());
             println!(
                 "  {} for transaction requests",
                 "r/request <JSON_FILE>".bold()
