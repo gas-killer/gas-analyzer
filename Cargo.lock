@@ -3296,6 +3296,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-dyn-abi",
  "alloy-primitives",
+ "alloy-sol-types",
  "anyhow",
  "gas-analyzer-core",
  "getrandom 0.2.16",
@@ -3319,6 +3320,7 @@ dependencies = [
  "revm 31.0.2",
  "sp1-cc-client-executor",
  "sp1-cc-host-executor",
+ "tokio",
  "url",
 ]
 

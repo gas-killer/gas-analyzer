@@ -1,9 +1,27 @@
+use alloy::sol_types::SolError;
 use alloy::{hex, providers::ProviderBuilder};
 use alloy_provider::Provider;
 use anyhow::Result;
 use colored::Colorize;
+use gas_analyzer_core::RevertingContext;
 use std::env;
 use url::Url;
+
+/// Try to decode a `RevertingContext` error from an anyhow error.
+///
+/// Looks for hex-encoded revert data in the error message (the format revm
+/// produces: "Gas estimation reverted (gas: N): 0x...") and attempts to
+/// ABI-decode it as a `RevertingContext`.
+fn decode_reverting_context(e: &anyhow::Error) -> Option<RevertingContext> {
+    let msg = format!("{e:?}");
+    let hex_start = msg.rfind("0x")?;
+    let hex_body = &msg[hex_start + 2..];
+    let hex_end = hex_body
+        .find(|c: char| !c.is_ascii_hexdigit())
+        .unwrap_or(hex_body.len());
+    let bytes = hex::decode(&hex_body[..hex_end]).ok()?;
+    RevertingContext::abi_decode(&bytes).ok()
+}
 
 #[cfg(feature = "evmsketch")]
 use alloy_eips::BlockNumberOrTag;
@@ -16,6 +34,7 @@ enum Commands {
 struct CliArgs {
     command: Option<Commands>,
     use_anvil: bool,
+    debug: bool,
 }
 
 fn parse_args() -> CliArgs {
@@ -23,6 +42,9 @@ fn parse_args() -> CliArgs {
 
     // Check for --anvil flag
     let use_anvil = args.iter().any(|a| a == "--anvil" || a == "--legacy");
+
+    // Check for --debug flag
+    let debug = args.iter().any(|a| a == "--debug");
 
     // Filter out flags to get positional args
     let positional: Vec<&str> = args
@@ -40,11 +62,22 @@ fn parse_args() -> CliArgs {
         match input_type {
             "t" | "tx" => Some(Commands::Transaction(value)),
             "r" | "request" => Some(Commands::Request(value)),
+            "d" | "debug" => Some(Commands::Transaction(value)),
             _ => None,
         }
     };
 
-    CliArgs { command, use_anvil }
+    // `debug <hash>` is an alias for `t <hash> --debug`
+    let debug = debug
+        || positional
+            .get(1)
+            .is_some_and(|s| *s == "debug" || *s == "d");
+
+    CliArgs {
+        command,
+        use_anvil,
+        debug,
+    }
 }
 
 #[tokio::main]
@@ -52,9 +85,14 @@ async fn main() {
     dotenv::dotenv().ok();
     let cli_args = parse_args();
 
+    let debug = cli_args.debug;
     let result = execute_command(cli_args).await;
     if let Err(e) = result {
-        println!("{}", format!("{e:?}").red());
+        if debug {
+            println!("{}", format!("{e:?}").red());
+        } else {
+            println!("{}", format!("{e}").red());
+        }
     }
 }
 
@@ -83,6 +121,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 .expect("couldn't retrieve transaction index");
             let gas_used = receipt.gas_used;
             let original_status = receipt.status();
+            let tx_sender = receipt.from;
 
             #[cfg(feature = "anvil")]
             if cli_args.use_anvil {
@@ -138,7 +177,15 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     report.gas_savings, report.percent_savings
                 );
                 if let Some(error) = &report.error_log {
-                    println!("{}: {}", "Error".red(), error);
+                    if cli_args.debug {
+                        println!("{}: {}", "Error".red(), error);
+                    } else {
+                        println!(
+                            "{}: {}",
+                            "Error".red(),
+                            error.split('\n').next().unwrap_or("Unknown error")
+                        );
+                    }
                 }
 
                 return Ok(());
@@ -176,13 +223,17 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                                     "Warning: Trace extraction failed, using fallback heuristic estimation"
                                         .yellow()
                                 );
-                                println!(
-                                    "   Reason: {}",
-                                    format!("{}", e)
-                                        .split('\n')
-                                        .next()
-                                        .unwrap_or("Unknown error")
-                                );
+                                if cli_args.debug {
+                                    println!("   Reason: {e:?}");
+                                } else {
+                                    println!(
+                                        "   Reason: {}",
+                                        format!("{e}")
+                                            .split('\n')
+                                            .next()
+                                            .unwrap_or("Unknown error")
+                                    );
+                                }
 
                                 // Return empty state updates and use fallback heuristic
                                 (Vec::new(), std::collections::HashSet::new(), 0, true)
@@ -208,7 +259,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 let (gas_estimate, is_heuristic) = if use_fallback || state_updates.is_empty() {
                     // Use heuristic estimation when trace extraction failed or no state updates
                     let gk = GasKillerEvmSketchDefault::builder(rpc_url.clone())
-                        .at_block(BlockNumberOrTag::Number(block_number - 1))
+                        .at_block(BlockNumberOrTag::Number(block_number))
                         .build()
                         .await?;
 
@@ -244,7 +295,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
 
                     // Build EvmSketch for gas estimation (injecting StateChangeHandler contract)
                     let gk = GasKillerEvmSketchDefault::builder(rpc_url.clone())
-                        .at_block(BlockNumberOrTag::Number(block_number - 1))
+                        .at_block(BlockNumberOrTag::Number(block_number))
                         .build()
                         .await?;
 
@@ -274,16 +325,52 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     // Try measured gas estimation with preceding tx replay
                     match gk.estimate_state_changes_gas_with_preceding(
                         contract_address,
+                        tx_sender,
                         &state_updates,
                         &preceding_txs,
                     ) {
                         Ok(gas) => (gas + TURETZKY_UPPER_GAS_LIMIT, false),
-                        Err(_) => {
+                        Err(e) => {
                             // Fall back to heuristic estimation
                             println!(
                                 "{}",
                                 "Warning: Measured gas estimation failed, using heuristic".yellow()
                             );
+                            match decode_reverting_context(&e) {
+                                Some(ctx) => {
+                                    println!(
+                                        "   Reason: {} CALL #{} to {} reverted",
+                                        "RevertingContext".red(),
+                                        ctx.index,
+                                        ctx.target,
+                                    );
+                                    if cli_args.debug {
+                                        if !ctx.revertData.is_empty() {
+                                            println!(
+                                                "   Revert data: 0x{}",
+                                                hex::encode(&ctx.revertData)
+                                            );
+                                        }
+                                        println!(
+                                            "   Call args:   0x{}",
+                                            hex::encode(&ctx.callargs)
+                                        );
+                                    }
+                                }
+                                None => {
+                                    if cli_args.debug {
+                                        println!("   Reason: {e:?}");
+                                    } else {
+                                        println!(
+                                            "   Reason: {}",
+                                            format!("{e}")
+                                                .split('\n')
+                                                .next()
+                                                .unwrap_or("Unknown error")
+                                        );
+                                    }
+                                }
+                            }
                             let heuristic =
                                 estimate_gas_from_state_updates(&state_updates, call_gas_total);
                             (heuristic + TURETZKY_UPPER_GAS_LIMIT, true)
@@ -294,18 +381,20 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 // Encode the state updates
                 let _encoded = encode_state_updates_to_abi(&state_updates);
 
-                // Print state updates
-                println!("\n{}", "=== State Updates ===".green().bold());
-                println!("Total state updates: {}", state_updates.len());
-                for (i, update) in state_updates.iter().enumerate() {
-                    println!("  {}: {:?}", i + 1, update);
-                }
-                if !skipped_opcodes.is_empty() {
-                    println!(
-                        "\n{}: {}",
-                        "Skipped opcodes".yellow(),
-                        skipped_opcodes.into_iter().collect::<Vec<_>>().join(", ")
-                    );
+                // Print state updates (debug only)
+                if cli_args.debug {
+                    println!("\n{}", "=== State Updates ===".green().bold());
+                    println!("Total state updates: {}", state_updates.len());
+                    for (i, update) in state_updates.iter().enumerate() {
+                        println!("  {}: {:?}", i + 1, update);
+                    }
+                    if !skipped_opcodes.is_empty() {
+                        println!(
+                            "\n{}: {}",
+                            "Skipped opcodes".yellow(),
+                            skipped_opcodes.into_iter().collect::<Vec<_>>().join(", ")
+                        );
+                    }
                 }
 
                 // Print gas analysis
@@ -360,6 +449,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             println!("Gas Killer Analyzer\n");
             println!("Usage:\n");
             println!("  {} for accepted transactions", "t/tx <HASH>".bold());
+            println!("  {} alias for t <HASH> --debug", "debug <HASH>".bold());
             println!(
                 "  {} for transaction requests",
                 "r/request <JSON_FILE>".bold()
@@ -368,6 +458,10 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             println!(
                 "  {} Use Anvil-based implementation (requires --features anvil)",
                 "--anvil".bold()
+            );
+            println!(
+                "  {} Print full error details including RPC errors",
+                "--debug".bold()
             );
             println!("\nExamples:\n");
             println!("  # Default (EvmSketch - Anvil-free):");
