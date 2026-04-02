@@ -511,4 +511,47 @@ mod tests {
             "estimate_state_changes_gas should fail when timestamp mismatches"
         );
     }
+
+    #[test]
+    fn test_sim_env_wrong_block_number_reverts() {
+        let caller = address!("0x000000000000000000000000000000000000c411");
+        let sim_env = SimEnvOpts {
+            number: 42,
+            timestamp: 1_700_000_000,
+            gas_limit: 30_000_000,
+            coinbase: address!("0x00000000000000000000000000000000c01ba5e0"),
+            prevrandao: B256::from(U256::from(0xdeadbeef_u64)),
+            gas_price: 1_000_000_000,
+        };
+
+        let (mut cache_db, callee_address) = deploy_sim_env_test(caller, &sim_env);
+
+        let test_selector = Bytes::from(vec![0xf8, 0xa8, 0xfd, 0x6d]);
+        let state_updates = vec![StateUpdate::Call(IStateUpdateTypes::Call {
+            target: callee_address,
+            value: U256::ZERO,
+            callargs: test_selector,
+        })];
+
+        let estimator_address = address!("0x000000000000000000000000000000000000E570");
+
+        // Use a wrong block number — SimEnvCallee.test() should revert
+        let wrong_env = SimEnvOpts {
+            number: 999,
+            ..sim_env
+        };
+
+        let result = estimate_state_changes_gas(
+            &mut cache_db,
+            estimator_address,
+            caller,
+            &state_updates,
+            &wrong_env,
+        );
+
+        assert!(
+            result.is_err(),
+            "estimate_state_changes_gas should fail when block number mismatches"
+        );
+    }
 }
