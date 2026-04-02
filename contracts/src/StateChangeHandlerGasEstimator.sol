@@ -3,8 +3,47 @@ pragma solidity ^0.8.13;
 
 import { StateChangeHandlerLib, StateUpdateType } from "../lib/gas-killer-avs-sol/src/StateChangeHandlerLib.sol";
 
+/// @notice Gas estimator with transparent-proxy fallback.
+///
+/// When injected into the simulation at the original contract's address, this
+/// contract handles `runStateUpdatesCall` for gas measurement and forwards every
+/// other call (e.g. callbacks from oracles or AMMs) to the original implementation
+/// via DELEGATECALL, preserving `address(this)`, `msg.sender`, and storage context.
+///
+/// The implementation address is stored in an EIP-1967-style isolated storage slot
+/// to avoid colliding with the original contract's storage layout when the fallback
+/// DELEGATECALLs into the backup bytecode.
+///
+/// Rust bypasses the constructor: it loads the deployed bytecode directly from the
+/// Foundry artifact and writes `backup_addr` to IMPL_SLOT via `insert_account_storage`.
 contract StateChangeHandlerGasEstimator {
+    /// @dev Isolated storage slot for the implementation address.
+    /// keccak256("gas.estimator.implementation") - 1
+    bytes32 private constant IMPL_SLOT =
+        0x96d8ea8ab34935626cad61e29511d513907fd7c186676bae1b82974066723cbf;
+
+    constructor(address _implementation) {
+        assembly {
+            sstore(IMPL_SLOT, _implementation)
+        }
+    }
+
     function runStateUpdatesCall(StateUpdateType[] memory types, bytes[] memory args) external {
         StateChangeHandlerLib._runStateUpdates(types, args);
     }
+
+    /// @dev Forward any unknown selector to the original implementation via DELEGATECALL.
+    fallback() external payable {
+        assembly {
+            let impl := sload(IMPL_SLOT)
+            calldatacopy(0, 0, calldatasize())
+            let success := delegatecall(gas(), impl, 0, calldatasize(), 0, 0)
+            returndatacopy(0, 0, returndatasize())
+            switch success
+            case 0 { revert(0, returndatasize()) }
+            default { return(0, returndatasize()) }
+        }
+    }
+
+    receive() external payable {}
 }

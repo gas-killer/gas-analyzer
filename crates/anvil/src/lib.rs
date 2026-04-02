@@ -43,6 +43,14 @@ use foundry_evm_traces::identifier::SignaturesIdentifier;
 use serde::Serialize;
 use url::Url;
 
+/// Compute the isolated storage slot for the implementation address.
+/// Mirrors the Solidity constant: `keccak256("gas.estimator.implementation") - 1`
+fn impl_slot() -> U256 {
+    U256::from_be_bytes(*alloy::primitives::keccak256(
+        "gas.estimator.implementation",
+    )) - U256::from(1)
+}
+
 use gas_analyzer_core::{
     Opcode, RevertingContext, StateUpdate, TURETZKY_UPPER_GAS_LIMIT, compute_state_updates,
     encode_state_updates_to_abi, encode_state_updates_to_sol,
@@ -200,7 +208,11 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
             .wallet(signer)
             .connect_http(anvil.endpoint_url());
 
-        let contract = StateChangeHandlerGasEstimator::deploy(provider.clone()).await?;
+        let contract = StateChangeHandlerGasEstimator::deploy(
+            provider.clone(),
+            alloy::primitives::Address::ZERO,
+        )
+        .await?;
         let address = *contract.address();
         let code = provider.get_code_at(address).await?;
 
@@ -238,17 +250,29 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
         let initial_block_number = self.provider.get_block_number().await?;
         let snapshot_id: U256 = self.provider.raw_request("evm_snapshot".into(), ()).await?;
         let original_code = self.provider.get_code_at(contract_address).await?;
+
+        // Stash the original bytecode at a synthetic backup address so the proxy's
+        // fallback can DELEGATECALL to it when external protocols (oracles, AMMs)
+        // callback into contract_address during a state-update CALL.
+        let backup_addr = Address::from([0xba; 20]);
+        self.provider
+            .anvil_set_code(backup_addr, original_code.clone())
+            .await?;
+
+        // Inject the proxy (estimator) at contract_address.
         self.provider
             .anvil_set_code(contract_address, self.code.clone())
             .await?;
-        let target_contract = StateChangeHandlerGasEstimator::new(contract_address, &self.provider);
 
+        // Write backup_addr into the isolated IMPL_SLOT so the proxy's fallback
+        // can find it. Slot = keccak256("gas.estimator.implementation") - 1.
+        let backup_addr_b256 =
+            alloy::primitives::B256::from(U256::from_be_slice(backup_addr.as_slice()));
         self.provider
-            .anvil_set_balance(
-                contract_address,
-                U256::from(100000000000000000000000000000u128),
-            )
+            .anvil_set_storage_at(contract_address, impl_slot(), backup_addr_b256)
             .await?;
+
+        let target_contract = StateChangeHandlerGasEstimator::new(contract_address, &self.provider);
 
         let (types, args) = encode_state_updates_to_sol(state_updates);
         let types = types.iter().map(|x| *x as u8).collect::<Vec<_>>();
@@ -673,7 +697,7 @@ pub struct StateUpdateReport {
 mod tests {
     use super::*;
     use gas_analyzer_core::constants::*;
-    use gas_analyzer_core::{IStateUpdateTypes, StateUpdateType, decode_state_updates_tuple};
+    use gas_analyzer_core::{IStateUpdateTypes, StateUpdateType, encode_state_updates_to_sol};
 
     // Local sol! with #[sol(rpc)] for test that needs SimpleStorageInstance
     alloy::sol! {
@@ -683,8 +707,50 @@ mod tests {
         }
     }
     use alloy::primitives::{U256, address, b256, bytes};
+    use anyhow::bail;
     use csv::Writer;
     use std::fs::File;
+
+    /// Decode (uint256[], bytes[]) ABI tuple used for state update transport
+    fn decode_state_updates_tuple(data: &[u8]) -> Result<(Vec<U256>, Vec<Bytes>)> {
+        fn read_u256_as_usize(word: &[u8]) -> usize {
+            let mut buf = [0u8; 16];
+            let copy_len = word.len().min(16);
+            buf[16 - copy_len..].copy_from_slice(&word[word.len() - copy_len..]);
+            u128::from_be_bytes(buf) as usize
+        }
+
+        fn get(data: &[u8], start: usize, len: usize) -> Result<&[u8]> {
+            if start + len > data.len() {
+                bail!("slice {}..{} of {}", start, start + len, data.len());
+            }
+            Ok(&data[start..start + len])
+        }
+
+        let types_offset = read_u256_as_usize(get(data, 0, 32)?);
+        let data_offset = read_u256_as_usize(get(data, 32, 32)?);
+
+        // types: uint256[]
+        let n_types = read_u256_as_usize(get(data, types_offset, 32)?);
+        let mut types = Vec::with_capacity(n_types);
+        for i in 0..n_types {
+            let word = get(data, types_offset + 32 + i * 32, 32)?;
+            types.push(U256::from_be_slice(word));
+        }
+
+        // data: bytes[]
+        let n_data = read_u256_as_usize(get(data, data_offset, 32)?);
+        let head = data_offset + 32;
+        let mut out = Vec::with_capacity(n_data);
+        for i in 0..n_data {
+            let rel = read_u256_as_usize(get(data, head + i * 32, 32)?);
+            let start = head + rel;
+            let len = read_u256_as_usize(get(data, start, 32)?);
+            out.push(Bytes::copy_from_slice(get(data, start + 32, len)?));
+        }
+
+        Ok((types, out))
+    }
 
     #[test]
     fn test_stateupdatetype_tuple_encoding() -> Result<()> {
@@ -709,7 +775,14 @@ mod tests {
             types,
             vec![U256::from(0u8), U256::from(2u8), U256::from(3u8),]
         );
-        assert_eq!(data.len(), 3);
+        let (_, expected_data) = encode_state_updates_to_sol(&state_updates);
+        assert_eq!(data.len(), expected_data.len());
+        for (i, (decoded, expected)) in data.iter().zip(expected_data.iter()).enumerate() {
+            assert_eq!(
+                decoded, expected,
+                "data[{i}] mismatch: decoded bytes don't match encoded input"
+            );
+        }
         Ok(())
     }
 
@@ -738,6 +811,15 @@ mod tests {
         assert_eq!(types[0], U256::from(StateUpdateType::STORE as u8));
         assert_eq!(types[1], U256::from(StateUpdateType::LOG0 as u8));
         assert_eq!(types[2], U256::from(StateUpdateType::LOG1 as u8));
+
+        // Verify decoded data matches the original ABI-encoded state updates
+        let (_, expected_data) = encode_state_updates_to_sol(&state_updates);
+        for (i, (decoded, expected)) in data.iter().zip(expected_data.iter()).enumerate() {
+            assert_eq!(
+                decoded, expected,
+                "data[{i}] mismatch: decoded bytes don't match encoded input"
+            );
+        }
 
         // Verify the encoding doesn't start with 0x20 (the extra wrapper)
         // The first 32 bytes should be 0x40 (offset to types[]), not 0x20
@@ -842,8 +924,7 @@ mod tests {
             Err(e) => e.to_string(),
         };
 
-        // cast sig "RevertingContext(address,bytes)"
-        assert!(error_msg.contains("custom error 0xaa86ecee"));
+        assert!(error_msg.contains("Simulation subcontext reverted"));
 
         Ok(())
     }

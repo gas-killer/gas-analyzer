@@ -35,6 +35,11 @@ The CLI supports analyzing single transactions and transaction requests. By defa
 cargo run -- t 0x9add9d0f26bc6d867c1d6d41dda6287d9721a377cea42440250884f76d2a0fa7
 ```
 
+Add `--debug` to print full error details when gas estimation or trace extraction fails:
+```bash
+cargo run -- t 0x9add9d0f26bc6d867c1d6d41dda6287d9721a377cea42440250884f76d2a0fa7 --debug
+```
+
 ### Analyze a transaction request
 ```bash
 cargo run -- r path/to/file.json

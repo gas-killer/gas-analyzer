@@ -3,9 +3,8 @@
 //! This module provides functions for ABI-encoding state updates
 //! for transport to the StateChangeHandler contract.
 
-use alloy_primitives::{Bytes, U256};
+use alloy_primitives::Bytes;
 use alloy_sol_types::SolValue;
-use anyhow::{Result, bail};
 
 use crate::types::{StateUpdate, StateUpdateType};
 
@@ -119,47 +118,4 @@ pub fn encode_state_updates_to_abi(state_updates: &[StateUpdate]) -> Bytes {
     encoded.extend_from_slice(&datas_payload);
 
     Bytes::copy_from_slice(&encoded)
-}
-
-/// Decode (uint256[], bytes[]) ABI tuple used for state update transport
-#[allow(dead_code)]
-pub fn decode_state_updates_tuple(data: &[u8]) -> Result<(Vec<U256>, Vec<Bytes>)> {
-    fn read_u256_as_usize(word: &[u8]) -> usize {
-        let mut buf = [0u8; 16];
-        let copy_len = word.len().min(16);
-        buf[16 - copy_len..].copy_from_slice(&word[word.len() - copy_len..]);
-        u128::from_be_bytes(buf) as usize
-    }
-
-    fn get(data: &[u8], start: usize, len: usize) -> Result<&[u8]> {
-        if start + len > data.len() {
-            bail!("slice {}..{} of {}", start, start + len, data.len());
-        }
-        Ok(&data[start..start + len])
-    }
-
-    let types_offset = read_u256_as_usize(get(data, 0, 32)?);
-    let data_offset = read_u256_as_usize(get(data, 32, 32)?);
-
-    // types: uint256[]
-    let n_types = read_u256_as_usize(get(data, types_offset, 32)?);
-    let mut types = Vec::with_capacity(n_types);
-    for i in 0..n_types {
-        let word = get(data, types_offset + 32 + i * 32, 32)?;
-        types.push(U256::from_be_slice(word));
-    }
-
-    // data: bytes[]
-    let n_data = read_u256_as_usize(get(data, data_offset, 32)?);
-    let head = data_offset + 32;
-    let tail = head + 32 * n_data;
-    let mut out = Vec::with_capacity(n_data);
-    for i in 0..n_data {
-        let rel = read_u256_as_usize(get(data, head + i * 32, 32)?);
-        let start = tail + rel;
-        let len = read_u256_as_usize(get(data, start, 32)?);
-        out.push(Bytes::copy_from_slice(get(data, start + 32, len)?));
-    }
-
-    Ok((types, out))
 }
