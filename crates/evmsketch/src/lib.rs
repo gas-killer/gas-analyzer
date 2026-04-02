@@ -24,11 +24,14 @@ use sp1_cc_host_executor::EvmSketch;
 use std::collections::HashSet;
 use url::Url;
 
+pub mod simple_rpc_db;
+use simple_rpc_db::SimpleRpcDb;
+
 use gas_analyzer_core::{
     Opcode, StateUpdate, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_operations, extract_operation_counts_from_trace,
 };
-use gas_analyzer_estimator::PrecedingTx;
+use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
 use gas_analyzer_rpc::get_trace_from_call;
 
 // ============================================================================
@@ -134,16 +137,34 @@ impl DefaultEvmSketchExecutor {
         contract_address: Address,
         caller_address: Address,
         calldata: Bytes,
+        gas_price: u128,
     ) -> Result<u64> {
         let mut cache_db = CacheDB::new(&self.sketch.rpc_db);
-        let gas_limit = self.sketch.anchor.header().gas_limit;
+        let mut sim_env = self.sim_env();
+        sim_env.gas_price = gas_price;
         gas_analyzer_estimator::estimate_gas_raw(
             &mut cache_db,
             contract_address,
             caller_address,
             calldata,
-            gas_limit,
+            &sim_env,
         )
+    }
+
+    /// Build a `SimEnv` from the anchored block header.
+    ///
+    /// `gas_price` defaults to 0 since it is a transaction-level field;
+    /// callers with access to the original transaction can override it.
+    pub fn sim_env(&self) -> SimEnvOpts {
+        let header = self.sketch.anchor.header();
+        SimEnvOpts {
+            number: header.number,
+            timestamp: header.timestamp,
+            gas_limit: header.gas_limit,
+            coinbase: header.beneficiary,
+            prevrandao: header.mix_hash,
+            gas_price: 0,
+        }
     }
 
     /// Get the block hash that the executor is anchored to.
@@ -216,19 +237,30 @@ impl GasKillerEvmSketchDefault {
 
     /// Estimate gas for state changes by actually executing them.
     ///
-    /// Delegates to the shared gas-analyzer-estimator crate.
+    /// Delegates to the shared gas-analyzer-estimator crate using a `SimpleRpcDb`
+    /// backed by standard RPC calls (`eth_getStorageAt`, `eth_getBalance`, etc.)
+    /// instead of sp1-cc's `BasicRpcDb` which requires `eth_getProof`. This avoids
+    /// the "proof window" limitation on Reth and other nodes.
     pub fn estimate_state_changes_gas(
         &self,
         contract_address: Address,
+        caller_address: Address,
         state_updates: &[StateUpdate],
     ) -> Result<u64> {
-        let mut cache_db = CacheDB::new(&self.executor.sketch.rpc_db);
-        let gas_limit = self.executor.sketch.anchor.header().gas_limit;
+        // Use block_number - 1 (pre-transaction state), matching the Anvil path.
+        let state_block = self.executor.anchor_block_number().saturating_sub(1);
+        let simple_db = SimpleRpcDb {
+            provider: self.executor.sketch.provider.clone(),
+            block_number: state_block,
+        };
+        let mut cache_db = CacheDB::new(simple_db);
+        let sim_env = self.executor.sim_env();
         gas_analyzer_estimator::estimate_state_changes_gas(
             &mut cache_db,
             contract_address,
+            caller_address,
             state_updates,
-            gas_limit,
+            &sim_env,
         )
     }
 
@@ -244,6 +276,7 @@ impl GasKillerEvmSketchDefault {
     pub fn estimate_state_changes_gas_with_preceding(
         &self,
         contract_address: Address,
+        caller_address: Address,
         state_updates: &[StateUpdate],
         preceding_txs: &[PrecedingTx],
     ) -> Result<u64> {
@@ -258,11 +291,13 @@ impl GasKillerEvmSketchDefault {
             )?;
         }
 
+        let sim_env = self.executor.sim_env();
         gas_analyzer_estimator::estimate_state_changes_gas(
             &mut cache_db,
             contract_address,
+            caller_address,
             state_updates,
-            gas_limit,
+            &sim_env,
         )
     }
 
@@ -321,6 +356,8 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
         })
         .ok_or_else(|| anyhow!("Transaction must have a 'to' address"))?;
 
+    let caller_address = tx_request.from.unwrap_or_default();
+
     let provider = ProviderBuilder::new().connect_http(url.clone());
     let block_id = BlockId::Number(block);
     let trace = get_trace_from_call(&provider, tx_request, block_id).await?;
@@ -332,7 +369,8 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
         .at_block(block)
         .build()
         .await?;
-    let gas_estimate = gk.estimate_state_changes_gas(contract_address, &state_updates)?;
+    let gas_estimate =
+        gk.estimate_state_changes_gas(contract_address, caller_address, &state_updates)?;
 
     Ok((storage_updates, gas_estimate, false, skipped_opcodes))
 }
