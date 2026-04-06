@@ -3331,8 +3331,11 @@ dependencies = [
  "alloy",
  "alloy-eips",
  "alloy-provider",
+ "alloy-rpc-types",
  "anyhow",
  "gas-analyzer-core",
+ "gas-analyzer-estimator",
+ "revm 31.0.2",
 ]
 
 [[package]]

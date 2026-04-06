@@ -31,7 +31,7 @@ use gas_analyzer_core::{
     Opcode, StateUpdate, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_operations, extract_operation_counts_from_trace,
 };
-use gas_analyzer_estimator::SimEnvOpts;
+use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
 use gas_analyzer_rpc::get_trace_from_call;
 
 // ============================================================================
@@ -254,6 +254,43 @@ impl GasKillerEvmSketchDefault {
             block_number: state_block,
         };
         let mut cache_db = CacheDB::new(simple_db);
+        let sim_env = self.executor.sim_env();
+        gas_analyzer_estimator::estimate_state_changes_gas(
+            &mut cache_db,
+            contract_address,
+            caller_address,
+            state_updates,
+            &sim_env,
+        )
+    }
+
+    /// Estimate gas for state changes, replaying preceding transactions first.
+    ///
+    /// Creates a single CacheDB, replays all preceding transactions to bring
+    /// it to the correct mid-block state, then runs gas estimation on that
+    /// state. This ensures the simulation sees the same state the original
+    /// transaction executed against.
+    ///
+    /// If `preceding_txs` is empty (first-in-block), this behaves identically
+    /// to `estimate_state_changes_gas`.
+    pub fn estimate_state_changes_gas_with_preceding(
+        &self,
+        contract_address: Address,
+        caller_address: Address,
+        state_updates: &[StateUpdate],
+        preceding_txs: &[PrecedingTx],
+    ) -> Result<u64> {
+        let mut cache_db = CacheDB::new(&self.executor.sketch.rpc_db);
+        let gas_limit = self.executor.sketch.anchor.header().gas_limit;
+
+        if !preceding_txs.is_empty() {
+            gas_analyzer_estimator::replay_preceding_transactions(
+                &mut cache_db,
+                preceding_txs,
+                gas_limit,
+            )?;
+        }
+
         let sim_env = self.executor.sim_env();
         gas_analyzer_estimator::estimate_state_changes_gas(
             &mut cache_db,

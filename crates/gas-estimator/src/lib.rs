@@ -13,6 +13,7 @@ use alloy_primitives::{Address, B256, Bytes, U256};
 use anyhow::{Result, anyhow};
 use revm::context::result::ExecutionResult;
 use revm::database::CacheDB;
+use revm::primitives::TxKind;
 use revm::state::AccountInfo;
 
 use gas_analyzer_core::encoding::encode_state_updates_to_sol;
@@ -251,6 +252,82 @@ where
         calldata,
         sim_env,
     )
+}
+
+// ============================================================================
+// Preceding Transaction Replay
+// ============================================================================
+
+/// A simplified representation of a preceding transaction for replay.
+///
+/// This avoids bringing alloy-rpc-types into the gas-estimator crate,
+/// keeping it WASM-compatible. The conversion from alloy's `Transaction`
+/// type happens in the calling code.
+pub struct PrecedingTx {
+    pub from: Address,
+    pub kind: TxKind,
+    pub input: Bytes,
+    pub value: U256,
+    pub gas_limit: u64,
+    pub nonce: u64,
+}
+
+/// Replay preceding transactions against a CacheDB to bring it to the
+/// correct mid-block state.
+///
+/// Given transactions `txs[0..tx_index-1]` from block N, this function
+/// executes each one via revm's `transact_commit`, which commits state
+/// changes to the underlying CacheDB. After this function returns, the
+/// CacheDB reflects the state as if those transactions had already been
+/// mined.
+///
+/// Transaction results (success/revert/halt) are intentionally ignored —
+/// in a real block, even a reverted transaction modifies state (nonce
+/// increment, gas payment to coinbase).
+pub fn replay_preceding_transactions<DB>(
+    cache_db: &mut CacheDB<DB>,
+    preceding_txs: &[PrecedingTx],
+    block_gas_limit: u64,
+) -> Result<()>
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+{
+    use revm::context::{Context, TxEnv};
+    use revm::{ExecuteCommitEvm, MainBuilder, MainContext};
+
+    let mut evm = Context::mainnet()
+        .with_db(&mut *cache_db)
+        .modify_cfg_chained(|cfg| {
+            cfg.disable_nonce_check = true;
+            cfg.disable_balance_check = true;
+            cfg.disable_base_fee = true;
+            cfg.disable_fee_charge = true;
+        })
+        .modify_block_chained(|block| {
+            block.basefee = 0;
+            block.gas_limit = block_gas_limit;
+        })
+        .build_mainnet();
+
+    for (i, tx) in preceding_txs.iter().enumerate() {
+        let revm_tx = TxEnv::builder()
+            .caller(tx.from)
+            .kind(tx.kind)
+            .data(tx.input.clone())
+            .value(tx.value)
+            .gas_limit(tx.gas_limit)
+            .nonce(tx.nonce)
+            .build()
+            .map_err(|e| anyhow!("Failed to build tx env for preceding tx {}: {:?}", i, e))?;
+
+        // transact_commit executes and commits state changes to the CacheDB.
+        // We ignore the result — reverted/halted txs still modify state.
+        let _result = evm
+            .transact_commit(revm_tx)
+            .map_err(|e| anyhow!("Failed to replay preceding tx {}: {:?}", i, e))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
