@@ -22,7 +22,7 @@ use gas_analyzer_core::types::StateUpdate;
 /// Environment fields for the gas estimation simulation.
 ///
 /// These are set on revm's `BlockEnv` and `TxEnv` so that contracts reading
-/// opcodes like COINBASE, TIMESTAMP, NUMBER, GASLIMIT, GASPRICE, or
+/// opcodes like COINBASE, TIMESTAMP, NUMBER, GASLIMIT, GASPRICE, BASEFEE, or
 /// PREVRANDAO see realistic values.
 #[derive(Clone, Debug)]
 pub struct SimEnvOpts {
@@ -32,6 +32,7 @@ pub struct SimEnvOpts {
     pub coinbase: Address,
     pub prevrandao: B256,
     pub gas_price: u128,
+    pub basefee: u64,
 }
 
 /// Embedded ABI JSON for StateChangeHandlerGasEstimator - loaded at compile time
@@ -182,7 +183,7 @@ where
             block.gas_limit = sim_env.gas_limit;
             block.beneficiary = sim_env.coinbase;
             block.prevrandao = Some(sim_env.prevrandao);
-            block.basefee = 0;
+            block.basefee = sim_env.basefee;
             block.difficulty = U256::ZERO;
         });
 
@@ -263,6 +264,10 @@ where
 /// This avoids bringing alloy-rpc-types into the gas-estimator crate,
 /// keeping it WASM-compatible. The conversion from alloy's `Transaction`
 /// type happens in the calling code.
+///
+/// `gas_price` is the *effective* per-gas price of the tx (post-EIP-1559:
+/// `min(maxFeePerGas, baseFee + maxPriorityFeePerGas)`), so the GASPRICE
+/// opcode returns the same value the original tx observed.
 pub struct PrecedingTx {
     pub from: Address,
     pub kind: TxKind,
@@ -270,6 +275,7 @@ pub struct PrecedingTx {
     pub value: U256,
     pub gas_limit: u64,
     pub nonce: u64,
+    pub gas_price: u128,
 }
 
 /// Replay preceding transactions against a CacheDB to bring it to the
@@ -281,13 +287,20 @@ pub struct PrecedingTx {
 /// CacheDB reflects the state as if those transactions had already been
 /// mined.
 ///
+/// `sim_env` supplies the block-level context (number, timestamp, gas
+/// limit, coinbase, prevrandao, basefee) so opcodes like BASEFEE,
+/// COINBASE, NUMBER, TIMESTAMP, and GASLIMIT return the same values they
+/// would in the real block. Per-tx GASPRICE comes from `PrecedingTx::gas_price`.
+///
 /// Transaction results (success/revert/halt) are intentionally ignored —
-/// in a real block, even a reverted transaction modifies state (nonce
-/// increment, gas payment to coinbase).
+/// in a real block even a reverted transaction still bumps the sender's
+/// nonce. Fee transfers to the coinbase are *not* applied: replay sets
+/// `disable_fee_charge`, so coinbase balance won't move and senders are
+/// not debited for gas. Downstream callers must not rely on either.
 pub fn replay_preceding_transactions<DB>(
     cache_db: &mut CacheDB<DB>,
     preceding_txs: &[PrecedingTx],
-    block_gas_limit: u64,
+    sim_env: &SimEnvOpts,
 ) -> Result<()>
 where
     DB: revm::database_interface::DatabaseRef,
@@ -305,8 +318,13 @@ where
             cfg.disable_fee_charge = true;
         })
         .modify_block_chained(|block| {
-            block.basefee = 0;
-            block.gas_limit = block_gas_limit;
+            block.number = U256::from(sim_env.number);
+            block.timestamp = U256::from(sim_env.timestamp);
+            block.gas_limit = sim_env.gas_limit;
+            block.beneficiary = sim_env.coinbase;
+            block.prevrandao = Some(sim_env.prevrandao);
+            block.basefee = sim_env.basefee;
+            block.difficulty = U256::ZERO;
         })
         .build_mainnet();
 
@@ -318,11 +336,12 @@ where
             .value(tx.value)
             .gas_limit(tx.gas_limit)
             .nonce(tx.nonce)
+            .gas_price(tx.gas_price)
             .build()
             .map_err(|e| anyhow!("Failed to build tx env for preceding tx {}: {:?}", i, e))?;
 
         // transact_commit executes and commits state changes to the CacheDB.
-        // We ignore the result — reverted/halted txs still modify state.
+        // We ignore the result — reverted/halted txs still bump nonces.
         let _result = evm
             .transact_commit(revm_tx)
             .map_err(|e| anyhow!("Failed to replay preceding tx {}: {:?}", i, e))?;
@@ -512,6 +531,7 @@ mod tests {
             coinbase: address!("0x00000000000000000000000000000000c01ba5e0"),
             prevrandao: B256::from(U256::from(0xdeadbeef_u64)),
             gas_price: 1_000_000_000,
+            basefee: 0,
         };
 
         let (mut cache_db, callee_address) = deploy_sim_env_test(caller, &sim_env);
@@ -556,6 +576,7 @@ mod tests {
             coinbase: address!("0x00000000000000000000000000000000c01ba5e0"),
             prevrandao: B256::from(U256::from(0xdeadbeef_u64)),
             gas_price: 1_000_000_000,
+            basefee: 0,
         };
 
         let (mut cache_db, callee_address) = deploy_sim_env_test(caller, &sim_env);
