@@ -142,7 +142,7 @@ pub async fn get_preceding_transactions<P: Provider>(
 
     let txs: Vec<_> = block.transactions.into_transactions().collect();
 
-    if (tx_index as usize) > txs.len() {
+    if (tx_index as usize) >= txs.len() {
         bail!(
             "Transaction index {} exceeds block transaction count {}",
             tx_index,
