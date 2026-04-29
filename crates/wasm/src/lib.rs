@@ -93,6 +93,7 @@ pub fn analyze_trace_inner(
         coinbase: Address::ZERO,
         prevrandao: B256::ZERO,
         gas_price: 0,
+        basefee: 0,
     };
 
     let (gas_estimate, is_heuristic) =

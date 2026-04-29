@@ -140,6 +140,7 @@ pub async fn get_preceding_transactions<P: Provider>(
         .await?
         .ok_or_else(|| anyhow!("Block {} not found", block_number))?;
 
+    let base_fee = block.header.base_fee_per_gas;
     let txs: Vec<_> = block.transactions.into_transactions().collect();
 
     if (tx_index as usize) >= txs.len() {
@@ -164,6 +165,7 @@ pub async fn get_preceding_transactions<P: Provider>(
                 value: tx.inner.value(),
                 gas_limit: tx.inner.gas_limit(),
                 nonce: tx.inner.nonce(),
+                gas_price: tx.inner.effective_gas_price(base_fee),
             }
         })
         .collect();

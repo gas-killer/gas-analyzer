@@ -299,21 +299,22 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                         .build()
                         .await?;
 
-                    // Fetch preceding transactions for mid-block state accuracy
+                    // Fetch preceding transactions for mid-block state accuracy.
+                    // We fail hard here rather than falling back to block-N-1 state:
+                    // a silent fallback can produce a confidently wrong gas number for
+                    // any tx that depends on mid-block state.
                     let preceding_txs = gas_analyzer_rpc::get_preceding_transactions(
                         &provider,
                         block_number,
                         tx_index,
                     )
                     .await
-                    .unwrap_or_else(|e| {
-                        eprintln!(
-                            "Warning: Failed to fetch preceding transactions: {}. \
-                             Estimating with block N-1 state.",
-                            e
-                        );
-                        Vec::new()
-                    });
+                    .map_err(|e| {
+                        anyhow::Error::msg(format!(
+                            "Failed to fetch preceding transactions for block {} (tx index {}): {}",
+                            block_number, tx_index, e
+                        ))
+                    })?;
 
                     if !preceding_txs.is_empty() {
                         println!(
