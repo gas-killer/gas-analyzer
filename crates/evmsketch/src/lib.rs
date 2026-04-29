@@ -155,6 +155,7 @@ impl DefaultEvmSketchExecutor {
     ///
     /// `gas_price` defaults to 0 since it is a transaction-level field;
     /// callers with access to the original transaction can override it.
+    /// `basefee` comes from the header (0 for pre-EIP-1559 blocks).
     pub fn sim_env(&self) -> SimEnvOpts {
         let header = self.sketch.anchor.header();
         SimEnvOpts {
@@ -164,6 +165,7 @@ impl DefaultEvmSketchExecutor {
             coinbase: header.beneficiary,
             prevrandao: header.mix_hash,
             gas_price: 0,
+            basefee: header.base_fee_per_gas.unwrap_or(0),
         }
     }
 
@@ -281,17 +283,16 @@ impl GasKillerEvmSketchDefault {
         preceding_txs: &[PrecedingTx],
     ) -> Result<u64> {
         let mut cache_db = CacheDB::new(&self.executor.sketch.rpc_db);
-        let gas_limit = self.executor.sketch.anchor.header().gas_limit;
+        let sim_env = self.executor.sim_env();
 
         if !preceding_txs.is_empty() {
             gas_analyzer_estimator::replay_preceding_transactions(
                 &mut cache_db,
                 preceding_txs,
-                gas_limit,
+                &sim_env,
             )?;
         }
 
-        let sim_env = self.executor.sim_env();
         gas_analyzer_estimator::estimate_state_changes_gas(
             &mut cache_db,
             contract_address,
