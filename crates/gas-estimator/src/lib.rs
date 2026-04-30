@@ -45,8 +45,8 @@ static ESTIMATOR_BYTECODE: OnceLock<Bytes> = OnceLock::new();
 fn estimator_bytecode() -> Bytes {
     ESTIMATOR_BYTECODE
         .get_or_init(|| {
-            let json: serde_json::Value =
-                serde_json::from_str(ESTIMATOR_ABI_JSON).expect("embedded estimator JSON is malformed");
+            let json: serde_json::Value = serde_json::from_str(ESTIMATOR_ABI_JSON)
+                .expect("embedded estimator JSON is malformed");
             let hex_str = json["deployedBytecode"]["object"]
                 .as_str()
                 .expect("missing deployedBytecode.object in estimator artifact");
