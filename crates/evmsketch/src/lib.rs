@@ -282,7 +282,17 @@ impl GasKillerEvmSketchDefault {
         state_updates: &[StateUpdate],
         preceding_txs: &[PrecedingTx],
     ) -> Result<u64> {
-        let mut cache_db = CacheDB::new(&self.executor.sketch.rpc_db);
+        // Source storage from block N-1 (pre-tx state) so that nonce-dependent
+        // logic like EIP-2612 permit signatures still validates after
+        // `replay_preceding_transactions` brings the DB to mid-block state.
+        // Anchoring to `block_number` itself reads post-block state, where any
+        // nonces consumed in this block are already incremented.
+        let state_block = self.executor.anchor_block_number().saturating_sub(1);
+        let simple_db = SimpleRpcDb {
+            provider: self.executor.sketch.provider.clone(),
+            block_number: state_block,
+        };
+        let mut cache_db = CacheDB::new(simple_db);
         let sim_env = self.executor.sim_env();
 
         if !preceding_txs.is_empty() {
