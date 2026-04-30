@@ -19,6 +19,10 @@ use revm::state::AccountInfo;
 use gas_analyzer_core::encoding::encode_state_updates_to_sol;
 use gas_analyzer_core::types::StateUpdate;
 
+/// EIP-7825 per-tx gas cap, activated in Osaka (Fusaka). The block gas limit
+/// can exceed this, but a single tx cannot use more than `2^24` gas.
+const EIP7825_TX_GAS_CAP: u64 = 1 << 24;
+
 /// Environment fields for the gas estimation simulation.
 ///
 /// These are set on revm's `BlockEnv` and `TxEnv` so that contracts reading
@@ -176,6 +180,10 @@ where
             cfg.disable_balance_check = true;
             cfg.disable_base_fee = true;
             cfg.disable_fee_charge = true;
+            // Default is PRAGUE; use the newest spec revm knows so that
+            // contracts using post-Pectra opcodes (e.g. EOF in Fusaka/Osaka)
+            // don't halt with `NotActivated`.
+            cfg.spec = revm::primitives::hardfork::SpecId::OSAKA;
         })
         .modify_block_chained(|block| {
             block.number = U256::from(sim_env.number);
@@ -194,7 +202,7 @@ where
         .kind(revm::primitives::TxKind::Call(contract_address))
         .data(calldata)
         .value(U256::ZERO)
-        .gas_limit(sim_env.gas_limit)
+        .gas_limit(sim_env.gas_limit.min(EIP7825_TX_GAS_CAP))
         .gas_price(sim_env.gas_price)
         .build()
         .map_err(|e| anyhow!("Failed to build tx env: {:?}", e))?;
@@ -316,6 +324,7 @@ where
             cfg.disable_balance_check = true;
             cfg.disable_base_fee = true;
             cfg.disable_fee_charge = true;
+            cfg.spec = revm::primitives::hardfork::SpecId::OSAKA;
         })
         .modify_block_chained(|block| {
             block.number = U256::from(sim_env.number);
@@ -334,7 +343,7 @@ where
             .kind(tx.kind)
             .data(tx.input.clone())
             .value(tx.value)
-            .gas_limit(tx.gas_limit)
+            .gas_limit(tx.gas_limit.min(EIP7825_TX_GAS_CAP))
             .nonce(tx.nonce)
             .gas_price(tx.gas_price)
             .build()
