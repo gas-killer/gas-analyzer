@@ -28,9 +28,15 @@ pub fn copy_memory(memory: &[u8], offset: usize, length: usize) -> Vec<u8> {
 }
 
 /// Parse trace memory from Geth format (hex strings) to bytes.
+///
+/// Accepts entries with or without an `0x` prefix — Anvil began emitting prefixed
+/// memory words after revm-inspectors v0.38.1 (Foundry v1.7.0), while geth/erigon
+/// and older Anvil emit bare hex.
 pub fn parse_trace_memory(memory: Vec<String>) -> Vec<u8> {
     memory
-        .join("")
+        .iter()
+        .map(|s| s.strip_prefix("0x").unwrap_or(s))
+        .collect::<String>()
         .chars()
         .collect::<Vec<char>>()
         .chunks(2)
@@ -252,4 +258,33 @@ pub fn compute_state_updates(
     }
 
     Ok((state_updates, skipped_opcodes, total_call_gas))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_trace_memory_handles_both_prefixed_and_bare_hex() {
+        let bare = vec![
+            "00000000000000000000000000000000000000000000000000000000000000ff".to_string(),
+            "1100000000000000000000000000000000000000000000000000000000000000".to_string(),
+        ];
+        let prefixed = vec![
+            "0x00000000000000000000000000000000000000000000000000000000000000ff".to_string(),
+            "0x1100000000000000000000000000000000000000000000000000000000000000".to_string(),
+        ];
+        let mixed = vec![
+            "0x00000000000000000000000000000000000000000000000000000000000000ff".to_string(),
+            "1100000000000000000000000000000000000000000000000000000000000000".to_string(),
+        ];
+
+        let expected = parse_trace_memory(bare);
+        assert_eq!(expected.len(), 64);
+        assert_eq!(expected[31], 0xff);
+        assert_eq!(expected[32], 0x11);
+
+        assert_eq!(parse_trace_memory(prefixed), expected);
+        assert_eq!(parse_trace_memory(mixed), expected);
+    }
 }
