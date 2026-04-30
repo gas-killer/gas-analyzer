@@ -85,6 +85,7 @@ impl GasKillerReport {
     pub fn report_error(
         time: DateTime<Utc>,
         receipt: &TransactionReceipt,
+        function_selector: FixedBytes<4>,
         e: &anyhow::Error,
     ) -> Self {
         let commit = env!("GIT_HASH").to_string();
@@ -112,7 +113,7 @@ impl GasKillerReport {
             gaskiller_estimated_gas_cost: 0.0,
             gas_savings: 0,
             percent_savings: 0.0,
-            function_selector: FixedBytes::default(),
+            function_selector,
             skipped_opcodes: "".to_string(),
             error_log: Some(format!("{e:?}")),
         }
@@ -491,7 +492,11 @@ pub async fn gas_estimate_block(
         reports.push(
             get_report(&provider, receipt.transaction_hash, &receipt, &gk)
                 .await
-                .unwrap_or_else(|e| GasKillerReport::report_error(Utc::now(), &receipt, &e)),
+                .unwrap_or_else(|e| {
+                    // Outer fallback: only reached if `get_report` couldn't even fetch
+                    // the transaction. We have no selector to report in that case.
+                    GasKillerReport::report_error(Utc::now(), &receipt, FixedBytes::default(), &e)
+                }),
         );
         println!("done");
     }
@@ -529,12 +534,34 @@ pub async fn get_report(
     receipt: &TransactionReceipt,
     gk: &GasKillerDefault,
 ) -> Result<GasKillerReport> {
-    let details = gaskiller_reporter(&provider, tx_hash, gk, receipt).await;
+    // Fetch the function selector up front so it's available on both the success
+    // and the failure paths. Defaulting to zero only when the transaction's input
+    // is shorter than 4 bytes (e.g. a plain ETH transfer that slipped past upstream
+    // filters); in every other case the error report will carry the real selector.
+    let function_selector = fetch_function_selector(&provider, tx_hash).await?;
+
+    let details = gaskiller_reporter(&provider, tx_hash, gk, receipt, function_selector).await;
     if let Err(e) = details {
-        return Ok(GasKillerReport::report_error(Utc::now(), receipt, &e));
+        return Ok(GasKillerReport::report_error(
+            Utc::now(),
+            receipt,
+            function_selector,
+            &e,
+        ));
     }
 
     Ok(GasKillerReport::from(Utc::now(), receipt, details.unwrap()))
+}
+
+async fn fetch_function_selector(
+    provider: impl Provider,
+    tx_hash: FixedBytes<32>,
+) -> Result<FixedBytes<4>> {
+    let transaction = provider
+        .get_transaction_by_hash(tx_hash)
+        .await?
+        .ok_or_else(|| anyhow!("could not get transaction for tx {}", tx_hash))?;
+    Ok(transaction.function_selector().copied().unwrap_or_default())
 }
 
 /// Generate detailed report for a transaction
@@ -543,11 +570,8 @@ pub async fn gaskiller_reporter(
     tx_hash: FixedBytes<32>,
     gk: &GasKillerDefault,
     receipt: &TransactionReceipt,
+    function_selector: FixedBytes<4>,
 ) -> Result<ReportDetails> {
-    let transaction = provider
-        .get_transaction_by_hash(tx_hash)
-        .await?
-        .ok_or_else(|| anyhow!("could not get receipt for tx {}", tx_hash))?;
     let trace = get_tx_trace(&provider, tx_hash).await?;
     let (state_updates, skipped_opcodes_set, _call_gas_total) = compute_state_updates(trace)?;
     let skipped_opcodes = skipped_opcodes_set
@@ -565,9 +589,6 @@ pub async fn gaskiller_reporter(
     let approx_gas_price_per_unit: f64 = receipt.effective_gas_price as f64 / gas_used as f64;
     let gaskiller_estimated_gas_cost = approx_gas_price_per_unit * gaskiller_gas_estimate as f64;
     let gas_savings = gas_used.saturating_sub(gaskiller_gas_estimate);
-    let function_selector = *transaction
-        .function_selector()
-        .ok_or_else(|| anyhow!("could not get function selector for tx 0x{}", tx_hash))?;
     Ok(ReportDetails {
         approx_gas_price_per_unit,
         gaskiller_gas_estimate,
