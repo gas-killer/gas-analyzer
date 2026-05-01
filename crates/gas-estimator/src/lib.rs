@@ -19,9 +19,12 @@ use revm::state::AccountInfo;
 use gas_analyzer_core::encoding::encode_state_updates_to_sol;
 use gas_analyzer_core::types::StateUpdate;
 
+mod tracing;
+pub use tracing::estimate_state_changes_gas_traced;
+
 /// EIP-7825 per-tx gas cap, activated in Osaka (Fusaka). The block gas limit
 /// can exceed this, but a single tx cannot use more than `2^24` gas.
-const EIP7825_TX_GAS_CAP: u64 = 1 << 24;
+pub(crate) const EIP7825_TX_GAS_CAP: u64 = 1 << 24;
 
 /// Environment fields for the gas estimation simulation.
 ///
@@ -44,13 +47,13 @@ const ESTIMATOR_ABI_JSON: &str = include_str!("../../../abis/StateChangeHandlerG
 
 /// Compute the isolated storage slot for the implementation address.
 /// Mirrors the Solidity constant: `keccak256("gas.estimator.implementation") - 1`
-fn impl_slot() -> U256 {
+pub(crate) fn impl_slot() -> U256 {
     U256::from_be_bytes(*alloy_primitives::keccak256("gas.estimator.implementation"))
         - U256::from(1)
 }
 
 /// Load the StateChangeHandlerGasEstimator deployed bytecode from the embedded artifact.
-fn load_estimator_bytecode() -> Result<Vec<u8>> {
+pub(crate) fn load_estimator_bytecode() -> Result<Vec<u8>> {
     let json: serde_json::Value = serde_json::from_str(ESTIMATOR_ABI_JSON)
         .map_err(|e| anyhow!("Failed to parse embedded JSON: {}", e))?;
 

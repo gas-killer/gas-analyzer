@@ -7,6 +7,9 @@ use gas_analyzer_core::RevertingContext;
 use std::env;
 use url::Url;
 
+mod verbose;
+use verbose::Verbose;
+
 /// Try to decode a `RevertingContext` error from an anyhow error.
 ///
 /// Looks for hex-encoded revert data in the error message (the format revm
@@ -35,6 +38,7 @@ struct CliArgs {
     command: Option<Commands>,
     use_anvil: bool,
     debug: bool,
+    verbose: bool,
 }
 
 fn parse_args() -> CliArgs {
@@ -46,11 +50,14 @@ fn parse_args() -> CliArgs {
     // Check for --debug flag
     let debug = args.iter().any(|a| a == "--debug");
 
+    // Check for --verbose / -v flag
+    let verbose = args.iter().any(|a| a == "--verbose" || a == "-v");
+
     // Filter out flags to get positional args
     let positional: Vec<&str> = args
         .iter()
         .map(|s| s.as_str())
-        .filter(|a| !a.starts_with("--"))
+        .filter(|a| !a.starts_with('-'))
         .collect();
 
     let command = if positional.len() < 3 {
@@ -77,6 +84,7 @@ fn parse_args() -> CliArgs {
         command,
         use_anvil,
         debug,
+        verbose,
     }
 }
 
@@ -205,6 +213,8 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             {
                 println!("Using EvmSketch implementation...");
 
+                let verbose = Verbose::new(cli_args.verbose);
+
                 // Use shared trace function from rpc crate
                 use gas_analyzer_rpc::compute_state_updates_from_tx;
 
@@ -323,6 +333,9 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                         );
                     }
 
+                    // Verbose: decode every state update against Etherscan ABIs.
+                    verbose.print_state_updates(&state_updates).await;
+
                     // Try measured gas estimation with preceding tx replay
                     match gk.estimate_state_changes_gas_with_preceding(
                         contract_address,
@@ -357,6 +370,13 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                                             hex::encode(&ctx.callargs)
                                         );
                                     }
+                                    verbose.print_reverting_context(&ctx).await;
+                                    verbose.rerun_with_tracing(
+                                        &gk,
+                                        contract_address,
+                                        tx_sender,
+                                        &state_updates,
+                                    );
                                 }
                                 None => {
                                     if cli_args.debug {
@@ -463,6 +483,14 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             println!(
                 "  {} Print full error details including RPC errors",
                 "--debug".bold()
+            );
+            println!(
+                "  {} ABI-decode state updates and trace failed estimations",
+                "-v / --verbose".bold()
+            );
+            println!(
+                "    (requires {} environment variable)",
+                "ETHERSCAN_API_KEY".bold()
             );
             println!("\nExamples:\n");
             println!("  # Default (EvmSketch - Anvil-free):");

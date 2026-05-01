@@ -11,12 +11,17 @@ path = "src/main.rs"
 gas-analyzer-core = { path = "../core" }
 gas-analyzer-rpc = { path = "../rpc" }
 alloy = { version = "1.0.37", features = ["rpc", "rpc-types"] }
+alloy-dyn-abi = "1.0.37"
 alloy-eips = "1.0.37"
+alloy-json-abi = "1.0.37"
+alloy-primitives = "1.0.37"
 alloy-provider = { version = "1.0.37", features = ["debug-api"] }
 anyhow = "1.0.98"
 colored = "3.0.0"
 dotenv = "0.15.0"
 hex = "0.4"
+reqwest = { version = "0.12", features = ["json"] }
+serde_json = "1.0"
 tokio = { version = "1.45.1", features = ["rt-multi-thread"] }
 url = "2.5.4"
 

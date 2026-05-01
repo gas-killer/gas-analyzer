@@ -322,6 +322,35 @@ impl GasKillerEvmSketchDefault {
         )
     }
 
+    /// Estimate gas under a tracing inspector that emits a per-frame call
+    /// trace to stderr. Use this when a normal estimation produced an opaque
+    /// outer revert and you need to see which sub-call actually misbehaved.
+    ///
+    /// Same state-anchoring as `estimate_state_changes_gas` (block N-1 via
+    /// `SimpleRpcDb`); does not replay preceding-tx history. Intended as a
+    /// debug rerun, not a production estimation path.
+    pub fn estimate_state_changes_gas_traced(
+        &self,
+        contract_address: Address,
+        caller_address: Address,
+        state_updates: &[StateUpdate],
+    ) -> Result<u64> {
+        let state_block = self.executor.anchor_block_number().saturating_sub(1);
+        let simple_db = SimpleRpcDb {
+            provider: self.executor.sketch.provider.clone(),
+            block_number: state_block,
+        };
+        let mut cache_db = CacheDB::new(simple_db);
+        let sim_env = self.executor.sim_env();
+        gas_analyzer_estimator::estimate_state_changes_gas_traced(
+            &mut cache_db,
+            contract_address,
+            caller_address,
+            state_updates,
+            &sim_env,
+        )
+    }
+
     /// Estimate gas using a fallback heuristic based on the original transaction trace.
     ///
     /// This extracts operations (SSTORE, LOG, CALL) from the original transaction trace
