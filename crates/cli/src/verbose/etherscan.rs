@@ -65,10 +65,7 @@ impl EtherscanClient {
 
     /// Calls `getsourcecode` and returns `(abi, implementation_address)`.
     /// `implementation_address` is `Some` for verified proxies.
-    async fn fetch_source(
-        &self,
-        address: Address,
-    ) -> Result<(Option<JsonAbi>, Option<Address>)> {
+    async fn fetch_source(&self, address: Address) -> Result<(Option<JsonAbi>, Option<Address>)> {
         let url = format!(
             "{ETHERSCAN_V2}?chainid={}&module=contract&action=getsourcecode&address=0x{:x}&apikey={}",
             self.chain_id, address, self.api_key
@@ -95,8 +92,7 @@ impl EtherscanClient {
             .ok_or_else(|| anyhow!("etherscan getsourcecode missing result[0]"))?;
 
         let abi_str = entry.get("ABI").and_then(|v| v.as_str()).unwrap_or("");
-        let abi = if abi_str.is_empty()
-            || abi_str.starts_with("Contract source code not verified")
+        let abi = if abi_str.is_empty() || abi_str.starts_with("Contract source code not verified")
         {
             None
         } else {

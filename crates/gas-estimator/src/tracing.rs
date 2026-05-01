@@ -90,12 +90,16 @@ where
 
     match result {
         ExecutionResult::Success { gas_used, .. } => Ok(gas_used),
-        ExecutionResult::Revert { output, gas_used, .. } => Err(anyhow!(
+        ExecutionResult::Revert {
+            output, gas_used, ..
+        } => Err(anyhow!(
             "Gas estimation reverted (gas: {}): {}",
             gas_used,
             output
         )),
-        ExecutionResult::Halt { reason, gas_used, .. } => Err(anyhow!(
+        ExecutionResult::Halt {
+            reason, gas_used, ..
+        } => Err(anyhow!(
             "Gas estimation halted (gas: {}): {:?}",
             gas_used,
             reason
@@ -242,7 +246,9 @@ where
             );
         }
 
-        if is_fail && out_len == 0 && !self.printed_failure
+        if is_fail
+            && out_len == 0
+            && !self.printed_failure
             && let Some(f) = frame
         {
             // EIP-150 forwards (1 - 1/64) of available gas to the callee, so

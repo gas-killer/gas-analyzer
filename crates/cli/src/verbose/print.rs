@@ -17,7 +17,9 @@ use super::etherscan::EtherscanClient;
 pub async fn state_updates(client: &EtherscanClient, updates: &[StateUpdate]) {
     println!(
         "\n{}",
-        "=== Decoded State Updates (via Etherscan) ===".green().bold()
+        "=== Decoded State Updates (via Etherscan) ==="
+            .green()
+            .bold()
     );
     for (i, update) in updates.iter().enumerate() {
         match update {
@@ -55,10 +57,7 @@ pub async fn reverting_context(client: &EtherscanClient, ctx: &RevertingContext)
         }
     } else if ctx.callargs.len() >= 4 {
         let sel = hex::encode(&ctx.callargs[..4]);
-        println!(
-            "   selector 0x{} (not in ABI; try openchain.xyz)",
-            sel
-        );
+        println!("   selector 0x{} (not in ABI; try openchain.xyz)", sel);
         println!("   callargs: 0x{}", hex::encode(&ctx.callargs));
     }
 

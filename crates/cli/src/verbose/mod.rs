@@ -94,10 +94,7 @@ impl Verbose {
                 .yellow()
                 .bold()
         );
-        let _ = gk.estimate_state_changes_gas_traced(
-            contract_address,
-            caller_address,
-            state_updates,
-        );
+        let _ =
+            gk.estimate_state_changes_gas_traced(contract_address, caller_address, state_updates);
     }
 }
