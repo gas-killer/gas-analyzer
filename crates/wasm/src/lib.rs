@@ -99,6 +99,7 @@ pub fn analyze_trace_inner(
         // WASM runs against EmptyDB with no real chain state; pick the newest
         // spec so post-Pectra opcodes don't halt with `NotActivated`.
         spec: SpecId::OSAKA,
+        value: U256::ZERO,
     };
 
     let (gas_estimate, is_heuristic) =
