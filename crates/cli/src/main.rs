@@ -1,3 +1,5 @@
+use alloy::consensus::Transaction as _;
+use alloy::primitives::U256;
 use alloy::sol_types::SolError;
 use alloy::{hex, providers::ProviderBuilder};
 use alloy_provider::Provider;
@@ -122,6 +124,16 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             let gas_used = receipt.gas_used;
             let original_status = receipt.status();
             let tx_sender = receipt.from;
+
+            // Fetch the original tx so we can mirror its `msg.value` during
+            // simulation. Pass-through contracts (deposit-then-forward, intent
+            // settlers, swap routers) lose ETH otherwise and value-bearing
+            // CALL state updates halt with OutOfFunds.
+            let tx_value: U256 = provider
+                .get_transaction_by_hash(bytes.into())
+                .await?
+                .map(|tx| tx.value())
+                .unwrap_or(U256::ZERO);
 
             #[cfg(feature = "anvil")]
             if cli_args.use_anvil {
@@ -329,6 +341,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                         tx_sender,
                         &state_updates,
                         &preceding_txs,
+                        tx_value,
                     ) {
                         Ok(gas) => (gas + TURETZKY_UPPER_GAS_LIMIT, false),
                         Err(e) => {

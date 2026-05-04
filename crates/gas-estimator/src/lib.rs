@@ -64,6 +64,10 @@ pub struct SimEnvOpts {
     pub basefee: u64,
     pub difficulty: U256,
     pub spec: SpecId,
+    /// `msg.value` of the proxy invocation. Mirrors the original transaction's
+    /// `value` so contracts that pass-through ETH (deposit-then-forward, intent
+    /// settlers, swap routers) can fund value-bearing CALL state updates.
+    pub value: U256,
 }
 
 /// Embedded ABI JSON for StateChangeHandlerGasEstimator - loaded at compile time
@@ -200,6 +204,28 @@ where
         .insert_account_storage(contract_address, impl_slot(), backup_addr_u256)
         .map_err(|e| anyhow!("Failed to write IMPL_SLOT: {:?}", e))?;
 
+    // disable_balance_check skips the *pre-flight* check on the caller, but
+    // revm still debits the caller during the call's value transfer. If the
+    // caller's balance can't cover `sim_env.value`, the proxy ends up
+    // under-credited and any pass-through CALL with `value > 0` halts with
+    // OutOfFunds. Top up the caller so the transfer is always well-defined.
+    if !sim_env.value.is_zero() {
+        let caller_account = cache_db
+            .basic_ref(caller_address)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        cache_db.insert_account_info(
+            caller_address,
+            AccountInfo {
+                balance: caller_account.balance.saturating_add(sim_env.value),
+                nonce: caller_account.nonce,
+                code_hash: caller_account.code_hash,
+                code: caller_account.code,
+            },
+        );
+    }
+
     let ctx = Context::mainnet()
         .with_db(&mut *cache_db)
         .modify_cfg_chained(|cfg| {
@@ -227,7 +253,7 @@ where
         .caller(caller_address)
         .kind(revm::primitives::TxKind::Call(contract_address))
         .data(calldata)
-        .value(U256::ZERO)
+        .value(sim_env.value)
         .gas_limit(tx_gas_limit)
         .gas_price(sim_env.gas_price)
         .build()
@@ -598,6 +624,7 @@ mod tests {
             basefee: 25_000_000_000,
             difficulty: U256::ZERO,
             spec: SpecId::OSAKA,
+            value: U256::ZERO,
         };
 
         let (mut cache_db, callee_address) = deploy_sim_env_test(caller, &sim_env);
@@ -645,6 +672,7 @@ mod tests {
             basefee: 25_000_000_000,
             difficulty: U256::ZERO,
             spec: SpecId::OSAKA,
+            value: U256::ZERO,
         };
 
         let (mut cache_db, callee_address) = deploy_sim_env_test(caller, &sim_env);
@@ -691,6 +719,7 @@ mod tests {
             basefee: 25_000_000_000,
             difficulty: U256::ZERO,
             spec: SpecId::OSAKA,
+            value: U256::ZERO,
         };
 
         let (mut cache_db, callee_address) = deploy_sim_env_test(caller, &sim_env);
@@ -737,6 +766,7 @@ mod tests {
             basefee: 25_000_000_000,
             difficulty: U256::ZERO,
             spec: SpecId::OSAKA,
+            value: U256::ZERO,
         };
 
         let (mut cache_db, callee_address) = deploy_sim_env_test(caller, &sim_env);
@@ -782,6 +812,7 @@ mod tests {
             basefee: 0,
             difficulty: U256::ZERO,
             spec,
+            value: U256::ZERO,
         }
     }
 
