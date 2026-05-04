@@ -282,7 +282,27 @@ impl GasKillerEvmSketchDefault {
         state_updates: &[StateUpdate],
         preceding_txs: &[PrecedingTx],
     ) -> Result<u64> {
-        let mut cache_db = CacheDB::new(&self.executor.sketch.rpc_db);
+        // Source storage from block N-1 (pre-block state). Anchoring to
+        // `block_number` itself makes RPC reads return state at the *end* of
+        // block N — after every tx in that block (including the one we're
+        // analyzing) has already been applied. `replay_preceding_transactions`
+        // would then re-apply txs `[0..tx_index)` on top of post-block state,
+        // compounding the error.
+        //
+        // Reading from N-1 puts the DB in the correct pre-block state, and
+        // the subsequent replay brings it to the right mid-block point.
+        //
+        // The most visible failure mode is any replayed call whose logic
+        // depends on state mutated earlier in the same block — e.g. an
+        // EIP-2612 `permit` whose nonce was already consumed by the original
+        // tx, causing signature recovery to mismatch and the call to revert
+        // with "invalid signature".
+        let state_block = self.executor.anchor_block_number().saturating_sub(1);
+        let simple_db = SimpleRpcDb {
+            provider: self.executor.sketch.provider.clone(),
+            block_number: state_block,
+        };
+        let mut cache_db = CacheDB::new(simple_db);
         let sim_env = self.executor.sim_env();
 
         if !preceding_txs.is_empty() {
