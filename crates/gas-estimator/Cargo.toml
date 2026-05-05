@@ -20,6 +20,8 @@ revm = { version = "31.0.1", default-features = false, features = [
 
 [dev-dependencies]
 alloy-sol-types = { version = "1", features = ["json"] }
+alloy-signer = "1"
+alloy-signer-local = "1"
 
 # For WASM builds, the consumer must enable getrandom/js.
 # This feature enables it from this crate for testing.
