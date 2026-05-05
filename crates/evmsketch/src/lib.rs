@@ -473,11 +473,11 @@ mod tests {
         // test fails loudly if the chainspec is ever swapped (e.g. for
         // Sepolia, where these heights are different).
         let cases: &[(&str, u64, u64, SpecId)] = &[
-            ("Berlin",   12_244_000,           0,        SpecId::BERLIN),
-            ("London",   12_965_000,           0,        SpecId::LONDON),
-            ("Paris",    15_537_394,           0,        SpecId::MERGE),
-            ("Shanghai", 17_034_870, 1_681_338_455,      SpecId::SHANGHAI),
-            ("Cancun",   19_426_587, 1_710_338_135,      SpecId::CANCUN),
+            ("Berlin", 12_244_000, 0, SpecId::BERLIN),
+            ("London", 12_965_000, 0, SpecId::LONDON),
+            ("Paris", 15_537_394, 0, SpecId::MERGE),
+            ("Shanghai", 17_034_870, 1_681_338_455, SpecId::SHANGHAI),
+            ("Cancun", 19_426_587, 1_710_338_135, SpecId::CANCUN),
         ];
 
         for &(name, number, timestamp, expected) in cases {
@@ -518,17 +518,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_simple_rpc_db_queries_at_configured_block() {
         use alloy_json_rpc::{RequestPacket, Response, ResponsePacket};
-        use alloy_provider::network::AnyNetwork;
         use alloy_provider::RootProvider;
+        use alloy_provider::network::AnyNetwork;
         use alloy_rpc_client::RpcClient;
-        use alloy_transport::{mock::Asserter, TransportError, TransportFut};
+        use alloy_transport::{TransportError, TransportFut, mock::Asserter};
         use revm::database_interface::DatabaseRef;
         use std::sync::{Arc, Mutex};
         use std::task::{Context, Poll};
         use tower::Service;
 
         use crate::simple_rpc_db::SimpleRpcDb;
-        use alloy::primitives::{address, U256};
+        use alloy::primitives::{U256, address};
 
         /// A tower::Service that records every JSON-RPC request and pulls
         /// canned responses from an `Asserter`.
@@ -553,10 +553,8 @@ mod tests {
                     match req {
                         RequestPacket::Single(r) => {
                             let method = r.method().to_string();
-                            let params = r
-                                .params()
-                                .map(|p| p.get().to_string())
-                                .unwrap_or_default();
+                            let params =
+                                r.params().map(|p| p.get().to_string()).unwrap_or_default();
                             me.requests.lock().unwrap().push((method, params));
                             let payload = me.asserter.pop_response().expect("response queue empty");
                             Ok(ResponsePacket::Single(Response {

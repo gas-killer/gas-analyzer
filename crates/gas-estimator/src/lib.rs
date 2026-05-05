@@ -12,8 +12,8 @@ use alloy_dyn_abi::DynSolValue;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use anyhow::{Result, anyhow};
 use revm::context::result::ExecutionResult;
-use revm::database::CacheDB;
 use revm::context_interface::transaction::{AccessList, SignedAuthorization};
+use revm::database::CacheDB;
 use revm::primitives::TxKind;
 use revm::primitives::hardfork::SpecId;
 use revm::state::AccountInfo;
@@ -812,7 +812,10 @@ mod tests {
             effective_tx_gas_limit(30_000_000, SpecId::CANCUN),
             30_000_000
         );
-        assert_eq!(effective_tx_gas_limit(30_000_000, SpecId::PRAGUE), 30_000_000);
+        assert_eq!(
+            effective_tx_gas_limit(30_000_000, SpecId::PRAGUE),
+            30_000_000
+        );
 
         // Osaka onward: capped at 2^24.
         assert_eq!(
@@ -887,9 +890,8 @@ mod tests {
         let target = address!("0x00000000000000000000000000000000d1ff1c11");
 
         // DIFFICULTY (0x44) PUSH1 0 (0x6000) SSTORE (0x55) STOP (0x00)
-        let runtime = revm::state::Bytecode::new_raw(Bytes::from(
-            hex::decode("4460005500").unwrap(),
-        ));
+        let runtime =
+            revm::state::Bytecode::new_raw(Bytes::from(hex::decode("4460005500").unwrap()));
 
         let mut cache_db = CacheDB::new(EmptyDB::default());
         fund(&mut cache_db, sender);
@@ -962,9 +964,7 @@ mod tests {
         let target = address!("0x000000000000000000000000000000000000515a");
 
         // PUSH1 5 SLOAD STOP — just touches slot 5 once.
-        let runtime = revm::state::Bytecode::new_raw(Bytes::from(
-            hex::decode("60055400").unwrap(),
-        ));
+        let runtime = revm::state::Bytecode::new_raw(Bytes::from(hex::decode("60055400").unwrap()));
 
         let make_db = || {
             let mut db = CacheDB::new(EmptyDB::default());
@@ -1006,9 +1006,8 @@ mod tests {
             address: target,
             storage_keys: vec![B256::from(U256::from(5u64))],
         }]);
-        let with_al_results =
-            replay_preceding_transactions(&mut db_with_al, &[tx_no_al], &sim_env)
-                .expect("replay with_al");
+        let with_al_results = replay_preceding_transactions(&mut db_with_al, &[tx_no_al], &sim_env)
+            .expect("replay with_al");
 
         let gas_no_al = no_al_results[0].gas_used();
         let gas_with_al = with_al_results[0].gas_used();
