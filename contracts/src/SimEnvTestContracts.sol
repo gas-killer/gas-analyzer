@@ -12,6 +12,7 @@ interface SimEnvOptsStructs {
         uint256 blockTimestamp;
         uint256 blockGasLimit;
         uint256 blockPrevRandao;
+        uint256 blockBaseFee;
     }
 
     error EnvironmentMismatch(SimEnvOpts expected, SimEnvOpts actual, string explanation);
@@ -23,7 +24,7 @@ interface SimEnvOptsStructs {
 /// @notice Not covered: Blobs (BLOBHASH, BLOBBASEFEE), Block (BLOCKHASH). Possibly more
 contract SimEnvOptsTestMain is SimEnvOptsStructs {
     SimEnvOptsCallee simEnvOptsCallee;
-    
+
     constructor (
         address txOrigin,
         uint256 txGasPrice,
@@ -31,7 +32,8 @@ contract SimEnvOptsTestMain is SimEnvOptsStructs {
         uint256 blockNumber,
         uint256 blockTimestamp,
         uint256 blockGasLimit,
-        uint256 blockPrevRandao
+        uint256 blockPrevRandao,
+        uint256 blockBaseFee
     ) {
         simEnvOptsCallee = new SimEnvOptsCallee(
             txOrigin,
@@ -40,7 +42,8 @@ contract SimEnvOptsTestMain is SimEnvOptsStructs {
             blockNumber,
             blockTimestamp,
             blockGasLimit,
-            blockPrevRandao
+            blockPrevRandao,
+            blockBaseFee
         );
     }
 
@@ -61,7 +64,8 @@ contract SimEnvOptsCallee is SimEnvOptsStructs {
         uint256 blockNumber,
         uint256 blockTimestamp,
         uint256 blockGasLimit,
-        uint256 blockPrevRandao
+        uint256 blockPrevRandao,
+        uint256 blockBaseFee
     ) {
         simEnv.txOrigin = txOrigin;
         simEnv.txGasPrice = txGasPrice;
@@ -70,6 +74,7 @@ contract SimEnvOptsCallee is SimEnvOptsStructs {
         simEnv.blockTimestamp = blockTimestamp;
         simEnv.blockGasLimit = blockGasLimit;
         simEnv.blockPrevRandao = blockPrevRandao;
+        simEnv.blockBaseFee = blockBaseFee;
     }
 
     function test() external {
@@ -82,6 +87,7 @@ contract SimEnvOptsCallee is SimEnvOptsStructs {
         actual.blockTimestamp = block.timestamp;
         actual.blockGasLimit = block.gaslimit;
         actual.blockPrevRandao = block.prevrandao;
+        actual.blockBaseFee = block.basefee;
 
         bool correct = true;
         string memory reason = "Mismatched fields: ";
@@ -112,6 +118,10 @@ contract SimEnvOptsCallee is SimEnvOptsStructs {
         if (actual.blockPrevRandao != expected.blockPrevRandao) {
             correct = false;
             reason = string.concat(reason, "blockPrevRandao, ");
+        }
+        if (actual.blockBaseFee != expected.blockBaseFee) {
+            correct = false;
+            reason = string.concat(reason, "blockBaseFee, ");
         }
 
         if (!correct) {
