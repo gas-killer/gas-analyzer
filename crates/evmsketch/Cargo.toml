@@ -18,3 +18,11 @@ reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1" 
 revm = { version = "31.0.1" }
 sp1-cc-host-executor = { git = "https://github.com/BreadchainCoop/sp1-contract-call", branch = "cancun-v1", package = "sp1-cc-host-executor" }
 sp1-cc-client-executor = { git = "https://github.com/BreadchainCoop/sp1-contract-call", branch = "cancun-v1", package = "sp1-cc-client-executor" }
+
+[dev-dependencies]
+alloy-consensus = "1"
+alloy-json-rpc = "1"
+alloy-rpc-client = "1"
+alloy-transport = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tower = "0.5"
