@@ -14,17 +14,47 @@ use alloy_dyn_abi::DynSolValue;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use anyhow::{Result, anyhow};
 use revm::context::result::ExecutionResult;
+use revm::context_interface::transaction::{AccessList, SignedAuthorization};
 use revm::database::CacheDB;
+use revm::primitives::TxKind;
+use revm::primitives::hardfork::SpecId;
 use revm::state::AccountInfo;
 
 use gas_analyzer_core::encoding::encode_state_updates_to_sol;
 use gas_analyzer_core::types::StateUpdate;
 
+/// EIP-7825 per-tx gas cap, activated in Osaka (Fusaka). The block gas limit
+/// can exceed this, but a single tx cannot use more than `2^24` gas.
+const EIP7825_TX_GAS_CAP: u64 = 1 << 24;
+
+/// Apply the EIP-7825 per-tx cap if the spec is Osaka or later.
+///
+/// Pre-Osaka blocks must not be capped — a legitimate ~30M-gas tx would
+/// otherwise OOG mid-execution during replay, which (in `transact_commit`)
+/// drops storage writes and silently corrupts the CacheDB.
+pub(crate) fn effective_tx_gas_limit(gas_limit: u64, spec: SpecId) -> u64 {
+    if spec >= SpecId::OSAKA {
+        gas_limit.min(EIP7825_TX_GAS_CAP)
+    } else {
+        gas_limit
+    }
+}
+
 /// Environment fields for the gas estimation simulation.
 ///
 /// These are set on revm's `BlockEnv` and `TxEnv` so that contracts reading
-/// opcodes like COINBASE, TIMESTAMP, NUMBER, GASLIMIT, GASPRICE, or
-/// PREVRANDAO see realistic values.
+/// opcodes like COINBASE, TIMESTAMP, NUMBER, GASLIMIT, GASPRICE, BASEFEE,
+/// PREVRANDAO, or DIFFICULTY see realistic values.
+///
+/// `spec` selects the EVM hardfork rules. It must be derived from the block
+/// being simulated — using a newer spec for an older block applies wrong gas
+/// schedules, opcode availability, and per-tx limits, which can flip
+/// success/revert outcomes during preceding-tx replay and corrupt the
+/// CacheDB state the analyzed tx will read.
+///
+/// `difficulty` is the legacy DIFFICULTY opcode value. Post-Merge it is zero
+/// by protocol; pre-Merge it carries real PoW difficulty and is read directly
+/// by the opcode under pre-Paris specs.
 #[derive(Clone, Debug)]
 pub struct SimEnvOpts {
     pub number: u64,
@@ -33,6 +63,9 @@ pub struct SimEnvOpts {
     pub coinbase: Address,
     pub prevrandao: B256,
     pub gas_price: u128,
+    pub basefee: u64,
+    pub difficulty: U256,
+    pub spec: SpecId,
 }
 
 const ESTIMATOR_ABI_JSON: &str = include_str!("../../../abis/StateChangeHandlerGasEstimator.json");
@@ -178,6 +211,7 @@ where
             cfg.disable_balance_check = true;
             cfg.disable_base_fee = true;
             cfg.disable_fee_charge = true;
+            cfg.spec = sim_env.spec;
         })
         .modify_block_chained(|block| {
             block.number = U256::from(sim_env.number);
@@ -185,18 +219,20 @@ where
             block.gas_limit = sim_env.gas_limit;
             block.beneficiary = sim_env.coinbase;
             block.prevrandao = Some(sim_env.prevrandao);
-            block.basefee = 0;
-            block.difficulty = U256::ZERO;
+            block.basefee = sim_env.basefee;
+            block.difficulty = sim_env.difficulty;
         });
 
     let mut evm = ctx.build_mainnet();
+
+    let tx_gas_limit = effective_tx_gas_limit(sim_env.gas_limit, sim_env.spec);
 
     let tx = TxEnv::builder()
         .caller(caller_address)
         .kind(revm::primitives::TxKind::Call(contract_address))
         .data(calldata)
         .value(U256::ZERO)
-        .gas_limit(sim_env.gas_limit)
+        .gas_limit(tx_gas_limit)
         .gas_price(sim_env.gas_price)
         .build()
         .map_err(|e| anyhow!("Failed to build tx env: {:?}", e))?;
@@ -255,6 +291,126 @@ where
         calldata,
         sim_env,
     )
+}
+
+// ============================================================================
+// Preceding Transaction Replay
+// ============================================================================
+
+/// A simplified representation of a preceding transaction for replay.
+///
+/// This avoids bringing alloy-rpc-types into the gas-estimator crate,
+/// keeping it WASM-compatible. The conversion from alloy's `Transaction`
+/// type happens in the calling code.
+///
+/// `gas_price` is the *effective* per-gas price of the tx (post-EIP-1559:
+/// `min(maxFeePerGas, baseFee + maxPriorityFeePerGas)`), so the GASPRICE
+/// opcode returns the same value the original tx observed.
+///
+/// `access_list` (EIP-2930) pre-warms addresses and storage slots, lowering
+/// SLOAD/cold-access costs. Omitting it makes replay gas costs higher than
+/// the original tx, and a tight-budget tx can OOG mid-replay; an OOG halt
+/// in `transact_commit` does not commit storage writes (only the nonce
+/// bump), which silently corrupts the CacheDB state the analyzed tx will
+/// then read against.
+///
+/// `authorization_list` (EIP-7702) carries set-code authorizations. Without
+/// it, replay skips the EOA-to-bytecode delegation, so any later tx in the
+/// block that calls into those EOAs sees an empty account.
+#[derive(Clone, Debug)]
+pub struct PrecedingTx {
+    pub from: Address,
+    pub kind: TxKind,
+    pub input: Bytes,
+    pub value: U256,
+    pub gas_limit: u64,
+    pub nonce: u64,
+    pub gas_price: u128,
+    pub access_list: AccessList,
+    pub authorization_list: Vec<SignedAuthorization>,
+}
+
+/// Replay preceding transactions against a CacheDB to bring it to the
+/// correct mid-block state.
+///
+/// Given transactions `txs[0..tx_index-1]` from block N, this function
+/// executes each one via revm's `transact_commit`, which commits state
+/// changes to the underlying CacheDB. After this function returns, the
+/// CacheDB reflects the state as if those transactions had already been
+/// mined.
+///
+/// `sim_env` supplies the block-level context (number, timestamp, gas
+/// limit, coinbase, prevrandao, basefee) so opcodes like BASEFEE,
+/// COINBASE, NUMBER, TIMESTAMP, and GASLIMIT return the same values they
+/// would in the real block. Per-tx GASPRICE comes from `PrecedingTx::gas_price`.
+///
+/// Transaction results (success/revert/halt) are intentionally ignored —
+/// in a real block even a reverted transaction still bumps the sender's
+/// nonce. Fee transfers to the coinbase are *not* applied: replay sets
+/// `disable_fee_charge`, so coinbase balance won't move and senders are
+/// not debited for gas. Downstream callers must not rely on either.
+pub fn replay_preceding_transactions<DB>(
+    cache_db: &mut CacheDB<DB>,
+    preceding_txs: &[PrecedingTx],
+    sim_env: &SimEnvOpts,
+) -> Result<Vec<ExecutionResult>>
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+{
+    use revm::context::{Context, TxEnv};
+    use revm::{ExecuteCommitEvm, MainBuilder, MainContext};
+
+    let mut evm = Context::mainnet()
+        .with_db(&mut *cache_db)
+        .modify_cfg_chained(|cfg| {
+            cfg.disable_nonce_check = true;
+            cfg.disable_balance_check = true;
+            cfg.disable_base_fee = true;
+            cfg.disable_fee_charge = true;
+            cfg.spec = sim_env.spec;
+        })
+        .modify_block_chained(|block| {
+            block.number = U256::from(sim_env.number);
+            block.timestamp = U256::from(sim_env.timestamp);
+            block.gas_limit = sim_env.gas_limit;
+            block.beneficiary = sim_env.coinbase;
+            block.prevrandao = Some(sim_env.prevrandao);
+            block.basefee = sim_env.basefee;
+            block.difficulty = sim_env.difficulty;
+        })
+        .build_mainnet();
+
+    let mut results = Vec::with_capacity(preceding_txs.len());
+    for (i, tx) in preceding_txs.iter().enumerate() {
+        // No EIP-7825 cap here. With `disable_fee_charge = true` the gas
+        // limit is irrelevant to fee accounting, and capping would refuse
+        // legitimate >16.7M-gas txs from pre-Osaka blocks. An OOG halt in
+        // `transact_commit` would not commit storage writes — only bump
+        // the nonce — silently corrupting the CacheDB state seen by every
+        // subsequent replay and by the analyzed tx itself.
+        let revm_tx = TxEnv::builder()
+            .caller(tx.from)
+            .kind(tx.kind)
+            .data(tx.input.clone())
+            .value(tx.value)
+            .gas_limit(tx.gas_limit)
+            .nonce(tx.nonce)
+            .gas_price(tx.gas_price)
+            .access_list(tx.access_list.clone())
+            .authorization_list_signed(tx.authorization_list.clone())
+            .build()
+            .map_err(|e| anyhow!("Failed to build tx env for preceding tx {}: {:?}", i, e))?;
+
+        // transact_commit executes and commits state changes to the CacheDB.
+        // Reverted/halted txs still bump nonces; results are returned for
+        // observability (gas accounting, halt reasons) and may be ignored.
+        let result = evm
+            .transact_commit(revm_tx)
+            .map_err(|e| anyhow!("Failed to replay preceding tx {}: {:?}", i, e))?;
+        results.push(result);
+    }
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -359,6 +515,7 @@ mod tests {
             DynSolValue::Uint(U256::from(sim_env.timestamp), 256),
             DynSolValue::Uint(U256::from(sim_env.gas_limit), 256),
             DynSolValue::Uint(sim_env.prevrandao.into(), 256),
+            DynSolValue::Uint(U256::from(sim_env.basefee), 256),
         ]);
         let encoded_args = constructor_args.abi_encode_params();
 
@@ -384,6 +541,7 @@ mod tests {
                 cfg.disable_balance_check = true;
                 cfg.disable_base_fee = true;
                 cfg.disable_fee_charge = true;
+                cfg.spec = sim_env.spec;
             })
             .modify_block_chained(|block| {
                 block.number = U256::from(sim_env.number);
@@ -391,8 +549,8 @@ mod tests {
                 block.gas_limit = sim_env.gas_limit;
                 block.beneficiary = sim_env.coinbase;
                 block.prevrandao = Some(sim_env.prevrandao);
-                block.basefee = 0;
-                block.difficulty = U256::ZERO;
+                block.basefee = sim_env.basefee;
+                block.difficulty = sim_env.difficulty;
             });
 
         let mut evm = ctx.build_mainnet();
@@ -402,7 +560,9 @@ mod tests {
             .kind(revm::primitives::TxKind::Create)
             .data(deploy_data.into())
             .value(U256::ZERO)
-            .gas_limit(30_000_000)
+            // Stay under EIP-7825's 2^24 per-tx cap; SimEnvTestMain's
+            // constructor uses well under this.
+            .gas_limit(EIP7825_TX_GAS_CAP)
             .gas_price(sim_env.gas_price)
             .build()
             .unwrap();
@@ -439,6 +599,9 @@ mod tests {
             coinbase: address!("0x00000000000000000000000000000000c01ba5e0"),
             prevrandao: B256::from(U256::from(0xdeadbeef_u64)),
             gas_price: 1_000_000_000,
+            basefee: 25_000_000_000,
+            difficulty: U256::ZERO,
+            spec: SpecId::OSAKA,
         };
 
         let (mut cache_db, callee_address) = deploy_sim_env_test(caller, &sim_env);
@@ -483,6 +646,9 @@ mod tests {
             coinbase: address!("0x00000000000000000000000000000000c01ba5e0"),
             prevrandao: B256::from(U256::from(0xdeadbeef_u64)),
             gas_price: 1_000_000_000,
+            basefee: 25_000_000_000,
+            difficulty: U256::ZERO,
+            spec: SpecId::OSAKA,
         };
 
         let (mut cache_db, callee_address) = deploy_sim_env_test(caller, &sim_env);
@@ -517,6 +683,52 @@ mod tests {
     }
 
     #[test]
+    fn test_sim_env_wrong_basefee_reverts() {
+        let caller = address!("0x000000000000000000000000000000000000c411");
+        let sim_env = SimEnvOpts {
+            number: 42,
+            timestamp: 1_700_000_000,
+            gas_limit: 30_000_000,
+            coinbase: address!("0x00000000000000000000000000000000c01ba5e0"),
+            prevrandao: B256::from(U256::from(0xdeadbeef_u64)),
+            gas_price: 1_000_000_000,
+            basefee: 25_000_000_000,
+            difficulty: U256::ZERO,
+            spec: SpecId::OSAKA,
+        };
+
+        let (mut cache_db, callee_address) = deploy_sim_env_test(caller, &sim_env);
+
+        let test_selector = Bytes::from(vec![0xf8, 0xa8, 0xfd, 0x6d]);
+        let state_updates = vec![StateUpdate::Call(IStateUpdateTypes::Call {
+            target: callee_address,
+            value: U256::ZERO,
+            callargs: test_selector,
+        })];
+
+        let estimator_address = address!("0x000000000000000000000000000000000000E570");
+
+        // Use a wrong basefee — SimEnvCallee.test() should revert
+        let wrong_env = SimEnvOpts {
+            basefee: 1,
+            ..sim_env
+        };
+
+        let result = estimate_state_changes_gas(
+            &mut cache_db,
+            estimator_address,
+            caller,
+            &state_updates,
+            &wrong_env,
+        );
+
+        assert!(
+            result.is_err(),
+            "estimate_state_changes_gas should fail when basefee mismatches"
+        );
+    }
+
+    #[test]
     fn test_sim_env_wrong_block_number_reverts() {
         let caller = address!("0x000000000000000000000000000000000000c411");
         let sim_env = SimEnvOpts {
@@ -526,6 +738,9 @@ mod tests {
             coinbase: address!("0x00000000000000000000000000000000c01ba5e0"),
             prevrandao: B256::from(U256::from(0xdeadbeef_u64)),
             gas_price: 1_000_000_000,
+            basefee: 25_000_000_000,
+            difficulty: U256::ZERO,
+            spec: SpecId::OSAKA,
         };
 
         let (mut cache_db, callee_address) = deploy_sim_env_test(caller, &sim_env);
@@ -557,5 +772,327 @@ mod tests {
             result.is_err(),
             "estimate_state_changes_gas should fail when block number mismatches"
         );
+    }
+
+    /// Convenience: SimEnvOpts with sensible defaults at a chosen spec.
+    fn sim_env_with_spec(spec: SpecId) -> SimEnvOpts {
+        SimEnvOpts {
+            number: 100,
+            timestamp: 1_700_000_000,
+            gas_limit: 30_000_000,
+            coinbase: address!("0x00000000000000000000000000000000c01ba5e0"),
+            prevrandao: B256::ZERO,
+            gas_price: 0,
+            basefee: 0,
+            difficulty: U256::ZERO,
+            spec,
+        }
+    }
+
+    fn fund(cache_db: &mut CacheDB<EmptyDB>, addr: Address) {
+        cache_db.insert_account_info(
+            addr,
+            AccountInfo {
+                balance: U256::from(10u128.pow(24)),
+                nonce: 0,
+                code_hash: B256::ZERO,
+                code: None,
+            },
+        );
+    }
+
+    /// EIP-7825's 2^24 per-tx gas cap is an Osaka-and-later rule. Pre-Osaka
+    /// specs must pass `gas_limit` through unchanged — capping a historical
+    /// 30M-gas tx at 16.7M would OOG it mid-replay and silently drop its
+    /// storage writes.
+    #[test]
+    fn test_effective_tx_gas_limit_only_caps_under_osaka() {
+        // Pre-Osaka: cap not applied.
+        assert_eq!(
+            effective_tx_gas_limit(30_000_000, SpecId::SHANGHAI),
+            30_000_000
+        );
+        assert_eq!(
+            effective_tx_gas_limit(30_000_000, SpecId::CANCUN),
+            30_000_000
+        );
+        assert_eq!(
+            effective_tx_gas_limit(30_000_000, SpecId::PRAGUE),
+            30_000_000
+        );
+
+        // Osaka onward: capped at 2^24.
+        assert_eq!(
+            effective_tx_gas_limit(30_000_000, SpecId::OSAKA),
+            EIP7825_TX_GAS_CAP
+        );
+        // Below the cap is left alone even under Osaka.
+        assert_eq!(effective_tx_gas_limit(1_000_000, SpecId::OSAKA), 1_000_000);
+    }
+
+    /// A pre-Osaka preceding tx with `gas_limit > 2^24` must execute against
+    /// its real limit during replay, not a truncated 16.7M. A `JUMPDEST/JUMP`
+    /// gas burner is given 25M gas under Shanghai; its OOG `gas_used` must
+    /// exceed 2^24, proving the limit was not capped before being handed
+    /// to revm.
+    #[test]
+    fn test_replay_does_not_apply_eip7825_cap_pre_osaka() {
+        let sender = address!("0x000000000000000000000000000000000000beef");
+        let mut cache_db = CacheDB::new(EmptyDB::default());
+        fund(&mut cache_db, sender);
+
+        // JUMPDEST PUSH1 0 JUMP — infinite loop that burns gas until OOG.
+        let burner_init = Bytes::from(hex::decode("5b600056").unwrap());
+
+        let preceding = vec![PrecedingTx {
+            from: sender,
+            kind: TxKind::Create,
+            input: burner_init,
+            value: U256::ZERO,
+            gas_limit: 25_000_000,
+            nonce: 0,
+            gas_price: 0,
+            access_list: Default::default(),
+            authorization_list: Default::default(),
+        }];
+
+        let sim_env = sim_env_with_spec(SpecId::SHANGHAI);
+        let results =
+            replay_preceding_transactions(&mut cache_db, &preceding, &sim_env).expect("replay");
+
+        let result = &results[0];
+        assert!(
+            matches!(result, ExecutionResult::Halt { .. }),
+            "burner should OOG-halt, got {:?}",
+            result
+        );
+        let gas_used = result.gas_used();
+        assert!(
+            gas_used > EIP7825_TX_GAS_CAP,
+            "gas burner only used {} gas — replay path is applying the EIP-7825 cap of {}",
+            gas_used,
+            EIP7825_TX_GAS_CAP
+        );
+        assert!(
+            gas_used <= 25_000_000,
+            "gas burner used {} > tx gas_limit",
+            gas_used
+        );
+    }
+
+    /// Under pre-Paris specs the DIFFICULTY opcode reads from
+    /// `BlockEnv::difficulty`, so `SimEnvOpts::difficulty` must be plumbed
+    /// through. Pre-deployed runtime `DIFFICULTY PUSH1 0 SSTORE` is invoked
+    /// under GRAY_GLACIER and slot 0 of the target must equal
+    /// `sim_env.difficulty` afterward.
+    #[test]
+    fn test_difficulty_propagates_to_block_env() {
+        use revm::context::{Context, TxEnv};
+        use revm::{ExecuteCommitEvm, MainBuilder, MainContext};
+
+        let sender = address!("0x000000000000000000000000000000000000beef");
+        let target = address!("0x00000000000000000000000000000000d1ff1c11");
+
+        // DIFFICULTY (0x44) PUSH1 0 (0x6000) SSTORE (0x55) STOP (0x00)
+        let runtime =
+            revm::state::Bytecode::new_raw(Bytes::from(hex::decode("4460005500").unwrap()));
+
+        let mut cache_db = CacheDB::new(EmptyDB::default());
+        fund(&mut cache_db, sender);
+        cache_db.insert_account_info(
+            target,
+            AccountInfo {
+                balance: U256::ZERO,
+                nonce: 0,
+                code_hash: B256::ZERO,
+                code: Some(runtime),
+            },
+        );
+
+        let mut sim_env = sim_env_with_spec(SpecId::GRAY_GLACIER); // pre-Paris
+        sim_env.difficulty = U256::from(0xdeadbeef_u64);
+
+        // Mirror the production replay setup so we directly test the
+        // BlockEnv plumbing of `sim_env.difficulty`.
+        let mut evm = Context::mainnet()
+            .with_db(&mut cache_db)
+            .modify_cfg_chained(|cfg| {
+                cfg.disable_nonce_check = true;
+                cfg.disable_balance_check = true;
+                cfg.disable_base_fee = true;
+                cfg.disable_fee_charge = true;
+                cfg.spec = sim_env.spec;
+            })
+            .modify_block_chained(|block| {
+                block.number = U256::from(sim_env.number);
+                block.timestamp = U256::from(sim_env.timestamp);
+                block.gas_limit = sim_env.gas_limit;
+                block.beneficiary = sim_env.coinbase;
+                block.basefee = sim_env.basefee;
+                block.difficulty = sim_env.difficulty;
+            })
+            .build_mainnet();
+
+        let tx = TxEnv::builder()
+            .caller(sender)
+            .kind(TxKind::Call(target))
+            .gas_limit(1_000_000)
+            .gas_price(0)
+            .build()
+            .unwrap();
+        evm.transact_commit(tx).expect("difficulty contract call");
+
+        use revm::database_interface::DatabaseRef;
+        let stored = cache_db
+            .storage_ref(target, U256::ZERO)
+            .expect("storage_ref");
+        assert_eq!(
+            stored,
+            U256::from(0xdeadbeef_u64),
+            "DIFFICULTY opcode read {:?}, expected sim_env.difficulty 0xdeadbeef",
+            stored
+        );
+    }
+
+    /// `PrecedingTx::access_list` must reach revm's `TxEnv` during replay.
+    /// EIP-2930 charges 2400 (address) + 1900 (slot) = 4300 intrinsic gas
+    /// per entry, partly offset by 2000 saved on the first warm SLOAD; the
+    /// same SLOAD tx with vs without the slot pre-warmed should differ by
+    /// exactly 2300 gas. A delta of zero would mean the field is being
+    /// dropped before it reaches revm.
+    #[test]
+    fn test_access_list_threaded_through_replay() {
+        use revm::context_interface::transaction::AccessListItem;
+
+        let sender = address!("0x000000000000000000000000000000000000beef");
+        let target = address!("0x000000000000000000000000000000000000515a");
+
+        // PUSH1 5 SLOAD STOP — just touches slot 5 once.
+        let runtime = revm::state::Bytecode::new_raw(Bytes::from(hex::decode("60055400").unwrap()));
+
+        let make_db = || {
+            let mut db = CacheDB::new(EmptyDB::default());
+            fund(&mut db, sender);
+            db.insert_account_info(
+                target,
+                AccountInfo {
+                    balance: U256::ZERO,
+                    nonce: 0,
+                    code_hash: B256::ZERO,
+                    code: Some(runtime.clone()),
+                },
+            );
+            db
+        };
+
+        let base_tx = || PrecedingTx {
+            from: sender,
+            kind: TxKind::Call(target),
+            input: Bytes::new(),
+            value: U256::ZERO,
+            gas_limit: 100_000,
+            nonce: 0,
+            gas_price: 0,
+            access_list: Default::default(),
+            authorization_list: Default::default(),
+        };
+
+        let sim_env = sim_env_with_spec(SpecId::SHANGHAI);
+
+        let mut db_no_al = make_db();
+        let mut tx_no_al = base_tx();
+        let no_al_results =
+            replay_preceding_transactions(&mut db_no_al, &[tx_no_al.clone()], &sim_env)
+                .expect("replay no_al");
+
+        let mut db_with_al = make_db();
+        tx_no_al.access_list = AccessList(vec![AccessListItem {
+            address: target,
+            storage_keys: vec![B256::from(U256::from(5u64))],
+        }]);
+        let with_al_results = replay_preceding_transactions(&mut db_with_al, &[tx_no_al], &sim_env)
+            .expect("replay with_al");
+
+        let gas_no_al = no_al_results[0].gas_used();
+        let gas_with_al = with_al_results[0].gas_used();
+        assert_eq!(
+            gas_with_al as i64 - gas_no_al as i64,
+            2300,
+            "access list field is not being threaded into the replay TxEnv \
+             (gas_used: with_al={} no_al={})",
+            gas_with_al,
+            gas_no_al
+        );
+    }
+
+    /// A signed EIP-7702 authorization carried in
+    /// `PrecedingTx::authorization_list` must be applied during replay: the
+    /// authority's account in the `CacheDB` should gain the 23-byte
+    /// `0xef0100 || delegated_address` indicator code post-replay.
+    #[test]
+    fn test_authorization_list_applies_delegation() {
+        use alloy_signer::SignerSync;
+        use alloy_signer_local::PrivateKeySigner;
+        use revm::context_interface::transaction::Authorization;
+        use revm::database_interface::DatabaseRef;
+
+        // A test private key (32 bytes of 0x42).
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x42)).unwrap();
+        let authority: Address = signer.address();
+        let delegated = address!("0x00000000000000000000000000000000de1e6a7e");
+
+        // EIP-7702 requires chain_id == tx.chain_id || 0. revm's
+        // mainnet config defaults to chain_id 1. Sign for chain 1.
+        let auth = Authorization {
+            chain_id: U256::from(1u64),
+            address: delegated,
+            nonce: 0,
+        };
+        let sig = signer.sign_hash_sync(&auth.signature_hash()).unwrap();
+        let signed = auth.into_signed(sig);
+
+        let funder = address!("0x000000000000000000000000000000000000beef");
+        let recipient = address!("0x000000000000000000000000000000000000d057");
+        let mut cache_db = CacheDB::new(EmptyDB::default());
+        fund(&mut cache_db, funder);
+        // The authority itself needs to exist (nonce 0) for the
+        // authorization to apply.
+        fund(&mut cache_db, authority);
+
+        // The "preceding tx" that carries the authorization. A simple value
+        // transfer is enough — the authorization is applied during
+        // intrinsic-gas processing regardless of execution outcome.
+        let tx = PrecedingTx {
+            from: funder,
+            kind: TxKind::Call(recipient),
+            input: Bytes::new(),
+            value: U256::ZERO,
+            gas_limit: 200_000,
+            nonce: 0,
+            gas_price: 0,
+            access_list: Default::default(),
+            authorization_list: vec![signed],
+        };
+
+        let sim_env = sim_env_with_spec(SpecId::PRAGUE); // 7702 active
+
+        replay_preceding_transactions(&mut cache_db, &[tx], &sim_env).expect("replay");
+
+        let info = cache_db
+            .basic_ref(authority)
+            .expect("basic_ref")
+            .expect("authority must exist");
+        let code = info.code.expect("authority must have code post-delegation");
+        let bytes = code.original_bytes();
+        // EIP-7702 delegation indicator: 0xef0100 || target_address (23 bytes).
+        assert_eq!(
+            bytes.len(),
+            23,
+            "expected 23-byte delegation indicator, got {} bytes — \
+             authorization_list is not reaching the replay TxEnv",
+            bytes.len()
+        );
+        assert_eq!(&bytes[..3], &[0xef, 0x01, 0x00], "delegation prefix");
+        assert_eq!(&bytes[3..], delegated.as_slice(), "delegated address");
     }
 }

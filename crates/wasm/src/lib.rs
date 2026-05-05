@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types::trace::geth::DefaultFrame;
 use gas_analyzer_core::{
     StateUpdate, compute_state_updates, encode_state_updates_to_abi,
@@ -6,6 +6,7 @@ use gas_analyzer_core::{
 };
 use gas_analyzer_estimator::{SimEnvOpts, estimate_state_changes_gas};
 use revm::database::{CacheDB, EmptyDB};
+use revm::primitives::hardfork::SpecId;
 use serde::Serialize;
 use std::collections::HashSet;
 use wasm_bindgen::prelude::*;
@@ -93,6 +94,11 @@ pub fn analyze_trace_inner(
         coinbase: Address::ZERO,
         prevrandao: B256::ZERO,
         gas_price: 0,
+        basefee: 0,
+        difficulty: U256::ZERO,
+        // WASM runs against EmptyDB with no real chain state; pick the newest
+        // spec so post-Pectra opcodes don't halt with `NotActivated`.
+        spec: SpecId::OSAKA,
     };
 
     let (gas_estimate, is_heuristic) =
