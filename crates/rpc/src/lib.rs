@@ -158,6 +158,16 @@ pub async fn get_preceding_transactions<P: Provider>(
                 Some(addr) => revm::primitives::TxKind::Call(addr),
                 None => revm::primitives::TxKind::Create,
             };
+            // EIP-2930 access list pre-warms slots/addresses; without it
+            // replay sees higher gas costs than the original tx and can
+            // OOG-halt, dropping storage writes from the CacheDB.
+            let access_list = tx.inner.access_list().cloned().unwrap_or_default();
+            // EIP-7702 set-code authorizations; only present on type-4 txs.
+            let authorization_list = tx
+                .inner
+                .authorization_list()
+                .map(<[_]>::to_vec)
+                .unwrap_or_default();
             PrecedingTx {
                 from: tx.inner.signer(),
                 kind,
@@ -166,6 +176,8 @@ pub async fn get_preceding_transactions<P: Provider>(
                 gas_limit: tx.inner.gas_limit(),
                 nonce: tx.inner.nonce(),
                 gas_price: tx.inner.effective_gas_price(base_fee),
+                access_list,
+                authorization_list,
             }
         })
         .collect();
