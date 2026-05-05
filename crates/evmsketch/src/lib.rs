@@ -454,4 +454,170 @@ mod tests {
         let result = tx_request_to_contract_input(&tx_request);
         assert!(result.is_err());
     }
+
+    // ========================================================================
+    // Regression tests for bagelface's review on PR #96.
+    // ========================================================================
+
+    /// Issue 1 — `sim_env()` derives the `SpecId` from the anchored header
+    /// against Ethereum mainnet hardforks, rather than hardcoding Osaka.
+    ///
+    /// `sim_env()` itself requires a full `EvmSketch` to construct, which
+    /// is heavy. The substantive logic is the `alloy_evm::spec` call against
+    /// `EthSpec::mainnet()`; this test exercises that call directly with
+    /// synthesized headers at known mainnet fork heights, so any future
+    /// chainspec swap (e.g. accidentally using Sepolia) is caught.
+    #[test]
+    fn test_sim_env_spec_derivation_against_mainnet() {
+        use alloy_consensus::Header;
+        use alloy_evm::eth::spec::EthSpec;
+        use revm::primitives::hardfork::SpecId;
+
+        let mainnet = EthSpec::mainnet();
+
+        // Mainnet historical fork heights / timestamps. Hardcoded so the
+        // test fails loudly if the chainspec is ever swapped (e.g. for
+        // Sepolia, where these heights are different).
+        let cases: &[(&str, u64, u64, SpecId)] = &[
+            ("Berlin",   12_244_000,           0,        SpecId::BERLIN),
+            ("London",   12_965_000,           0,        SpecId::LONDON),
+            ("Paris",    15_537_394,           0,        SpecId::MERGE),
+            ("Shanghai", 17_034_870, 1_681_338_455,      SpecId::SHANGHAI),
+            ("Cancun",   19_426_587, 1_710_338_135,      SpecId::CANCUN),
+        ];
+
+        for &(name, number, timestamp, expected) in cases {
+            let header = Header {
+                number,
+                timestamp,
+                ..Default::default()
+            };
+            let actual = alloy_evm::spec(&mainnet, &header);
+            assert_eq!(
+                actual, expected,
+                "{name} header (block {number}, ts {timestamp}) mapped to {actual:?}, \
+                 expected {expected:?} — sim_env() may be using the wrong chainspec",
+            );
+        }
+
+        // A wildly future timestamp should map to the latest known spec
+        // (at least Prague — chainspec library may have rolled forward).
+        let future = Header {
+            number: 50_000_000,
+            timestamp: 5_000_000_000,
+            ..Default::default()
+        };
+        let fut_spec = alloy_evm::spec(&mainnet, &future);
+        assert!(
+            fut_spec >= SpecId::PRAGUE,
+            "future block should map to at least Prague, got {:?}",
+            fut_spec
+        );
+    }
+
+    /// Issue 7 — `SimpleRpcDb::storage_ref` issues `eth_getStorageAt` with
+    /// the configured `block_number` as the block tag.
+    ///
+    /// `estimate_state_changes_gas_raw` constructs the DB with
+    /// `block_number = anchor - 1`; this test verifies the underlying
+    /// primitive honors that block. A custom recording transport captures
+    /// the JSON-RPC params so we can assert on the block tag.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simple_rpc_db_queries_at_configured_block() {
+        use alloy_json_rpc::{RequestPacket, Response, ResponsePacket};
+        use alloy_provider::network::AnyNetwork;
+        use alloy_provider::RootProvider;
+        use alloy_rpc_client::RpcClient;
+        use alloy_transport::{mock::Asserter, TransportError, TransportFut};
+        use revm::database_interface::DatabaseRef;
+        use std::sync::{Arc, Mutex};
+        use std::task::{Context, Poll};
+        use tower::Service;
+
+        use crate::simple_rpc_db::SimpleRpcDb;
+        use alloy::primitives::{address, U256};
+
+        /// A tower::Service that records every JSON-RPC request and pulls
+        /// canned responses from an `Asserter`.
+        #[derive(Clone)]
+        struct RecordingTransport {
+            asserter: Asserter,
+            requests: Arc<Mutex<Vec<(String, String)>>>,
+        }
+
+        impl Service<RequestPacket> for RecordingTransport {
+            type Response = ResponsePacket;
+            type Error = TransportError;
+            type Future = TransportFut<'static>;
+
+            fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, req: RequestPacket) -> Self::Future {
+                let me = self.clone();
+                Box::pin(async move {
+                    match req {
+                        RequestPacket::Single(r) => {
+                            let method = r.method().to_string();
+                            let params = r
+                                .params()
+                                .map(|p| p.get().to_string())
+                                .unwrap_or_default();
+                            me.requests.lock().unwrap().push((method, params));
+                            let payload = me.asserter.pop_response().expect("response queue empty");
+                            Ok(ResponsePacket::Single(Response {
+                                id: r.id().clone(),
+                                payload,
+                            }))
+                        }
+                        RequestPacket::Batch(_) => unreachable!("batch not used in this test"),
+                    }
+                })
+            }
+        }
+
+        let asserter = Asserter::new();
+        // `eth_getStorageAt` returns a 32-byte hex value. Push 0x...42.
+        asserter.push_success(&format!("0x{:0>64}", "42"));
+
+        let transport = RecordingTransport {
+            asserter,
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let recorded = transport.requests.clone();
+        let client = RpcClient::new(transport, true);
+        let provider: RootProvider<AnyNetwork> = RootProvider::new(client);
+
+        let db = SimpleRpcDb {
+            provider,
+            block_number: 99,
+        };
+
+        // SimpleRpcDb's storage_ref blocks the current thread; spawn_blocking
+        // gives it the worker thread it needs under multi_thread runtime.
+        let val = tokio::task::spawn_blocking(move || {
+            db.storage_ref(
+                address!("0x0000000000000000000000000000000000001234"),
+                U256::from(7u64),
+            )
+        })
+        .await
+        .expect("join")
+        .expect("storage_ref");
+
+        assert_eq!(val, U256::from(0x42u64));
+
+        let reqs = recorded.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 1, "expected exactly one RPC call");
+        assert_eq!(reqs[0].0, "eth_getStorageAt", "wrong RPC method");
+        // 99 = 0x63. Block tag is the third positional param.
+        assert!(
+            reqs[0].1.contains("\"0x63\""),
+            "request params {:?} did not carry block tag 0x63 (=99) — \
+             SimpleRpcDb is ignoring its configured block_number, which \
+             would defeat the N-1 anchoring fix in estimate_state_changes_gas_raw",
+            reqs[0].1
+        );
+    }
 }
