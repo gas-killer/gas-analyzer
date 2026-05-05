@@ -132,6 +132,11 @@ impl DefaultEvmSketchExecutor {
     /// Estimate gas for executing a set of state updates using pre-built calldata.
     ///
     /// Delegates to the shared gas-analyzer-estimator crate which uses revm directly.
+    ///
+    /// Storage is read at `block_number - 1` via `SimpleRpcDb`, matching the
+    /// other estimation entry points. Anchoring to `block_number` itself
+    /// returns post-block state from `eth_getStorageAt` — the analyzed tx
+    /// would observe its own writes already applied.
     pub fn estimate_state_changes_gas_raw(
         &self,
         contract_address: Address,
@@ -139,7 +144,12 @@ impl DefaultEvmSketchExecutor {
         calldata: Bytes,
         gas_price: u128,
     ) -> Result<u64> {
-        let mut cache_db = CacheDB::new(&self.sketch.rpc_db);
+        let state_block = self.anchor_block_number().saturating_sub(1);
+        let simple_db = SimpleRpcDb {
+            provider: self.sketch.provider.clone(),
+            block_number: state_block,
+        };
+        let mut cache_db = CacheDB::new(simple_db);
         let mut sim_env = self.sim_env();
         sim_env.gas_price = gas_price;
         gas_analyzer_estimator::estimate_gas_raw(
@@ -156,8 +166,12 @@ impl DefaultEvmSketchExecutor {
     /// `gas_price` defaults to 0 since it is a transaction-level field;
     /// callers with access to the original transaction can override it.
     /// `basefee` comes from the header (0 for pre-EIP-1559 blocks).
+    /// `spec` is derived from the header against Ethereum mainnet hardforks
+    /// (this binary is mainnet-only); `difficulty` carries the legacy PoW
+    /// value (zero post-Merge).
     pub fn sim_env(&self) -> SimEnvOpts {
         let header = self.sketch.anchor.header();
+        let spec = alloy_evm::spec(&alloy_evm::eth::spec::EthSpec::mainnet(), header);
         SimEnvOpts {
             number: header.number,
             timestamp: header.timestamp,
@@ -166,6 +180,8 @@ impl DefaultEvmSketchExecutor {
             prevrandao: header.mix_hash,
             gas_price: 0,
             basefee: header.base_fee_per_gas.unwrap_or(0),
+            difficulty: header.difficulty,
+            spec,
         }
     }
 

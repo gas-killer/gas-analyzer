@@ -3311,6 +3311,7 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "alloy-eips",
+ "alloy-evm 0.25.2",
  "alloy-provider",
  "anyhow",
  "gas-analyzer-core",

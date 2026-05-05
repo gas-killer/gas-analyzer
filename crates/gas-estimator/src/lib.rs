@@ -13,7 +13,9 @@ use alloy_primitives::{Address, B256, Bytes, U256};
 use anyhow::{Result, anyhow};
 use revm::context::result::ExecutionResult;
 use revm::database::CacheDB;
+use revm::context_interface::transaction::{AccessList, SignedAuthorization};
 use revm::primitives::TxKind;
+use revm::primitives::hardfork::SpecId;
 use revm::state::AccountInfo;
 
 use gas_analyzer_core::encoding::encode_state_updates_to_sol;
@@ -26,8 +28,18 @@ const EIP7825_TX_GAS_CAP: u64 = 1 << 24;
 /// Environment fields for the gas estimation simulation.
 ///
 /// These are set on revm's `BlockEnv` and `TxEnv` so that contracts reading
-/// opcodes like COINBASE, TIMESTAMP, NUMBER, GASLIMIT, GASPRICE, BASEFEE, or
-/// PREVRANDAO see realistic values.
+/// opcodes like COINBASE, TIMESTAMP, NUMBER, GASLIMIT, GASPRICE, BASEFEE,
+/// PREVRANDAO, or DIFFICULTY see realistic values.
+///
+/// `spec` selects the EVM hardfork rules. It must be derived from the block
+/// being simulated — using a newer spec for an older block applies wrong gas
+/// schedules, opcode availability, and per-tx limits, which can flip
+/// success/revert outcomes during preceding-tx replay and corrupt the
+/// CacheDB state the analyzed tx will read.
+///
+/// `difficulty` is the legacy DIFFICULTY opcode value. Post-Merge it is zero
+/// by protocol; pre-Merge it carries real PoW difficulty and is read directly
+/// by the opcode under pre-Paris specs.
 #[derive(Clone, Debug)]
 pub struct SimEnvOpts {
     pub number: u64,
@@ -37,6 +49,8 @@ pub struct SimEnvOpts {
     pub prevrandao: B256,
     pub gas_price: u128,
     pub basefee: u64,
+    pub difficulty: U256,
+    pub spec: SpecId,
 }
 
 /// Embedded ABI JSON for StateChangeHandlerGasEstimator - loaded at compile time
@@ -180,10 +194,7 @@ where
             cfg.disable_balance_check = true;
             cfg.disable_base_fee = true;
             cfg.disable_fee_charge = true;
-            // Default is PRAGUE; use the newest spec revm knows so that
-            // contracts using post-Pectra opcodes (e.g. EOF in Fusaka/Osaka)
-            // don't halt with `NotActivated`.
-            cfg.spec = revm::primitives::hardfork::SpecId::OSAKA;
+            cfg.spec = sim_env.spec;
         })
         .modify_block_chained(|block| {
             block.number = U256::from(sim_env.number);
@@ -192,17 +203,25 @@ where
             block.beneficiary = sim_env.coinbase;
             block.prevrandao = Some(sim_env.prevrandao);
             block.basefee = sim_env.basefee;
-            block.difficulty = U256::ZERO;
+            block.difficulty = sim_env.difficulty;
         });
 
     let mut evm = ctx.build_mainnet();
+
+    // EIP-7825 caps a single tx at 2^24 gas, but only from Osaka onward.
+    // Applying it to pre-Osaka specs would refuse legitimate ~30M-gas txs.
+    let tx_gas_limit = if sim_env.spec >= SpecId::OSAKA {
+        sim_env.gas_limit.min(EIP7825_TX_GAS_CAP)
+    } else {
+        sim_env.gas_limit
+    };
 
     let tx = TxEnv::builder()
         .caller(caller_address)
         .kind(revm::primitives::TxKind::Call(contract_address))
         .data(calldata)
         .value(U256::ZERO)
-        .gas_limit(sim_env.gas_limit.min(EIP7825_TX_GAS_CAP))
+        .gas_limit(tx_gas_limit)
         .gas_price(sim_env.gas_price)
         .build()
         .map_err(|e| anyhow!("Failed to build tx env: {:?}", e))?;
@@ -276,6 +295,17 @@ where
 /// `gas_price` is the *effective* per-gas price of the tx (post-EIP-1559:
 /// `min(maxFeePerGas, baseFee + maxPriorityFeePerGas)`), so the GASPRICE
 /// opcode returns the same value the original tx observed.
+///
+/// `access_list` (EIP-2930) pre-warms addresses and storage slots, lowering
+/// SLOAD/cold-access costs. Omitting it makes replay gas costs higher than
+/// the original tx, and a tight-budget tx can OOG mid-replay; an OOG halt
+/// in `transact_commit` does not commit storage writes (only the nonce
+/// bump), which silently corrupts the CacheDB state the analyzed tx will
+/// then read against.
+///
+/// `authorization_list` (EIP-7702) carries set-code authorizations. Without
+/// it, replay skips the EOA-to-bytecode delegation, so any later tx in the
+/// block that calls into those EOAs sees an empty account.
 pub struct PrecedingTx {
     pub from: Address,
     pub kind: TxKind,
@@ -284,6 +314,8 @@ pub struct PrecedingTx {
     pub gas_limit: u64,
     pub nonce: u64,
     pub gas_price: u128,
+    pub access_list: AccessList,
+    pub authorization_list: Vec<SignedAuthorization>,
 }
 
 /// Replay preceding transactions against a CacheDB to bring it to the
@@ -324,7 +356,7 @@ where
             cfg.disable_balance_check = true;
             cfg.disable_base_fee = true;
             cfg.disable_fee_charge = true;
-            cfg.spec = revm::primitives::hardfork::SpecId::OSAKA;
+            cfg.spec = sim_env.spec;
         })
         .modify_block_chained(|block| {
             block.number = U256::from(sim_env.number);
@@ -333,19 +365,27 @@ where
             block.beneficiary = sim_env.coinbase;
             block.prevrandao = Some(sim_env.prevrandao);
             block.basefee = sim_env.basefee;
-            block.difficulty = U256::ZERO;
+            block.difficulty = sim_env.difficulty;
         })
         .build_mainnet();
 
     for (i, tx) in preceding_txs.iter().enumerate() {
+        // No EIP-7825 cap here. With `disable_fee_charge = true` the gas
+        // limit is irrelevant to fee accounting, and capping would refuse
+        // legitimate >16.7M-gas txs from pre-Osaka blocks. An OOG halt in
+        // `transact_commit` would not commit storage writes — only bump
+        // the nonce — silently corrupting the CacheDB state seen by every
+        // subsequent replay and by the analyzed tx itself.
         let revm_tx = TxEnv::builder()
             .caller(tx.from)
             .kind(tx.kind)
             .data(tx.input.clone())
             .value(tx.value)
-            .gas_limit(tx.gas_limit.min(EIP7825_TX_GAS_CAP))
+            .gas_limit(tx.gas_limit)
             .nonce(tx.nonce)
             .gas_price(tx.gas_price)
+            .access_list(tx.access_list.clone())
+            .authorization_list_signed(tx.authorization_list.clone())
             .build()
             .map_err(|e| anyhow!("Failed to build tx env for preceding tx {}: {:?}", i, e))?;
 
@@ -486,6 +526,7 @@ mod tests {
                 cfg.disable_balance_check = true;
                 cfg.disable_base_fee = true;
                 cfg.disable_fee_charge = true;
+                cfg.spec = sim_env.spec;
             })
             .modify_block_chained(|block| {
                 block.number = U256::from(sim_env.number);
@@ -494,7 +535,7 @@ mod tests {
                 block.beneficiary = sim_env.coinbase;
                 block.prevrandao = Some(sim_env.prevrandao);
                 block.basefee = sim_env.basefee;
-                block.difficulty = U256::ZERO;
+                block.difficulty = sim_env.difficulty;
             });
 
         let mut evm = ctx.build_mainnet();
@@ -504,7 +545,9 @@ mod tests {
             .kind(revm::primitives::TxKind::Create)
             .data(deploy_data.into())
             .value(U256::ZERO)
-            .gas_limit(30_000_000)
+            // Stay under EIP-7825's 2^24 per-tx cap; SimEnvTestMain's
+            // constructor uses well under this.
+            .gas_limit(EIP7825_TX_GAS_CAP)
             .gas_price(sim_env.gas_price)
             .build()
             .unwrap();
@@ -542,6 +585,8 @@ mod tests {
             prevrandao: B256::from(U256::from(0xdeadbeef_u64)),
             gas_price: 1_000_000_000,
             basefee: 25_000_000_000,
+            difficulty: U256::ZERO,
+            spec: SpecId::OSAKA,
         };
 
         let (mut cache_db, callee_address) = deploy_sim_env_test(caller, &sim_env);
@@ -587,6 +632,8 @@ mod tests {
             prevrandao: B256::from(U256::from(0xdeadbeef_u64)),
             gas_price: 1_000_000_000,
             basefee: 25_000_000_000,
+            difficulty: U256::ZERO,
+            spec: SpecId::OSAKA,
         };
 
         let (mut cache_db, callee_address) = deploy_sim_env_test(caller, &sim_env);
@@ -631,6 +678,8 @@ mod tests {
             prevrandao: B256::from(U256::from(0xdeadbeef_u64)),
             gas_price: 1_000_000_000,
             basefee: 25_000_000_000,
+            difficulty: U256::ZERO,
+            spec: SpecId::OSAKA,
         };
 
         let (mut cache_db, callee_address) = deploy_sim_env_test(caller, &sim_env);
@@ -675,6 +724,8 @@ mod tests {
             prevrandao: B256::from(U256::from(0xdeadbeef_u64)),
             gas_price: 1_000_000_000,
             basefee: 25_000_000_000,
+            difficulty: U256::ZERO,
+            spec: SpecId::OSAKA,
         };
 
         let (mut cache_db, callee_address) = deploy_sim_env_test(caller, &sim_env);
