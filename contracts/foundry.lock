@@ -2,7 +2,7 @@
   "lib/forge-std": {
     "rev": "77041d2ce690e692d6e03cc812b57d1ddaa4d505"
   },
-  "lib/gas-killer-avs-sol": {
-    "rev": "33ef63ec63dccf6f7de98778de1cbbf2754489a6"
+  "lib/solidity-sdk": {
+    "rev": "ca0be7078f77e414952e7723c9b92a2d4d4f8e54"
   }
 }
