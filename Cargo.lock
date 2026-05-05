@@ -3296,6 +3296,8 @@ version = "0.1.0"
 dependencies = [
  "alloy-dyn-abi",
  "alloy-primitives",
+ "alloy-signer",
+ "alloy-signer-local",
  "alloy-sol-types",
  "anyhow",
  "gas-analyzer-core",
@@ -3310,9 +3312,13 @@ name = "gas-analyzer-evmsketch"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "alloy-consensus",
  "alloy-eips",
  "alloy-evm 0.25.2",
+ "alloy-json-rpc",
  "alloy-provider",
+ "alloy-rpc-client",
+ "alloy-transport",
  "anyhow",
  "gas-analyzer-core",
  "gas-analyzer-estimator",
@@ -3322,6 +3328,7 @@ dependencies = [
  "sp1-cc-client-executor",
  "sp1-cc-host-executor",
  "tokio",
+ "tower",
  "url",
 ]
 
