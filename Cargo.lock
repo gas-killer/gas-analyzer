@@ -3315,6 +3315,7 @@ dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-evm 0.25.2",
+ "alloy-hardforks 0.4.7",
  "alloy-json-rpc",
  "alloy-provider",
  "alloy-rpc-client",
