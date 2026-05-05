@@ -770,14 +770,6 @@ mod tests {
         );
     }
 
-    // ========================================================================
-    // Regression tests for bagelface's review on PR #96.
-    //
-    // Each test below exercises a specific correctness fix flagged in that
-    // review. They are deliberately written to fail under the pre-fix code
-    // so future regressions surface immediately.
-    // ========================================================================
-
     /// Convenience: SimEnvOpts with sensible defaults at a chosen spec.
     fn sim_env_with_spec(spec: SpecId) -> SimEnvOpts {
         SimEnvOpts {
@@ -805,11 +797,10 @@ mod tests {
         );
     }
 
-    /// Issue 2 — EIP-7825 cap is gated on Osaka.
-    ///
-    /// `effective_tx_gas_limit` must leave pre-Osaka gas limits untouched
-    /// so a legitimate ~30M-gas historical tx isn't artificially capped at
-    /// 16.7M (which would OOG it during replay).
+    /// EIP-7825's 2^24 per-tx gas cap is an Osaka-and-later rule. Pre-Osaka
+    /// specs must pass `gas_limit` through unchanged — capping a historical
+    /// 30M-gas tx at 16.7M would OOG it mid-replay and silently drop its
+    /// storage writes.
     #[test]
     fn test_effective_tx_gas_limit_only_caps_under_osaka() {
         // Pre-Osaka: cap not applied.
@@ -832,12 +823,11 @@ mod tests {
         assert_eq!(effective_tx_gas_limit(1_000_000, SpecId::OSAKA), 1_000_000);
     }
 
-    /// Issue 3 — `replay_preceding_transactions` must NOT cap per-tx gas at
-    /// EIP-7825's 2^24 limit when the spec is pre-Osaka.
-    ///
-    /// A "gas burner" preceding tx (`JUMPDEST PUSH1 0 JUMP`) loops until OOG
-    /// at exactly its `gas_limit`. We give it 30M gas under SHANGHAI; the
-    /// recorded `gas_used` must reflect the real limit, not 2^24.
+    /// A pre-Osaka preceding tx with `gas_limit > 2^24` must execute against
+    /// its real limit during replay, not a truncated 16.7M. A `JUMPDEST/JUMP`
+    /// gas burner is given 25M gas under Shanghai; its OOG `gas_used` must
+    /// exceed 2^24, proving the limit was not capped before being handed
+    /// to revm.
     #[test]
     fn test_replay_does_not_apply_eip7825_cap_pre_osaka() {
         let sender = address!("0x000000000000000000000000000000000000beef");
@@ -870,11 +860,9 @@ mod tests {
             result
         );
         let gas_used = result.gas_used();
-        // Under the buggy code, gas_used would be ≤ 2^24 (16,777,216).
-        // With the fix, it reflects the real 25M cap.
         assert!(
             gas_used > EIP7825_TX_GAS_CAP,
-            "gas burner only used {} gas — replay path is still applying EIP-7825 cap of {}",
+            "gas burner only used {} gas — replay path is applying the EIP-7825 cap of {}",
             gas_used,
             EIP7825_TX_GAS_CAP
         );
@@ -885,12 +873,11 @@ mod tests {
         );
     }
 
-    /// Issue 4 — `sim_env.difficulty` flows into `block.difficulty`, which is
-    /// what the DIFFICULTY opcode reads under pre-Merge specs.
-    ///
-    /// Pre-deploys runtime bytecode `DIFFICULTY PUSH1 0 SSTORE STOP` at a
-    /// fixed address, calls it, then reads slot 0. Slot 0 must equal
-    /// `sim_env.difficulty`.
+    /// Under pre-Paris specs the DIFFICULTY opcode reads from
+    /// `BlockEnv::difficulty`, so `SimEnvOpts::difficulty` must be plumbed
+    /// through. Pre-deployed runtime `DIFFICULTY PUSH1 0 SSTORE` is invoked
+    /// under GRAY_GLACIER and slot 0 of the target must equal
+    /// `sim_env.difficulty` afterward.
     #[test]
     fn test_difficulty_propagates_to_block_env() {
         use revm::context::{Context, TxEnv};
@@ -961,11 +948,12 @@ mod tests {
         );
     }
 
-    /// Issue 5 — `PrecedingTx.access_list` is threaded into the replay
-    /// `TxEnv`. EIP-2930 charges 2400 + 1900 = 4300 gas for a single
-    /// (address, slot) entry, so a tx with the entry uses observably more
-    /// gas than the same tx without it. If the field were dropped, the gas
-    /// numbers would match.
+    /// `PrecedingTx::access_list` must reach revm's `TxEnv` during replay.
+    /// EIP-2930 charges 2400 (address) + 1900 (slot) = 4300 intrinsic gas
+    /// per entry, partly offset by 2000 saved on the first warm SLOAD; the
+    /// same SLOAD tx with vs without the slot pre-warmed should differ by
+    /// exactly 2300 gas. A delta of zero would mean the field is being
+    /// dropped before it reaches revm.
     #[test]
     fn test_access_list_threaded_through_replay() {
         use revm::context_interface::transaction::AccessListItem;
@@ -1024,8 +1012,6 @@ mod tests {
 
         let gas_no_al = no_al_results[0].gas_used();
         let gas_with_al = with_al_results[0].gas_used();
-        // The access-list-entry intrinsic cost (2400 + 1900) minus the warm
-        // SLOAD savings (2100 - 100 = 2000) = 2300 extra gas.
         assert_eq!(
             gas_with_al as i64 - gas_no_al as i64,
             2300,
@@ -1036,10 +1022,10 @@ mod tests {
         );
     }
 
-    /// Issue 6 — `PrecedingTx.authorization_list` (EIP-7702) is threaded
-    /// into the replay `TxEnv`, and revm applies the delegation: the
-    /// authority's account in the `CacheDB` gains the `0xef0100 || target`
-    /// delegation indicator code.
+    /// A signed EIP-7702 authorization carried in
+    /// `PrecedingTx::authorization_list` must be applied during replay: the
+    /// authority's account in the `CacheDB` should gain the 23-byte
+    /// `0xef0100 || delegated_address` indicator code post-replay.
     #[test]
     fn test_authorization_list_applies_delegation() {
         use alloy_signer::SignerSync;
@@ -1099,8 +1085,8 @@ mod tests {
         assert_eq!(
             bytes.len(),
             23,
-            "expected 23-byte delegation indicator, got {} bytes — authorization_list \
-             field is not being threaded into the replay TxEnv",
+            "expected 23-byte delegation indicator, got {} bytes — \
+             authorization_list is not reaching the replay TxEnv",
             bytes.len()
         );
         assert_eq!(&bytes[..3], &[0xef, 0x01, 0x00], "delegation prefix");
