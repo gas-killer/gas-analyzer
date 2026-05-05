@@ -12,6 +12,7 @@ use alloy::providers::ProviderBuilder;
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy_eips::BlockId;
 use alloy_eips::BlockNumberOrTag;
+use alloy_evm::eth::spec::EthSpec;
 use alloy_provider::Provider;
 use alloy_provider::RootProvider;
 use alloy_provider::ext::DebugApi;
@@ -20,9 +21,33 @@ use anyhow::{Result, anyhow};
 use reth_primitives::EthPrimitives;
 use revm::database::CacheDB;
 use sp1_cc_client_executor::{ContractCalldata, ContractInput};
-use sp1_cc_host_executor::EvmSketch;
+use sp1_cc_host_executor::{EvmSketch, Genesis};
 use std::collections::HashSet;
 use url::Url;
+
+/// Ethereum mainnet chain ID.
+pub const MAINNET_CHAIN_ID: u64 = 1;
+/// Ethereum Sepolia chain ID.
+pub const SEPOLIA_CHAIN_ID: u64 = 11_155_111;
+
+/// Map a chain ID to the corresponding `Genesis` for `EvmSketch` and the
+/// matching `EthSpec` for hardfork derivation.
+///
+/// Only Ethereum mainnet and Sepolia are supported — other chain IDs return
+/// an error rather than silently defaulting to mainnet, which would produce
+/// a wrong `SpecId` whenever the active hardfork on the target chain
+/// differs from mainnet at the same height/timestamp.
+pub fn chain_id_to_genesis_and_spec(chain_id: u64) -> Result<(Genesis, EthSpec)> {
+    match chain_id {
+        MAINNET_CHAIN_ID => Ok((Genesis::Mainnet, EthSpec::mainnet())),
+        SEPOLIA_CHAIN_ID => Ok((Genesis::Sepolia, EthSpec::sepolia())),
+        other => Err(anyhow!(
+            "unsupported chain id {other}: only mainnet ({}) and sepolia ({}) are supported",
+            MAINNET_CHAIN_ID,
+            SEPOLIA_CHAIN_ID,
+        )),
+    }
+}
 
 pub mod simple_rpc_db;
 use simple_rpc_db::SimpleRpcDb;
@@ -86,6 +111,10 @@ pub fn tx_request_to_contract_input(tx_request: &TransactionRequest) -> Result<C
 pub struct EvmSketchExecutor<P, PT> {
     /// The underlying EvmSketch instance
     pub sketch: EvmSketch<P, PT>,
+    /// The chain ID detected from the RPC at build time. Used by `sim_env`
+    /// to pick the right `EthSpec` so hardfork derivation matches the
+    /// network being analyzed (mainnet vs Sepolia).
+    pub chain_id: u64,
 }
 
 /// Builder for EvmSketchExecutor
@@ -114,17 +143,31 @@ impl EvmSketchExecutorBuilder {
     }
 
     /// Build the EvmSketchExecutor.
+    ///
+    /// Queries `eth_chainId` from the RPC and selects the matching `Genesis`
+    /// (and, later, `EthSpec` in `sim_env`). Errors if the chain is neither
+    /// mainnet nor Sepolia: silently defaulting to mainnet when pointed at a
+    /// different network would yield wrong hardfork activation and corrupt
+    /// gas estimation.
     pub async fn build(self) -> Result<DefaultEvmSketchExecutor> {
         let rpc_url = self.rpc_url.ok_or_else(|| anyhow!("RPC URL is required"))?;
+
+        let chain_probe = RootProvider::<AnyNetwork>::new_http(rpc_url.clone());
+        let chain_id = chain_probe
+            .get_chain_id()
+            .await
+            .map_err(|e| anyhow!("Failed to query eth_chainId: {}", e))?;
+        let (genesis, _spec) = chain_id_to_genesis_and_spec(chain_id)?;
 
         let sketch = EvmSketch::builder()
             .at_block(self.block)
             .el_rpc_url(rpc_url)
+            .with_genesis(genesis)
             .build()
             .await
             .map_err(|e| anyhow!("Failed to build EvmSketch: {}", e))?;
 
-        Ok(EvmSketchExecutor { sketch })
+        Ok(EvmSketchExecutor { sketch, chain_id })
     }
 }
 
@@ -166,12 +209,16 @@ impl DefaultEvmSketchExecutor {
     /// `gas_price` defaults to 0 since it is a transaction-level field;
     /// callers with access to the original transaction can override it.
     /// `basefee` comes from the header (0 for pre-EIP-1559 blocks).
-    /// `spec` is derived from the header against Ethereum mainnet hardforks
-    /// (this binary is mainnet-only); `difficulty` carries the legacy PoW
-    /// value (zero post-Merge).
+    /// `spec` is derived from the header against the chain detected at
+    /// build time (mainnet or Sepolia hardforks); `difficulty` carries the
+    /// legacy PoW value (zero post-Merge).
     pub fn sim_env(&self) -> SimEnvOpts {
         let header = self.sketch.anchor.header();
-        let spec = alloy_evm::spec(&alloy_evm::eth::spec::EthSpec::mainnet(), header);
+        let eth_spec = match self.chain_id {
+            SEPOLIA_CHAIN_ID => EthSpec::sepolia(),
+            _ => EthSpec::mainnet(),
+        };
+        let spec = alloy_evm::spec(&eth_spec, header);
         SimEnvOpts {
             number: header.number,
             timestamp: header.timestamp,
@@ -183,6 +230,11 @@ impl DefaultEvmSketchExecutor {
             difficulty: header.difficulty,
             spec,
         }
+    }
+
+    /// Returns the chain ID detected from the RPC at build time.
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
     }
 
     /// Get the block hash that the executor is anchored to.
@@ -609,6 +661,87 @@ mod tests {
              SimpleRpcDb is ignoring its configured block_number, which \
              would defeat N-1 anchoring in the gas estimators",
             reqs[0].1
+        );
+    }
+
+    /// `chain_id_to_genesis_and_spec` must accept mainnet (1) and Sepolia
+    /// (11_155_111) and reject anything else. Silently mapping an unknown
+    /// chain ID to mainnet would let `sim_env()` derive the wrong `SpecId`
+    /// for any non-mainnet target (e.g. Cancun activates ~3 days earlier
+    /// on Sepolia than on mainnet, see `test_sepolia_spec_diverges_from_mainnet`).
+    #[test]
+    fn test_chain_id_to_genesis_and_spec_supported_and_rejected_chains() {
+        use alloy_hardforks::{EthereumHardfork, EthereumHardforks, ForkCondition};
+
+        let (mainnet_genesis, mainnet_spec) =
+            chain_id_to_genesis_and_spec(MAINNET_CHAIN_ID).expect("mainnet should be supported");
+        assert!(matches!(mainnet_genesis, Genesis::Mainnet));
+        // Sanity-check the EthSpec wiring: mainnet activates Cancun at the
+        // well-known timestamp 1_710_338_135. If this drifts the
+        // `EthSpec::mainnet()` constructor was swapped or the upstream
+        // chainspec changed.
+        assert_eq!(
+            mainnet_spec.ethereum_fork_activation(EthereumHardfork::Cancun),
+            ForkCondition::Timestamp(1_710_338_135),
+        );
+
+        let (sepolia_genesis, sepolia_spec) =
+            chain_id_to_genesis_and_spec(SEPOLIA_CHAIN_ID).expect("sepolia should be supported");
+        assert!(matches!(sepolia_genesis, Genesis::Sepolia));
+        assert_eq!(
+            sepolia_spec.ethereum_fork_activation(EthereumHardfork::Cancun),
+            ForkCondition::Timestamp(1_706_655_072),
+        );
+
+        // Holesky (17_000) and Anvil (31_337) must error rather than silently
+        // pretending to be mainnet — the wrong chainspec produces wrong
+        // hardfork activation, which corrupts gas estimation.
+        assert!(chain_id_to_genesis_and_spec(17_000).is_err());
+        assert!(chain_id_to_genesis_and_spec(31_337).is_err());
+        assert!(chain_id_to_genesis_and_spec(0).is_err());
+    }
+
+    /// At a header with a timestamp that falls *between* the Sepolia and
+    /// mainnet Cancun activation timestamps, `alloy_evm::spec` must return
+    /// different `SpecId`s for the two chains. This pins the fact that
+    /// chain selection is load-bearing — picking the wrong `EthSpec` here
+    /// would silently misclassify Sepolia headers as Shanghai when they
+    /// are already Cancun (or vice versa for the symmetric range).
+    #[test]
+    fn test_sepolia_spec_diverges_from_mainnet() {
+        use alloy_consensus::Header;
+        use revm::primitives::hardfork::SpecId;
+
+        // Sepolia Cancun: 1_706_655_072. Mainnet Cancun: 1_710_338_135.
+        // Pick a timestamp strictly inside that window.
+        const TS_BETWEEN_SEPOLIA_AND_MAINNET_CANCUN: u64 = 1_708_000_000;
+
+        let header = Header {
+            // Block number high enough to be post-Shanghai on both networks.
+            number: 18_000_000,
+            timestamp: TS_BETWEEN_SEPOLIA_AND_MAINNET_CANCUN,
+            ..Default::default()
+        };
+
+        let mainnet_spec = alloy_evm::spec(&EthSpec::mainnet(), &header);
+        let sepolia_spec = alloy_evm::spec(&EthSpec::sepolia(), &header);
+
+        assert_eq!(
+            mainnet_spec,
+            SpecId::SHANGHAI,
+            "mainnet at ts {} should still be Shanghai (Cancun activates at 1_710_338_135)",
+            TS_BETWEEN_SEPOLIA_AND_MAINNET_CANCUN,
+        );
+        assert_eq!(
+            sepolia_spec,
+            SpecId::CANCUN,
+            "sepolia at ts {} should already be Cancun (activated at 1_706_655_072)",
+            TS_BETWEEN_SEPOLIA_AND_MAINNET_CANCUN,
+        );
+        assert_ne!(
+            mainnet_spec, sepolia_spec,
+            "specs must differ across chains in the inter-activation window — \
+             a hardcoded mainnet EthSpec would silently break Sepolia analysis here",
         );
     }
 }
