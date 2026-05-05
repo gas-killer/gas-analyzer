@@ -4,7 +4,7 @@ out = "out"
 libs = ["lib"]
 
 remappings = [
-    "gk/=lib/gas-killer-avs-sol/src/"
+    "gk/=lib/solidity-sdk/src/"
 ]
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
