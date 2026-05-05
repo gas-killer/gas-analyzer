@@ -4,7 +4,7 @@ Solidity contracts used by the Gas Analyzer for on-chain gas estimation and inte
 
 ## Contents
 
-- **`src/StateChangeHandlerGasEstimator.sol`** — Wrapper around `StateChangeHandlerLib` from [gas-killer-avs-sol](https://github.com/BreadchainCoop/gas-killer-avs-sol). Deployed to an Anvil fork to measure the actual gas cost of replaying a transaction's state updates.
+- **`src/StateChangeHandlerGasEstimator.sol`** — Wrapper around `StateChangeHandlerLib` from [solidity-sdk](https://github.com/gas-killer/solidity-sdk). Deployed to an Anvil fork to measure the actual gas cost of replaying a transaction's state updates.
 - **`src/AccessControlTestContracts.sol`** — Test contracts for verifying state update extraction across access-controlled calls.
 - **`src/DelegateCallTestContracts.sol`** — Test contracts for verifying correct state update extraction with `DELEGATECALL` (only top-level context changes should be captured).
 - **`script/`** — Foundry deployment scripts for the test contracts.
@@ -18,7 +18,7 @@ Solidity contracts used by the Gas Analyzer for on-chain gas estimation and inte
 ```bash
 cd contracts
 
-# Install dependencies (forge-std, gas-killer-avs-sol)
+# Install dependencies (forge-std, solidity-sdk)
 forge install
 
 # Build
