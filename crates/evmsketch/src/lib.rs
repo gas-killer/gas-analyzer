@@ -455,18 +455,12 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ========================================================================
-    // Regression tests for bagelface's review on PR #96.
-    // ========================================================================
-
-    /// Issue 1 — `sim_env()` derives the `SpecId` from the anchored header
-    /// against Ethereum mainnet hardforks, rather than hardcoding Osaka.
-    ///
-    /// `sim_env()` itself requires a full `EvmSketch` to construct, which
-    /// is heavy. The substantive logic is the `alloy_evm::spec` call against
-    /// `EthSpec::mainnet()`; this test exercises that call directly with
-    /// synthesized headers at known mainnet fork heights, so any future
-    /// chainspec swap (e.g. accidentally using Sepolia) is caught.
+    /// `SimEnvOpts::spec` must reflect the mainnet hardfork active at the
+    /// anchored block. Synthesized headers at known mainnet
+    /// Berlin/London/Paris/Shanghai/Cancun heights are fed through the
+    /// same `alloy_evm::spec(&EthSpec::mainnet(), ...)` call `sim_env()`
+    /// uses; an accidental chainspec swap (e.g. to Sepolia, where these
+    /// heights differ) would surface as a wrong `SpecId`.
     #[test]
     fn test_sim_env_spec_derivation_against_mainnet() {
         use alloy_consensus::Header;
@@ -515,13 +509,12 @@ mod tests {
         );
     }
 
-    /// Issue 7 — `SimpleRpcDb::storage_ref` issues `eth_getStorageAt` with
-    /// the configured `block_number` as the block tag.
-    ///
-    /// `estimate_state_changes_gas_raw` constructs the DB with
-    /// `block_number = anchor - 1`; this test verifies the underlying
-    /// primitive honors that block. A custom recording transport captures
-    /// the JSON-RPC params so we can assert on the block tag.
+    /// `SimpleRpcDb::storage_ref` must issue `eth_getStorageAt` with its
+    /// configured `block_number` as the block tag — the gas estimators rely
+    /// on this to anchor reads at block N-1 (pre-block state) rather than
+    /// at the post-block state of the anchor itself. A recording
+    /// `tower::Service` captures the JSON-RPC params so the block tag can
+    /// be asserted directly.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_simple_rpc_db_queries_at_configured_block() {
         use alloy_json_rpc::{RequestPacket, Response, ResponsePacket};
@@ -616,7 +609,7 @@ mod tests {
             reqs[0].1.contains("\"0x63\""),
             "request params {:?} did not carry block tag 0x63 (=99) — \
              SimpleRpcDb is ignoring its configured block_number, which \
-             would defeat the N-1 anchoring fix in estimate_state_changes_gas_raw",
+             would defeat N-1 anchoring in the gas estimators",
             reqs[0].1
         );
     }
