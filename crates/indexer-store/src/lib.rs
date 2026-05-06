@@ -178,6 +178,29 @@ impl Store {
         Ok(())
     }
 
+    /// Retro-relabel `analysis` rows whose `project_slug` is still
+    /// `unknown:0xADDR` but whose `to_address` now resolves to a real project
+    /// via `address_project`. Returns the number of rows updated.
+    ///
+    /// Called after a resolver refresh that may have introduced new mappings —
+    /// historical analyses get corrected without re-running the worker.
+    pub async fn relabel_unknowns(&self) -> Result<u64, StoreError> {
+        let res = sqlx::query(
+            r#"
+            UPDATE analysis a
+            SET project_slug = ap.project_slug
+            FROM address_project ap
+            WHERE a.chain_id = ap.chain_id
+              AND a.to_address = ap.address
+              AND a.project_slug LIKE 'unknown:%'
+              AND ap.project_slug NOT LIKE 'unknown:%'
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     pub async fn refresh_rollups(&self) -> Result<(), StoreError> {
         // CONCURRENTLY needs the unique index, which we declared.
         sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY project_daily")

@@ -91,11 +91,11 @@ pre { background: #0a0d12; border: 1px solid var(--panel-border); padding: 12px;
 .data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .data-table th, .data-table td { padding: 8px 12px; border-bottom: 1px solid var(--panel-border); text-align: left; }
 .data-table th { color: var(--muted); font-weight: 500; }
+.data-table th.sortable { user-select: none; }
+.data-table th.sortable:hover { color: var(--link); }
+.sort-indicator { display: inline-block; width: 12px; font-size: 10px; color: var(--accent); }
 .data-table tr:last-child td { border-bottom: 0; }
 .data-table .right { text-align: right; }
-
-.tag-heuristic { color: var(--warn); font-size: 11px; padding: 2px 6px; border: 1px solid var(--warn); border-radius: 4px; }
-.tag-measured  { color: var(--accent); font-size: 11px; padding: 2px 6px; border: 1px solid var(--accent); border-radius: 4px; }
 
 .project-header { margin-bottom: 18px; }
 .project-header h2 { margin: 0 0 6px 0; }

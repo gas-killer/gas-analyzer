@@ -78,6 +78,14 @@ impl ResolverSnapshot {
     pub fn projects(&self) -> impl Iterator<Item = &ProjectInfo> {
         self.projects.values()
     }
+
+    /// Iterate every `(chain_id, address)` mapping the resolver knows about.
+    /// Used by the refresher to persist mappings into `address_project`.
+    pub fn addresses(&self) -> impl Iterator<Item = (u64, [u8; 20], &ProjectInfo)> {
+        self.addresses
+            .iter()
+            .map(|((chain, addr), info)| (*chain, *addr, info))
+    }
 }
 
 pub struct Resolver {
@@ -167,6 +175,9 @@ struct DefiLlamaProtocol {
     slug: String,
     name: String,
     category: Option<String>,
+    /// Optional protocol "main" address. Format is either a bare `0xHEX` or
+    /// `<chain>:<addr>`. We only consume Ethereum mainnet entries.
+    address: Option<String>,
 }
 
 async fn load_defillama(url: &str, into: &mut ResolverSnapshot) -> Result<(), ResolverError> {
@@ -175,21 +186,54 @@ async fn load_defillama(url: &str, into: &mut ResolverSnapshot) -> Result<(), Re
         .build()?;
     let protocols: Vec<DefiLlamaProtocol> = client.get(url).send().await?.json().await?;
 
+    let mut harvested_addresses = 0usize;
     for p in protocols {
-        // Don't overwrite overlay project metadata.
-        into.projects.entry(p.slug.clone()).or_insert(ProjectInfo {
-            slug: p.slug,
+        let info = ProjectInfo {
+            slug: p.slug.clone(),
             name: p.name,
             category: p.category,
             contact_email: None,
             contact_url: None,
-        });
-        // DefiLlama address-to-protocol mapping is not in this endpoint —
-        // would require fetching `/protocol/{slug}` for each. Deferred to a
-        // follow-up so we don't burn rate on every refresh.
+        };
+        // Don't overwrite overlay project metadata.
+        into.projects.entry(p.slug.clone()).or_insert_with(|| info.clone());
+
+        // The bulk /protocols endpoint already exposes the protocol's "main"
+        // address (usually the governance token). We only consume Ethereum
+        // mainnet entries; everything else is silently dropped. Overlay
+        // entries are never overwritten.
+        if let Some((chain_id, addr)) = parse_defillama_address(p.address.as_deref()) {
+            into.addresses
+                .entry((chain_id, addr))
+                .or_insert_with(|| info.clone());
+            harvested_addresses += 1;
+        }
     }
 
+    tracing::info!(addresses = harvested_addresses, "defillama addresses harvested");
     Ok(())
+}
+
+/// Parse DefiLlama's `address` field into `(chain_id, [u8;20])` if it is a
+/// recognised Ethereum mainnet 20-byte address. Returns `None` for any other
+/// chain, malformed hex, or unknown prefix — caller treats those as "skip".
+fn parse_defillama_address(raw: Option<&str>) -> Option<(u64, [u8; 20])> {
+    let s = raw?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let hex_part = match s.split_once(':') {
+        // Bare `0x...` — interpret as Ethereum mainnet.
+        None => s,
+        // Prefixed — only accept ethereum mainnet for now.
+        Some((prefix, rest)) => {
+            if !prefix.eq_ignore_ascii_case("ethereum") {
+                return None;
+            }
+            rest
+        }
+    };
+    parse_address(hex_part).ok().map(|a| (1, a))
 }
 
 fn parse_address(s: &str) -> Result<[u8; 20], ResolverError> {

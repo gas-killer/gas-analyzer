@@ -95,7 +95,7 @@ async fn refresh_resolver_into_store(
         return;
     }
     let snapshot = resolver.snapshot();
-    let mut count = 0;
+    let mut project_count = 0;
     for info in snapshot.projects() {
         let project = Project {
             slug: info.slug.clone(),
@@ -107,10 +107,47 @@ async fn refresh_resolver_into_store(
         if let Err(e) = store.upsert_project(&project).await {
             tracing::warn!(error = %e, slug = info.slug, "upsert_project failed");
         } else {
-            count += 1;
+            project_count += 1;
         }
     }
-    tracing::info!(projects = count, "resolver refreshed");
+
+    // Persist resolver addresses (overlay + DefiLlama). The upsert is idempotent
+    // and uses ON CONFLICT DO UPDATE — so a real slug always overwrites a prior
+    // synthetic `unknown:*` entry on the same address.
+    let mut address_count = 0u64;
+    for (chain_id, addr, info) in snapshot.addresses() {
+        if let Err(e) = store
+            .upsert_address_project(chain_id, addr, &info.slug)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                slug = info.slug,
+                addr = %hex::encode(addr),
+                "upsert_address_project failed"
+            );
+        } else {
+            address_count += 1;
+        }
+    }
+
+    // Retro-relabel historical `analysis` rows that were written with the
+    // synthetic `unknown:0xADDR` slug but now have a real mapping. Without
+    // this, the leaderboard would only ever reflect *new* analyses post-refresh.
+    let relabeled = match store.relabel_unknowns().await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(error = %e, "relabel_unknowns failed");
+            0
+        }
+    };
+
+    tracing::info!(
+        projects = project_count,
+        addresses = address_count,
+        relabeled,
+        "resolver refreshed"
+    );
 }
 
 #[derive(Deserialize)]

@@ -194,6 +194,29 @@ where
     }
 }
 
+/// Default `is_transient` predicate: retry on 5xx, 429, and common network
+/// transport failures (connection reset, EOF, timeouts). Conservative —
+/// errors that don't match are treated as permanent.
+///
+/// Pattern-matches on the `Display` form of the error because alloy's
+/// transport errors don't expose status codes through a stable typed API
+/// (yet); the rendered string is the most reliable signal across providers.
+pub fn is_transient_rpc_error<E: std::fmt::Display>(e: &E) -> bool {
+    let s = e.to_string().to_lowercase();
+    s.contains("503")
+        || s.contains("502")
+        || s.contains("504")
+        || s.contains("429")
+        || s.contains("error sending request")
+        || s.contains("connection reset")
+        || s.contains("connection closed")
+        || s.contains("connection refused")
+        || s.contains("timed out")
+        || s.contains("timeout")
+        || s.contains("temporarily unavailable")
+        || s.contains("unexpected eof")
+}
+
 fn backoff_with_jitter(config: &RetryConfig, attempt: u32) -> Duration {
     // 200ms * 4^(attempt-1) -> 200ms, 800ms, 3.2s. Capped at max_delay.
     let exp = config.base_delay.as_millis() as u64 * 4u64.pow(attempt.saturating_sub(1));

@@ -13,7 +13,7 @@
         <div class="metric">
             {% match health.last_seen_block %}
                 {% when Some with (b) %}{{ b }}
-                {% when None %}<span class="tag-heuristic">stale</span>
+                {% when None %}<span class="muted">stale</span>
             {% endmatch %}
         </div>
     </div>
@@ -42,14 +42,6 @@
                 {% when None %}—
             {% endmatch %}
         </div>
-    </div>
-    <div class="health-cell">
-        <div class="muted">Heuristic 1h</div>
-        <div class="metric">{{ health.heuristic_rate_1h }}</div>
-    </div>
-    <div class="health-cell">
-        <div class="muted">Heuristic 24h</div>
-        <div class="metric">{{ health.heuristic_rate_24h }}</div>
     </div>
     <div class="health-cell">
         <div class="muted">Total rows</div>

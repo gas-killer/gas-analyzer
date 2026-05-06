@@ -92,10 +92,8 @@ pub struct OverviewPage {
     pub totals_30d: TotalsView,
     pub totals_7d: TotalsView,
     pub totals_24h: TotalsView,
-    pub heuristic_24h: String,
     pub leaderboard: Vec<LeaderRow>,
     pub daily_30d: Vec<DailyView>,
-    pub categories: Vec<CategoryView>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,11 +107,8 @@ pub struct TotalsView {
 pub struct LeaderRow {
     pub project_slug: String,
     pub display_name: String,
-    pub category: String,
-    pub usd_saved: String,
     pub tx_count: i64,
     pub avg_savings_pct_pct: String,
-    pub heuristic_rate_pct: String,
 }
 
 #[derive(Debug, Clone)]
@@ -121,12 +116,6 @@ pub struct DailyView {
     pub day: String,
     pub usd_saved: f64,
     pub tx_count: i64,
-}
-
-#[derive(Debug, Clone)]
-pub struct CategoryView {
-    pub category: String,
-    pub usd_saved: f64,
 }
 
 pub async fn overview(
@@ -140,9 +129,6 @@ pub async fn overview(
     let totals_30d = totals_view(queries::overview_totals(pool, chain_id, queries::Window::Days(30)).await?);
     let totals_7d = totals_view(queries::overview_totals(pool, chain_id, queries::Window::Days(7)).await?);
     let totals_24h = totals_view(queries::overview_totals(pool, chain_id, queries::Window::Days(1)).await?);
-    let heuristic_24h = format_pct(
-        queries::heuristic_rate(pool, chain_id, "24 hours").await?.rate,
-    );
 
     let lb = queries::leaderboard_30d(pool, chain_id, 50, 0).await?;
     let leaderboard = lb
@@ -152,11 +138,8 @@ pub async fn overview(
                 .project_name
                 .clone()
                 .unwrap_or_else(|| r.project_slug.clone()),
-            category: r.category.unwrap_or_else(|| "—".to_string()),
-            usd_saved: format_usd(r.usd_saved.as_ref()),
             tx_count: r.tx_count.unwrap_or(0),
             avg_savings_pct_pct: format_pct(r.avg_savings_pct),
-            heuristic_rate_pct: format_pct(r.heuristic_rate),
             project_slug: r.project_slug,
         })
         .collect();
@@ -171,15 +154,6 @@ pub async fn overview(
         })
         .collect();
 
-    let cats = queries::category_breakdown_30d(pool, chain_id).await?;
-    let categories = cats
-        .into_iter()
-        .map(|c| CategoryView {
-            category: c.category.unwrap_or_else(|| "uncategorized".to_string()),
-            usd_saved: bd_to_f64(c.usd_saved.as_ref()),
-        })
-        .collect();
-
     let page = OverviewPage {
         user,
         chain_id,
@@ -187,10 +161,8 @@ pub async fn overview(
         totals_30d,
         totals_7d,
         totals_24h,
-        heuristic_24h,
         leaderboard,
         daily_30d,
-        categories,
     };
     Ok(page.into_response())
 }
@@ -212,7 +184,6 @@ pub struct ProjectPage {
     pub totals_lifetime: TotalsView,
     pub totals_30d: TotalsView,
     pub avg_savings_pct_30d: String,
-    pub heuristic_rate_30d: String,
     pub daily_90d: Vec<DailyView>,
     pub top_contracts: Vec<ContractRowView>,
     pub top_selectors: Vec<SelectorRowView>,
@@ -242,7 +213,6 @@ pub struct RecentTxView {
     pub gas_used: i64,
     pub gas_saved: i64,
     pub wei_saved: String,
-    pub is_heuristic: bool,
     pub when: String,
 }
 
@@ -269,7 +239,6 @@ pub async fn project(
         project_count: 0,
     };
     let avg_savings_pct_30d = format_pct(totals_30d_raw.avg_savings_pct);
-    let heuristic_rate_30d = format_pct(totals_30d_raw.heuristic_rate);
 
     let daily = queries::daily_for_project(pool, chain_id, &slug, 90).await?;
     let daily_90d = daily
@@ -312,7 +281,6 @@ pub async fn project(
             gas_used: r.gas_used,
             gas_saved: r.gas_saved,
             wei_saved: format_eth(Some(&r.wei_saved)),
-            is_heuristic: r.is_heuristic,
             when: format_when(r.block_timestamp),
         })
         .collect();
@@ -341,7 +309,6 @@ pub async fn project(
         totals_lifetime,
         totals_30d,
         avg_savings_pct_30d,
-        heuristic_rate_30d,
         daily_90d,
         top_contracts,
         top_selectors,

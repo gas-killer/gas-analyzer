@@ -26,11 +26,6 @@
         <h3>Avg savings · 30d</h3>
         <div class="metric">{{ avg_savings_pct_30d }}</div>
     </div>
-    <div class="card">
-        <h3>Heuristic · 30d</h3>
-        <div class="metric">{{ heuristic_rate_30d }}</div>
-        <div class="muted">share of estimates that fell back to heuristic</div>
-    </div>
 </section>
 
 <section class="card chart-card">
@@ -93,7 +88,6 @@
                 <th class="right">Gas saved</th>
                 <th class="right">ETH saved</th>
                 <th class="right">When</th>
-                <th>Source</th>
             </tr>
         </thead>
         <tbody>
@@ -105,10 +99,9 @@
                 <td class="right">{{ t.gas_saved }}</td>
                 <td class="right">{{ t.wei_saved }}</td>
                 <td class="right">{{ t.when }}</td>
-                <td>{% if t.is_heuristic %}<span class="tag-heuristic">heuristic</span>{% else %}<span class="tag-measured">measured</span>{% endif %}</td>
             </tr>
         {% else %}
-            <tr><td colspan="7" class="muted">No transactions persisted yet for this project.</td></tr>
+            <tr><td colspan="6" class="muted">No transactions persisted yet for this project.</td></tr>
         {% endfor %}
         </tbody>
     </table>
