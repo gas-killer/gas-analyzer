@@ -52,19 +52,24 @@ fn bench_trace_parsing(c: &mut Criterion) {
         trace.struct_logs.len()
     );
 
-    // Alloc-count pass: pre-clone inputs before the Region opens so clone
-    // allocations are not counted, then measure only compute_state_updates.
-    const ALLOC_ITERS: usize = 50;
-    let copies: Vec<_> = (0..ALLOC_ITERS).map(|_| trace.clone()).collect();
-    let region = Region::new(GLOBAL);
-    for t in copies {
-        let _ = black_box(gas_analyzer_core::compute_state_updates(t));
+    // Two-pass alloc-count: subtract clone overhead so only compute_state_updates
+    // allocations are reported, without holding ALLOC_ITERS copies simultaneously.
+    const ALLOC_ITERS: usize = 10;
+    let clone_region = Region::new(GLOBAL);
+    for _ in 0..ALLOC_ITERS {
+        let _ = black_box(trace.clone());
     }
-    let stats = region.change();
+    let clone_stats = clone_region.change();
+    let region = Region::new(GLOBAL);
+    for _ in 0..ALLOC_ITERS {
+        let t = trace.clone();
+        let _ = black_box(gas_analyzer_core::compute_state_updates(black_box(t)));
+    }
+    let total_stats = region.change();
     eprintln!(
         "  compute_state_updates — allocs/iter: {}, bytes/iter: {}",
-        stats.allocations / ALLOC_ITERS,
-        stats.bytes_allocated / ALLOC_ITERS,
+        total_stats.allocations.saturating_sub(clone_stats.allocations) / ALLOC_ITERS,
+        total_stats.bytes_allocated.saturating_sub(clone_stats.bytes_allocated) / ALLOC_ITERS,
     );
 
     // Wall-time: clone is in the setup closure, outside criterion's timed region.

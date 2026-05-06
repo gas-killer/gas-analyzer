@@ -4,6 +4,10 @@ BASELINE ?= main
 # Fall back to .env for RPC_URL if not already set in the environment.
 RPC_URL ?= $(shell [ -f .env ] && grep -m1 '^RPC_URL=' .env | cut -d= -f2-)
 
+# Guard used by targets that require a live Sepolia node.
+require-rpc-url:
+	@[ -n "$(RPC_URL)" ] || { echo "Error: RPC_URL is not set. Pass it on the command line or add it to .env."; exit 1; }
+
 # Run the offline benchmarks (no RPC required).
 bench:
 	cargo bench -p gas-analyzer-evmsketch --bench trace_parsing
@@ -12,7 +16,7 @@ bench:
 
 # Run the end-to-end RPC benchmark.  Requires a live Sepolia node.
 # Example:  make bench-rpc RPC_URL=https://rpc.sepolia.org
-bench-rpc:
+bench-rpc: require-rpc-url
 	RPC_URL=$(RPC_URL) cargo bench -p gas-analyzer-evmsketch --bench end_to_end
 
 # Save a named baseline for later comparison (default: BASELINE=main).
@@ -46,7 +50,7 @@ flamegraph-heap:
 
 # CPU flamegraph including the full end-to-end RPC pipeline.
 # Example:  make flamegraph-online RPC_URL=https://rpc.sepolia.org
-flamegraph-online:
+flamegraph-online: require-rpc-url
 	RPC_URL=$(RPC_URL) RUSTFLAGS="-C force-frame-pointers=yes" \
 		cargo bench -p gas-analyzer-evmsketch --bench flamegraph -- --profile-time 60
 
@@ -59,12 +63,12 @@ flamegraph-speedscope:
 
 # Speedscope protobuf output including the full end-to-end RPC pipeline.
 # Example:  make flamegraph-speedscope-online RPC_URL=https://rpc.sepolia.org
-flamegraph-speedscope-online:
+flamegraph-speedscope-online: require-rpc-url
 	RPC_URL=$(RPC_URL) FLAMEGRAPH_PROTO=1 RUSTFLAGS="-C force-frame-pointers=yes" \
 		cargo bench -p gas-analyzer-evmsketch --bench flamegraph -- --profile-time 60
 
 # Fetch a Sepolia trace and write it to benches/fixtures/sepolia_trace.json.
-# Only needed once; commit the resulting file so `make bench` works offline.
+# sepolia_trace.json is gitignored (too large); generate it locally before running make bench.
 # Example:  make fixture RPC_URL=https://rpc.sepolia.org
 fixture:
 	RPC_URL=$(RPC_URL) cargo run -p gas-analyzer-evmsketch --example generate_fixture

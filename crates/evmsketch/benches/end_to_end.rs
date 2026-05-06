@@ -20,8 +20,8 @@ const SEPOLIA_TX_HASH: &str = "0x680e2abfbccaf6246b4bda0989fc55dee169d0f6aef2ca4
 
 fn bench_end_to_end(c: &mut Criterion) {
     let rpc_url = match std::env::var("RPC_URL") {
-        Ok(u) => u,
-        Err(_) => {
+        Ok(u) if !u.trim().is_empty() => u,
+        _ => {
             eprintln!(
                 "Skipping end_to_end bench: RPC_URL not set.\n\
                  Run `make bench-rpc RPC_URL=<sepolia-node>` to include this benchmark."

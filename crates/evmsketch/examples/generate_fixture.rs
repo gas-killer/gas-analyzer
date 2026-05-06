@@ -18,6 +18,8 @@ const FIXTURE_PATH: &str = concat!(
 
 fn main() -> Result<()> {
     let rpc_url = std::env::var("RPC_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
         .expect("RPC_URL env var is required (Sepolia node with debug_traceTransaction support)");
 
     let rt = tokio::runtime::Builder::new_current_thread()

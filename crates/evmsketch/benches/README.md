@@ -11,10 +11,11 @@ make bench
 # End-to-end benchmark (requires a live Sepolia node)
 make bench-rpc RPC_URL=https://your-sepolia-node
 
-# Generate the trace_parsing fixture (once, then commit it)
+# Generate the trace_parsing fixture (once, then run make bench)
+# sepolia_trace.json is gitignored due to size — generate it locally
 make fixture RPC_URL=https://your-sepolia-node
 
-# Generate the replay fixture (once, then commit it)
+# Generate the replay fixture (once, then commit the resulting files)
 make replay-fixture RPC_URL=https://your-sepolia-node
 ```
 
