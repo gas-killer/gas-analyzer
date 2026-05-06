@@ -18,5 +18,8 @@ Thumbs.db
 # Ignore log/output files
 *.log
 
+# Ignore large generated bench fixtures (regenerate with `make fixture`)
+crates/evmsketch/benches/fixtures/sepolia_trace.json
+
 # Ignore test files
 test.csv
