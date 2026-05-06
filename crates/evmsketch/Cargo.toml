@@ -24,6 +24,15 @@ alloy-consensus = "1"
 alloy-hardforks = "0.4"
 alloy-json-rpc = "1"
 alloy-rpc-client = "1"
+alloy-sol-types = "1"
 alloy-transport = "1"
+dotenv = "0.15"
+gas-analyzer-estimator = { path = "../gas-estimator" }
+gas-analyzer-rpc = { path = "../rpc" }
+hex = "0.4"
+reqwest = { version = "0.12", features = ["json"] }
+rsp-rpc-db = { git = "https://github.com/succinctlabs/rsp", tag = "reth-1.9.1b" }
+serde_json = "1"
+sp1-cc-host-executor = { git = "https://github.com/BreadchainCoop/sp1-contract-call", branch = "cancun-v1", package = "sp1-cc-host-executor" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 tower = "0.5"
