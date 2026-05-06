@@ -26,8 +26,7 @@ use revm::primitives::hardfork::SpecId;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-const SEPOLIA_TX_HASH: &str =
-    "0x680e2abfbccaf6246b4bda0989fc55dee169d0f6aef2ca4c63a17c6a8a39d6cb";
+const SEPOLIA_TX_HASH: &str = "0x680e2abfbccaf6246b4bda0989fc55dee169d0f6aef2ca4c63a17c6a8a39d6cb";
 
 const PRECEDING_TXS_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -142,8 +141,7 @@ async fn run(rpc_url: String) -> Result<()> {
     // ----------------------------------------------------------------
     eprintln!("Fetching {tx_index} preceding transactions for block {block_number}...");
     let preceding_txs =
-        gas_analyzer_rpc::get_preceding_transactions(&eth_provider, block_number, tx_index)
-            .await?;
+        gas_analyzer_rpc::get_preceding_transactions(&eth_provider, block_number, tx_index).await?;
     eprintln!("Fetched {} preceding txs", preceding_txs.len());
 
     // ----------------------------------------------------------------
@@ -207,9 +205,7 @@ async fn run(rpc_url: String) -> Result<()> {
                 .get_storage_at(*addr, *slot)
                 .number(state_block)
                 .await
-                .map_err(|e| {
-                    anyhow::anyhow!("get_storage_at failed for {addr}[{slot}]: {e}")
-                })?;
+                .map_err(|e| anyhow::anyhow!("get_storage_at failed for {addr}[{slot}]: {e}"))?;
             storage.insert(*slot, value);
         }
 

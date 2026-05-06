@@ -68,8 +68,14 @@ fn bench_trace_parsing(c: &mut Criterion) {
     let total_stats = region.change();
     eprintln!(
         "  compute_state_updates — allocs/iter: {}, bytes/iter: {}",
-        total_stats.allocations.saturating_sub(clone_stats.allocations) / ALLOC_ITERS,
-        total_stats.bytes_allocated.saturating_sub(clone_stats.bytes_allocated) / ALLOC_ITERS,
+        total_stats
+            .allocations
+            .saturating_sub(clone_stats.allocations)
+            / ALLOC_ITERS,
+        total_stats
+            .bytes_allocated
+            .saturating_sub(clone_stats.bytes_allocated)
+            / ALLOC_ITERS,
     );
 
     // Wall-time: clone is in the setup closure, outside criterion's timed region.
