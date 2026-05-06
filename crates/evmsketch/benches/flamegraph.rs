@@ -17,7 +17,9 @@
 //!   Set RPC_URL=<sepolia-node> to also profile the full end-to-end RPC pipeline:
 //!       make flamegraph-online RPC_URL=<sepolia-node>
 
-use std::collections::HashMap;
+#[path = "common.rs"]
+mod common;
+
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256, Bytes, FixedBytes, TxKind, U256, address};
@@ -29,16 +31,11 @@ use alloy_rpc_types::TransactionTrait;
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use gas_analyzer_core::types::{IStateUpdateTypes, StateUpdate};
 use gas_analyzer_estimator::{
-    PrecedingTx, SimEnvOpts, build_gas_estimation_calldata, estimate_gas_raw,
-    replay_preceding_transactions,
+    SimEnvOpts, build_gas_estimation_calldata, estimate_gas_raw, replay_preceding_transactions,
 };
 use pprof::criterion::{Output, PProfProfiler};
-use revm::context_interface::transaction::AccessList;
 use revm::database::{CacheDB, EmptyDB};
-use revm::primitives::KECCAK_EMPTY;
 use revm::primitives::hardfork::SpecId;
-use revm::state::{AccountInfo, Bytecode};
-use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "heap-profile")]
 #[global_allocator]
@@ -160,128 +157,11 @@ fn bench_gas_estimation(c: &mut Criterion) {
     group.finish();
 }
 
-// ---- replay fixture types (mirrors benches/replay.rs) ----
-
-const PRECEDING_TXS_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/benches/fixtures/preceding_txs.json"
-);
-const PRE_BLOCK_STATE_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/benches/fixtures/pre_block_state.json"
-);
-
-#[derive(Serialize, Deserialize)]
-struct SimEnvJson {
-    number: u64,
-    timestamp: u64,
-    gas_limit: u64,
-    coinbase: Address,
-    prevrandao: B256,
-    gas_price: String,
-    basefee: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-struct TxJson {
-    from: Address,
-    to: Option<Address>,
-    input: Bytes,
-    value: U256,
-    gas_limit: u64,
-    nonce: u64,
-    gas_price: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct PrecedingTxsFixture {
-    sim_env: SimEnvJson,
-    txs: Vec<TxJson>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct AccountSnap {
-    balance: U256,
-    nonce: u64,
-    code: Bytes,
-    storage: HashMap<U256, U256>,
-}
-
-fn load_replay_fixtures() -> Option<(Vec<PrecedingTx>, CacheDB<EmptyDB>, SimEnvOpts)> {
-    let txs_json = std::fs::read_to_string(PRECEDING_TXS_PATH).ok()?;
-    let state_json = std::fs::read_to_string(PRE_BLOCK_STATE_PATH).ok()?;
-
-    let fixture: PrecedingTxsFixture =
-        serde_json::from_str(&txs_json).expect("preceding_txs.json is not valid JSON");
-    let state_snap: HashMap<Address, AccountSnap> =
-        serde_json::from_str(&state_json).expect("pre_block_state.json is not valid JSON");
-
-    let env = fixture.sim_env;
-    let sim_env = SimEnvOpts {
-        number: env.number,
-        timestamp: env.timestamp,
-        gas_limit: env.gas_limit,
-        coinbase: env.coinbase,
-        prevrandao: env.prevrandao,
-        gas_price: env
-            .gas_price
-            .parse()
-            .expect("gas_price is not a valid u128"),
-        basefee: env.basefee,
-        difficulty: U256::ZERO,
-        spec: SpecId::CANCUN,
-    };
-
-    let preceding_txs: Vec<PrecedingTx> = fixture
-        .txs
-        .into_iter()
-        .map(|t| PrecedingTx {
-            from: t.from,
-            kind: match t.to {
-                Some(addr) => TxKind::Call(addr),
-                None => TxKind::Create,
-            },
-            input: t.input,
-            value: t.value,
-            gas_limit: t.gas_limit,
-            nonce: t.nonce,
-            gas_price: t.gas_price.parse().expect("gas_price is not a valid u128"),
-            access_list: AccessList::default(),
-            authorization_list: vec![],
-        })
-        .collect();
-
-    let mut cache_db: CacheDB<EmptyDB> = CacheDB::new(EmptyDB::default());
-    for (addr, snap) in state_snap {
-        let bytecode = if snap.code.is_empty() {
-            Bytecode::default()
-        } else {
-            Bytecode::new_raw(snap.code)
-        };
-        cache_db.insert_account_info(
-            addr,
-            AccountInfo {
-                balance: snap.balance,
-                nonce: snap.nonce,
-                code: Some(bytecode),
-                code_hash: KECCAK_EMPTY,
-            },
-        );
-        for (slot, value) in snap.storage {
-            cache_db
-                .insert_account_storage(addr, slot, value)
-                .expect("insert_account_storage on EmptyDB should not fail");
-        }
-    }
-
-    Some((preceding_txs, cache_db, sim_env))
-}
-
 fn bench_replay(c: &mut Criterion) {
     #[cfg(feature = "heap-profile")]
     ensure_heap_profiler();
 
-    let (preceding_txs, template_db, sim_env) = match load_replay_fixtures() {
+    let (preceding_txs, template_db, sim_env) = match common::load_replay_fixtures() {
         Some(v) => v,
         None => {
             eprintln!(
@@ -314,8 +194,8 @@ fn bench_end_to_end(c: &mut Criterion) {
     ensure_heap_profiler();
 
     let rpc_url = match std::env::var("RPC_URL") {
-        Ok(u) => u,
-        Err(_) => {
+        Ok(u) if !u.trim().is_empty() => u,
+        _ => {
             eprintln!(
                 "Skipping end_to_end: RPC_URL not set.\n\
                  Example: make flamegraph-online RPC_URL=<sepolia-node>"

@@ -32,12 +32,13 @@ alloy-transport = "1"
 criterion   = { version = "0.5", features = ["html_reports", "async_tokio"] }
 dhat        = "0.3"
 pprof       = { version = "0.15", features = ["flamegraph", "criterion", "frame-pointer", "prost-codec"] }
+revm        = { version = "31.0.1", features = ["serde"] }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 sha2        = "0.10"
 stats_alloc = "0.1"
 tokio       = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
-tower        = "0.5"
+tower       = "0.5"
 
 [[bench]]
 name    = "trace_parsing"

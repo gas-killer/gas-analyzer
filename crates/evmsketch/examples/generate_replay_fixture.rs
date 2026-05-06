@@ -20,11 +20,14 @@ use anyhow::Result;
 use gas_analyzer_estimator::{SimEnvOpts, replay_preceding_transactions};
 use gas_analyzer_evmsketch::simple_rpc_db::SimpleRpcDb;
 use gas_analyzer_evmsketch::{DefaultEvmSketchExecutor, EvmSketchExecutorBuilder};
+use revm::context_interface::transaction::{AccessList, SignedAuthorization};
 use revm::database::CacheDB;
+use revm::primitives::hardfork::SpecId;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-const SEPOLIA_TX_HASH: &str = "0x680e2abfbccaf6246b4bda0989fc55dee169d0f6aef2ca4c63a17c6a8a39d6cb";
+const SEPOLIA_TX_HASH: &str =
+    "0x680e2abfbccaf6246b4bda0989fc55dee169d0f6aef2ca4c63a17c6a8a39d6cb";
 
 const PRECEDING_TXS_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -45,6 +48,8 @@ struct SimEnvJson {
     /// Decimal string to preserve u128 precision across JSON parsers.
     gas_price: String,
     basefee: u64,
+    difficulty: U256,
+    spec: SpecId,
 }
 
 impl From<SimEnvOpts> for SimEnvJson {
@@ -57,6 +62,8 @@ impl From<SimEnvOpts> for SimEnvJson {
             prevrandao: e.prevrandao,
             gas_price: e.gas_price.to_string(),
             basefee: e.basefee,
+            difficulty: e.difficulty,
+            spec: e.spec,
         }
     }
 }
@@ -71,6 +78,8 @@ struct TxJson {
     nonce: u64,
     /// Decimal string to preserve u128 precision across JSON parsers.
     gas_price: String,
+    access_list: AccessList,
+    authorization_list: Vec<SignedAuthorization>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -133,7 +142,8 @@ async fn run(rpc_url: String) -> Result<()> {
     // ----------------------------------------------------------------
     eprintln!("Fetching {tx_index} preceding transactions for block {block_number}...");
     let preceding_txs =
-        gas_analyzer_rpc::get_preceding_transactions(&eth_provider, block_number, tx_index).await?;
+        gas_analyzer_rpc::get_preceding_transactions(&eth_provider, block_number, tx_index)
+            .await?;
     eprintln!("Fetched {} preceding txs", preceding_txs.len());
 
     // ----------------------------------------------------------------
@@ -179,17 +189,17 @@ async fn run(rpc_url: String) -> Result<()> {
             .get_balance(*addr)
             .number(state_block)
             .await
-            .unwrap_or(U256::ZERO);
+            .map_err(|e| anyhow::anyhow!("get_balance failed for {addr}: {e}"))?;
         let nonce = eth_provider
             .get_transaction_count(*addr)
             .number(state_block)
             .await
-            .unwrap_or(0);
+            .map_err(|e| anyhow::anyhow!("get_transaction_count failed for {addr}: {e}"))?;
         let code = eth_provider
             .get_code_at(*addr)
             .number(state_block)
             .await
-            .unwrap_or_default();
+            .map_err(|e| anyhow::anyhow!("get_code_at failed for {addr}: {e}"))?;
 
         let mut storage = HashMap::new();
         for slot in slots {
@@ -197,7 +207,9 @@ async fn run(rpc_url: String) -> Result<()> {
                 .get_storage_at(*addr, *slot)
                 .number(state_block)
                 .await
-                .unwrap_or(U256::ZERO);
+                .map_err(|e| {
+                    anyhow::anyhow!("get_storage_at failed for {addr}[{slot}]: {e}")
+                })?;
             storage.insert(*slot, value);
         }
 
@@ -228,6 +240,8 @@ async fn run(rpc_url: String) -> Result<()> {
             gas_limit: tx.gas_limit,
             nonce: tx.nonce,
             gas_price: tx.gas_price.to_string(),
+            access_list: tx.access_list.clone(),
+            authorization_list: tx.authorization_list.clone(),
         })
         .collect();
 
