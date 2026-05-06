@@ -1,0 +1,21 @@
+[package]
+name = "indexer-store"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+indexer-api = { path = "../indexer-api" }
+bigdecimal = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0.219", features = ["derive"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "bigdecimal",
+    "chrono",
+    "macros",
+    "migrate",
+] }
+thiserror = "1.0"
+tokio = { version = "1.45", features = ["sync", "rt"] }
+tracing = "0.1"

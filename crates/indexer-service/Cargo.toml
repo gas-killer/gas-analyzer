@@ -1,0 +1,37 @@
+[package]
+name = "indexer-service"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "indexer_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "indexer-service"
+path = "src/main.rs"
+
+[dependencies]
+indexer-api = { path = "../indexer-api" }
+indexer-rpc = { path = "../indexer-rpc" }
+indexer-store = { path = "../indexer-store" }
+indexer-resolver = { path = "../indexer-resolver" }
+
+alloy = { version = "1.0.37", features = ["rpc", "rpc-types"] }
+alloy-provider = { version = "1.0.37", features = ["debug-api"] }
+
+anyhow = "1.0"
+alloy-rpc-types = "1.0.37"
+bigdecimal = { version = "0.4", features = ["serde"] }
+thiserror = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.45", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"

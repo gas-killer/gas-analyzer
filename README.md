@@ -1,6 +1,11 @@
 # Gas Analyzer
 
-Compute state update instructions for gas killer application and estimate gas savings
+Compute state update instructions for gas killer application and estimate gas savings.
+
+This repository contains two surfaces:
+
+- **CLI / library** (`crates/{core,gas-estimator,rpc,evmsketch,anvil,cli,wasm}`) — the original one-shot analyzer. See sections below.
+- **Indexer service** (`crates/indexer-{api,rpc,store,resolver,service,web}`) — a persistent block-by-block indexer that pipes per-tx gas-savings into Postgres, plus a purpose-built `indexer-web` UI (axum + askama + htmx) on port 3000 for BD dashboards and admin actions. Architecture, deployment, and known limitations: [`docs/INDEXER.md`](docs/INDEXER.md).
 
 ## Implementation Notes
 - Default mode uses EvmSketch for Anvil-free transaction simulation
