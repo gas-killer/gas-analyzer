@@ -15,7 +15,6 @@ alloy-eips = "1.0.37"
 alloy-provider = { version = "1.0.37", features = ["debug-api"] }
 anyhow = "1.0.98"
 colored = "3.0.0"
-tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenv = "0.15.0"
 hex = "0.4"
