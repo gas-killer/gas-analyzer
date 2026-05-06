@@ -39,8 +39,6 @@ pub struct HealthView {
     pub head_stale: bool,
     pub pending_queue: i64,
     pub dead_letter: i64,
-    pub heuristic_rate_1h: String,
-    pub heuristic_rate_24h: String,
     pub last_insert_age_secs: Option<i64>,
     pub total_rows: i64,
 }
@@ -136,8 +134,6 @@ async fn collect_health(state: &AppState) -> Result<HealthView, WebError> {
     let pool = state.store.pool();
 
     let analysis = queries::analysis_health(pool, chain_id).await?;
-    let h1 = queries::heuristic_rate(pool, chain_id, "1 hour").await?;
-    let h24 = queries::heuristic_rate(pool, chain_id, "24 hours").await?;
 
     let mut conn = state.redis.clone();
     let pending: i64 = conn
@@ -166,16 +162,7 @@ async fn collect_health(state: &AppState) -> Result<HealthView, WebError> {
         head_stale,
         pending_queue: pending,
         dead_letter: dead,
-        heuristic_rate_1h: format_pct(h1.rate),
-        heuristic_rate_24h: format_pct(h24.rate),
         last_insert_age_secs: analysis.last_insert_age_secs.map(|s| s as i64),
         total_rows: analysis.total_rows.unwrap_or(0),
     })
-}
-
-fn format_pct(v: Option<f64>) -> String {
-    match v {
-        Some(x) => format!("{:.1}%", x * 100.0),
-        None => "—".to_string(),
-    }
 }

@@ -22,6 +22,7 @@ use url::Url;
 use gas_analyzer_core::{TURETZKY_UPPER_GAS_LIMIT, estimate_gas_from_state_updates};
 use gas_analyzer_evmsketch::GasKillerEvmSketchDefault;
 use gas_analyzer_rpc::{compute_state_updates_from_tx, get_preceding_transactions};
+use indexer_rpc::{RetryConfig, is_transient_rpc_error, with_retry};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisReport {
@@ -136,13 +137,15 @@ impl EvmSketchAnalyzer {
 impl Analyzer for EvmSketchAnalyzer {
     async fn analyze_tx(&self, tx_hash: FixedBytes<32>) -> Result<AnalysisReport, AnalyzerError> {
         let provider = self.provider.as_ref();
+        let retry_cfg = RetryConfig::default();
 
         // 1. Receipt — gates skip decisions.
-        let receipt = provider
-            .get_transaction_receipt(tx_hash)
-            .await
-            .map_err(|e| AnalyzerError::Rpc(format!("get_transaction_receipt: {e}")))?
-            .ok_or_else(|| AnalyzerError::ReceiptNotFound(format!("0x{}", hex::encode(tx_hash))))?;
+        let receipt = with_retry(&retry_cfg, is_transient_rpc_error, || async {
+            provider.get_transaction_receipt(tx_hash).await
+        })
+        .await
+        .map_err(|e| AnalyzerError::Rpc(format!("get_transaction_receipt: {e}")))?
+        .ok_or_else(|| AnalyzerError::ReceiptNotFound(format!("0x{}", hex::encode(tx_hash))))?;
 
         if !receipt.status() {
             return Err(AnalyzerError::Skipped(SkipReason::Reverted));
@@ -167,36 +170,42 @@ impl Analyzer for EvmSketchAnalyzer {
         let effective_gas_price_wei = receipt.effective_gas_price;
 
         // 2. Block timestamp — needed for the report row.
-        let block = provider
-            .get_block_by_number(block_number.into())
-            .await
-            .map_err(|e| AnalyzerError::Rpc(format!("get_block_by_number: {e}")))?
-            .ok_or_else(|| AnalyzerError::Rpc(format!("block {block_number} not found")))?;
+        let block = with_retry(&retry_cfg, is_transient_rpc_error, || async {
+            provider.get_block_by_number(block_number.into()).await
+        })
+        .await
+        .map_err(|e| AnalyzerError::Rpc(format!("get_block_by_number: {e}")))?
+        .ok_or_else(|| AnalyzerError::Rpc(format!("block {block_number} not found")))?;
         let block_timestamp = block.header.timestamp;
 
         // 3. Function selector via `eth_getTransactionByHash`.
-        let function_selector = provider
-            .get_transaction_by_hash(tx_hash)
-            .await
-            .map_err(|e| AnalyzerError::Rpc(format!("get_transaction_by_hash: {e}")))?
-            .and_then(|tx| tx.function_selector().copied())
-            .map(|fs| {
-                let bytes: [u8; 4] = fs.into();
-                bytes
-            })
-            .unwrap_or([0u8; 4]);
+        let function_selector = with_retry(&retry_cfg, is_transient_rpc_error, || async {
+            provider.get_transaction_by_hash(tx_hash).await
+        })
+        .await
+        .map_err(|e| AnalyzerError::Rpc(format!("get_transaction_by_hash: {e}")))?
+        .and_then(|tx| tx.function_selector().copied())
+        .map(|fs| {
+            let bytes: [u8; 4] = fs.into();
+            bytes
+        })
+        .unwrap_or([0u8; 4]);
 
         // 4. Compute state updates from the actual historical trace.
-        let (state_updates, skipped_opcodes, call_gas_total) =
-            match compute_state_updates_from_tx(provider, tx_hash).await {
-                Ok(t) => t,
-                Err(e) => {
-                    // Tx succeeded on-chain (we checked above) but trace
-                    // extraction failed — mirror the CLI's heuristic fallback.
-                    tracing::warn!(error = %e, "trace extraction failed; using heuristic");
-                    (Vec::new(), std::collections::HashSet::new(), 0u64)
-                }
-            };
+        // Retry transient transport errors before falling back to heuristic.
+        let trace_result = with_retry(&retry_cfg, is_transient_rpc_error, || async {
+            compute_state_updates_from_tx(provider, tx_hash).await
+        })
+        .await;
+        let (state_updates, skipped_opcodes, call_gas_total) = match trace_result {
+            Ok(t) => t,
+            Err(e) => {
+                // Tx succeeded on-chain (we checked above) but trace
+                // extraction failed — mirror the CLI's heuristic fallback.
+                tracing::warn!(error = %e, "trace extraction failed; using heuristic");
+                (Vec::new(), std::collections::HashSet::new(), 0u64)
+            }
+        };
 
         // 5. Mid-block state — fetch preceding transactions.
         let preceding_txs = match get_preceding_transactions(provider, block_number, tx_index).await

@@ -4275,6 +4275,7 @@ dependencies = [
  "gas-analyzer-evmsketch",
  "gas-analyzer-rpc",
  "hex",
+ "indexer-rpc",
  "serde",
  "thiserror 1.0.69",
  "tracing",

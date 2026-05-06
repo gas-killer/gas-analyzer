@@ -7,6 +7,7 @@ edition = "2024"
 gas-analyzer-core = { path = "../core" }
 gas-analyzer-rpc = { path = "../rpc" }
 gas-analyzer-evmsketch = { path = "../evmsketch" }
+indexer-rpc = { path = "../indexer-rpc" }
 alloy = { version = "1.0.37", features = ["rpc", "rpc-types"] }
 alloy-eips = "1.0.37"
 alloy-provider = { version = "1.0.37", features = ["debug-api"] }

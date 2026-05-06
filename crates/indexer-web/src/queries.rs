@@ -64,34 +64,6 @@ pub async fn overview_totals(
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub struct HeuristicRate {
-    pub rate: Option<f64>,
-    pub sample_count: Option<i64>,
-}
-
-pub async fn heuristic_rate(
-    pool: &PgPool,
-    chain_id: i64,
-    interval_str: &str,
-) -> Result<HeuristicRate, WebError> {
-    let q = format!(
-        r#"SELECT
-             CASE WHEN COUNT(*) > 0
-               THEN SUM(CASE WHEN is_heuristic THEN 1 ELSE 0 END)::float8 / COUNT(*)::float8
-               ELSE NULL
-             END AS rate,
-             COUNT(*)::bigint AS sample_count
-           FROM analysis
-           WHERE chain_id = $1 AND inserted_at >= now() - interval '{interval_str}'"#
-    );
-    let row = sqlx::query_as::<_, HeuristicRate>(&q)
-        .bind(chain_id)
-        .fetch_one(pool)
-        .await?;
-    Ok(row)
-}
-
-#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct LeaderboardRow {
     pub project_slug: String,
     pub project_name: Option<String>,
@@ -99,7 +71,6 @@ pub struct LeaderboardRow {
     pub usd_saved: Option<BigDecimal>,
     pub tx_count: Option<i64>,
     pub avg_savings_pct: Option<f64>,
-    pub heuristic_rate: Option<f64>,
 }
 
 pub async fn leaderboard_30d(
@@ -115,14 +86,13 @@ pub async fn leaderboard_30d(
              p.category,
              SUM(pd.usd_saved_total)::numeric AS usd_saved,
              SUM(pd.tx_count)::bigint         AS tx_count,
-             AVG(pd.avg_savings_pct)::float8  AS avg_savings_pct,
-             AVG(pd.heuristic_rate)::float8   AS heuristic_rate
+             AVG(pd.avg_savings_pct)::float8  AS avg_savings_pct
            FROM project_daily pd
            LEFT JOIN projects p ON p.project_slug = pd.project_slug
            WHERE pd.chain_id = $1
              AND pd.day >= (now() - interval '30 days')::date
            GROUP BY pd.project_slug, p.project_name, p.category
-           ORDER BY usd_saved DESC NULLS LAST
+           ORDER BY tx_count DESC NULLS LAST
            LIMIT $2 OFFSET $3"#,
     )
     .bind(chain_id)
@@ -242,7 +212,6 @@ pub struct ProjectTotals {
     pub usd_saved: Option<BigDecimal>,
     pub tx_count: Option<i64>,
     pub avg_savings_pct: Option<f64>,
-    pub heuristic_rate: Option<f64>,
 }
 
 pub async fn project_totals(
@@ -256,8 +225,7 @@ pub async fn project_totals(
             r#"SELECT
                  COALESCE(SUM(usd_saved_total), 0)::numeric AS usd_saved,
                  COALESCE(SUM(tx_count), 0)::bigint         AS tx_count,
-                 AVG(avg_savings_pct)::float8               AS avg_savings_pct,
-                 AVG(heuristic_rate)::float8                AS heuristic_rate
+                 AVG(avg_savings_pct)::float8               AS avg_savings_pct
                FROM project_daily
                WHERE chain_id = $1 AND project_slug = $2"#
         ),
@@ -265,8 +233,7 @@ pub async fn project_totals(
             r#"SELECT
                  COALESCE(SUM(usd_saved_total), 0)::numeric AS usd_saved,
                  COALESCE(SUM(tx_count), 0)::bigint         AS tx_count,
-                 AVG(avg_savings_pct)::float8               AS avg_savings_pct,
-                 AVG(heuristic_rate)::float8                AS heuristic_rate
+                 AVG(avg_savings_pct)::float8               AS avg_savings_pct
                FROM project_daily
                WHERE chain_id = $1 AND project_slug = $2
                  AND day >= (now() - interval '{i}')::date"#
@@ -355,7 +322,6 @@ pub struct RecentTxRow {
     pub gas_used: i64,
     pub gas_saved: i64,
     pub wei_saved: BigDecimal,
-    pub is_heuristic: bool,
     pub block_timestamp: DateTime<Utc>,
 }
 
@@ -372,7 +338,6 @@ pub async fn recent_txs_for_project(
              gas_used,
              gas_saved,
              wei_saved,
-             is_heuristic,
              block_timestamp
            FROM analysis
            WHERE chain_id = $1 AND project_slug = $2
