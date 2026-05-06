@@ -1,0 +1,58 @@
+<div class="health-grid">
+    <div class="health-cell">
+        <div class="muted">Latest analyzed block</div>
+        <div class="metric">
+            {% match health.latest_analyzed_block %}
+                {% when Some with (b) %}{{ b }}
+                {% when None %}—
+            {% endmatch %}
+        </div>
+    </div>
+    <div class="health-cell">
+        <div class="muted">Head-tracker last seen</div>
+        <div class="metric">
+            {% match health.last_seen_block %}
+                {% when Some with (b) %}{{ b }}
+                {% when None %}<span class="tag-heuristic">stale</span>
+            {% endmatch %}
+        </div>
+    </div>
+    <div class="health-cell">
+        <div class="muted">Blocks behind head</div>
+        <div class="metric">
+            {% match health.blocks_behind %}
+                {% when Some with (b) %}{{ b }}
+                {% when None %}—
+            {% endmatch %}
+        </div>
+    </div>
+    <div class="health-cell">
+        <div class="muted">Pending queue</div>
+        <div class="metric">{{ health.pending_queue }}</div>
+    </div>
+    <div class="health-cell">
+        <div class="muted">Dead-letter</div>
+        <div class="metric">{{ health.dead_letter }}</div>
+    </div>
+    <div class="health-cell">
+        <div class="muted">Last insert</div>
+        <div class="metric">
+            {% match health.last_insert_age_secs %}
+                {% when Some with (s) %}{{ s }}s ago
+                {% when None %}—
+            {% endmatch %}
+        </div>
+    </div>
+    <div class="health-cell">
+        <div class="muted">Heuristic 1h</div>
+        <div class="metric">{{ health.heuristic_rate_1h }}</div>
+    </div>
+    <div class="health-cell">
+        <div class="muted">Heuristic 24h</div>
+        <div class="metric">{{ health.heuristic_rate_24h }}</div>
+    </div>
+    <div class="health-cell">
+        <div class="muted">Total rows</div>
+        <div class="metric">{{ health.total_rows }}</div>
+    </div>
+</div>

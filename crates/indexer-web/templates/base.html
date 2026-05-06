@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}Gas Killer Indexer{% endblock %}</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" defer></script>
+</head>
+<body>
+<header class="nav">
+    <div class="nav-brand"><a href="/">Gas Killer</a> <span class="muted">/ chain {{ chain_id }}</span></div>
+    <nav>
+        <a href="/">Overview</a>
+        <a href="/unknowns">Unknowns</a>
+        <a href="/admin">Admin</a>
+    </nav>
+    <div class="nav-user">
+        <span class="muted">{{ user }}</span>
+        <a href="/logout" class="logout">Sign out</a>
+    </div>
+</header>
+<main class="container">
+    {% block content %}{% endblock %}
+</main>
+</body>
+</html>

@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}Overview — Gas Killer Indexer{% endblock %}
+{% block content %}
+
+<section class="totals-grid">
+    <div class="card">
+        <h3>Lifetime</h3>
+        <div class="metric">{{ totals_lifetime.usd_saved }}</div>
+        <div class="muted">{{ totals_lifetime.tx_count }} txs · {{ totals_lifetime.project_count }} projects</div>
+    </div>
+    <div class="card">
+        <h3>Last 30d</h3>
+        <div class="metric">{{ totals_30d.usd_saved }}</div>
+        <div class="muted">{{ totals_30d.tx_count }} txs · {{ totals_30d.project_count }} projects</div>
+    </div>
+    <div class="card">
+        <h3>Last 7d</h3>
+        <div class="metric">{{ totals_7d.usd_saved }}</div>
+        <div class="muted">{{ totals_7d.tx_count }} txs</div>
+    </div>
+    <div class="card">
+        <h3>Last 24h</h3>
+        <div class="metric">{{ totals_24h.usd_saved }}</div>
+        <div class="muted">{{ totals_24h.tx_count }} txs · heuristic {{ heuristic_24h }}</div>
+    </div>
+</section>
+
+<section class="charts-row">
+    <div class="card chart-card">
+        <h3>USD saved · last 30 days</h3>
+        <canvas id="dailyChart"></canvas>
+    </div>
+    <div class="card chart-card">
+        <h3>Categories · last 30 days</h3>
+        <canvas id="categoryChart"></canvas>
+    </div>
+</section>
+
+<section class="card">
+    <h3>Project leaderboard · last 30 days</h3>
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Project</th>
+                <th>Category</th>
+                <th class="right">USD saved 30d</th>
+                <th class="right">Txs</th>
+                <th class="right">Avg savings %</th>
+                <th class="right">Heuristic</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for row in leaderboard %}
+            <tr>
+                <td><a href="/projects/{{ row.project_slug }}">{{ row.display_name }}</a></td>
+                <td>{{ row.category }}</td>
+                <td class="right">{{ row.usd_saved }}</td>
+                <td class="right">{{ row.tx_count }}</td>
+                <td class="right">{{ row.avg_savings_pct_pct }}</td>
+                <td class="right">{{ row.heuristic_rate_pct }}</td>
+            </tr>
+        {% else %}
+            <tr><td colspan="6" class="muted">No data yet — once the indexer has been running for a few hours, projects will populate here.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<script id="daily-data" type="application/json">{
+    "labels": [{% for p in daily_30d %}"{{ p.day }}"{% if !loop.last %},{% endif %}{% endfor %}],
+    "values": [{% for p in daily_30d %}{{ p.usd_saved }}{% if !loop.last %},{% endif %}{% endfor %}]
+}</script>
+<script id="category-data" type="application/json">{
+    "labels": [{% for c in categories %}"{{ c.category }}"{% if !loop.last %},{% endif %}{% endfor %}],
+    "values": [{% for c in categories %}{{ c.usd_saved }}{% if !loop.last %},{% endif %}{% endfor %}]
+}</script>
+<script>
+window.addEventListener("DOMContentLoaded", () => {
+    const daily = JSON.parse(document.getElementById("daily-data").textContent);
+    new Chart(document.getElementById("dailyChart"), {
+        type: "line",
+        data: {
+            labels: daily.labels,
+            datasets: [{ label: "USD saved", data: daily.values, borderColor: "#7ec8a4", backgroundColor: "rgba(126,200,164,0.18)", tension: 0.25, fill: true }]
+        },
+        options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { ticks: { callback: v => "$" + Number(v).toLocaleString() } } } }
+    });
+    const cats = JSON.parse(document.getElementById("category-data").textContent);
+    new Chart(document.getElementById("categoryChart"), {
+        type: "bar",
+        data: { labels: cats.labels, datasets: [{ label: "USD saved", data: cats.values, backgroundColor: "#9aa6e8" }] },
+        options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { ticks: { callback: v => "$" + Number(v).toLocaleString() } } } }
+    });
+});
+</script>
+{% endblock %}

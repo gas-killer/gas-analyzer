@@ -1,0 +1,49 @@
+[package]
+name = "indexer-web"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "indexer-web"
+path = "src/main.rs"
+
+[dependencies]
+indexer-store = { path = "../indexer-store" }
+indexer-service = { path = "../indexer-service" }
+
+axum = { version = "0.7", features = ["macros"] }
+askama = { version = "0.12", features = ["with-axum"] }
+askama_axum = "0.4"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["compression-gzip", "trace", "fs"] }
+tower-cookies = "0.10"
+
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "macros",
+    "chrono",
+    "bigdecimal",
+] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+
+bcrypt = "0.15"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2.6"
+base64 = "0.22"
+hex = "0.4"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"
+bigdecimal = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+tokio = { version = "1.45", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+anyhow = "1.0"
+thiserror = "1.0"
+
+clap = { version = "4", features = ["derive", "env"] }

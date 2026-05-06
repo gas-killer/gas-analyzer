@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Admin — Gas Killer Indexer{% endblock %}
+{% block content %}
+
+<h2>Admin</h2>
+
+{% match replay_message %}
+    {% when Some with (r) %}
+        <div class="banner {% if r.success %}banner-success{% else %}banner-error{% endif %}">
+            {{ r.message }}
+            {% match r.tx_hash_hex %}
+                {% when Some with (h) %}
+                    <div class="muted"><code>{{ h }}</code> — <a href="{{ explorer_tx_url }}{{ h }}" target="_blank" rel="noopener">explorer</a></div>
+                {% when None %}
+            {% endmatch %}
+        </div>
+    {% when None %}
+{% endmatch %}
+
+<section class="card">
+    <h3>Service health</h3>
+    <div id="health-region"
+         hx-get="/admin/health"
+         hx-trigger="every 5s"
+         hx-swap="innerHTML">
+        {% include "_health.html" %}
+    </div>
+</section>
+
+<section class="card">
+    <h3>On-demand tx replay</h3>
+    <p class="muted">Enqueues an analysis job for the given transaction. Bypasses the head-tracker's <code>MIN_GAS_USED</code> filter — if the tx exists on chain, the worker will pick it up within seconds.</p>
+    <form method="post" action="/admin/replay" class="replay-form">
+        <label>
+            Transaction hash
+            <input type="text" name="tx_hash" placeholder="0x..." pattern="^0x[0-9a-fA-F]{64}$" required>
+        </label>
+        <button type="submit">Replay</button>
+    </form>
+</section>
+
+{% endblock %}

@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Unknowns — Gas Killer Indexer{% endblock %}
+{% block content %}
+
+<section class="card">
+    <h3>Top unlabeled contracts · last 30 days</h3>
+    <p class="muted">Sorted by ETH saved. Add the worthwhile ones to <code>crates/indexer-resolver/data/overlay.yaml</code>; the refresher picks up new entries on its next tick (default 24h).</p>
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Address</th>
+                <th class="right">Txs</th>
+                <th class="right">ETH saved</th>
+                <th class="right">Last seen</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for r in rows %}
+            <tr>
+                <td><a href="{{ explorer_address_url }}{{ r.address_hex }}" target="_blank" rel="noopener"><code>{{ r.address_hex }}</code></a></td>
+                <td class="right">{{ r.tx_count }}</td>
+                <td class="right">{{ r.wei_saved }}</td>
+                <td class="right">{{ r.last_seen }}</td>
+            </tr>
+        {% else %}
+            <tr><td colspan="4" class="muted">No unknown contracts in the last 30 days — every measured tx mapped to a known project.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<section class="card">
+    <h3>Overlay snippet</h3>
+    <p class="muted">Drop these into <code>overlay.yaml</code> and replace the placeholders.</p>
+<pre><code>{% for r in rows %}- chain_id: 1
+  address: "{{ r.address_hex }}"
+  project_slug: "TODO-slug"
+  project_name: "TODO Name"
+  category: "TODO"
+{% endfor %}</code></pre>
+</section>
+
+{% endblock %}

@@ -1,25 +1,130 @@
-version: "3.8"
-
 services:
-  ethereum:
-    platform: linux/amd64
-    image: ghcr.io/breadchaincoop/ethereum:dev
-    env_file:
-      - .env
-    ports:
-      - "8545:8545"
-
-  test-runner:
-    build: .
-    env_file:
-      - .env
+  postgres:
+    image: postgres:16
     environment:
-      RPC_URL: "http://ethereum:8545" # Override RPC_URL from .env
+      POSTGRES_USER: indexer
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: indexer
     volumes:
-      - .:/app # Mount the source code for faster development
-      - cargo-cache:/usr/local/cargo # Mount cargo cache for faster builds
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "indexer", "-d", "indexer"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  indexer-build:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gas-killer/indexer-service:local
+    entrypoint: ["true"]
+    profiles: ["build"]
+
+  head-tracker:
+    image: gas-killer/indexer-service:local
+    command: ["/usr/local/bin/indexer-service", "head-tracker"]
+    environment:
+      RPC_URL: ${RPC_URL:?set RPC_URL}
+      CHAIN_ID: ${CHAIN_ID:-1}
+      DATABASE_URL: postgres://indexer:${POSTGRES_PASSWORD}@postgres:5432/indexer
+      REDIS_URL: redis://redis:6379
+      RPC_RPS_BUDGET: ${RPC_RPS_BUDGET:-100}
+      RPC_BURST: ${RPC_BURST:-25}
+      RPC_MAX_CONCURRENCY: ${RPC_MAX_CONCURRENCY:-8}
+      MIN_GAS_USED: ${MIN_GAS_USED:-50000}
+      MAX_QUEUE_DEPTH: ${MAX_QUEUE_DEPTH:-1000}
+      HEAD_POLL_MS: ${HEAD_POLL_MS:-4000}
+      RUST_LOG: ${RUST_LOG:-info}
     depends_on:
-      - ethereum
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    image: gas-killer/indexer-service:local
+    command: ["/usr/local/bin/indexer-service", "worker"]
+    deploy:
+      replicas: 4
+    environment:
+      RPC_URL: ${RPC_URL:?set RPC_URL}
+      CHAIN_ID: ${CHAIN_ID:-1}
+      DATABASE_URL: postgres://indexer:${POSTGRES_PASSWORD}@postgres:5432/indexer
+      REDIS_URL: redis://redis:6379
+      RPC_RPS_BUDGET: ${RPC_RPS_BUDGET:-100}
+      RPC_BURST: ${RPC_BURST:-25}
+      RPC_MAX_CONCURRENCY: ${RPC_MAX_CONCURRENCY:-8}
+      MIN_GAS_USED: ${MIN_GAS_USED:-50000}
+      WORKER_MAX_RETRIES: ${WORKER_MAX_RETRIES:-3}
+      OVERLAY_PATH: /etc/indexer/overlay.yaml
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  refresher:
+    image: gas-killer/indexer-service:local
+    command: ["/usr/local/bin/indexer-service", "refresher"]
+    environment:
+      RPC_URL: ${RPC_URL:?set RPC_URL}
+      CHAIN_ID: ${CHAIN_ID:-1}
+      DATABASE_URL: postgres://indexer:${POSTGRES_PASSWORD}@postgres:5432/indexer
+      REDIS_URL: redis://redis:6379
+      OVERLAY_PATH: /etc/indexer/overlay.yaml
+      DEFILLAMA_URL: ${DEFILLAMA_URL:-https://api.llama.fi/protocols}
+      PRICE_URL: ${PRICE_URL:-https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd}
+      RESOLVER_REFRESH_SECS: ${RESOLVER_REFRESH_SECS:-86400}
+      PRICE_REFRESH_SECS: ${PRICE_REFRESH_SECS:-3600}
+      ROLLUP_REFRESH_SECS: ${ROLLUP_REFRESH_SECS:-3600}
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  indexer-web:
+    image: gas-killer/indexer-service:local
+    command: ["/usr/local/bin/indexer-web"]
+    environment:
+      DATABASE_URL: postgres://indexer:${POSTGRES_PASSWORD}@postgres:5432/indexer
+      REDIS_URL: redis://redis:6379
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET}
+      AUTH_ALLOWLIST_PATH: /etc/indexer/users.yaml
+      BIND_ADDR: 0.0.0.0:3000
+      CHAIN_ID: ${CHAIN_ID:-1}
+      EXPLORER_TX_URL: ${EXPLORER_TX_URL:-https://etherscan.io/tx/}
+      EXPLORER_ADDRESS_URL: ${EXPLORER_ADDRESS_URL:-https://etherscan.io/address/}
+      STATIC_DIR: /opt/indexer-web/static
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./users.yaml:/etc/indexer/users.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
-  cargo-cache:
+  postgres-data:
+  redis-data:
