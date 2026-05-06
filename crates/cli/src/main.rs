@@ -85,6 +85,16 @@ async fn main() {
     dotenv::dotenv().ok();
     let cli_args = parse_args();
 
+    let log_level = if cli_args.debug { "debug" } else { "info" };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
+        )
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        .with_target(false)
+        .init();
+
     let debug = cli_args.debug;
     let result = execute_command(cli_args).await;
     if let Err(e) = result {
