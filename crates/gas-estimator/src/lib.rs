@@ -271,6 +271,7 @@ where
 /// * `caller_address` - The address to use as the caller (also used as tx.origin)
 /// * `state_updates` - The state updates to estimate gas for
 /// * `sim_env` - Simulation environment fields (block and tx context)
+#[tracing::instrument(name = "gas.evm_execute", skip_all, fields(block_number = sim_env.number, state_update_count = state_updates.len()))]
 pub fn estimate_state_changes_gas<DB>(
     cache_db: &mut CacheDB<DB>,
     contract_address: Address,
