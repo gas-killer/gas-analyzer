@@ -43,11 +43,12 @@ def build_report(
     baseline: dict[str, float],
     candidate: dict[str, float],
     threshold: float,
+    baseline_name: str,
 ) -> tuple[list[str], list[tuple[str, float, float, float]]]:
     """Return (report_lines, regressions)."""
     regressions: list[tuple[str, float, float, float]] = []
     table: list[str] = [
-        f"| Benchmark | Baseline (`{args.baseline}`) | Candidate | Change |",
+        f"| Benchmark | Baseline (`{baseline_name}`) | Candidate | Change |",
         "|-----------|:-----------------:|:---------:|:------:|",
     ]
 
@@ -77,7 +78,7 @@ def build_report(
     )
 
     if not baseline:
-        summary = f"> No baseline found on `{args.baseline}` — results are for reference only."
+        summary = f"> No baseline found on `{baseline_name}` — results are for reference only."
     elif regressions:
         summary = (
             f"> **{len(regressions)} regression(s) detected** "
@@ -108,7 +109,7 @@ def main() -> int:
         _write("\n".join(lines) + "\n", args.output_file)
         return 0
 
-    lines, regressions = build_report(baseline, candidate, args.threshold)
+    lines, regressions = build_report(baseline, candidate, args.threshold, args.baseline)
     _write("\n".join(lines) + "\n", args.output_file)
 
     if regressions:
