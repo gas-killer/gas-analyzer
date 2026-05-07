@@ -5,6 +5,7 @@ mod admin;
 mod auth;
 mod error;
 mod handlers;
+mod labels;
 mod queries;
 
 use std::path::PathBuf;
@@ -64,6 +65,26 @@ struct Cli {
     /// Static-file directory served at `/static`.
     #[arg(long, env = "STATIC_DIR", default_value = "crates/indexer-web/static")]
     static_dir: PathBuf,
+
+    // -------- Manual refresh sources --------
+    //
+    // Mirror the relevant CommonConfig / RefresherConfig env vars so the
+    // admin "refresh now" buttons can hit the same endpoints the loop hits.
+    #[arg(long, env = "OVERLAY_PATH", default_value = "/etc/indexer/overlay.yaml")]
+    overlay_path: PathBuf,
+
+    #[arg(long, env = "DEFILLAMA_URL", default_value = "https://api.llama.fi/protocols")]
+    defillama_url: String,
+
+    #[arg(long, env = "PRICE_URL",
+          default_value = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd")]
+    price_url: String,
+
+    #[arg(long, env = "LABELER_BATCH_SIZE", default_value_t = 200)]
+    labeler_batch_size: i64,
+
+    #[arg(long, env = "LABELER_RETRY_DAYS", default_value_t = 7)]
+    labeler_retry_days: i64,
 }
 
 #[derive(Clone)]
@@ -74,6 +95,14 @@ pub struct AppState {
     pub chain_id: i64,
     pub explorer_tx_url: Arc<String>,
     pub explorer_address_url: Arc<String>,
+
+    // Refresh-button surface.
+    pub resolver: Arc<indexer_resolver::Resolver>,
+    pub overlay_path: Arc<PathBuf>,
+    pub defillama_url: Arc<String>,
+    pub price_url: Arc<String>,
+    pub labeler_batch_size: i64,
+    pub labeler_retry_days: i64,
 }
 
 impl FromRef<AppState> for AuthState {
@@ -110,6 +139,12 @@ async fn main() -> Result<()> {
         chain_id: cli.chain_id,
         explorer_tx_url: Arc::new(cli.explorer_tx_url),
         explorer_address_url: Arc::new(cli.explorer_address_url),
+        resolver: Arc::new(indexer_resolver::Resolver::new()),
+        overlay_path: Arc::new(cli.overlay_path),
+        defillama_url: Arc::new(cli.defillama_url),
+        price_url: Arc::new(cli.price_url),
+        labeler_batch_size: cli.labeler_batch_size,
+        labeler_retry_days: cli.labeler_retry_days,
     };
 
     let app = Router::new()
@@ -118,7 +153,14 @@ async fn main() -> Result<()> {
         .route("/unknowns", get(handlers::public::unknowns))
         .route("/admin", get(admin::admin_page))
         .route("/admin/health", get(admin::health_partial))
-        .route("/admin/replay", post(admin::replay_post))
+        .route("/admin/refresh/rollups",   post(admin::refresh_rollups))
+        .route("/admin/refresh/eth-price", post(admin::refresh_eth_price))
+        .route("/admin/refresh/resolver",  post(admin::refresh_resolver))
+        .route("/admin/refresh/labeler",   post(admin::refresh_labeler))
+        .route("/admin/refresh/relabel",   post(admin::refresh_relabel))
+        .route("/api/labels/cell",         get(labels::label_cell))
+        .route("/api/labels/edit",         get(labels::label_edit))
+        .route("/api/labels/override",     post(labels::label_override))
         .route("/login", get(handlers::public::login_get).post(handlers::public::login_post))
         .route("/logout", get(handlers::public::logout))
         .route("/healthz", get(|| async { "ok" }))

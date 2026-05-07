@@ -32,6 +32,16 @@ pub struct Project {
     pub contact_url: Option<String>,
 }
 
+/// Row returned by `Store::top_unknown_addresses`. Used by the auto-labeler
+/// to decide which contracts to look up first (highest wei_saved → highest
+/// BD value to label).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UnknownAddressRow {
+    pub address: Vec<u8>,
+    pub wei_saved_total: BigDecimal,
+    pub tx_count: i64,
+}
+
 #[derive(Clone)]
 pub struct Store {
     pool: PgPool,
@@ -137,6 +147,9 @@ impl Store {
         Ok(())
     }
 
+    /// Upsert an automatic mapping. Will NOT overwrite rows whose
+    /// `manual_override` flag is set — that's how human edits made via the
+    /// admin UI stay sticky across resolver / labeler refreshes.
     pub async fn upsert_address_project(
         &self,
         chain_id: u64,
@@ -145,10 +158,11 @@ impl Store {
     ) -> Result<(), StoreError> {
         sqlx::query(
             r#"
-            INSERT INTO address_project (chain_id, address, project_slug)
-            VALUES ($1, $2, $3)
+            INSERT INTO address_project (chain_id, address, project_slug, manual_override)
+            VALUES ($1, $2, $3, FALSE)
             ON CONFLICT (chain_id, address) DO UPDATE SET
                 project_slug = EXCLUDED.project_slug
+            WHERE address_project.manual_override = FALSE
             "#,
         )
         .bind(chain_id as i64)
@@ -157,6 +171,50 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Upsert a human override. Always wins, sets `manual_override=true` so
+    /// no automatic source can clobber it later. Caller is responsible for
+    /// ensuring a `projects` row exists for `slug` (FK).
+    pub async fn upsert_manual_address_project(
+        &self,
+        chain_id: u64,
+        address: [u8; 20],
+        slug: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            INSERT INTO address_project (chain_id, address, project_slug, manual_override)
+            VALUES ($1, $2, $3, TRUE)
+            ON CONFLICT (chain_id, address) DO UPDATE SET
+                project_slug    = EXCLUDED.project_slug,
+                manual_override = TRUE
+            "#,
+        )
+        .bind(chain_id as i64)
+        .bind(&address[..])
+        .bind(slug)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Returns whether the given address has a manual override set. Used by
+    /// the UI to decide whether to show "(manual)" alongside the label.
+    pub async fn is_manual_override(
+        &self,
+        chain_id: u64,
+        address: [u8; 20],
+    ) -> Result<bool, StoreError> {
+        let row: Option<(bool,)> = sqlx::query_as(
+            r#"SELECT manual_override FROM address_project
+               WHERE chain_id = $1 AND address = $2"#,
+        )
+        .bind(chain_id as i64)
+        .bind(&address[..])
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.0).unwrap_or(false))
     }
 
     pub async fn upsert_eth_price(
@@ -199,6 +257,82 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
+    }
+
+    /// Returns top-N unmapped contract addresses for a chain, ranked by total
+    /// `wei_saved` over the lifetime. Skips addresses whose last labeling
+    /// attempt was within `retry_after_days` and resulted in a non-success
+    /// (so we don't waste API budget on contracts that are still unverified).
+    pub async fn top_unknown_addresses(
+        &self,
+        chain_id: u64,
+        limit: i64,
+        retry_after_days: i64,
+    ) -> Result<Vec<UnknownAddressRow>, StoreError> {
+        let rows = sqlx::query_as::<_, UnknownAddressRow>(
+            r#"
+            SELECT
+                a.to_address                  AS address,
+                COALESCE(SUM(a.wei_saved), 0)::numeric AS wei_saved_total,
+                COUNT(*)::bigint              AS tx_count
+            FROM analysis a
+            LEFT JOIN address_label_attempt l
+              ON l.chain_id = a.chain_id
+             AND l.address  = a.to_address
+            WHERE a.chain_id = $1
+              AND a.project_slug LIKE 'unknown:%'
+              AND (
+                l.last_attempted_at IS NULL
+                -- Transient failures (rate limit, transport) are retried on
+                -- every producer cycle, not throttled to retry_after_days.
+                -- 'matched' rows can also reappear here if relabel_unknowns
+                -- hasn't run yet for that address.
+                OR l.last_result IN ('matched','error')
+                OR l.last_attempted_at < now() - make_interval(days => $3::int)
+              )
+            GROUP BY a.to_address
+            ORDER BY wei_saved_total DESC NULLS LAST
+            LIMIT $2
+            "#,
+        )
+        .bind(chain_id as i64)
+        .bind(limit)
+        .bind(retry_after_days)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Record an auto-labeler attempt. Idempotent — overwrites prior
+    /// attempts for the same address.
+    pub async fn upsert_label_attempt(
+        &self,
+        chain_id: u64,
+        address: [u8; 20],
+        result: &str,
+        contract_name: Option<&str>,
+        matched_slug: Option<&str>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            INSERT INTO address_label_attempt
+                (chain_id, address, last_attempted_at, last_result, contract_name, matched_slug)
+            VALUES ($1, $2, now(), $3, $4, $5)
+            ON CONFLICT (chain_id, address) DO UPDATE SET
+                last_attempted_at = EXCLUDED.last_attempted_at,
+                last_result       = EXCLUDED.last_result,
+                contract_name     = EXCLUDED.contract_name,
+                matched_slug      = COALESCE(EXCLUDED.matched_slug, address_label_attempt.matched_slug)
+            "#,
+        )
+        .bind(chain_id as i64)
+        .bind(&address[..])
+        .bind(result)
+        .bind(contract_name)
+        .bind(matched_slug)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn refresh_rollups(&self) -> Result<(), StoreError> {

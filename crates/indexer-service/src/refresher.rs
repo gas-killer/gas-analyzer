@@ -6,6 +6,7 @@
 //! Three independent loops driven by `tokio::time::interval`. Each tick is
 //! best-effort: failures log and move on without bringing the binary down.
 
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,14 +21,31 @@ use tokio::time::interval;
 
 use crate::config::{CommonConfig, RefresherConfig};
 
+/// Counts returned by `refresh_resolver_now` so callers (loop, admin button)
+/// can report what changed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResolverRefreshOutcome {
+    pub projects: u64,
+    pub addresses: u64,
+    pub relabeled: u64,
+}
+
 pub async fn run(common: CommonConfig, cfg: RefresherConfig) -> Result<()> {
     let store = Store::connect(&common.database_url, 4).await?;
     store.migrate().await?;
     let resolver = Arc::new(Resolver::new());
 
-    // Initial pass synchronously so we don't start with empty state.
+    // Initial pass synchronously so we don't start with empty state. The
+    // rollup refresh in particular matters: dashboards read from the
+    // materialized view, so without this the UI is stale until the first
+    // tick fires (1h after startup).
     refresh_resolver_into_store(&resolver, &store, &common).await;
     refresh_eth_price(&store, &common).await;
+    if let Err(e) = store.refresh_rollups().await {
+        tracing::warn!(error = %e, "initial rollup refresh failed");
+    } else {
+        tracing::info!("initial rollups refreshed");
+    }
 
     let resolver_secs = cfg.resolver_refresh_secs;
     let price_secs = cfg.price_refresh_secs;
@@ -71,7 +89,14 @@ pub async fn run(common: CommonConfig, cfg: RefresherConfig) -> Result<()> {
         }
     });
 
-    let _ = tokio::try_join!(resolver_loop, price_loop, rollup_loop);
+    let store_d = store.clone();
+    let common_d = common.clone();
+    let cfg_d = cfg.clone();
+    let labeler_loop = tokio::spawn(async move {
+        crate::labeler::run(common_d, cfg_d, store_d).await;
+    });
+
+    let _ = tokio::try_join!(resolver_loop, price_loop, rollup_loop, labeler_loop);
     Ok(())
 }
 
@@ -90,12 +115,25 @@ async fn refresh_resolver_into_store(
     } else {
         None
     };
-    if let Err(e) = resolver.refresh(overlay_path, defillama).await {
+    let _ = refresh_resolver_with(resolver, store, overlay_path, defillama).await;
+}
+
+/// Run one resolver-refresh cycle: reload the overlay + DefiLlama into the
+/// passed-in `Resolver`, then persist projects + addresses to Postgres and
+/// retro-relabel historical `analysis` rows. Public so admin endpoints can
+/// trigger it on demand without going through the internal loop.
+pub async fn refresh_resolver_with(
+    resolver: &Arc<Resolver>,
+    store: &Store,
+    overlay_path: Option<&Path>,
+    defillama_url: Option<&str>,
+) -> ResolverRefreshOutcome {
+    if let Err(e) = resolver.refresh(overlay_path, defillama_url).await {
         tracing::warn!(error = %e, "resolver refresh failed");
-        return;
+        return ResolverRefreshOutcome::default();
     }
     let snapshot = resolver.snapshot();
-    let mut project_count = 0;
+    let mut project_count = 0u64;
     for info in snapshot.projects() {
         let project = Project {
             slug: info.slug.clone(),
@@ -148,6 +186,11 @@ async fn refresh_resolver_into_store(
         relabeled,
         "resolver refreshed"
     );
+    ResolverRefreshOutcome {
+        projects: project_count,
+        addresses: address_count,
+        relabeled,
+    }
 }
 
 #[derive(Deserialize)]
@@ -161,43 +204,38 @@ struct CoingeckoEth {
 }
 
 async fn refresh_eth_price(store: &Store, common: &CommonConfig) {
-    if common.price_url.is_empty() {
-        return;
+    if !common.price_url.is_empty() {
+        let _ = refresh_eth_price_now(store, &common.price_url).await;
     }
-    let client = match reqwest::Client::builder()
+}
+
+/// Public entry point for an on-demand ETH/USD price refresh. Returns
+/// `Ok(usd_per_eth)` on success so the caller can show "stored $X" in a
+/// status banner.
+pub async fn refresh_eth_price_now(store: &Store, price_url: &str) -> Result<BigDecimal> {
+    if price_url.is_empty() {
+        return Err(anyhow::anyhow!("price_url is empty"));
+    }
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, "price client build failed");
-            return;
-        }
-    };
-    let resp: CoingeckoResp = match client
-        .get(&common.price_url)
+        .map_err(|e| anyhow::anyhow!("price client build failed: {e}"))?;
+    let resp: CoingeckoResp = client
+        .get(price_url)
         .send()
         .await
         .and_then(|r| r.error_for_status())
-    {
-        Ok(r) => match r.json().await {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::warn!(error = %e, "price json decode failed");
-                return;
-            }
-        },
-        Err(e) => {
-            tracing::warn!(error = %e, "price fetch failed");
-            return;
-        }
-    };
+        .map_err(|e| anyhow::anyhow!("price fetch failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("price json decode failed: {e}"))?;
     let price = BigDecimal::from_str(&format!("{:.8}", resp.ethereum.usd))
         .unwrap_or_else(|_| BigDecimal::from(0));
     let day = Utc::now().date_naive();
-    if let Err(e) = store.upsert_eth_price(day, price.clone()).await {
-        tracing::warn!(error = %e, "upsert_eth_price failed");
-    } else {
-        tracing::info!(day = %day, usd = ?price, "eth price stored");
-    }
+    store
+        .upsert_eth_price(day, price.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("upsert_eth_price failed: {e}"))?;
+    tracing::info!(day = %day, usd = ?price, "eth price stored");
+    Ok(price)
 }

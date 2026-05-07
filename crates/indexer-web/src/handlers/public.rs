@@ -109,6 +109,10 @@ pub struct LeaderRow {
     pub display_name: String,
     pub tx_count: i64,
     pub avg_savings_pct_pct: String,
+    /// Populated only when `project_slug` is `unknown:0xADDR`. Lets the
+    /// template render a pencil-icon override link for that single
+    /// address. None for real project slugs (which can span N addresses).
+    pub unknown_address_hex: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,14 +137,21 @@ pub async fn overview(
     let lb = queries::leaderboard_30d(pool, chain_id, 50, 0).await?;
     let leaderboard = lb
         .into_iter()
-        .map(|r| LeaderRow {
-            display_name: r
-                .project_name
-                .clone()
-                .unwrap_or_else(|| r.project_slug.clone()),
-            tx_count: r.tx_count.unwrap_or(0),
-            avg_savings_pct_pct: format_pct(r.avg_savings_pct),
-            project_slug: r.project_slug,
+        .map(|r| {
+            let unknown_address_hex = r
+                .project_slug
+                .strip_prefix("unknown:0x")
+                .map(|hex| format!("0x{hex}"));
+            LeaderRow {
+                display_name: r
+                    .project_name
+                    .clone()
+                    .unwrap_or_else(|| r.project_slug.clone()),
+                tx_count: r.tx_count.unwrap_or(0),
+                avg_savings_pct_pct: format_pct(r.avg_savings_pct),
+                project_slug: r.project_slug,
+                unknown_address_hex,
+            }
         })
         .collect();
 

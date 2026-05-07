@@ -391,6 +391,27 @@ pub struct AnalysisHealthRow {
     pub last_insert_age_secs: Option<f64>,
 }
 
+/// Resolve `(chain_id, address)` → `(project_slug, project_name)` via
+/// `address_project` JOIN `projects`. Returns `None` when the address
+/// has no mapping (caller falls back to a synthetic `unknown:0xADDR`).
+pub async fn resolved_label(
+    pool: &PgPool,
+    chain_id: i64,
+    address: [u8; 20],
+) -> Result<Option<(String, Option<String>)>, WebError> {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        r#"SELECT ap.project_slug, p.project_name
+           FROM address_project ap
+           LEFT JOIN projects p ON p.project_slug = ap.project_slug
+           WHERE ap.chain_id = $1 AND ap.address = $2"#,
+    )
+    .bind(chain_id)
+    .bind(&address[..])
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 pub async fn analysis_health(pool: &PgPool, chain_id: i64) -> Result<AnalysisHealthRow, WebError> {
     let row = sqlx::query_as::<_, AnalysisHealthRow>(
         r#"SELECT

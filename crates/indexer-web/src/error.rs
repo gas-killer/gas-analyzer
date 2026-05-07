@@ -5,6 +5,8 @@ use axum::response::{IntoResponse, Response};
 pub enum WebError {
     #[error("sqlx error: {0}")]
     Sqlx(#[from] sqlx::Error),
+    #[error("store error: {0}")]
+    Store(#[from] indexer_store::StoreError),
     #[error("redis error: {0}")]
     Redis(#[from] redis::RedisError),
     #[error("template render error: {0}")]

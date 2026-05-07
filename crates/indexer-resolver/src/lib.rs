@@ -17,6 +17,8 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
+pub mod etherscan;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ResolverError {
     #[error("io error: {0}")]
@@ -27,6 +29,10 @@ pub enum ResolverError {
     Address(String, String),
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("etherscan: {0}")]
+    Etherscan(String),
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

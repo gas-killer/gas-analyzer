@@ -45,7 +45,21 @@
         <tbody>
         {% for row in leaderboard %}
             <tr>
-                <td><a href="/projects/{{ row.project_slug }}">{{ row.display_name }}</a></td>
+                <td>
+                    {% match row.unknown_address_hex %}
+                        {% when Some with (addr) %}
+                            <span class="label-cell" id="label-cell-{{ addr }}">
+                                <a href="/projects/{{ row.project_slug }}" class="label-unknown">{{ row.display_name }}</a>
+                                <a class="label-edit-icon" href="#"
+                                   hx-get="/api/labels/edit?address={{ addr }}&chain_id={{ chain_id }}"
+                                   hx-target="#label-cell-{{ addr }}"
+                                   hx-swap="outerHTML"
+                                   title="Edit label">✎</a>
+                            </span>
+                        {% when None %}
+                            <a href="/projects/{{ row.project_slug }}">{{ row.display_name }}</a>
+                    {% endmatch %}
+                </td>
                 <td class="right">{{ row.tx_count }}</td>
                 <td class="right">{{ row.avg_savings_pct_pct }}</td>
             </tr>

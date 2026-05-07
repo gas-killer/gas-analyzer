@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod head_tracker;
+pub mod labeler;
 pub mod queue;
 pub mod refresher;
 pub mod worker;

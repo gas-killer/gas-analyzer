@@ -69,7 +69,20 @@ async fn handle(
     let _permit = limiter.acquire(weights::ANALYZE_TX).await;
     let hash = FixedBytes::<32>::from(job.tx_hash);
 
-    match analyzer.analyze_tx(hash).await {
+    // Backstop: an individual analysis must complete in a bounded time.
+    // Without this, a hung HTTP read pins the worker forever (alloy's default
+    // transport has no read timeout). On timeout we requeue.
+    let analyze = tokio::time::timeout(
+        Duration::from_secs(cfg.analyze_timeout_secs),
+        analyzer.analyze_tx(hash),
+    )
+    .await
+    .unwrap_or_else(|_| Err(AnalyzerError::Rpc(format!(
+        "analyze_tx timed out after {}s",
+        cfg.analyze_timeout_secs
+    ))));
+
+    match analyze {
         Ok(report) => {
             let project = resolver.resolve(report.chain_id, report.to);
             store.insert_analysis(&report, &project.slug).await?;
