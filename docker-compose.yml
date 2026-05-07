@@ -94,9 +94,17 @@ services:
       RESOLVER_REFRESH_SECS: ${RESOLVER_REFRESH_SECS:-86400}
       PRICE_REFRESH_SECS: ${PRICE_REFRESH_SECS:-3600}
       ROLLUP_REFRESH_SECS: ${ROLLUP_REFRESH_SECS:-3600}
+      ETHERSCAN_API_KEY: ${ETHERSCAN_API_KEY:-}
+      LABELER_PRODUCER_INTERVAL_SECS: ${LABELER_PRODUCER_INTERVAL_SECS:-3600}
+      LABELER_BATCH_SIZE: ${LABELER_BATCH_SIZE:-200}
+      LABELER_RETRY_DAYS: ${LABELER_RETRY_DAYS:-7}
+      LABELER_MIN_DELAY_MS: ${LABELER_MIN_DELAY_MS:-250}
+      KNOWN_NAMES_PATH: /etc/indexer/known_names.yaml
       RUST_LOG: ${RUST_LOG:-info}
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     restart: unless-stopped
 

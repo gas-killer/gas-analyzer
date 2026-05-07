@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 indexer-store = { path = "../indexer-store" }
 indexer-service = { path = "../indexer-service" }
+indexer-resolver = { path = "../indexer-resolver" }
 
 axum = { version = "0.7", features = ["macros"] }
 askama = { version = "0.12", features = ["with-axum"] }

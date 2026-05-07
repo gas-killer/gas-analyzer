@@ -26,7 +26,8 @@ WORKDIR /home/indexer
 
 COPY --from=builder /build/target/release/indexer-service /usr/local/bin/indexer-service
 COPY --from=builder /build/target/release/indexer-web     /usr/local/bin/indexer-web
-COPY crates/indexer-resolver/data/overlay.yaml /etc/indexer/overlay.yaml
+COPY crates/indexer-resolver/data/overlay.yaml      /etc/indexer/overlay.yaml
+COPY crates/indexer-resolver/data/known_names.yaml  /etc/indexer/known_names.yaml
 # Static assets for the web UI must live alongside the binary at runtime.
 COPY crates/indexer-web/static    /opt/indexer-web/static
 COPY crates/indexer-web/templates /opt/indexer-web/templates

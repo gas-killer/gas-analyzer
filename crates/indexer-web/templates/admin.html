@@ -4,19 +4,6 @@
 
 <h2>Admin</h2>
 
-{% match replay_message %}
-    {% when Some with (r) %}
-        <div class="banner {% if r.success %}banner-success{% else %}banner-error{% endif %}">
-            {{ r.message }}
-            {% match r.tx_hash_hex %}
-                {% when Some with (h) %}
-                    <div class="muted"><code>{{ h }}</code> — <a href="{{ explorer_tx_url }}{{ h }}" target="_blank" rel="noopener">explorer</a></div>
-                {% when None %}
-            {% endmatch %}
-        </div>
-    {% when None %}
-{% endmatch %}
-
 <section class="card">
     <h3>Service health</h3>
     <div id="health-region"
@@ -28,15 +15,16 @@
 </section>
 
 <section class="card">
-    <h3>On-demand tx replay</h3>
-    <p class="muted">Enqueues an analysis job for the given transaction. Bypasses the head-tracker's <code>MIN_GAS_USED</code> filter — if the tx exists on chain, the worker will pick it up within seconds.</p>
-    <form method="post" action="/admin/replay" class="replay-form">
-        <label>
-            Transaction hash
-            <input type="text" name="tx_hash" placeholder="0x..." pattern="^0x[0-9a-fA-F]{64}$" required>
-        </label>
-        <button type="submit">Replay</button>
-    </form>
+    <h3>Manual refresh</h3>
+    <p class="muted">Each button triggers the same job the refresher loop runs internally — useful when you want the dashboard to reflect a recent change without waiting for the next tick.</p>
+    <div class="refresh-grid">
+        <button class="btn" hx-post="/admin/refresh/rollups"     hx-target="#refresh-banner" hx-swap="innerHTML">Refresh project_daily</button>
+        <button class="btn" hx-post="/admin/refresh/eth-price"   hx-target="#refresh-banner" hx-swap="innerHTML">Refresh ETH price</button>
+        <button class="btn" hx-post="/admin/refresh/resolver"    hx-target="#refresh-banner" hx-swap="innerHTML">Refresh resolver</button>
+        <button class="btn" hx-post="/admin/refresh/labeler"     hx-target="#refresh-banner" hx-swap="innerHTML">Tick labeler producer</button>
+        <button class="btn" hx-post="/admin/refresh/relabel"     hx-target="#refresh-banner" hx-swap="innerHTML">Relabel unknowns</button>
+    </div>
+    <div id="refresh-banner"></div>
 </section>
 
 {% endblock %}

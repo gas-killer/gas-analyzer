@@ -1,14 +1,17 @@
-//! Admin handlers: read-only service health + on-demand tx replay.
+//! Admin handlers: read-only service health + on-demand refresh buttons.
+//!
+//! The refresh endpoints reuse the same functions the refresher loop calls
+//! (now exposed as `pub` from `indexer-service`). Each returns an htmx
+//! fragment with status + duration so the admin page can swap a banner in
+//! place without a full reload.
+
+use std::time::Instant;
 
 use askama::Template;
 use askama_axum::IntoResponse;
-use axum::Form;
 use axum::extract::State;
-use axum::http::StatusCode;
 use axum::response::Response;
-use indexer_service::queue::AnalyzeTxJob;
 use redis::AsyncCommands;
-use serde::Deserialize;
 
 use crate::AppState;
 use crate::auth::AuthUser;
@@ -21,8 +24,6 @@ pub struct AdminPage {
     pub user: String,
     pub health: HealthView,
     pub chain_id: i64,
-    pub explorer_tx_url: String,
-    pub replay_message: Option<ReplayBanner>,
 }
 
 #[derive(Template)]
@@ -43,13 +44,6 @@ pub struct HealthView {
     pub total_rows: i64,
 }
 
-#[derive(Debug, Clone)]
-pub struct ReplayBanner {
-    pub success: bool,
-    pub message: String,
-    pub tx_hash_hex: Option<String>,
-}
-
 pub async fn admin_page(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
@@ -59,8 +53,6 @@ pub async fn admin_page(
         user,
         health,
         chain_id: state.chain_id,
-        explorer_tx_url: state.explorer_tx_url.as_str().to_string(),
-        replay_message: None,
     };
     Ok(page.into_response())
 }
@@ -73,60 +65,124 @@ pub async fn health_partial(
     Ok(HealthFragment { health }.into_response())
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ReplayForm {
-    pub tx_hash: String,
+// ---------- Refresh banners ----------
+
+#[derive(Template)]
+#[template(path = "_refresh_banner.html")]
+pub struct RefreshBanner {
+    pub success: bool,
+    pub label: String,
+    pub message: String,
+    pub duration_ms: u128,
 }
 
-pub async fn replay_post(
-    AuthUser(user): AuthUser,
-    State(state): State<AppState>,
-    Form(form): Form<ReplayForm>,
-) -> Result<Response, WebError> {
-    let raw = form.tx_hash.trim();
-    let stripped = raw.strip_prefix("0x").unwrap_or(raw);
-    let bytes = hex::decode(stripped)
-        .map_err(|e| WebError::BadRequest(format!("invalid hex: {e}")))?;
-    if bytes.len() != 32 {
-        return Err(WebError::BadRequest(format!(
-            "tx hash must be 32 bytes, got {}",
-            bytes.len()
-        )));
+fn ok(label: &str, message: String, started: Instant) -> Response {
+    RefreshBanner {
+        success: true,
+        label: label.to_string(),
+        message,
+        duration_ms: started.elapsed().as_millis(),
     }
-    let mut tx_hash = [0u8; 32];
-    tx_hash.copy_from_slice(&bytes);
+    .into_response()
+}
 
-    let job = AnalyzeTxJob {
-        chain_id: state.chain_id as u64,
-        tx_hash,
-        // The worker only uses tx_hash; block_number / tx_index are just for
-        // dead-letter context. Zero them; the analyzer fetches the receipt.
-        block_number: 0,
-        tx_index: 0,
-        attempt: 0,
+fn err(label: &str, message: String, started: Instant) -> Response {
+    RefreshBanner {
+        success: false,
+        label: label.to_string(),
+        message,
+        duration_ms: started.elapsed().as_millis(),
+    }
+    .into_response()
+}
+
+pub async fn refresh_rollups(
+    _user: AuthUser,
+    State(state): State<AppState>,
+) -> Response {
+    let t = Instant::now();
+    match state.store.refresh_rollups().await {
+        Ok(()) => ok("Rollup", "project_daily refreshed".to_string(), t),
+        Err(e) => err("Rollup", format!("{e}"), t),
+    }
+}
+
+pub async fn refresh_relabel(
+    _user: AuthUser,
+    State(state): State<AppState>,
+) -> Response {
+    let t = Instant::now();
+    match state.store.relabel_unknowns().await {
+        Ok(n) => ok("Relabel", format!("{n} historical rows updated"), t),
+        Err(e) => err("Relabel", format!("{e}"), t),
+    }
+}
+
+pub async fn refresh_eth_price(
+    _user: AuthUser,
+    State(state): State<AppState>,
+) -> Response {
+    let t = Instant::now();
+    match indexer_service::refresher::refresh_eth_price_now(&state.store, &state.price_url).await {
+        Ok(price) => ok("ETH price", format!("stored ${price}"), t),
+        Err(e) => err("ETH price", format!("{e}"), t),
+    }
+}
+
+pub async fn refresh_resolver(
+    _user: AuthUser,
+    State(state): State<AppState>,
+) -> Response {
+    let t = Instant::now();
+    let overlay = if state.overlay_path.exists() {
+        Some(state.overlay_path.as_path())
+    } else {
+        None
     };
+    let defillama = if state.defillama_url.is_empty() {
+        None
+    } else {
+        Some(state.defillama_url.as_str())
+    };
+    let outcome = indexer_service::refresher::refresh_resolver_with(
+        &state.resolver,
+        &state.store,
+        overlay,
+        defillama,
+    )
+    .await;
+    ok(
+        "Resolver",
+        format!(
+            "{} projects, {} addresses, {} relabeled",
+            outcome.projects, outcome.addresses, outcome.relabeled
+        ),
+        t,
+    )
+}
 
-    let payload = serde_json::to_vec(&job)?;
+pub async fn refresh_labeler(
+    _user: AuthUser,
+    State(state): State<AppState>,
+) -> Response {
+    let t = Instant::now();
     let mut conn = state.redis.clone();
-    let _: () = conn
-        .rpush(indexer_service::queue::QUEUE_KEY, payload)
-        .await?;
-
-    tracing::info!(user, tx_hash = %hex::encode(tx_hash), "replay enqueued");
-
-    let health = collect_health(&state).await?;
-    let page = AdminPage {
-        user,
-        health,
-        chain_id: state.chain_id,
-        explorer_tx_url: state.explorer_tx_url.as_str().to_string(),
-        replay_message: Some(ReplayBanner {
-            success: true,
-            message: "Job enqueued. Refresh the page in ~10s; if the tx isn't in the analysis table by then, check worker logs.".to_string(),
-            tx_hash_hex: Some(format!("0x{}", hex::encode(tx_hash))),
-        }),
-    };
-    Ok((StatusCode::OK, page).into_response())
+    match indexer_service::labeler::producer_tick_once(
+        &state.store,
+        &mut conn,
+        state.chain_id as u64,
+        state.labeler_batch_size,
+        state.labeler_retry_days,
+    )
+    .await
+    {
+        Ok((pushed, depth)) => ok(
+            "Labeler queue",
+            format!("{pushed} new, {depth} total in queue"),
+            t,
+        ),
+        Err(e) => err("Labeler queue", format!("{e}"), t),
+    }
 }
 
 async fn collect_health(state: &AppState) -> Result<HealthView, WebError> {

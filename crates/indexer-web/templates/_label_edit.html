@@ -1,0 +1,19 @@
+<form class="label-edit" id="label-cell-{{ address_hex }}"
+      hx-post="/api/labels/override"
+      hx-target="#label-cell-{{ address_hex }}"
+      hx-swap="outerHTML">
+    <input type="hidden" name="address" value="{{ address_hex }}">
+    <input type="hidden" name="chain_id" value="{{ chain_id }}">
+    <input type="text" name="slug"
+           value="{{ current_slug }}"
+           placeholder="project-slug"
+           pattern="^[a-z0-9-]{1,64}$"
+           required autofocus>
+    <input type="text" name="project_name"
+           placeholder="Display name (optional)">
+    <button type="submit" class="btn-small">Save</button>
+    <a href="#" class="btn-small btn-cancel"
+       hx-get="/api/labels/cell?address={{ address_hex }}&chain_id={{ chain_id }}"
+       hx-target="#label-cell-{{ address_hex }}"
+       hx-swap="outerHTML">Cancel</a>
+</form>

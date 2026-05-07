@@ -74,6 +74,11 @@ pub struct WorkerConfig {
     /// Per-worker max retries on transient failure before dead-lettering.
     #[arg(long, env = "WORKER_MAX_RETRIES", default_value_t = 3)]
     pub max_retries: u32,
+
+    /// Hard cap on a single `analyze_tx` invocation. Backstop against hung
+    /// RPC reads pinning the worker. On timeout the job is requeued.
+    #[arg(long, env = "WORKER_ANALYZE_TIMEOUT_SECS", default_value_t = 60)]
+    pub analyze_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -89,4 +94,40 @@ pub struct RefresherConfig {
     /// Materialized view refresh interval (seconds).
     #[arg(long, env = "ROLLUP_REFRESH_SECS", default_value_t = 3600)]
     pub rollup_refresh_secs: u64,
+
+    // -------- Auto-labeler --------
+    //
+    /// Etherscan API key. If empty, the labeler loop is disabled and the
+    /// other refresher loops still run.
+    #[arg(long, env = "ETHERSCAN_API_KEY", default_value = "")]
+    pub etherscan_api_key: String,
+
+    /// How often the labeler producer rebuilds its priority queue from the
+    /// `analysis` table (seconds). The consumer drains continuously.
+    #[arg(long, env = "LABELER_PRODUCER_INTERVAL_SECS", default_value_t = 3600)]
+    pub labeler_producer_interval_secs: u64,
+
+    /// Max addresses to push into the queue on each producer tick.
+    #[arg(long, env = "LABELER_BATCH_SIZE", default_value_t = 200)]
+    pub labeler_batch_size: i64,
+
+    /// Re-attempt previously-failed addresses after this many days. Lets us
+    /// pick up newly-verified contracts and newly-added dictionary entries.
+    #[arg(long, env = "LABELER_RETRY_DAYS", default_value_t = 7)]
+    pub labeler_retry_days: i64,
+
+    /// Minimum delay between consecutive Etherscan calls (ms). Free tier on
+    /// the v2 API uses a sliding 1-second window with a strict 3-call cap;
+    /// 400ms can still trip it under jitter. 600ms gives ~1.6 rps with
+    /// breathing room.
+    #[arg(long, env = "LABELER_MIN_DELAY_MS", default_value_t = 600)]
+    pub labeler_min_delay_ms: u64,
+
+    /// Path to the curated Etherscan-name → slug dictionary.
+    #[arg(
+        long,
+        env = "KNOWN_NAMES_PATH",
+        default_value = "/etc/indexer/known_names.yaml"
+    )]
+    pub known_names_path: PathBuf,
 }

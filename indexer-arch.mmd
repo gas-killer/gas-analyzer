@@ -1,0 +1,69 @@
+flowchart TB
+  classDef ext fill:#fef3c7,stroke:#92400e,color:#78350f
+  classDef compose fill:#e0e7ff,stroke:#3730a3,color:#1e1b4b
+  classDef api fill:#dcfce7,stroke:#166534,color:#14532d
+  classDef store fill:#fce7f3,stroke:#9d174d,color:#500724
+  classDef existing fill:#f3f4f6,stroke:#374151,color:#111827,stroke-dasharray: 4 2
+
+  RPC[("Premium RPC<br/>Alchemy / QuickNode")]:::ext
+  DEFILLAMA[("DefiLlama API<br/>/protocols")]:::ext
+  PRICE[("Coingecko API")]:::ext
+  ESCAN[("Etherscan v2 API<br/>getsourcecode")]:::ext
+
+  subgraph compose["docker-compose stack on a single VM"]
+    direction TB
+    HEAD["head-tracker<br/>(1 replica)"]:::compose
+    REDIS[("Redis<br/>analyzer:queue:pending<br/>analyzer:queue:dead<br/>indexer:state:last_head<br/>labeler:queue (ZSET)")]:::compose
+    WORKERS["worker<br/>(N replicas)"]:::compose
+    REFRESH["refresher<br/>4 loops:<br/>resolver / price / rollups / labeler"]:::compose
+    PG[("Postgres<br/>analysis, projects,<br/>address_project,<br/>address_label_attempt,<br/>eth_prices, project_daily MV")]:::store
+    WEB["indexer-web<br/>axum + askama + htmx<br/>(BD dashboards + admin health)"]:::compose
+  end
+
+  USER[("Browser<br/>(allowlisted user)")]:::ext
+
+  subgraph worker_internals["Inside each worker — in-process"]
+    direction TB
+    API["indexer-api<br/>Analyzer trait<br/>EvmSketchAnalyzer<br/>(with_retry on RPC,<br/>60s timeout backstop)"]:::api
+    LIM["indexer-rpc<br/>token bucket + retry +<br/>is_transient_rpc_error"]:::api
+    RES["indexer-resolver<br/>address → project<br/>(overlay + DefiLlama +<br/>Etherscan NameDict)"]:::api
+    STO["indexer-store<br/>Postgres writes"]:::api
+
+    subgraph existing["gas-analyzer crates (UNTOUCHED)"]
+      direction LR
+      GA_RPC["gas-analyzer-rpc"]:::existing
+      GA_EVM["gas-analyzer-evmsketch"]:::existing
+      GA_CORE["gas-analyzer-core"]:::existing
+    end
+
+    API --> GA_RPC
+    API --> GA_EVM
+    GA_RPC --> GA_CORE
+    GA_EVM --> GA_CORE
+  end
+
+  HEAD -- "RPUSH AnalyzeTxJob" --> REDIS
+  REDIS -- "BLPOP claim" --> WORKERS
+  WORKERS --> API
+  WORKERS --> RES
+  WORKERS --> STO
+
+  HEAD -. "eth_blockNumber<br/>eth_getBlockByNumber (full)" .-> RPC
+  GA_RPC -. "debug_traceTransaction<br/>eth_getTransactionReceipt" .-> RPC
+  GA_EVM -. "eth_getStorageAt<br/>(bypasses limiter — see Known Limitations)" .-> RPC
+
+  HEAD -. uses .-> LIM
+  GA_RPC -. uses .-> LIM
+
+  STO -- "INSERT analysis<br/>UPSERT projects<br/>UPSERT address_project" --> PG
+
+  REFRESH -. "every 24h" .-> DEFILLAMA
+  REFRESH -. "every 1h" .-> PRICE
+  REFRESH -. "labeler consumer<br/>≤3 rps" .-> ESCAN
+  REFRESH -- "UPSERT projects,<br/>UPSERT address_project,<br/>UPSERT eth_prices,<br/>UPSERT address_label_attempt,<br/>UPDATE analysis (relabel),<br/>REFRESH MV" --> PG
+  REFRESH -- "labeler producer:<br/>ZADD by wei_saved<br/>ZPOPMAX one address" --> REDIS
+
+  HEAD -- "SET last_head<br/>(60s TTL)" --> REDIS
+  USER -- "form login<br/>signed cookie" --> WEB
+  WEB -- "SQL aggregates" --> PG
+  WEB -- "LLEN queue / dead<br/>GET last_head" --> REDIS
