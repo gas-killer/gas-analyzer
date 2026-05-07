@@ -1,0 +1,152 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────
+  # On every push to main: save a Criterion baseline for all offline benches
+  # and upload it as a named artifact for PR jobs to compare against.
+  #
+  # sepolia_trace.json is stored in Git LFS.  If LFS bandwidth is exhausted
+  # the pull fails gracefully and trace_parsing is skipped; gas_estimation
+  # and replay baselines are still saved.
+  # ────────────────────────────────────────────────────────────────────────
+  bench-save:
+    name: Save baseline
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull bench fixtures from LFS
+        continue-on-error: true
+        run: git lfs pull --include "crates/evmsketch/benches/fixtures/"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Save Criterion baseline
+        run: make bench-save-baseline
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-baseline
+          path: target/criterion/
+          retention-days: 90
+          overwrite: true
+
+  # ────────────────────────────────────────────────────────────────────────
+  # On every PR: compare benchmarks against the saved main baseline, post a
+  # sticky comment with the regression report, and fail if any offline metric
+  # regresses beyond 15 %.
+  #
+  # end_to_end is excluded — it requires a live Sepolia node and is dominated
+  # by network latency, making it unsuitable for threshold-based regression
+  # detection.
+  # ────────────────────────────────────────────────────────────────────────
+  bench-compare:
+    name: Benchmark regression check
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull bench fixtures from LFS
+        continue-on-error: true
+        run: git lfs pull --include "crates/evmsketch/benches/fixtures/"
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Fetch the most recent successful bench-save run on main and download
+      # its baseline artifact.  Skips gracefully when no baseline exists yet
+      # (first PR before main has ever run this workflow).
+      - name: Download main baseline
+        id: baseline
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RUN_ID=$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow bench.yml \
+            --branch main \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId // empty' 2>/dev/null || true)
+          if [ -n "$RUN_ID" ]; then
+            gh run download "$RUN_ID" \
+              --repo "$GITHUB_REPOSITORY" \
+              --name bench-baseline \
+              --dir target/criterion/ \
+              && echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No successful bench-save run found on main — running benchmarks for reference only."
+          fi
+
+      - name: Run benchmarks (with comparison)
+        if: steps.baseline.outputs.found == 'true'
+        run: make bench-compare
+
+      - name: Run benchmarks (reference only — no baseline)
+        if: steps.baseline.outputs.found != 'true'
+        run: make bench
+
+      - name: Check regressions and generate report
+        id: regcheck
+        continue-on-error: true
+        run: |
+          python3 .github/scripts/check_regressions.py \
+            --threshold 15 \
+            --criterion-dir target/criterion \
+            --output-file regression-report.md
+
+      - name: Post PR comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.existsSync('regression-report.md')
+              ? fs.readFileSync('regression-report.md', 'utf8')
+              : '## Benchmark Results\n\n> Report generation failed — check the workflow logs.';
+
+            const marker = '<!-- bench-ci -->';
+            const body = `${marker}\n${report}`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+            });
+            const existing = comments.find(c => c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body,
+              });
+            }
+
+      - name: Fail on regressions
+        if: steps.regcheck.outcome == 'failure'
+        run: |
+          echo "::error::Benchmark regressions detected — see the PR comment for details."
+          exit 1

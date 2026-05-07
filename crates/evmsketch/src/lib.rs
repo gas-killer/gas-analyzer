@@ -280,7 +280,6 @@ impl GasKillerEvmSketchBuilder {
     }
 
     /// Build the GasKillerEvmSketch instance.
-    #[tracing::instrument(name = "evmsketch.build", skip(self), fields(block_number = %self.block))]
     pub async fn build(self) -> Result<GasKillerEvmSketchDefault> {
         let executor = EvmSketchExecutorBuilder::new()
             .rpc_url(self.rpc_url)
@@ -312,7 +311,6 @@ impl GasKillerEvmSketchDefault {
     /// backed by standard RPC calls (`eth_getStorageAt`, `eth_getBalance`, etc.)
     /// instead of sp1-cc's `BasicRpcDb` which requires `eth_getProof`. This avoids
     /// the "proof window" limitation on Reth and other nodes.
-    #[tracing::instrument(name = "evmsketch.estimate", skip_all, fields(block_number = self.executor.anchor_block_number(), state_update_count = state_updates.len()))]
     pub fn estimate_state_changes_gas(
         &self,
         contract_address: Address,
@@ -431,7 +429,6 @@ impl GasKillerEvmSketchDefault {
 ///
 /// # Returns
 /// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`
-#[tracing::instrument(name = "evmsketch.encode", skip_all, fields(block_number = %block, state_update_count = tracing::field::Empty))]
 pub async fn call_to_encoded_state_updates_with_evmsketch(
     rpc_url: impl AsRef<str>,
     tx_request: TransactionRequest,
@@ -454,7 +451,6 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
     let block_id = BlockId::Number(block);
     let trace = get_trace_from_call(&provider, tx_request, block_id).await?;
     let (state_updates, skipped_opcodes, _call_gas_total) = compute_state_updates(trace)?;
-    tracing::Span::current().record("state_update_count", state_updates.len());
 
     let storage_updates = encode_state_updates_to_abi(&state_updates);
 
