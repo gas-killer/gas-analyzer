@@ -67,14 +67,14 @@ flamegraph-speedscope-online: require-rpc-url
 	RPC_URL=$(RPC_URL) FLAMEGRAPH_PROTO=1 RUSTFLAGS="-C force-frame-pointers=yes" \
 		cargo bench -p gas-analyzer-evmsketch --bench flamegraph -- --profile-time 60
 
-# Fetch a Sepolia trace and write it to benches/fixtures/sepolia_trace.json.
-# sepolia_trace.json is gitignored (too large); generate it locally before running make bench.
+# Regenerate the Sepolia trace fixture and commit it to LFS.
+# Only needed when repinning the benchmark transaction.
 # Example:  make fixture RPC_URL=https://rpc.sepolia.org
-fixture:
+fixture: require-rpc-url
 	RPC_URL=$(RPC_URL) cargo run -p gas-analyzer-evmsketch --example generate_fixture
 
-# Fetch preceding-tx data and pre-block state for the replay bench.
-# Only needed once; commit the resulting files so `make bench` works offline.
+# Regenerate the replay fixtures (preceding_txs.json + pre_block_state.json) and commit to LFS.
+# Only needed when repinning the benchmark transaction.
 # Example:  make replay-fixture RPC_URL=https://rpc.sepolia.org
-replay-fixture:
+replay-fixture: require-rpc-url
 	RPC_URL=$(RPC_URL) cargo run -p gas-analyzer-evmsketch --example generate_replay_fixture
