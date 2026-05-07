@@ -3496,6 +3496,7 @@ dependencies = [
  "stats_alloc",
  "tokio",
  "tower",
+ "tracing",
  "url",
 ]
 

@@ -20,6 +20,7 @@ revm = { version = "31.0.1" }
 sp1-cc-client-executor = { git = "https://github.com/BreadchainCoop/sp1-contract-call", branch = "cancun-v1", package = "sp1-cc-client-executor" }
 sp1-cc-host-executor = { git = "https://github.com/BreadchainCoop/sp1-contract-call", branch = "cancun-v1", package = "sp1-cc-host-executor" }
 tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"
 url = "2.5.4"
 
 [dev-dependencies]
