@@ -1,0 +1,168 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Expose secret so steps can guard on `if: env.RPC_URL != ''`
+  RPC_URL: ${{ secrets.RPC_URL }}
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────
+  # On every push to main: run the offline benchmarks, save a Criterion
+  # baseline, and upload it as a named artifact for PR jobs to compare
+  # against.  If RPC_URL is available the trace_parsing fixture is also
+  # (re-)generated and bundled with the artifact so PR runs can bench it.
+  # ────────────────────────────────────────────────────────────────────────
+  bench-save:
+    name: Save baseline
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Generate trace_parsing fixture
+        if: env.RPC_URL != ''
+        run: make fixture
+
+      - name: Save Criterion baseline
+        run: make bench-save-baseline
+
+      - name: Bundle baseline artifact
+        run: |
+          mkdir -p ci-baseline/criterion
+          cp -r target/criterion/. ci-baseline/criterion/
+          # Include the trace fixture so PR runs can bench trace_parsing too.
+          if [ -f crates/evmsketch/benches/fixtures/sepolia_trace.json ]; then
+            mkdir -p ci-baseline/fixtures
+            cp crates/evmsketch/benches/fixtures/sepolia_trace.json \
+               ci-baseline/fixtures/sepolia_trace.json
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-baseline
+          path: ci-baseline/
+          retention-days: 90
+          overwrite: true
+
+  # ────────────────────────────────────────────────────────────────────────
+  # On every PR: download the latest main baseline, compare the branch's
+  # bench results against it, post a sticky comment with the report, and
+  # fail the check if any metric regresses beyond 15 %.
+  #
+  # end_to_end is skipped — it requires a live Sepolia node and is dominated
+  # by network latency, making it unsuitable for regression detection.
+  # ────────────────────────────────────────────────────────────────────────
+  bench-compare:
+    name: Benchmark regression check
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Fetch the most recent successful bench-save run on main and download
+      # its baseline artifact.  Skips gracefully when no baseline exists yet
+      # (first PR before main has ever run this workflow).
+      - name: Download main baseline
+        id: baseline
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RUN_ID=$(gh run list \
+            --repo "$GITHUB_REPOSITORY" \
+            --workflow bench.yml \
+            --branch main \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId // empty' 2>/dev/null || true)
+          if [ -n "$RUN_ID" ]; then
+            gh run download "$RUN_ID" \
+              --repo "$GITHUB_REPOSITORY" \
+              --name bench-baseline \
+              --dir ci-baseline/ \
+              && echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No successful bench-save run found on main — running benchmarks for reference only."
+          fi
+
+      - name: Restore baseline into target/criterion
+        if: steps.baseline.outputs.found == 'true'
+        run: |
+          mkdir -p target/criterion
+          cp -r ci-baseline/criterion/. target/criterion/
+          if [ -f ci-baseline/fixtures/sepolia_trace.json ]; then
+            cp ci-baseline/fixtures/sepolia_trace.json \
+               crates/evmsketch/benches/fixtures/sepolia_trace.json
+          fi
+
+      - name: Run benchmarks (with comparison)
+        if: steps.baseline.outputs.found == 'true'
+        run: make bench-compare
+
+      - name: Run benchmarks (reference only — no baseline)
+        if: steps.baseline.outputs.found != 'true'
+        run: make bench
+
+      - name: Check regressions and generate report
+        id: regcheck
+        continue-on-error: true
+        run: |
+          python3 .github/scripts/check_regressions.py \
+            --threshold 15 \
+            --criterion-dir target/criterion \
+            --output-file regression-report.md
+
+      - name: Post PR comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.existsSync('regression-report.md')
+              ? fs.readFileSync('regression-report.md', 'utf8')
+              : '## Benchmark Results\n\n> Report generation failed — check the workflow logs.';
+
+            const marker = '<!-- bench-ci -->';
+            const body = `${marker}\n${report}`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+            });
+            const existing = comments.find(c => c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body,
+              });
+            }
+
+      - name: Fail on regressions
+        if: steps.regcheck.outcome == 'failure'
+        run: |
+          echo "::error::Benchmark regressions detected — see the PR comment for details."
+          exit 1
