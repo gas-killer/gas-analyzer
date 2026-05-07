@@ -13,9 +13,9 @@ jobs:
   # On every push to main: save a Criterion baseline for all offline benches
   # and upload it as a named artifact for PR jobs to compare against.
   #
-  # sepolia_trace.json is stored in Git LFS.  If LFS bandwidth is exhausted
-  # the pull fails gracefully and trace_parsing is skipped; gas_estimation
-  # and replay baselines are still saved.
+  # All fixtures are stored in Git LFS.  If LFS bandwidth is exhausted
+  # the pull fails gracefully; any bench whose fixture is missing skips
+  # cleanly and the remaining benches still save their baselines.
   # ────────────────────────────────────────────────────────────────────────
   bench-save:
     name: Save baseline
@@ -112,6 +112,7 @@ jobs:
 
       - name: Post PR comment
         if: always()
+        continue-on-error: true
         uses: actions/github-script@v7
         with:
           script: |

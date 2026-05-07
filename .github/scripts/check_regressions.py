@@ -47,7 +47,7 @@ def build_report(
     """Return (report_lines, regressions)."""
     regressions: list[tuple[str, float, float, float]] = []
     table: list[str] = [
-        "| Benchmark | Baseline (`main`) | Candidate | Change |",
+        f"| Benchmark | Baseline (`{args.baseline}`) | Candidate | Change |",
         "|-----------|:-----------------:|:---------:|:------:|",
     ]
 
@@ -77,7 +77,7 @@ def build_report(
     )
 
     if not baseline:
-        summary = "> No baseline found on `main` — results are for reference only."
+        summary = f"> No baseline found on `{args.baseline}` — results are for reference only."
     elif regressions:
         summary = (
             f"> **{len(regressions)} regression(s) detected** "

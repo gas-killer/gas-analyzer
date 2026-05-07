@@ -46,7 +46,16 @@ fn bench_trace_parsing(c: &mut Criterion) {
     }
 
     let trace: alloy::rpc::types::trace::geth::DefaultFrame =
-        serde_json::from_str(&trace_json).expect("fixture JSON is not a valid DefaultFrame");
+        match serde_json::from_str(&trace_json) {
+            Ok(t) => t,
+            Err(_) if trace_json.starts_with("version https://git-lfs.github.com") => {
+                eprintln!(
+                    "Skipping trace_parsing bench: fixture is an LFS pointer — run `git lfs pull`."
+                );
+                return;
+            }
+            Err(e) => panic!("fixture JSON is not a valid DefaultFrame: {e}"),
+        };
 
     eprintln!(
         "trace_parsing: loaded fixture with {} struct-log entries",
