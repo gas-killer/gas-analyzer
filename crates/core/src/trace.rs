@@ -165,6 +165,7 @@ pub fn append_state_update_from_struct_log(
 ///
 /// Returns: (state_updates, skipped_opcodes, call_gas_total)
 /// - `call_gas_total` is the total gas cost of all CALL operations in state_updates
+#[tracing::instrument(name = "gas.trace_parse", skip_all, fields(state_update_count = tracing::field::Empty))]
 pub fn compute_state_updates(
     trace: DefaultFrame,
 ) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64)> {
@@ -257,6 +258,7 @@ pub fn compute_state_updates(
         );
     }
 
+    tracing::Span::current().record("state_update_count", state_updates.len());
     Ok((state_updates, skipped_opcodes, total_call_gas))
 }
 
