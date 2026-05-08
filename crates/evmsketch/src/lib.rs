@@ -7,7 +7,7 @@
 //! via `debug_traceTransaction`, and gas estimation is delegated to the
 //! `gas-analyzer-estimator` crate which uses revm directly.
 
-use alloy::primitives::{Address, B256, Bytes, TxKind};
+use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
 use alloy::providers::ProviderBuilder;
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy_eips::BlockId;
@@ -229,6 +229,7 @@ impl DefaultEvmSketchExecutor {
             basefee: header.base_fee_per_gas.unwrap_or(0),
             difficulty: header.difficulty,
             spec,
+            value: U256::ZERO,
         }
     }
 
@@ -351,6 +352,7 @@ impl GasKillerEvmSketchDefault {
         caller_address: Address,
         state_updates: &[StateUpdate],
         preceding_txs: &[PrecedingTx],
+        tx_value: U256,
     ) -> Result<u64> {
         // Source storage from block N-1 (pre-block state). Anchoring to
         // `block_number` itself makes RPC reads return state at the *end* of
@@ -373,7 +375,7 @@ impl GasKillerEvmSketchDefault {
             block_number: state_block,
         };
         let mut cache_db = CacheDB::new(simple_db);
-        let sim_env = self.executor.sim_env();
+        let mut sim_env = self.executor.sim_env();
 
         if !preceding_txs.is_empty() {
             gas_analyzer_estimator::replay_preceding_transactions(
@@ -383,6 +385,7 @@ impl GasKillerEvmSketchDefault {
             )?;
         }
 
+        sim_env.value = tx_value;
         gas_analyzer_estimator::estimate_state_changes_gas(
             &mut cache_db,
             contract_address,

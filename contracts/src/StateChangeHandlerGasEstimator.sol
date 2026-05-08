@@ -28,7 +28,7 @@ contract StateChangeHandlerGasEstimator {
         }
     }
 
-    function runStateUpdatesCall(StateUpdateType[] memory types, bytes[] memory args) external {
+    function runStateUpdatesCall(StateUpdateType[] memory types, bytes[] memory args) external payable {
         StateChangeHandlerLib._runStateUpdates(types, args);
     }
 
