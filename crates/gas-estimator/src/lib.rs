@@ -8,6 +8,8 @@
 //!
 //! No reth-evm, no sp1-contract-call, no async, no I/O.
 
+use std::sync::OnceLock;
+
 use alloy_dyn_abi::DynSolValue;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use anyhow::{Result, anyhow};
@@ -44,15 +46,19 @@ pub(crate) fn effective_tx_gas_limit(gas_limit: u64, spec: SpecId) -> u64 {
 /// opcodes like COINBASE, TIMESTAMP, NUMBER, GASLIMIT, GASPRICE, BASEFEE,
 /// PREVRANDAO, or DIFFICULTY see realistic values.
 ///
+/// `difficulty` is the legacy DIFFICULTY opcode value. Post-Merge it is zero
+/// by protocol; pre-Merge it carries real PoW difficulty and is read directly
+/// by the opcode under pre-Paris specs.
+///
 /// `spec` selects the EVM hardfork rules. It must be derived from the block
 /// being simulated — using a newer spec for an older block applies wrong gas
 /// schedules, opcode availability, and per-tx limits, which can flip
 /// success/revert outcomes during preceding-tx replay and corrupt the
 /// CacheDB state the analyzed tx will read.
 ///
-/// `difficulty` is the legacy DIFFICULTY opcode value. Post-Merge it is zero
-/// by protocol; pre-Merge it carries real PoW difficulty and is read directly
-/// by the opcode under pre-Paris specs.
+/// `value` is the `msg.value` of the proxy invocation. Mirrors the original
+/// transaction's `value` so contracts that pass-through ETH (deposit-then-forward,
+///  intent settlers, swap routers) can fund value-bearing CALL state updates.
 #[derive(Clone, Debug)]
 pub struct SimEnvOpts {
     pub number: u64,
@@ -64,35 +70,35 @@ pub struct SimEnvOpts {
     pub basefee: u64,
     pub difficulty: U256,
     pub spec: SpecId,
-    /// `msg.value` of the proxy invocation. Mirrors the original transaction's
-    /// `value` so contracts that pass-through ETH (deposit-then-forward, intent
-    /// settlers, swap routers) can fund value-bearing CALL state updates.
     pub value: U256,
 }
 
-/// Embedded ABI JSON for StateChangeHandlerGasEstimator - loaded at compile time
 const ESTIMATOR_ABI_JSON: &str = include_str!("../../../abis/StateChangeHandlerGasEstimator.json");
 
-/// Compute the isolated storage slot for the implementation address.
-/// Mirrors the Solidity constant: `keccak256("gas.estimator.implementation") - 1`
+static ESTIMATOR_BYTECODE: OnceLock<Bytes> = OnceLock::new();
+
+/// Returns the StateChangeHandlerGasEstimator deployed bytecode, parsed once per process.
+///
+/// Subsequent calls clone the inner `Arc<[u8]>` — no JSON parse or hex decode.
+fn estimator_bytecode() -> Bytes {
+    ESTIMATOR_BYTECODE
+        .get_or_init(|| {
+            let json: serde_json::Value = serde_json::from_str(ESTIMATOR_ABI_JSON)
+                .expect("embedded estimator JSON is malformed");
+            let hex_str = json["deployedBytecode"]["object"]
+                .as_str()
+                .expect("missing deployedBytecode.object in estimator artifact");
+            let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+            hex::decode(hex_str)
+                .expect("invalid hex in estimator bytecode")
+                .into()
+        })
+        .clone()
+}
+
 fn impl_slot() -> U256 {
     U256::from_be_bytes(*alloy_primitives::keccak256("gas.estimator.implementation"))
         - U256::from(1)
-}
-
-/// Load the StateChangeHandlerGasEstimator deployed bytecode from the embedded artifact.
-fn load_estimator_bytecode() -> Result<Vec<u8>> {
-    let json: serde_json::Value = serde_json::from_str(ESTIMATOR_ABI_JSON)
-        .map_err(|e| anyhow!("Failed to parse embedded JSON: {}", e))?;
-
-    let bytecode_hex = json
-        .get("deployedBytecode")
-        .and_then(|d| d.get("object"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("Missing 'deployedBytecode.object' in JSON"))?;
-
-    let bytecode_hex = bytecode_hex.strip_prefix("0x").unwrap_or(bytecode_hex);
-    hex::decode(bytecode_hex).map_err(|e| anyhow!("Failed to decode bytecode: {}", e))
 }
 
 /// Build the calldata for `runStateUpdatesCall(uint8[], bytes[])` from state updates.
@@ -188,14 +194,13 @@ where
         );
     }
 
-    let proxy_bytes = load_estimator_bytecode()?;
     cache_db.insert_account_info(
         contract_address,
         AccountInfo {
             balance: original_account.balance,
             nonce: 0,
             code_hash: B256::ZERO,
-            code: Some(revm::state::Bytecode::new_raw(proxy_bytes.into())),
+            code: Some(revm::state::Bytecode::new_raw(estimator_bytecode())),
         },
     );
 
@@ -293,6 +298,7 @@ where
 /// * `caller_address` - The address to use as the caller (also used as tx.origin)
 /// * `state_updates` - The state updates to estimate gas for
 /// * `sim_env` - Simulation environment fields (block and tx context)
+#[tracing::instrument(name = "gas.evm_execute", skip_all, fields(block_number = sim_env.number, state_update_count = state_updates.len()))]
 pub fn estimate_state_changes_gas<DB>(
     cache_db: &mut CacheDB<DB>,
     contract_address: Address,

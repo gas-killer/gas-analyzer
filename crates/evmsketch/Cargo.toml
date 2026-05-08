@@ -3,26 +3,68 @@ name = "gas-analyzer-evmsketch"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+heap-profile = []
+
 [dependencies]
-gas-analyzer-core = { path = "../core" }
-gas-analyzer-rpc = { path = "../rpc" }
-gas-analyzer-estimator = { path = "../gas-estimator" }
 alloy = { version = "1.0.37", features = ["rpc", "rpc-types"] }
 alloy-eips = "1.0.37"
 alloy-evm = "0.25"
 alloy-provider = { version = "1.0.37", features = ["debug-api"] }
 anyhow = "1.0.98"
-tokio = { version = "1", features = ["rt"] }
-url = "2.5.4"
+gas-analyzer-core = { path = "../core" }
+gas-analyzer-estimator = { path = "../gas-estimator" }
+gas-analyzer-rpc = { path = "../rpc" }
 reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1" }
 revm = { version = "31.0.1" }
-sp1-cc-host-executor = { git = "https://github.com/BreadchainCoop/sp1-contract-call", branch = "cancun-v1", package = "sp1-cc-host-executor" }
 sp1-cc-client-executor = { git = "https://github.com/BreadchainCoop/sp1-contract-call", branch = "cancun-v1", package = "sp1-cc-client-executor" }
+sp1-cc-host-executor = { git = "https://github.com/BreadchainCoop/sp1-contract-call", branch = "cancun-v1", package = "sp1-cc-host-executor" }
+tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"
+url = "2.5.4"
 
 [dev-dependencies]
 alloy-consensus = "1"
+alloy-hardforks = "0.4"
 alloy-json-rpc = "1"
 alloy-rpc-client = "1"
+alloy-rpc-types = "1.0.37"
 alloy-transport = "1"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
-tower = "0.5"
+criterion   = { version = "0.5", features = ["html_reports", "async_tokio"] }
+dhat        = "0.3"
+pprof       = { version = "0.15", features = ["flamegraph", "criterion", "frame-pointer", "prost-codec"] }
+revm        = { version = "31.0.1", features = ["serde"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+sha2        = "0.10"
+stats_alloc = "0.1"
+tokio       = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tower       = "0.5"
+
+[[bench]]
+name    = "trace_parsing"
+harness = false
+
+[[bench]]
+name    = "gas_estimation"
+harness = false
+
+[[bench]]
+name    = "end_to_end"
+harness = false
+
+[[bench]]
+name    = "flamegraph"
+harness = false
+
+[[bench]]
+name    = "replay"
+harness = false
+
+[[example]]
+name = "generate_fixture"
+path = "benches/fixtures/generate_fixture.rs"
+
+[[example]]
+name = "generate_replay_fixture"
+path = "benches/fixtures/generate_replay_fixture.rs"
