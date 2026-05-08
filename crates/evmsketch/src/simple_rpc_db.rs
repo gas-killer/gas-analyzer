@@ -37,6 +37,7 @@ pub struct SimpleRpcDb {
 impl DatabaseRef for SimpleRpcDb {
     type Error = SimpleRpcDbError;
 
+    #[tracing::instrument(name = "evmsketch.rpc.account", skip_all, level = "debug", fields(block_number = self.block_number, rpc_call_count = 3u32))]
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let handle =
             tokio::runtime::Handle::try_current().map_err(|e| format!("no tokio runtime: {e}"))?;
@@ -80,6 +81,7 @@ impl DatabaseRef for SimpleRpcDb {
             .into())
     }
 
+    #[tracing::instrument(name = "evmsketch.rpc.storage", skip_all, level = "debug", fields(block_number = self.block_number, rpc_call_count = 1u32))]
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let handle =
             tokio::runtime::Handle::try_current().map_err(|e| format!("no tokio runtime: {e}"))?;
