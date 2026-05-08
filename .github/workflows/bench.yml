@@ -44,20 +44,10 @@ jobs:
         run: rm -rf target/criterion/
 
       - name: Bench PR branch (candidate)
-        run: make bench-save-baseline BASELINE=new
-
-      # Criterion 0.5 leaves benchmark.json empty on first write; the baseline
-      # run would find the empty file and overwrite the new/ directory with its
-      # own data, making both baselines identical (all 0% changes). Save the
-      # candidate results before switching branches and restore them after.
-      - name: Preserve candidate Criterion data
-        run: cp -r target/criterion/ /tmp/criterion-candidate/
+        run: make bench-save-baseline BASELINE=candidate
 
       - name: Switch to base branch
         run: git checkout ${{ github.event.pull_request.base.sha }}
-
-      - name: Clear Criterion data for baseline run
-        run: rm -rf target/criterion/
 
       - name: Flush page cache and allocator
         run: |
@@ -67,9 +57,6 @@ jobs:
       - name: Bench base branch (baseline)
         run: make bench-save-baseline
 
-      - name: Restore candidate data for comparison
-        run: cp -rn /tmp/criterion-candidate/. target/criterion/
-
       - name: Check regressions and generate report
         id: regcheck
         continue-on-error: true
@@ -77,6 +64,7 @@ jobs:
           python3 .github/scripts/check_regressions.py \
             --threshold 15 \
             --criterion-dir target/criterion \
+            --candidate candidate \
             --output-file regression-report.md
 
       - name: Post PR comment
