@@ -1,12 +1,12 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/anvil",
+    "crates/cli",
     "crates/core",
+    "crates/evmsketch",
     "crates/gas-estimator",
     "crates/rpc",
-    "crates/anvil",
-    "crates/evmsketch",
-    "crates/cli",
     "crates/wasm",
 ]
 default-members = [
@@ -16,3 +16,6 @@ default-members = [
     "crates/evmsketch",
     "crates/cli",
 ]
+
+[profile.bench]
+debug = 1
