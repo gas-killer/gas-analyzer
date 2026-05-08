@@ -58,6 +58,7 @@ impl From<SimEnvJson> for SimEnvOpts {
             basefee: e.basefee,
             difficulty: e.difficulty,
             spec: e.spec,
+            value: U256::ZERO,
         }
     }
 }
