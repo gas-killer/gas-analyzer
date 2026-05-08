@@ -72,9 +72,8 @@ def build_report(
             )
 
     footer = (
-        "<sub>Benchmarks run on shared GitHub-hosted runners. "
-        f"Hardware variance may cause false positives — "
-        f"only regressions >{threshold:.0f}% are flagged.</sub>"
+        "<sub>Base and candidate benchmarks run back-to-back on the same CI runner. "
+        f"Only regressions >{threshold:.0f}% are flagged.</sub>"
     )
 
     if not baseline:
