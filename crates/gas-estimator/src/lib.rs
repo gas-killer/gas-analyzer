@@ -58,7 +58,7 @@ pub(crate) fn effective_tx_gas_limit(gas_limit: u64, spec: SpecId) -> u64 {
 ///
 /// `value` is the `msg.value` of the proxy invocation. Mirrors the original
 /// transaction's `value` so contracts that pass-through ETH (deposit-then-forward,
-///  intent settlers, swap routers) can fund value-bearing CALL state updates.
+/// intent settlers, swap routers) can fund value-bearing CALL state updates.
 #[derive(Clone, Debug)]
 pub struct SimEnvOpts {
     pub number: u64,
@@ -224,9 +224,7 @@ where
             caller_address,
             AccountInfo {
                 balance: caller_account.balance.saturating_add(sim_env.value),
-                nonce: caller_account.nonce,
-                code_hash: caller_account.code_hash,
-                code: caller_account.code,
+                ..caller_account
             },
         );
     }
