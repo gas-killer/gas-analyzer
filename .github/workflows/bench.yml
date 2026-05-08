@@ -8,11 +8,13 @@ env:
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────
-  # On every PR: bench the base branch and the PR branch back-to-back on the
+  # On every PR: bench the PR branch and the base branch back-to-back on the
   # same runner, post a sticky comment with the regression report, and fail
   # if any offline metric regresses beyond 15 %.
   #
   # Running both measurements in one job eliminates cross-machine variance.
+  # The candidate runs FIRST so that any warm-cache ordering bias works
+  # against the candidate rather than masking regressions.
   # Fixtures are pulled once from LFS after the initial checkout; they
   # persist on disk through the branch switch since target/ is gitignored.
   #
@@ -29,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
       - name: Pull bench fixtures from LFS
@@ -38,14 +40,22 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Bench base branch (baseline)
-        run: make bench-save-baseline
-
-      - name: Switch to PR branch
-        run: git checkout ${{ github.event.pull_request.head.sha }}
+      - name: Clear any stale Criterion data
+        run: rm -rf target/criterion/
 
       - name: Bench PR branch (candidate)
-        run: make bench-compare
+        run: make bench-save-baseline BASELINE=new
+
+      - name: Switch to base branch
+        run: git checkout ${{ github.event.pull_request.base.sha }}
+
+      - name: Flush page cache and allocator
+        run: |
+          sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+          python3 -c "import ctypes; ctypes.CDLL('libc.so.6').malloc_trim(0)"
+
+      - name: Bench base branch (baseline)
+        run: make bench-save-baseline
 
       - name: Check regressions and generate report
         id: regcheck
