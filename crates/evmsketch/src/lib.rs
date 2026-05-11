@@ -188,10 +188,7 @@ impl DefaultEvmSketchExecutor {
         gas_price: u128,
     ) -> Result<u64> {
         let state_block = self.anchor_block_number().saturating_sub(1);
-        let simple_db = SimpleRpcDb {
-            provider: self.sketch.provider.clone(),
-            block_number: state_block,
-        };
+        let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
         let mut cache_db = CacheDB::new(simple_db);
         let mut sim_env = self.sim_env();
         sim_env.gas_price = gas_price;
@@ -322,10 +319,7 @@ impl GasKillerEvmSketchDefault {
     ) -> Result<u64> {
         // Use block_number - 1 (pre-transaction state), matching the Anvil path.
         let state_block = self.executor.anchor_block_number().saturating_sub(1);
-        let simple_db = SimpleRpcDb {
-            provider: self.executor.sketch.provider.clone(),
-            block_number: state_block,
-        };
+        let simple_db = SimpleRpcDb::new(self.executor.sketch.provider.clone(), state_block);
         let mut cache_db = CacheDB::new(simple_db);
         let sim_env = self.executor.sim_env();
         gas_analyzer_estimator::estimate_state_changes_gas(
@@ -370,10 +364,7 @@ impl GasKillerEvmSketchDefault {
         // tx, causing signature recovery to mismatch and the call to revert
         // with "invalid signature".
         let state_block = self.executor.anchor_block_number().saturating_sub(1);
-        let simple_db = SimpleRpcDb {
-            provider: self.executor.sketch.provider.clone(),
-            block_number: state_block,
-        };
+        let simple_db = SimpleRpcDb::new(self.executor.sketch.provider.clone(), state_block);
         let mut cache_db = CacheDB::new(simple_db);
         let mut sim_env = self.executor.sim_env();
 
@@ -639,10 +630,7 @@ mod tests {
         let client = RpcClient::new(transport, true);
         let provider: RootProvider<AnyNetwork> = RootProvider::new(client);
 
-        let db = SimpleRpcDb {
-            provider,
-            block_number: 99,
-        };
+        let db = SimpleRpcDb::new(provider, 99);
 
         // SimpleRpcDb's storage_ref blocks the current thread; spawn_blocking
         // gives it the worker thread it needs under multi_thread runtime.
