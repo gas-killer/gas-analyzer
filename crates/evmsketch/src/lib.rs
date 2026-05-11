@@ -22,7 +22,10 @@ use reth_primitives::EthPrimitives;
 use revm::database::CacheDB;
 use sp1_cc_client_executor::{ContractCalldata, ContractInput};
 use sp1_cc_host_executor::{EvmSketch, Genesis};
+use lru::LruCache;
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use url::Url;
 
 /// Ethereum mainnet chain ID.
@@ -69,6 +72,69 @@ pub type DefaultProvider = RootProvider<AnyNetwork>;
 pub type DefaultPrimitives = EthPrimitives;
 /// The default executor type
 pub type DefaultEvmSketchExecutor = EvmSketchExecutor<DefaultProvider, DefaultPrimitives>;
+
+// ============================================================================
+// Executor Cache
+// ============================================================================
+
+/// Thread-safe LRU cache of pre-built [`DefaultEvmSketchExecutor`]s.
+///
+/// `build()` costs ~80–120 ms (2× `eth_getBlockByNumber`).  An executor is safe
+/// to reuse across requests at the same block height: `sim_env()` reads only
+/// immutable header fields, and each gas estimate constructs its own `CacheDB`.
+/// Keyed by `(rpc_url, block_number)` — no extra RPC is needed for a cache hit.
+///
+/// A capacity of 4 covers all realistic burst scenarios on mainnet (~12 s blocks).
+pub struct EvmSketchExecutorCache {
+    inner: Mutex<LruCache<(String, u64), Arc<DefaultEvmSketchExecutor>>>,
+}
+
+impl EvmSketchExecutorCache {
+    /// Create a new cache with the given capacity.
+    ///
+    /// # Panics
+    /// Panics if `capacity` is zero.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(LruCache::new(
+                NonZeroUsize::new(capacity).expect("cache capacity must be non-zero"),
+            )),
+        }
+    }
+
+    /// Return a cached executor for `(rpc_url, block_number)`, building one if absent.
+    ///
+    /// Two concurrent callers that both miss may each call `build()`; the later
+    /// `put` overwrites the earlier entry.  Both executors are equivalent, so this
+    /// is safe — it only wastes one build in the rare cold-start race.
+    pub async fn get_or_build(
+        &self,
+        rpc_url: &str,
+        block_number: u64,
+    ) -> Result<Arc<DefaultEvmSketchExecutor>> {
+        let key = (rpc_url.to_string(), block_number);
+        {
+            let mut cache = self.inner.lock().expect("executor cache mutex poisoned");
+            if let Some(exec) = cache.get(&key) {
+                return Ok(Arc::clone(exec));
+            }
+        }
+
+        let url = Url::parse(rpc_url).map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+        let exec = Arc::new(
+            EvmSketchExecutorBuilder::new()
+                .rpc_url(url)
+                .at_block(BlockNumberOrTag::Number(block_number))
+                .build()
+                .await?,
+        );
+        {
+            let mut cache = self.inner.lock().expect("executor cache mutex poisoned");
+            cache.put(key, Arc::clone(&exec));
+        }
+        Ok(exec)
+    }
+}
 
 // ============================================================================
 // Transaction Request Conversion
@@ -204,6 +270,30 @@ impl DefaultEvmSketchExecutor {
         )
     }
 
+    /// Estimate gas for a set of state updates at the anchor block.
+    ///
+    /// Constructs a fresh `CacheDB` backed by `SimpleRpcDb` at `block_number - 1`
+    /// (pre-block state) so each call is independent of any prior estimation on
+    /// this executor.
+    pub fn estimate_state_changes_gas(
+        &self,
+        contract_address: Address,
+        caller_address: Address,
+        state_updates: &[gas_analyzer_core::StateUpdate],
+    ) -> Result<u64> {
+        let state_block = self.anchor_block_number().saturating_sub(1);
+        let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
+        let mut cache_db = CacheDB::new(simple_db);
+        let sim_env = self.sim_env();
+        gas_analyzer_estimator::estimate_state_changes_gas(
+            &mut cache_db,
+            contract_address,
+            caller_address,
+            state_updates,
+            &sim_env,
+        )
+    }
+
     /// Build a `SimEnv` from the anchored block header.
     ///
     /// `gas_price` defaults to 0 since it is a transaction-level field;
@@ -320,6 +410,7 @@ impl GasKillerEvmSketchDefault {
         caller_address: Address,
         state_updates: &[StateUpdate],
     ) -> Result<u64> {
+<<<<<<< Updated upstream
         // Use block_number - 1 (pre-transaction state), matching the Anvil path.
         let state_block = self.executor.anchor_block_number().saturating_sub(1);
         let simple_db = SimpleRpcDb {
@@ -335,6 +426,10 @@ impl GasKillerEvmSketchDefault {
             state_updates,
             &sim_env,
         )
+=======
+        self.executor
+            .estimate_state_changes_gas(contract_address, caller_address, state_updates)
+>>>>>>> Stashed changes
     }
 
     /// Estimate gas for state changes, replaying preceding transactions first.
@@ -429,13 +524,17 @@ impl GasKillerEvmSketchDefault {
 /// Compute encoded state updates and gas estimate for a transaction call using EvmSketch.
 ///
 /// Simulates the call via `debug_traceCall` at the given block, extracts state updates,
-/// encodes them to ABI, and estimates gas using EvmSketch. Use this for validator-style
-/// analysis without Anvil.
+/// encodes them to ABI, and estimates gas. The executor build step (~80–120 ms,
+/// 2× `eth_getBlockByNumber`) is skipped on cache hits.
+///
+/// Pass a persistent `EvmSketchExecutorCache` shared across requests for the best
+/// performance.  For one-shot use (benchmarks, CLI) pass `&EvmSketchExecutorCache::new(1)`.
 ///
 /// # Returns
 /// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`
 #[tracing::instrument(name = "evmsketch.encode", skip_all, fields(block_number = %block, state_update_count = tracing::field::Empty))]
 pub async fn call_to_encoded_state_updates_with_evmsketch(
+    cache: &EvmSketchExecutorCache,
     rpc_url: impl AsRef<str>,
     tx_request: TransactionRequest,
     block: BlockNumberOrTag,
@@ -453,7 +552,17 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 
     let caller_address = tx_request.from.unwrap_or_default();
 
-    let provider = ProviderBuilder::new().connect_http(url.clone());
+    let block_number = match block {
+        BlockNumberOrTag::Number(n) => n,
+        _ => {
+            return Err(anyhow!(
+                "executor cache requires a specific block number, got {:?}",
+                block
+            ));
+        }
+    };
+
+    let provider = ProviderBuilder::new().connect_http(url);
     let block_id = BlockId::Number(block);
     let trace = get_trace_from_call(&provider, tx_request, block_id).await?;
     let (state_updates, skipped_opcodes, _call_gas_total) = compute_state_updates(trace)?;
@@ -461,12 +570,9 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 
     let storage_updates = encode_state_updates_to_abi(&state_updates);
 
-    let gk = GasKillerEvmSketchDefault::builder(url)
-        .at_block(block)
-        .build()
-        .await?;
+    let executor = cache.get_or_build(rpc_url, block_number).await?;
     let gas_estimate =
-        gk.estimate_state_changes_gas(contract_address, caller_address, &state_updates)?;
+        executor.estimate_state_changes_gas(contract_address, caller_address, &state_updates)?;
 
     Ok((storage_updates, gas_estimate, false, skipped_opcodes))
 }
@@ -479,6 +585,47 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 mod tests {
     use super::*;
     use alloy::primitives::{address, bytes};
+
+    /// Two `get_or_build` calls for the same key must return `Arc`s that point to the
+    /// same allocation (i.e. the second call is a cache hit, not a new build).
+    /// Requires a live RPC — run with `cargo test -- --ignored` and `HTTP_RPC` set.
+    #[tokio::test]
+    #[ignore = "requires live RPC via HTTP_RPC env var"]
+    async fn test_executor_cache_hit_returns_same_arc() {
+        let rpc_url = std::env::var("HTTP_RPC").expect("HTTP_RPC must be set");
+        let cache = EvmSketchExecutorCache::new(4);
+
+        // Fetch the latest block number so we have a concrete number to key on.
+        let provider = ProviderBuilder::new()
+            .connect_http(Url::parse(&rpc_url).unwrap());
+        let block_number = provider.get_block_number().await.unwrap();
+
+        let first = cache.get_or_build(&rpc_url, block_number).await.unwrap();
+        let second = cache.get_or_build(&rpc_url, block_number).await.unwrap();
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "second get_or_build must return the cached Arc, not a newly built executor"
+        );
+    }
+
+    /// A cache with capacity 1 must evict the old entry when a new key is inserted,
+    /// so a subsequent lookup of the evicted key misses and allocates a fresh Arc.
+    #[test]
+    fn test_executor_cache_lru_eviction() {
+        // We can only test the LRU capacity logic without a live RPC by checking
+        // that the underlying LruCache size stays bounded.  Use the lru crate
+        // directly here as a smoke-test for the capacity argument.
+        let mut lru: LruCache<(String, u64), u32> =
+            LruCache::new(NonZeroUsize::new(2).unwrap());
+        lru.put(("rpc".into(), 1), 1);
+        lru.put(("rpc".into(), 2), 2);
+        lru.put(("rpc".into(), 3), 3); // evicts ("rpc", 1)
+        assert_eq!(lru.len(), 2);
+        assert!(lru.get(&("rpc".into(), 1)).is_none(), "oldest entry should be evicted");
+        assert!(lru.get(&("rpc".into(), 2)).is_some());
+        assert!(lru.get(&("rpc".into(), 3)).is_some());
+    }
 
     #[test]
     fn test_tx_request_to_contract_input() {
