@@ -18,11 +18,11 @@ use alloy_provider::RootProvider;
 use alloy_provider::ext::DebugApi;
 use alloy_provider::network::AnyNetwork;
 use anyhow::{Result, anyhow};
+use lru::LruCache;
 use reth_primitives::EthPrimitives;
 use revm::database::CacheDB;
 use sp1_cc_client_executor::{ContractCalldata, ContractInput};
 use sp1_cc_host_executor::{EvmSketch, Genesis};
-use lru::LruCache;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -410,7 +410,6 @@ impl GasKillerEvmSketchDefault {
         caller_address: Address,
         state_updates: &[StateUpdate],
     ) -> Result<u64> {
-<<<<<<< Updated upstream
         // Use block_number - 1 (pre-transaction state), matching the Anvil path.
         let state_block = self.executor.anchor_block_number().saturating_sub(1);
         let simple_db = SimpleRpcDb {
@@ -426,10 +425,6 @@ impl GasKillerEvmSketchDefault {
             state_updates,
             &sim_env,
         )
-=======
-        self.executor
-            .estimate_state_changes_gas(contract_address, caller_address, state_updates)
->>>>>>> Stashed changes
     }
 
     /// Estimate gas for state changes, replaying preceding transactions first.
@@ -596,8 +591,7 @@ mod tests {
         let cache = EvmSketchExecutorCache::new(4);
 
         // Fetch the latest block number so we have a concrete number to key on.
-        let provider = ProviderBuilder::new()
-            .connect_http(Url::parse(&rpc_url).unwrap());
+        let provider = ProviderBuilder::new().connect_http(Url::parse(&rpc_url).unwrap());
         let block_number = provider.get_block_number().await.unwrap();
 
         let first = cache.get_or_build(&rpc_url, block_number).await.unwrap();
@@ -616,13 +610,15 @@ mod tests {
         // We can only test the LRU capacity logic without a live RPC by checking
         // that the underlying LruCache size stays bounded.  Use the lru crate
         // directly here as a smoke-test for the capacity argument.
-        let mut lru: LruCache<(String, u64), u32> =
-            LruCache::new(NonZeroUsize::new(2).unwrap());
+        let mut lru: LruCache<(String, u64), u32> = LruCache::new(NonZeroUsize::new(2).unwrap());
         lru.put(("rpc".into(), 1), 1);
         lru.put(("rpc".into(), 2), 2);
         lru.put(("rpc".into(), 3), 3); // evicts ("rpc", 1)
         assert_eq!(lru.len(), 2);
-        assert!(lru.get(&("rpc".into(), 1)).is_none(), "oldest entry should be evicted");
+        assert!(
+            lru.get(&("rpc".into(), 1)).is_none(),
+            "oldest entry should be evicted"
+        );
         assert!(lru.get(&("rpc".into(), 2)).is_some());
         assert!(lru.get(&("rpc".into(), 3)).is_some());
     }
