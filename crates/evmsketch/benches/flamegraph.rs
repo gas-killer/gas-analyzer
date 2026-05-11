@@ -255,8 +255,11 @@ fn bench_end_to_end(c: &mut Criterion) {
 
     group.bench_function("call_to_encoded_state_updates_with_evmsketch", |b| {
         b.to_async(&rt).iter(|| async {
+            // Fresh cache per iteration so each run pays the full build cost.
+            let cache = gas_analyzer_evmsketch::EvmSketchExecutorCache::new(1);
             black_box(
                 gas_analyzer_evmsketch::call_to_encoded_state_updates_with_evmsketch(
+                    &cache,
                     &rpc_url,
                     tx_request.clone(),
                     block,
