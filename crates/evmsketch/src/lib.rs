@@ -575,8 +575,9 @@ mod tests {
     /// Two `get_or_build` calls for the same key must return `Arc`s that point to the
     /// same allocation (i.e. the second call is a cache hit, not a new build).
     #[tokio::test]
+    #[ignore = "requires RPC_URL env var"]
     async fn test_executor_cache_hit_returns_same_arc() {
-        let rpc_url = std::env::var("HTTP_RPC").expect("HTTP_RPC must be set");
+        let rpc_url = std::env::var("RPC_URL").expect("RPC_URL must be set");
         let cache = EvmSketchExecutorCache::new(4);
 
         // Fetch the latest block number so we have a concrete number to key on.
