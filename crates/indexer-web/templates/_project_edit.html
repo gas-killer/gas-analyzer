@@ -1,0 +1,16 @@
+<form class="label-edit" id="project-cell-{{ project_slug }}"
+      hx-post="/api/projects/rename"
+      hx-target="#project-cell-{{ project_slug }}"
+      hx-swap="outerHTML">
+    <input type="hidden" name="slug" value="{{ project_slug }}">
+    <input type="text" name="project_name"
+           value="{{ current_name }}"
+           placeholder="Display name"
+           maxlength="128"
+           required autofocus>
+    <button type="submit" class="btn-small">Save</button>
+    <a href="#" class="btn-small btn-cancel"
+       hx-get="/api/projects/cell?slug={{ project_slug }}"
+       hx-target="#project-cell-{{ project_slug }}"
+       hx-swap="outerHTML">Cancel</a>
+</form>

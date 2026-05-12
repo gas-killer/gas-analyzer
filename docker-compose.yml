@@ -112,6 +112,9 @@ services:
     image: gas-killer/indexer-service:local
     command: ["/usr/local/bin/indexer-web"]
     environment:
+      OPENROUTER_KEY: ${OPENROUTER_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-anthropic/claude-sonnet-4-6}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
       DATABASE_URL: postgres://indexer:${POSTGRES_PASSWORD}@postgres:5432/indexer
       REDIS_URL: redis://redis:6379
       SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET}
@@ -121,6 +124,15 @@ services:
       EXPLORER_TX_URL: ${EXPLORER_TX_URL:-https://etherscan.io/tx/}
       EXPLORER_ADDRESS_URL: ${EXPLORER_ADDRESS_URL:-https://etherscan.io/address/}
       STATIC_DIR: /opt/indexer-web/static
+      # Mirror the refresh-source vars from the refresher so the manual
+      # refresh buttons hit the same upstreams.
+      DEFILLAMA_URL: ${DEFILLAMA_URL:-https://api.llama.fi/protocols}
+      PRICE_URL: ${PRICE_URL:-https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd}
+      LABELER_BATCH_SIZE: ${LABELER_BATCH_SIZE:-200}
+      LABELER_RETRY_DAYS: ${LABELER_RETRY_DAYS:-7}
+      # Used by the AI diagnostics bundle to flag whether the labeler
+      # pipeline is configured. Value is treated as a boolean (empty/non-empty).
+      ETHERSCAN_API_KEY: ${ETHERSCAN_API_KEY:-}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "3000:3000"

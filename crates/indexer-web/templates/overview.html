@@ -54,10 +54,17 @@
                                    hx-get="/api/labels/edit?address={{ addr }}&chain_id={{ chain_id }}"
                                    hx-target="#label-cell-{{ addr }}"
                                    hx-swap="outerHTML"
-                                   title="Edit label">✎</a>
+                                   title="Map to project">✎</a>
                             </span>
                         {% when None %}
-                            <a href="/projects/{{ row.project_slug }}">{{ row.display_name }}</a>
+                            <span class="label-cell" id="project-cell-{{ row.project_slug }}">
+                                <a href="/projects/{{ row.project_slug }}">{{ row.display_name }}</a>
+                                <a class="label-edit-icon" href="#"
+                                   hx-get="/api/projects/edit?slug={{ row.project_slug }}"
+                                   hx-target="#project-cell-{{ row.project_slug }}"
+                                   hx-swap="outerHTML"
+                                   title="Rename display name">✎</a>
+                            </span>
                     {% endmatch %}
                 </td>
                 <td class="right">{{ row.tx_count }}</td>

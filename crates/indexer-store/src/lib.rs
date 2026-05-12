@@ -199,6 +199,27 @@ impl Store {
         Ok(())
     }
 
+    /// Rename a project (display-name only — the slug is the stable key).
+    /// Returns whether a row was updated, so callers can distinguish
+    /// "renamed" from "no such slug" without an extra SELECT.
+    pub async fn rename_project(
+        &self,
+        slug: &str,
+        new_name: &str,
+    ) -> Result<bool, StoreError> {
+        let res = sqlx::query(
+            r#"UPDATE projects
+               SET project_name = $2,
+                   last_seen_at = now()
+               WHERE project_slug = $1"#,
+        )
+        .bind(slug)
+        .bind(new_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// Returns whether the given address has a manual override set. Used by
     /// the UI to decide whether to show "(manual)" alongside the label.
     pub async fn is_manual_override(

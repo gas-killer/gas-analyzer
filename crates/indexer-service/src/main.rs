@@ -3,6 +3,9 @@ use clap::{Parser, Subcommand};
 use indexer_service::{config, head_tracker, refresher, worker};
 use tracing_subscriber::EnvFilter;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "indexer-service", about = "Gas-killer block indexer")]
 struct Cli {

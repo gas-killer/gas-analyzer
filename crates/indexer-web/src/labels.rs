@@ -110,8 +110,15 @@ pub async fn label_override(
         .store
         .upsert_manual_address_project(form.chain_id as u64, addr, slug)
         .await?;
-    // Retro-fix every historical analysis row for this address.
+    // Retro-fix every historical analysis row for this address...
     let _ = state.store.relabel_unknowns().await?;
+    // ...and refresh the materialized view so the overview leaderboard
+    // groups by the new slug immediately. Without this the dashboard would
+    // keep showing the row under `unknown:0xADDR` until the next rollup
+    // tick (default 1h). Cheap on this DB size.
+    if let Err(e) = state.store.refresh_rollups().await {
+        tracing::warn!(error = %e, "refresh_rollups after override failed");
+    }
 
     let cell = build_cell(&state, form.chain_id, addr).await?;
     Ok(cell.into_response())
@@ -173,6 +180,94 @@ fn parse_addr(s: &str) -> Result<[u8; 20], WebError> {
     let mut out = [0u8; 20];
     out.copy_from_slice(&bytes);
     Ok(out)
+}
+
+// ---------- Project rename (display-name only) ----------
+
+#[derive(Debug, Deserialize)]
+pub struct ProjectQuery {
+    pub slug: String,
+}
+
+#[derive(Template)]
+#[template(path = "_project_cell.html")]
+pub struct ProjectCell {
+    pub project_slug: String,
+    pub display_name: String,
+}
+
+#[derive(Template)]
+#[template(path = "_project_edit.html")]
+pub struct ProjectEdit {
+    pub project_slug: String,
+    pub current_name: String,
+}
+
+pub async fn project_cell(
+    _user: AuthUser,
+    State(state): State<AppState>,
+    Query(q): Query<ProjectQuery>,
+) -> Result<Response, WebError> {
+    let cell = build_project_cell(&state, &q.slug).await?;
+    Ok(cell.into_response())
+}
+
+pub async fn project_edit(
+    _user: AuthUser,
+    State(state): State<AppState>,
+    Query(q): Query<ProjectQuery>,
+) -> Result<Response, WebError> {
+    let row = queries::project_header(state.store.pool(), &q.slug).await?;
+    let current_name = row
+        .and_then(|h| h.project_name)
+        .unwrap_or_else(|| q.slug.clone());
+    Ok(ProjectEdit {
+        project_slug: q.slug,
+        current_name,
+    }
+    .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RenameForm {
+    pub slug: String,
+    pub project_name: String,
+}
+
+pub async fn project_rename(
+    _user: AuthUser,
+    State(state): State<AppState>,
+    axum::Form(form): axum::Form<RenameForm>,
+) -> Result<Response, WebError> {
+    let new_name = form.project_name.trim();
+    if new_name.is_empty() || new_name.len() > 128 {
+        return Err(WebError::BadRequest(
+            "display name must be 1..=128 chars".to_string(),
+        ));
+    }
+    if form.slug.is_empty() {
+        return Err(WebError::BadRequest("slug is required".to_string()));
+    }
+    let renamed = state.store.rename_project(&form.slug, new_name).await?;
+    if !renamed {
+        return Err(WebError::NotFound);
+    }
+    let cell = build_project_cell(&state, &form.slug).await?;
+    Ok(cell.into_response())
+}
+
+async fn build_project_cell(
+    state: &AppState,
+    slug: &str,
+) -> Result<ProjectCell, WebError> {
+    let header = queries::project_header(state.store.pool(), slug).await?;
+    let display_name = header
+        .and_then(|h| h.project_name)
+        .unwrap_or_else(|| slug.to_string());
+    Ok(ProjectCell {
+        project_slug: slug.to_string(),
+        display_name,
+    })
 }
 
 /// Slugs follow DefiLlama's shape: lowercase, digits, dashes. Bounded
