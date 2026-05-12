@@ -10,6 +10,7 @@ heap-profile = []
 alloy = { version = "1.0.37", features = ["rpc", "rpc-types"] }
 alloy-eips = "1.0.37"
 alloy-evm = "0.25"
+alloy-genesis = "1"
 alloy-provider = { version = "1.0.37", features = ["debug-api"] }
 anyhow = "1.0.98"
 gas-analyzer-core = { path = "../core" }
