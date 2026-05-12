@@ -574,9 +574,7 @@ mod tests {
 
     /// Two `get_or_build` calls for the same key must return `Arc`s that point to the
     /// same allocation (i.e. the second call is a cache hit, not a new build).
-    /// Requires a live RPC — run with `cargo test -- --ignored` and `HTTP_RPC` set.
     #[tokio::test]
-    #[ignore = "requires live RPC via HTTP_RPC env var"]
     async fn test_executor_cache_hit_returns_same_arc() {
         let rpc_url = std::env::var("HTTP_RPC").expect("HTTP_RPC must be set");
         let cache = EvmSketchExecutorCache::new(4);
