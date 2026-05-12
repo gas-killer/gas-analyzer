@@ -105,7 +105,7 @@ pub async fn leaderboard_30d(
                project_slug,
                percentile_cont(0.5) WITHIN GROUP (
                  ORDER BY gas_saved::float8 / NULLIF(gas_used, 0)::float8
-               ) FILTER (WHERE gas_saved > 0)::float8 AS median_savings_pct_covered
+               ) FILTER (WHERE gas_saved > 0) AS median_savings_pct_covered
              FROM analysis
              WHERE chain_id = $1
                AND block_timestamp >= now() - interval '30 days'
