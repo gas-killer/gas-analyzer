@@ -1,11 +1,16 @@
 //! `indexer-web`: read-only BD dashboard + narrow admin surface for the
 //! gas-killer indexer service.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod admin;
 mod auth;
+mod diagnostics;
 mod error;
 mod handlers;
 mod labels;
+mod llm;
 mod queries;
 
 use std::path::PathBuf;
@@ -85,6 +90,29 @@ struct Cli {
 
     #[arg(long, env = "LABELER_RETRY_DAYS", default_value_t = 7)]
     labeler_retry_days: i64,
+
+    // -------- AI diagnostics --------
+    /// OpenRouter API key. Empty disables the diagnostics button.
+    #[arg(long, env = "OPENROUTER_KEY", default_value = "")]
+    openrouter_key: String,
+
+    /// OpenRouter model identifier.
+    #[arg(long, env = "OPENROUTER_MODEL", default_value = "anthropic/claude-sonnet-4-6")]
+    openrouter_model: String,
+
+    /// OpenRouter base URL (no trailing slash).
+    #[arg(long, env = "OPENROUTER_BASE_URL", default_value = "https://openrouter.ai/api/v1")]
+    openrouter_base_url: String,
+
+    /// Cache TTL for the most recent diagnose response (seconds). Repeat
+    /// clicks within this window return the cached result.
+    #[arg(long, env = "DIAGNOSE_CACHE_TTL_SECS", default_value_t = 30)]
+    diagnose_cache_ttl_secs: u64,
+
+    /// Minimum gap between diagnose requests across all users (seconds).
+    /// Stops accidental double-clicks from doubling spend.
+    #[arg(long, env = "DIAGNOSE_RATE_LIMIT_SECS", default_value_t = 10)]
+    diagnose_rate_limit_secs: u64,
 }
 
 #[derive(Clone)]
@@ -103,6 +131,24 @@ pub struct AppState {
     pub price_url: Arc<String>,
     pub labeler_batch_size: i64,
     pub labeler_retry_days: i64,
+
+    // AI diagnostics. `llm` is None when no API key is configured.
+    pub llm: Option<llm::LlmClient>,
+    pub diagnose_cache: Arc<tokio::sync::Mutex<DiagnoseCache>>,
+    pub diagnose_rate_limit_secs: u64,
+    pub diagnose_cache_ttl_secs: u64,
+    /// Hint string used by the diagnostics bundle to surface "etherscan
+    /// labeling enabled" without leaking the key. Empty when disabled.
+    pub etherscan_enabled_hint: Arc<String>,
+}
+
+/// In-memory cache for the most recent diagnose response. Per-process,
+/// per-restart — no cross-replica coordination needed since this is a
+/// single-replica admin tool.
+#[derive(Default)]
+pub struct DiagnoseCache {
+    pub last_response: Option<(std::time::Instant, String)>,
+    pub last_call_at: Option<std::time::Instant>,
 }
 
 impl FromRef<AppState> for AuthState {
@@ -132,6 +178,34 @@ async fn main() -> Result<()> {
         .await
         .context("redis connection")?;
 
+    let llm = if cli.openrouter_key.trim().is_empty() {
+        tracing::info!("AI diagnostics disabled (OPENROUTER_KEY not set)");
+        None
+    } else {
+        match llm::LlmClient::new(
+            cli.openrouter_key.trim().to_string(),
+            cli.openrouter_base_url,
+            cli.openrouter_model.clone(),
+        ) {
+            Ok(c) => {
+                tracing::info!(model = %cli.openrouter_model, "AI diagnostics enabled");
+                Some(c)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "AI diagnostics disabled (client init failed)");
+                None
+            }
+        }
+    };
+    let etherscan_enabled_hint = if std::env::var("ETHERSCAN_API_KEY")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
+        "etherscan".to_string()
+    } else {
+        String::new()
+    };
+
     let state = AppState {
         store,
         redis,
@@ -145,6 +219,11 @@ async fn main() -> Result<()> {
         price_url: Arc::new(cli.price_url),
         labeler_batch_size: cli.labeler_batch_size,
         labeler_retry_days: cli.labeler_retry_days,
+        llm,
+        diagnose_cache: Arc::new(tokio::sync::Mutex::new(DiagnoseCache::default())),
+        diagnose_rate_limit_secs: cli.diagnose_rate_limit_secs,
+        diagnose_cache_ttl_secs: cli.diagnose_cache_ttl_secs,
+        etherscan_enabled_hint: Arc::new(etherscan_enabled_hint),
     };
 
     let app = Router::new()
@@ -158,9 +237,13 @@ async fn main() -> Result<()> {
         .route("/admin/refresh/resolver",  post(admin::refresh_resolver))
         .route("/admin/refresh/labeler",   post(admin::refresh_labeler))
         .route("/admin/refresh/relabel",   post(admin::refresh_relabel))
+        .route("/admin/diagnose",          post(admin::diagnose))
         .route("/api/labels/cell",         get(labels::label_cell))
         .route("/api/labels/edit",         get(labels::label_edit))
         .route("/api/labels/override",     post(labels::label_override))
+        .route("/api/projects/cell",       get(labels::project_cell))
+        .route("/api/projects/edit",       get(labels::project_edit))
+        .route("/api/projects/rename",     post(labels::project_rename))
         .route("/login", get(handlers::public::login_get).post(handlers::public::login_post))
         .route("/logout", get(handlers::public::logout))
         .route("/healthz", get(|| async { "ok" }))

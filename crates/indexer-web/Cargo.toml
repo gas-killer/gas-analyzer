@@ -44,7 +44,12 @@ tokio = { version = "1.45", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# AI diagnostics
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+pulldown-cmark = { version = "0.10", default-features = false, features = ["html"] }
+
 anyhow = "1.0"
 thiserror = "1.0"
 
 clap = { version = "4", features = ["derive", "env"] }
+mimalloc = { version = "0.1", default-features = false }

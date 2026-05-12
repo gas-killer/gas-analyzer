@@ -15,6 +15,18 @@
 </section>
 
 <section class="card">
+    <h3>AI diagnostics</h3>
+    <p class="muted">Bundles current counters + recent error events and asks an LLM (via OpenRouter) to summarize what's wrong, what's healthy, and what to do next.</p>
+    <button class="btn"
+            hx-post="/admin/diagnose"
+            hx-target="#diagnose-region"
+            hx-swap="innerHTML"
+            hx-indicator="#diagnose-spinner">Diagnose now</button>
+    <span id="diagnose-spinner" class="htmx-indicator muted" style="margin-left:10px;">working…</span>
+    <div id="diagnose-region" class="diagnose-region"></div>
+</section>
+
+<section class="card">
     <h3>Manual refresh</h3>
     <p class="muted">Each button triggers the same job the refresher loop runs internally — useful when you want the dashboard to reflect a recent change without waiting for the next tick.</p>
     <div class="refresh-grid">
