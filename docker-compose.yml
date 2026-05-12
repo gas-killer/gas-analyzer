@@ -37,6 +37,7 @@ services:
   head-tracker:
     image: gas-killer/indexer-service:local
     command: ["/usr/local/bin/indexer-service", "head-tracker"]
+    mem_limit: 512m
     environment:
       RPC_URL: ${RPC_URL:?set RPC_URL}
       CHAIN_ID: ${CHAIN_ID:-1}
@@ -59,8 +60,9 @@ services:
   worker:
     image: gas-killer/indexer-service:local
     command: ["/usr/local/bin/indexer-service", "worker"]
+    mem_limit: 1g
     deploy:
-      replicas: 4
+      replicas: 2
     environment:
       RPC_URL: ${RPC_URL:?set RPC_URL}
       CHAIN_ID: ${CHAIN_ID:-1}
@@ -83,6 +85,7 @@ services:
   refresher:
     image: gas-killer/indexer-service:local
     command: ["/usr/local/bin/indexer-service", "refresher"]
+    mem_limit: 768m
     environment:
       RPC_URL: ${RPC_URL:?set RPC_URL}
       CHAIN_ID: ${CHAIN_ID:-1}
@@ -111,6 +114,7 @@ services:
   indexer-web:
     image: gas-killer/indexer-service:local
     command: ["/usr/local/bin/indexer-web"]
+    mem_limit: 512m
     environment:
       OPENROUTER_KEY: ${OPENROUTER_KEY:-}
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-anthropic/claude-sonnet-4-6}
@@ -135,7 +139,7 @@ services:
       ETHERSCAN_API_KEY: ${ETHERSCAN_API_KEY:-}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     volumes:
       - ./users.yaml:/etc/indexer/users.yaml:ro
     depends_on:
