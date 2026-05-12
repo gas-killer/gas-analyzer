@@ -13,6 +13,7 @@ use alloy::rpc::types::eth::TransactionRequest;
 use alloy_eips::BlockId;
 use alloy_eips::BlockNumberOrTag;
 use alloy_evm::eth::spec::EthSpec;
+use alloy_genesis::ChainConfig;
 use alloy_provider::Provider;
 use alloy_provider::RootProvider;
 use alloy_provider::ext::DebugApi;
@@ -29,23 +30,46 @@ use url::Url;
 pub const MAINNET_CHAIN_ID: u64 = 1;
 /// Ethereum Sepolia chain ID.
 pub const SEPOLIA_CHAIN_ID: u64 = 11_155_111;
+/// Gnosis Chain chain ID.
+pub const GNOSIS_CHAIN_ID: u64 = 100;
 
 /// Map a chain ID to the corresponding `Genesis` for `EvmSketch` and the
 /// matching `EthSpec` for hardfork derivation.
 ///
-/// Only Ethereum mainnet and Sepolia are supported — other chain IDs return
-/// an error rather than silently defaulting to mainnet, which would produce
-/// a wrong `SpecId` whenever the active hardfork on the target chain
-/// differs from mainnet at the same height/timestamp.
+/// Unsupported chain IDs return an error rather than silently defaulting to
+/// mainnet, which would produce a wrong `SpecId` whenever the active hardfork
+/// on the target chain differs from mainnet at the same height/timestamp.
 pub fn chain_id_to_genesis_and_spec(chain_id: u64) -> Result<(Genesis, EthSpec)> {
     match chain_id {
         MAINNET_CHAIN_ID => Ok((Genesis::Mainnet, EthSpec::mainnet())),
         SEPOLIA_CHAIN_ID => Ok((Genesis::Sepolia, EthSpec::sepolia())),
+        GNOSIS_CHAIN_ID => Ok((Genesis::Custom(gnosis_chain_config()), EthSpec::mainnet())),
         other => Err(anyhow!(
-            "unsupported chain id {other}: only mainnet ({}) and sepolia ({}) are supported",
+            "unsupported chain id {other}: only mainnet ({}), sepolia ({}), and gnosis ({}) are supported",
             MAINNET_CHAIN_ID,
             SEPOLIA_CHAIN_ID,
+            GNOSIS_CHAIN_ID,
         )),
+    }
+}
+
+fn gnosis_chain_config() -> ChainConfig {
+    ChainConfig {
+        chain_id: GNOSIS_CHAIN_ID,
+        homestead_block: Some(0),
+        eip150_block: Some(0),
+        eip155_block: Some(0),
+        eip158_block: Some(0),
+        byzantium_block: Some(0),
+        constantinople_block: Some(0),
+        petersburg_block: Some(0),
+        istanbul_block: Some(0),
+        berlin_block: Some(16_101_500),
+        london_block: Some(19_040_000),
+        shanghai_time: Some(1_690_889_660),
+        cancun_time: Some(1_710_181_820),
+        prague_time: Some(1_746_021_820),
+        ..Default::default()
     }
 }
 
