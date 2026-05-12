@@ -70,7 +70,14 @@ pub struct LeaderboardRow {
     pub category: Option<String>,
     pub usd_saved: Option<BigDecimal>,
     pub tx_count: Option<i64>,
+    pub covered_tx_count: Option<i64>,
+    pub wei_saved_total: Option<BigDecimal>,
+    pub wei_spent_total: Option<BigDecimal>,
     pub avg_savings_pct: Option<f64>,
+    /// Median (gas_saved / gas_used) across covered txs in the window.
+    /// Computed on-demand from `analysis` because medians do not compose
+    /// across daily rows in the rollup.
+    pub median_savings_pct_covered: Option<f64>,
 }
 
 pub async fn leaderboard_30d(
@@ -86,12 +93,27 @@ pub async fn leaderboard_30d(
              p.category,
              SUM(pd.usd_saved_total)::numeric AS usd_saved,
              SUM(pd.tx_count)::bigint         AS tx_count,
-             AVG(pd.avg_savings_pct)::float8  AS avg_savings_pct
+             SUM(pd.covered_tx_count)::bigint AS covered_tx_count,
+             SUM(pd.wei_saved_total)::numeric AS wei_saved_total,
+             SUM(pd.wei_spent_total)::numeric AS wei_spent_total,
+             AVG(pd.avg_savings_pct)::float8  AS avg_savings_pct,
+             m.median_savings_pct_covered
            FROM project_daily pd
            LEFT JOIN projects p ON p.project_slug = pd.project_slug
+           LEFT JOIN (
+             SELECT
+               project_slug,
+               percentile_cont(0.5) WITHIN GROUP (
+                 ORDER BY gas_saved::float8 / NULLIF(gas_used, 0)::float8
+               ) FILTER (WHERE gas_saved > 0)::float8 AS median_savings_pct_covered
+             FROM analysis
+             WHERE chain_id = $1
+               AND block_timestamp >= now() - interval '30 days'
+             GROUP BY project_slug
+           ) m ON m.project_slug = pd.project_slug
            WHERE pd.chain_id = $1
              AND pd.day >= (now() - interval '30 days')::date
-           GROUP BY pd.project_slug, p.project_name, p.category
+           GROUP BY pd.project_slug, p.project_name, p.category, m.median_savings_pct_covered
            ORDER BY tx_count DESC NULLS LAST
            LIMIT $2 OFFSET $3"#,
     )

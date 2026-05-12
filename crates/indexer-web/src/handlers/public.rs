@@ -109,6 +109,14 @@ pub struct LeaderRow {
     pub display_name: String,
     pub tx_count: i64,
     pub avg_savings_pct_pct: String,
+    /// % of total gas spend the project would have saved over the window.
+    /// `wei_saved / wei_spent` — the headline BD metric.
+    pub savings_of_spend_pct: String,
+    /// % of the project's txs where gas-killer produced any savings.
+    pub coverage_pct: String,
+    /// Median (gas_saved / gas_used) over covered txs — robust to the
+    /// many-zero-savings-txs skew that breaks the plain average.
+    pub median_savings_pct_pct: String,
     /// Populated only when `project_slug` is `unknown:0xADDR`. Lets the
     /// template render a pencil-icon override link for that single
     /// address. None for real project slugs (which can span N addresses).
@@ -142,13 +150,24 @@ pub async fn overview(
                 .project_slug
                 .strip_prefix("unknown:0x")
                 .map(|hex| format!("0x{hex}"));
+            let tx_count = r.tx_count.unwrap_or(0);
+            let covered = r.covered_tx_count.unwrap_or(0);
+            let coverage = if tx_count > 0 {
+                Some(covered as f64 / tx_count as f64)
+            } else {
+                None
+            };
+            let savings_of_spend = ratio_bd(r.wei_saved_total.as_ref(), r.wei_spent_total.as_ref());
             LeaderRow {
                 display_name: r
                     .project_name
                     .clone()
                     .unwrap_or_else(|| r.project_slug.clone()),
-                tx_count: r.tx_count.unwrap_or(0),
+                tx_count,
                 avg_savings_pct_pct: format_pct(r.avg_savings_pct),
+                savings_of_spend_pct: format_pct(savings_of_spend),
+                coverage_pct: format_pct(coverage),
+                median_savings_pct_pct: format_pct(r.median_savings_pct_covered),
                 project_slug: r.project_slug,
                 unknown_address_hex,
             }
@@ -419,6 +438,14 @@ fn format_pct(v: Option<f64>) -> String {
         Some(x) => format!("{:.1}%", x * 100.0),
         None => "—".to_string(),
     }
+}
+
+/// Divide two BigDecimals as f64, returning None on missing/zero denom.
+/// Used for the savings-to-gas-spend ratio where both sides are wei sums.
+fn ratio_bd(num: Option<&BigDecimal>, denom: Option<&BigDecimal>) -> Option<f64> {
+    let n = bd_to_f64(num);
+    let d = bd_to_f64(denom);
+    if d == 0.0 { None } else { Some(n / d) }
 }
 
 fn format_when(ts: DateTime<Utc>) -> String {
