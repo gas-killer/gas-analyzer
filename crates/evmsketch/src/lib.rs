@@ -12,7 +12,8 @@ use alloy::providers::ProviderBuilder;
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy_eips::BlockId;
 use alloy_eips::BlockNumberOrTag;
-use alloy_evm::eth::spec::EthSpec;
+use alloy_genesis::ChainConfig;
+use alloy_hardforks::{EthereumChainHardforks, EthereumHardfork, ForkCondition};
 use alloy_provider::Provider;
 use alloy_provider::RootProvider;
 use alloy_provider::ext::DebugApi;
@@ -21,6 +22,7 @@ use anyhow::{Result, anyhow};
 use lru::LruCache;
 use reth_primitives::EthPrimitives;
 use revm::database::CacheDB;
+use revm::primitives::hardfork::SpecId;
 use sp1_cc_client_executor::{ContractCalldata, ContractInput};
 use sp1_cc_host_executor::{EvmSketch, Genesis};
 use std::collections::HashSet;
@@ -32,24 +34,78 @@ use url::Url;
 pub const MAINNET_CHAIN_ID: u64 = 1;
 /// Ethereum Sepolia chain ID.
 pub const SEPOLIA_CHAIN_ID: u64 = 11_155_111;
+/// Gnosis Chain chain ID.
+pub const GNOSIS_CHAIN_ID: u64 = 100;
 
 /// Map a chain ID to the corresponding `Genesis` for `EvmSketch` and the
-/// matching `EthSpec` for hardfork derivation.
+/// matching `EthereumChainHardforks` for spec derivation.
 ///
-/// Only Ethereum mainnet and Sepolia are supported — other chain IDs return
-/// an error rather than silently defaulting to mainnet, which would produce
-/// a wrong `SpecId` whenever the active hardfork on the target chain
-/// differs from mainnet at the same height/timestamp.
-pub fn chain_id_to_genesis_and_spec(chain_id: u64) -> Result<(Genesis, EthSpec)> {
+/// Unsupported chain IDs return an error rather than silently defaulting to
+/// mainnet, which would produce a wrong `SpecId` whenever the active hardfork
+/// on the target chain differs from mainnet at the same height/timestamp.
+pub fn chain_id_to_genesis_and_spec(chain_id: u64) -> Result<(Genesis, EthereumChainHardforks)> {
     match chain_id {
-        MAINNET_CHAIN_ID => Ok((Genesis::Mainnet, EthSpec::mainnet())),
-        SEPOLIA_CHAIN_ID => Ok((Genesis::Sepolia, EthSpec::sepolia())),
+        MAINNET_CHAIN_ID => Ok((Genesis::Mainnet, EthereumChainHardforks::mainnet())),
+        SEPOLIA_CHAIN_ID => Ok((Genesis::Sepolia, EthereumChainHardforks::sepolia())),
+        GNOSIS_CHAIN_ID => Ok((Genesis::Custom(gnosis_chain_config()), gnosis_hardforks())),
         other => Err(anyhow!(
-            "unsupported chain id {other}: only mainnet ({}) and sepolia ({}) are supported",
+            "unsupported chain id {other}: only mainnet ({}), sepolia ({}), and gnosis ({}) are supported",
             MAINNET_CHAIN_ID,
             SEPOLIA_CHAIN_ID,
+            GNOSIS_CHAIN_ID,
         )),
     }
+}
+
+fn gnosis_chain_config() -> ChainConfig {
+    ChainConfig {
+        chain_id: GNOSIS_CHAIN_ID,
+        homestead_block: Some(0),
+        eip150_block: Some(0),
+        eip155_block: Some(0),
+        eip158_block: Some(0),
+        byzantium_block: Some(0),
+        constantinople_block: Some(0),
+        petersburg_block: Some(0),
+        istanbul_block: Some(0),
+        berlin_block: Some(16_101_500),
+        london_block: Some(19_040_000),
+        shanghai_time: Some(1_690_889_660),
+        cancun_time: Some(1_710_181_820),
+        prague_time: Some(1_746_021_820),
+        ..Default::default()
+    }
+}
+
+fn gnosis_hardforks() -> EthereumChainHardforks {
+    // Paris (Merge, Dec-08-2022) is omitted: its TTD-based ForkCondition has no
+    // fork_block, so is_paris_active_at_block always returns false. This is
+    // harmless because all current Gnosis blocks are post-Shanghai, and
+    // spec_by_timestamp_and_block_number checks timestamp forks first.
+    EthereumChainHardforks::new([
+        (EthereumHardfork::Frontier, ForkCondition::Block(0)),
+        (EthereumHardfork::Homestead, ForkCondition::Block(0)),
+        (EthereumHardfork::Tangerine, ForkCondition::Block(0)),
+        (EthereumHardfork::SpuriousDragon, ForkCondition::Block(0)),
+        (EthereumHardfork::Byzantium, ForkCondition::Block(0)),
+        (EthereumHardfork::Constantinople, ForkCondition::Block(0)),
+        (EthereumHardfork::Petersburg, ForkCondition::Block(0)),
+        (EthereumHardfork::Istanbul, ForkCondition::Block(0)),
+        (EthereumHardfork::Berlin, ForkCondition::Block(16_101_500)),
+        (EthereumHardfork::London, ForkCondition::Block(19_040_000)),
+        (
+            EthereumHardfork::Shanghai,
+            ForkCondition::Timestamp(1_690_889_660),
+        ),
+        (
+            EthereumHardfork::Cancun,
+            ForkCondition::Timestamp(1_710_181_820),
+        ),
+        (
+            EthereumHardfork::Prague,
+            ForkCondition::Timestamp(1_746_021_820),
+        ),
+    ])
 }
 
 pub mod simple_rpc_db;
@@ -177,10 +233,11 @@ pub fn tx_request_to_contract_input(tx_request: &TransactionRequest) -> Result<C
 pub struct EvmSketchExecutor<P, PT> {
     /// The underlying EvmSketch instance
     pub sketch: EvmSketch<P, PT>,
-    /// The chain ID detected from the RPC at build time. Used by `sim_env`
-    /// to pick the right `EthSpec` so hardfork derivation matches the
-    /// network being analyzed (mainnet vs Sepolia).
+    /// The chain ID detected from the RPC at build time.
     pub chain_id: u64,
+    /// The EVM spec (hardfork) for the anchored block, computed once at build
+    /// time from the chain's hardfork schedule and the anchor header.
+    pub spec: SpecId,
 }
 
 /// Builder for EvmSketchExecutor
@@ -211,10 +268,9 @@ impl EvmSketchExecutorBuilder {
     /// Build the EvmSketchExecutor.
     ///
     /// Queries `eth_chainId` from the RPC and selects the matching `Genesis`
-    /// (and, later, `EthSpec` in `sim_env`). Errors if the chain is neither
-    /// mainnet nor Sepolia: silently defaulting to mainnet when pointed at a
-    /// different network would yield wrong hardfork activation and corrupt
-    /// gas estimation.
+    /// and hardfork schedule. Errors on unsupported chains: silently defaulting
+    /// to mainnet when pointed at a different network would yield wrong hardfork
+    /// activation and corrupt gas estimation.
     pub async fn build(self) -> Result<DefaultEvmSketchExecutor> {
         let rpc_url = self.rpc_url.ok_or_else(|| anyhow!("RPC URL is required"))?;
 
@@ -223,7 +279,7 @@ impl EvmSketchExecutorBuilder {
             .get_chain_id()
             .await
             .map_err(|e| anyhow!("Failed to query eth_chainId: {}", e))?;
-        let (genesis, _spec) = chain_id_to_genesis_and_spec(chain_id)?;
+        let (genesis, hardforks) = chain_id_to_genesis_and_spec(chain_id)?;
 
         let sketch = EvmSketch::builder()
             .at_block(self.block)
@@ -233,7 +289,13 @@ impl EvmSketchExecutorBuilder {
             .await
             .map_err(|e| anyhow!("Failed to build EvmSketch: {}", e))?;
 
-        Ok(EvmSketchExecutor { sketch, chain_id })
+        let spec = alloy_evm::spec(&hardforks, sketch.anchor.header());
+
+        Ok(EvmSketchExecutor {
+            sketch,
+            chain_id,
+            spec,
+        })
     }
 }
 
@@ -296,16 +358,10 @@ impl DefaultEvmSketchExecutor {
     /// `gas_price` defaults to 0 since it is a transaction-level field;
     /// callers with access to the original transaction can override it.
     /// `basefee` comes from the header (0 for pre-EIP-1559 blocks).
-    /// `spec` is derived from the header against the chain detected at
-    /// build time (mainnet or Sepolia hardforks); `difficulty` carries the
-    /// legacy PoW value (zero post-Merge).
+    /// `spec` is the pre-computed `SpecId` stored at build time;
+    /// `difficulty` carries the legacy PoW value (zero post-Merge).
     pub fn sim_env(&self) -> SimEnvOpts {
         let header = self.sketch.anchor.header();
-        let eth_spec = match self.chain_id {
-            SEPOLIA_CHAIN_ID => EthSpec::sepolia(),
-            _ => EthSpec::mainnet(),
-        };
-        let spec = alloy_evm::spec(&eth_spec, header);
         SimEnvOpts {
             number: header.number,
             timestamp: header.timestamp,
@@ -315,7 +371,7 @@ impl DefaultEvmSketchExecutor {
             gas_price: 0,
             basefee: header.base_fee_per_gas.unwrap_or(0),
             difficulty: header.difficulty,
-            spec,
+            spec: self.spec,
             value: U256::ZERO,
         }
     }
@@ -801,11 +857,10 @@ mod tests {
         );
     }
 
-    /// `chain_id_to_genesis_and_spec` must accept mainnet (1) and Sepolia
-    /// (11_155_111) and reject anything else. Silently mapping an unknown
-    /// chain ID to mainnet would let `sim_env()` derive the wrong `SpecId`
-    /// for any non-mainnet target (e.g. Cancun activates ~3 days earlier
-    /// on Sepolia than on mainnet, see `test_sepolia_spec_diverges_from_mainnet`).
+    /// `chain_id_to_genesis_and_spec` must accept mainnet (1), Sepolia
+    /// (11_155_111), and Gnosis (100) and reject anything else. Silently
+    /// mapping an unknown chain ID to mainnet would let `sim_env()` derive
+    /// the wrong `SpecId` for any non-mainnet target.
     #[test]
     fn test_chain_id_to_genesis_and_spec_supported_and_rejected_chains() {
         use alloy_hardforks::{EthereumHardfork, EthereumHardforks, ForkCondition};
@@ -813,10 +868,8 @@ mod tests {
         let (mainnet_genesis, mainnet_spec) =
             chain_id_to_genesis_and_spec(MAINNET_CHAIN_ID).expect("mainnet should be supported");
         assert!(matches!(mainnet_genesis, Genesis::Mainnet));
-        // Sanity-check the EthSpec wiring: mainnet activates Cancun at the
-        // well-known timestamp 1_710_338_135. If this drifts the
-        // `EthSpec::mainnet()` constructor was swapped or the upstream
-        // chainspec changed.
+        // Sanity-check: mainnet activates Cancun at 1_710_338_135. If this
+        // drifts the upstream chainspec changed.
         assert_eq!(
             mainnet_spec.ethereum_fork_activation(EthereumHardfork::Cancun),
             ForkCondition::Timestamp(1_710_338_135),
@@ -828,6 +881,18 @@ mod tests {
         assert_eq!(
             sepolia_spec.ethereum_fork_activation(EthereumHardfork::Cancun),
             ForkCondition::Timestamp(1_706_655_072),
+        );
+
+        let (gnosis_genesis, gnosis_spec) =
+            chain_id_to_genesis_and_spec(GNOSIS_CHAIN_ID).expect("gnosis should be supported");
+        assert!(matches!(gnosis_genesis, Genesis::Custom(_)));
+        assert_eq!(
+            gnosis_spec.ethereum_fork_activation(EthereumHardfork::Cancun),
+            ForkCondition::Timestamp(1_710_181_820),
+        );
+        assert_eq!(
+            gnosis_spec.ethereum_fork_activation(EthereumHardfork::Prague),
+            ForkCondition::Timestamp(1_746_021_820),
         );
 
         // Holesky (17_000) and Anvil (31_337) must error rather than silently
@@ -847,6 +912,7 @@ mod tests {
     #[test]
     fn test_sepolia_spec_diverges_from_mainnet() {
         use alloy_consensus::Header;
+        use alloy_evm::eth::spec::EthSpec;
         use revm::primitives::hardfork::SpecId;
 
         // Sepolia Cancun: 1_706_655_072. Mainnet Cancun: 1_710_338_135.
@@ -879,6 +945,48 @@ mod tests {
             mainnet_spec, sepolia_spec,
             "specs must differ across chains in the inter-activation window — \
              a hardcoded mainnet EthSpec would silently break Sepolia analysis here",
+        );
+    }
+
+    /// Gnosis Cancun activated at 1_710_181_820 — ~156 s before mainnet
+    /// (1_710_338_135). A header timestamped inside that window must resolve
+    /// to CANCUN on Gnosis but SHANGHAI on mainnet, proving that
+    /// `gnosis_hardforks()` is wired correctly and is not just an alias for
+    /// `EthereumChainHardforks::mainnet()`.
+    #[test]
+    fn test_gnosis_spec_diverges_from_mainnet() {
+        use alloy_consensus::Header;
+        use revm::primitives::hardfork::SpecId;
+
+        // Strictly between Gnosis Cancun (1_710_181_820) and mainnet Cancun
+        // (1_710_338_135).
+        const TS_BETWEEN_GNOSIS_AND_MAINNET_CANCUN: u64 = 1_710_260_000;
+
+        let header = Header {
+            number: 33_000_000,
+            timestamp: TS_BETWEEN_GNOSIS_AND_MAINNET_CANCUN,
+            ..Default::default()
+        };
+
+        let (_, gnosis_hardforks) =
+            chain_id_to_genesis_and_spec(GNOSIS_CHAIN_ID).expect("gnosis supported");
+        let (_, mainnet_hardforks) =
+            chain_id_to_genesis_and_spec(MAINNET_CHAIN_ID).expect("mainnet supported");
+
+        let gnosis_spec = alloy_evm::spec(&gnosis_hardforks, &header);
+        let mainnet_spec = alloy_evm::spec(&mainnet_hardforks, &header);
+
+        assert_eq!(
+            gnosis_spec,
+            SpecId::CANCUN,
+            "gnosis at ts {} should be CANCUN (activated at 1_710_181_820)",
+            TS_BETWEEN_GNOSIS_AND_MAINNET_CANCUN,
+        );
+        assert_eq!(
+            mainnet_spec,
+            SpecId::SHANGHAI,
+            "mainnet at ts {} should still be SHANGHAI (Cancun activates at 1_710_338_135)",
+            TS_BETWEEN_GNOSIS_AND_MAINNET_CANCUN,
         );
     }
 }
