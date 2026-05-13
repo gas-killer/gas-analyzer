@@ -135,7 +135,7 @@ pub type DefaultEvmSketchExecutor = EvmSketchExecutor<DefaultProvider, DefaultPr
 
 /// Thread-safe LRU cache of pre-built [`DefaultEvmSketchExecutor`]s.
 ///
-/// `build()` costs ~80–120 ms (2× `eth_getBlockByNumber`).  An executor is safe
+/// `build()` costs ~50–70 ms (1× `eth_getBlockByNumber`).  An executor is safe
 /// to reuse across requests at the same block height: `sim_env()` reads only
 /// immutable header fields, and each gas estimate constructs its own `CacheDB`.
 /// Keyed by `(rpc_url, block_number)` — no extra RPC is needed for a cache hit.
@@ -285,6 +285,7 @@ impl EvmSketchExecutorBuilder {
             .at_block(self.block)
             .el_rpc_url(rpc_url)
             .with_genesis(genesis)
+            .without_state_root_seed()
             .build()
             .await
             .map_err(|e| anyhow!("Failed to build EvmSketch: {}", e))?;
@@ -566,8 +567,8 @@ impl GasKillerEvmSketchDefault {
 /// Compute encoded state updates and gas estimate for a transaction call using EvmSketch.
 ///
 /// Simulates the call via `debug_traceCall` at the given block, extracts state updates,
-/// encodes them to ABI, and estimates gas. The executor build step (~80–120 ms,
-/// 2× `eth_getBlockByNumber`) is skipped on cache hits.
+/// encodes them to ABI, and estimates gas. The executor build step (~50–70 ms,
+/// 1× `eth_getBlockByNumber`) is skipped on cache hits.
 ///
 /// Pass a persistent `EvmSketchExecutorCache` shared across requests for the best
 /// performance.  For one-shot use (benchmarks, CLI) pass `&EvmSketchExecutorCache::new(1)`.
