@@ -152,10 +152,7 @@ async fn run(rpc_url: String) -> Result<()> {
     // from the chain on demand.  After replay the cache keys tell us exactly
     // which accounts and slots need to be in the offline fixture.
     let state_block = block_number.saturating_sub(1);
-    let simple_db = SimpleRpcDb {
-        provider: any_provider,
-        block_number: state_block,
-    };
+    let simple_db = SimpleRpcDb::new(any_provider, state_block);
     let mut cache_db = CacheDB::new(simple_db);
 
     eprintln!("Replaying {tx_index} preceding txs to warm the cache (makes RPC calls)...");
