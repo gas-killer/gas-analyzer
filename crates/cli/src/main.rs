@@ -163,7 +163,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     .expect("Failed to initialize GasKiller");
 
                 // Get trace and compute state updates
-                let trace = get_tx_trace(&provider, bytes.into()).await?;
+                let trace = get_tx_trace(&provider, bytes.into(), original_status).await?;
                 let (state_updates, skipped_opcodes, _call_gas_total) =
                     compute_state_updates(trace)?;
 

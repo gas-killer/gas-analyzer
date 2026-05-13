@@ -543,7 +543,11 @@ impl GasKillerEvmSketchDefault {
     ) -> Result<u64> {
         use gas_analyzer_rpc::get_tx_trace;
 
-        let trace = get_tx_trace(provider, tx_hash).await?;
+        let receipt = provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("could not get receipt for tx {}", tx_hash))?;
+        let trace = get_tx_trace(provider, tx_hash, receipt.status()).await?;
         let operations = extract_operation_counts_from_trace(&trace);
         Ok(estimate_gas_from_operations(&operations))
     }
