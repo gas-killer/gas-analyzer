@@ -28,13 +28,9 @@ use gas_analyzer_estimator::PrecedingTx;
 pub async fn get_tx_trace<P: Provider + DebugApi>(
     provider: &P,
     tx_hash: FixedBytes<32>,
+    status: bool,
 ) -> Result<DefaultFrame> {
-    let tx_receipt = provider
-        .get_transaction_receipt(tx_hash)
-        .await?
-        .ok_or_else(|| anyhow!("could not get receipt for tx {}", tx_hash))?;
-
-    if !tx_receipt.status() {
+    if !status {
         bail!("transaction failed");
     }
 
@@ -99,8 +95,12 @@ pub async fn compute_state_updates_from_tx<P: Provider + DebugApi>(
     provider: &P,
     tx_hash: FixedBytes<32>,
 ) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64)> {
+    let receipt = provider
+        .get_transaction_receipt(tx_hash)
+        .await?
+        .ok_or_else(|| anyhow!("could not get receipt for tx {}", tx_hash))?;
     // Primary path: use the historical trace via debug_traceTransaction.
-    let trace = get_tx_trace(provider, tx_hash).await?;
+    let trace = get_tx_trace(provider, tx_hash, receipt.status()).await?;
     let struct_logs_len = trace.struct_logs.len();
     if struct_logs_len > 0 {
         return compute_state_updates(trace);

@@ -6,7 +6,7 @@
 //!   make fixture RPC_URL=<sepolia-node>
 
 use alloy::primitives::FixedBytes;
-use alloy::providers::ProviderBuilder;
+use alloy::providers::{Provider, ProviderBuilder};
 use anyhow::Result;
 
 const SEPOLIA_TX_HASH: &str = "0x680e2abfbccaf6246b4bda0989fc55dee169d0f6aef2ca4c63a17c6a8a39d6cb";
@@ -31,7 +31,11 @@ fn main() -> Result<()> {
         let hash: FixedBytes<32> = SEPOLIA_TX_HASH.parse().expect("invalid tx hash constant");
 
         eprintln!("Fetching trace for {SEPOLIA_TX_HASH} ...");
-        let trace = gas_analyzer_rpc::get_tx_trace(&provider, hash).await?;
+        let receipt = provider
+            .get_transaction_receipt(hash)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no receipt for tx {}", hash))?;
+        let trace = gas_analyzer_rpc::get_tx_trace(&provider, hash, receipt.status()).await?;
 
         let json = serde_json::to_string_pretty(&trace)?;
 
