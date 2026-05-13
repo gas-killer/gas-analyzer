@@ -21,6 +21,7 @@ use alloy_provider::network::AnyNetwork;
 use anyhow::{Result, anyhow};
 use reth_primitives::EthPrimitives;
 use revm::database::CacheDB;
+use revm::primitives::hardfork::SpecId;
 use sp1_cc_client_executor::{ContractCalldata, ContractInput};
 use sp1_cc_host_executor::{EvmSketch, Genesis};
 use std::collections::HashSet;
@@ -39,9 +40,7 @@ pub const GNOSIS_CHAIN_ID: u64 = 100;
 /// Unsupported chain IDs return an error rather than silently defaulting to
 /// mainnet, which would produce a wrong `SpecId` whenever the active hardfork
 /// on the target chain differs from mainnet at the same height/timestamp.
-pub fn chain_id_to_genesis_and_spec(
-    chain_id: u64,
-) -> Result<(Genesis, EthereumChainHardforks)> {
+pub fn chain_id_to_genesis_and_spec(chain_id: u64) -> Result<(Genesis, EthereumChainHardforks)> {
     match chain_id {
         MAINNET_CHAIN_ID => Ok((Genesis::Mainnet, EthereumChainHardforks::mainnet())),
         SEPOLIA_CHAIN_ID => Ok((Genesis::Sepolia, EthereumChainHardforks::sepolia())),
@@ -91,9 +90,18 @@ fn gnosis_hardforks() -> EthereumChainHardforks {
         (EthereumHardfork::Istanbul, ForkCondition::Block(0)),
         (EthereumHardfork::Berlin, ForkCondition::Block(16_101_500)),
         (EthereumHardfork::London, ForkCondition::Block(19_040_000)),
-        (EthereumHardfork::Shanghai, ForkCondition::Timestamp(1_690_889_660)),
-        (EthereumHardfork::Cancun, ForkCondition::Timestamp(1_710_181_820)),
-        (EthereumHardfork::Prague, ForkCondition::Timestamp(1_746_021_820)),
+        (
+            EthereumHardfork::Shanghai,
+            ForkCondition::Timestamp(1_690_889_660),
+        ),
+        (
+            EthereumHardfork::Cancun,
+            ForkCondition::Timestamp(1_710_181_820),
+        ),
+        (
+            EthereumHardfork::Prague,
+            ForkCondition::Timestamp(1_746_021_820),
+        ),
     ])
 }
 
@@ -161,9 +169,9 @@ pub struct EvmSketchExecutor<P, PT> {
     pub sketch: EvmSketch<P, PT>,
     /// The chain ID detected from the RPC at build time.
     pub chain_id: u64,
-    /// The hardfork schedule for the chain, used by `sim_env` to derive
-    /// the correct `SpecId` from the anchored block header.
-    pub hardforks: EthereumChainHardforks,
+    /// The EVM spec (hardfork) for the anchored block, computed once at build
+    /// time from the chain's hardfork schedule and the anchor header.
+    pub spec: SpecId,
 }
 
 /// Builder for EvmSketchExecutor
@@ -215,7 +223,13 @@ impl EvmSketchExecutorBuilder {
             .await
             .map_err(|e| anyhow!("Failed to build EvmSketch: {}", e))?;
 
-        Ok(EvmSketchExecutor { sketch, chain_id, hardforks })
+        let spec = alloy_evm::spec(&hardforks, sketch.anchor.header());
+
+        Ok(EvmSketchExecutor {
+            sketch,
+            chain_id,
+            spec,
+        })
     }
 }
 
@@ -257,12 +271,10 @@ impl DefaultEvmSketchExecutor {
     /// `gas_price` defaults to 0 since it is a transaction-level field;
     /// callers with access to the original transaction can override it.
     /// `basefee` comes from the header (0 for pre-EIP-1559 blocks).
-    /// `spec` is derived from the header against the chain's hardfork schedule
-    /// stored at build time; `difficulty` carries the legacy PoW value (zero
-    /// post-Merge).
+    /// `spec` is the pre-computed `SpecId` stored at build time;
+    /// `difficulty` carries the legacy PoW value (zero post-Merge).
     pub fn sim_env(&self) -> SimEnvOpts {
         let header = self.sketch.anchor.header();
-        let spec = alloy_evm::spec(&self.hardforks, header);
         SimEnvOpts {
             number: header.number,
             timestamp: header.timestamp,
@@ -272,7 +284,7 @@ impl DefaultEvmSketchExecutor {
             gas_price: 0,
             basefee: header.base_fee_per_gas.unwrap_or(0),
             difficulty: header.difficulty,
-            spec,
+            spec: self.spec,
             value: U256::ZERO,
         }
     }
