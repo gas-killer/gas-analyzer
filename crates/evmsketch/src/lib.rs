@@ -589,20 +589,18 @@ impl GasKillerEvmSketchDefault {
 
     /// Estimate gas using a fallback heuristic based on the original transaction trace.
     ///
-    /// This extracts operations (SSTORE, LOG, CALL) from the original transaction trace
-    /// and applies heuristic costs.
+    /// `status` must be `receipt.status()` for `tx_hash`. Pass the already-fetched
+    /// receipt's status to avoid an extra `eth_getTransactionReceipt` round-trip.
+    /// Extracts operations (SSTORE, LOG, CALL) from the trace and applies heuristic costs.
     pub async fn estimate_gas_from_trace<P: Provider + DebugApi>(
         &self,
         provider: &P,
         tx_hash: alloy::primitives::FixedBytes<32>,
+        status: bool,
     ) -> Result<u64> {
         use gas_analyzer_rpc::get_tx_trace;
 
-        let receipt = provider
-            .get_transaction_receipt(tx_hash)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("could not get receipt for tx {}", tx_hash))?;
-        let trace = get_tx_trace(provider, tx_hash, receipt.status()).await?;
+        let trace = get_tx_trace(provider, tx_hash, status).await?;
         let operations = extract_operation_counts_from_trace(&trace);
         Ok(estimate_gas_from_operations(&operations))
     }

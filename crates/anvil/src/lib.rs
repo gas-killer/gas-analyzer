@@ -547,7 +547,7 @@ pub async fn gaskiller_reporter(
     let transaction = provider
         .get_transaction_by_hash(tx_hash)
         .await?
-        .ok_or_else(|| anyhow!("could not get receipt for tx {}", tx_hash))?;
+        .ok_or_else(|| anyhow!("could not get transaction for tx {}", tx_hash))?;
     let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
     let (state_updates, skipped_opcodes_set, _call_gas_total) = compute_state_updates(trace)?;
     let skipped_opcodes = skipped_opcodes_set
