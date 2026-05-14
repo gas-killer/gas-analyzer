@@ -33,7 +33,11 @@ jobs:
         uses: foundry-rs/foundry-toolchain@v1
 
       - name: cargo test (evmsketch - default)
-        run: cargo test -- --include-ignored
+        run: cargo test
+
+      - name: cargo test --ignored (evmsketch RPC)
+        if: env.RPC_URL != ''
+        run: cargo test -- --ignored
 
       - name: cargo test (anvil)
         run: cargo test -p gas-analyzer-anvil -p gas-analyzer-cli --features gas-analyzer-cli/anvil --no-default-features
