@@ -18,14 +18,14 @@ use alloy_provider::Provider;
 use alloy_provider::RootProvider;
 use alloy_provider::ext::DebugApi;
 use alloy_provider::network::AnyNetwork;
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use lru::LruCache;
 use reth_primitives::EthPrimitives;
 use revm::database::CacheDB;
 use revm::primitives::hardfork::SpecId;
 use sp1_cc_client_executor::{ContractCalldata, ContractInput};
 use sp1_cc_host_executor::{EvmSketch, Genesis};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use url::Url;
@@ -109,7 +109,7 @@ fn gnosis_hardforks() -> EthereumChainHardforks {
 }
 
 pub mod simple_rpc_db;
-use simple_rpc_db::SimpleRpcDb;
+use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 
 use gas_analyzer_core::{
     Opcode, StateUpdate, compute_state_updates, encode_state_updates_to_abi,
@@ -361,6 +361,44 @@ impl DefaultEvmSketchExecutor {
         )
     }
 
+    /// Estimate gas for a set of state updates, prefetching storage slots first.
+    ///
+    /// Like `estimate_state_changes_gas` but accepts a map of `address →
+    /// storage keys` sourced from the transaction's EIP-2930 access list (or
+    /// any other prior knowledge). Before EVM execution begins, each address
+    /// in `storage_hints` is fetched via a single `eth_getProof` call that
+    /// returns both account metadata and the listed slot values, eliminating
+    /// the per-slot `eth_getStorageAt` round-trips for those keys.
+    ///
+    /// Cold-miss slots not present in `storage_hints` still fall back to
+    /// `eth_getStorageAt` during execution — an incomplete hint set is safe.
+    pub async fn estimate_state_changes_gas_with_hints(
+        &self,
+        contract_address: Address,
+        caller_address: Address,
+        state_updates: &[gas_analyzer_core::StateUpdate],
+        storage_hints: &HashMap<Address, Vec<B256>>,
+    ) -> Result<u64> {
+        let state_block = self.anchor_block_number().saturating_sub(1);
+        let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
+        let mut cache_db = CacheDB::new(simple_db);
+
+        if !storage_hints.is_empty() {
+            prefetch_slots_into_cache(&mut cache_db, storage_hints)
+                .await
+                .context("storage slot prefetch failed")?;
+        }
+
+        let sim_env = self.sim_env();
+        gas_analyzer_estimator::estimate_state_changes_gas(
+            &mut cache_db,
+            contract_address,
+            caller_address,
+            state_updates,
+            &sim_env,
+        )
+    }
+
     /// Build a `SimEnv` from the anchored block header.
     ///
     /// `gas_price` defaults to 0 since it is a transaction-level field;
@@ -523,6 +561,28 @@ impl GasKillerEvmSketchDefault {
         let mut sim_env = self.executor.sim_env();
 
         if !preceding_txs.is_empty() {
+            // Prefetch storage slots declared in preceding-tx access lists so
+            // that replay_preceding_transactions reads from the in-process cache
+            // instead of issuing per-slot eth_getStorageAt calls.
+            let mut hints: HashMap<Address, Vec<B256>> = HashMap::new();
+            for tx in preceding_txs {
+                for item in tx.access_list.iter() {
+                    hints
+                        .entry(item.address)
+                        .or_default()
+                        .extend(item.storage_keys.iter().copied());
+                }
+            }
+
+            if !hints.is_empty() {
+                let handle = tokio::runtime::Handle::try_current()
+                    .context("no tokio runtime for storage prefetch")?;
+                tokio::task::block_in_place(|| {
+                    handle.block_on(prefetch_slots_into_cache(&mut cache_db, &hints))
+                })
+                .context("prefetch storage slots for preceding txs")?;
+            }
+
             gas_analyzer_estimator::replay_preceding_transactions(
                 &mut cache_db,
                 preceding_txs,
@@ -602,6 +662,20 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 
     let caller_address = tx_request.from.unwrap_or_default();
 
+    // Collect storage hints from the EIP-2930 access list before tx_request
+    // is consumed by get_trace_from_call. These are passed to the estimator so
+    // that each hinted slot is fetched via a single eth_getProof call rather
+    // than an individual eth_getStorageAt during EVM execution.
+    let mut storage_hints: HashMap<Address, Vec<B256>> = HashMap::new();
+    if let Some(al) = &tx_request.access_list {
+        for item in al.iter() {
+            storage_hints
+                .entry(item.address)
+                .or_default()
+                .extend(item.storage_keys.iter().copied());
+        }
+    }
+
     let provider = ProviderBuilder::new().connect_http(url);
     let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
 
@@ -618,11 +692,6 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 
     let storage_updates = encode_state_updates_to_abi(&state_updates);
 
-<<<<<<< Updated upstream
-    let executor = cache.get_or_build(rpc_url, block_number).await?;
-    let gas_estimate =
-        executor.estimate_state_changes_gas(contract_address, caller_address, &state_updates)?;
-=======
     let gas_estimate = if storage_hints.is_empty() {
         executor.estimate_state_changes_gas(contract_address, caller_address, &state_updates)?
     } else {
@@ -635,7 +704,6 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
             )
             .await?
     };
->>>>>>> Stashed changes
 
     Ok((storage_updates, gas_estimate, false, skipped_opcodes))
 }
