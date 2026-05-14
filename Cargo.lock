@@ -3486,6 +3486,7 @@ dependencies = [
  "gas-analyzer-core",
  "gas-analyzer-estimator",
  "gas-analyzer-rpc",
+ "lru",
  "pprof",
  "reth-primitives",
  "revm 31.0.2",

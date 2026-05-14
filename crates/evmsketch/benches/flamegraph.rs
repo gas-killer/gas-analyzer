@@ -25,7 +25,6 @@ use std::time::Duration;
 use alloy::primitives::{Address, B256, Bytes, FixedBytes, TxKind, U256, address};
 use alloy::providers::ProviderBuilder;
 use alloy::rpc::types::eth::{TransactionInput, TransactionRequest};
-use alloy_eips::BlockNumberOrTag;
 use alloy_provider::Provider;
 use alloy_rpc_types::TransactionTrait;
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
@@ -244,10 +243,10 @@ fn bench_end_to_end(c: &mut Criterion) {
             ..Default::default()
         };
 
-        (req, BlockNumberOrTag::Number(block_num))
+        (req, block_num)
     });
 
-    eprintln!("end_to_end: pinned to block {block:?}, tx {SEPOLIA_TX_HASH}");
+    eprintln!("end_to_end: pinned to block {block}, tx {SEPOLIA_TX_HASH}");
 
     let mut group = c.benchmark_group("end_to_end");
     group.sample_size(10);
@@ -255,8 +254,11 @@ fn bench_end_to_end(c: &mut Criterion) {
 
     group.bench_function("call_to_encoded_state_updates_with_evmsketch", |b| {
         b.to_async(&rt).iter(|| async {
+            // Fresh cache per iteration so each run pays the full build cost.
+            let cache = gas_analyzer_evmsketch::EvmSketchExecutorCache::new(1);
             black_box(
                 gas_analyzer_evmsketch::call_to_encoded_state_updates_with_evmsketch(
+                    &cache,
                     &rpc_url,
                     tx_request.clone(),
                     block,
