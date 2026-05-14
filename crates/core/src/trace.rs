@@ -18,13 +18,14 @@ use crate::types::{IStateUpdateTypes, Opcode, StateUpdate};
 
 /// Copy memory with bounds checking, zero-padding if needed.
 pub fn copy_memory(memory: &[u8], offset: usize, length: usize) -> Vec<u8> {
-    if memory.len() >= offset + length {
-        memory[offset..offset + length].to_vec()
+    let end = offset.saturating_add(length);
+    if memory.len() >= end {
+        memory[offset..end].to_vec()
     } else {
         let mut result = vec![0u8; length];
         if offset < memory.len() {
-            let copy_len = memory.len() - offset;
-            result[..copy_len].copy_from_slice(&memory[offset..]);
+            let copy_len = (memory.len() - offset).min(length);
+            result[..copy_len].copy_from_slice(&memory[offset..offset + copy_len]);
         }
         result
     }
