@@ -72,6 +72,7 @@ where
         tracing_options: GethDebugTracingOptions {
             config: GethDefaultTracingOptions {
                 enable_memory: Some(true),
+                disable_storage: Some(true),
                 ..Default::default()
             },
             ..Default::default()

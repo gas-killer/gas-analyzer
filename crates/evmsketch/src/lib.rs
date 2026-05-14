@@ -604,15 +604,38 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 
     let provider = ProviderBuilder::new().connect_http(url);
     let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
-    let trace = get_trace_from_call(&provider, tx_request, block_id).await?;
+
+    // Run debug_traceCall and executor cache lookup concurrently — they are
+    // fully independent. On a cache miss this hides the entire executor build
+    // behind the trace fetch.
+    let (trace, executor) = tokio::try_join!(
+        get_trace_from_call(&provider, tx_request, block_id),
+        cache.get_or_build(rpc_url, block_number),
+    )?;
+
     let (state_updates, skipped_opcodes, _call_gas_total) = compute_state_updates(trace)?;
     tracing::Span::current().record("state_update_count", state_updates.len());
 
     let storage_updates = encode_state_updates_to_abi(&state_updates);
 
+<<<<<<< Updated upstream
     let executor = cache.get_or_build(rpc_url, block_number).await?;
     let gas_estimate =
         executor.estimate_state_changes_gas(contract_address, caller_address, &state_updates)?;
+=======
+    let gas_estimate = if storage_hints.is_empty() {
+        executor.estimate_state_changes_gas(contract_address, caller_address, &state_updates)?
+    } else {
+        executor
+            .estimate_state_changes_gas_with_hints(
+                contract_address,
+                caller_address,
+                &state_updates,
+                &storage_hints,
+            )
+            .await?
+    };
+>>>>>>> Stashed changes
 
     Ok((storage_updates, gas_estimate, false, skipped_opcodes))
 }
