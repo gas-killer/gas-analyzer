@@ -8,7 +8,7 @@
 //!
 //! No reth-evm, no sp1-contract-call, no async, no I/O.
 
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 use alloy_dyn_abi::DynSolValue;
 use alloy_primitives::{Address, B256, Bytes, U256};
@@ -96,10 +96,10 @@ fn estimator_bytecode() -> Bytes {
         .clone()
 }
 
-fn impl_slot() -> U256 {
+static IMPL_SLOT: LazyLock<U256> = LazyLock::new(|| {
     U256::from_be_bytes(*alloy_primitives::keccak256("gas.estimator.implementation"))
         - U256::from(1)
-}
+});
 
 /// Build the calldata for `runStateUpdatesCall(uint8[], bytes[])` from state updates.
 ///
@@ -206,7 +206,7 @@ where
 
     let backup_addr_u256 = U256::from_be_slice(backup_addr.as_slice());
     cache_db
-        .insert_account_storage(contract_address, impl_slot(), backup_addr_u256)
+        .insert_account_storage(contract_address, *IMPL_SLOT, backup_addr_u256)
         .map_err(|e| anyhow!("Failed to write IMPL_SLOT: {:?}", e))?;
 
     // disable_balance_check skips the *pre-flight* check on the caller, but
