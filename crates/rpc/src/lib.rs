@@ -23,18 +23,15 @@ use gas_analyzer_estimator::PrecedingTx;
 
 /// Get transaction trace from a provider using debug_traceTransaction.
 ///
-/// This fetches the actual historical trace from an already-executed transaction,
-/// ensuring we get the exact values that were stored during the original execution.
+/// `status` must be the receipt status for `tx_hash` (`receipt.status()`).
+/// Pass the already-fetched receipt's status to avoid a redundant RPC call.
+/// Returns an error immediately if `status` is `false` (transaction reverted).
 pub async fn get_tx_trace<P: Provider + DebugApi>(
     provider: &P,
     tx_hash: FixedBytes<32>,
+    status: bool,
 ) -> Result<DefaultFrame> {
-    let tx_receipt = provider
-        .get_transaction_receipt(tx_hash)
-        .await?
-        .ok_or_else(|| anyhow!("could not get receipt for tx {}", tx_hash))?;
-
-    if !tx_receipt.status() {
+    if !status {
         bail!("transaction failed");
     }
 
@@ -92,15 +89,17 @@ where
 
 /// Compute state updates from an existing transaction using its actual trace.
 ///
-/// This is a convenience function that combines `get_tx_trace` and `compute_state_updates`.
+/// `status` must be `receipt.status()` for `tx_hash`. Pass the already-fetched
+/// receipt's status to avoid an extra `eth_getTransactionReceipt` round-trip.
 ///
 /// Returns: (state_updates, skipped_opcodes, call_gas_total)
 pub async fn compute_state_updates_from_tx<P: Provider + DebugApi>(
     provider: &P,
     tx_hash: FixedBytes<32>,
+    status: bool,
 ) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64)> {
     // Primary path: use the historical trace via debug_traceTransaction.
-    let trace = get_tx_trace(provider, tx_hash).await?;
+    let trace = get_tx_trace(provider, tx_hash, status).await?;
     let struct_logs_len = trace.struct_logs.len();
     if struct_logs_len > 0 {
         return compute_state_updates(trace);

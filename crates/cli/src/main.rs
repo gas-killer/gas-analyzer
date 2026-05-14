@@ -163,7 +163,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     .expect("Failed to initialize GasKiller");
 
                 // Get trace and compute state updates
-                let trace = get_tx_trace(&provider, bytes.into()).await?;
+                let trace = get_tx_trace(&provider, bytes.into(), original_status).await?;
                 let (state_updates, skipped_opcodes, _call_gas_total) =
                     compute_state_updates(trace)?;
 
@@ -235,7 +235,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 use gas_analyzer_rpc::compute_state_updates_from_tx;
 
                 let state_updates_result =
-                    compute_state_updates_from_tx(&provider, bytes.into()).await;
+                    compute_state_updates_from_tx(&provider, bytes.into(), original_status).await;
 
                 let (state_updates, skipped_opcodes, call_gas_total, use_fallback) =
                     match state_updates_result {
@@ -291,7 +291,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
 
                     // Try trace-based heuristic estimation
                     let fallback_estimate = match gk
-                        .estimate_gas_from_trace(&provider, bytes.into())
+                        .estimate_gas_from_trace(&provider, bytes.into(), original_status)
                         .await
                     {
                         Ok(estimate) => {
