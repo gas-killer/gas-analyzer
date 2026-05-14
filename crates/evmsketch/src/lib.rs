@@ -158,6 +158,14 @@ impl EvmSketchExecutorCache {
         }
     }
 
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("executor cache mutex poisoned")
+            .len()
+    }
+
     /// Return a cached executor for `(rpc_url, block_number)`, building one if absent.
     ///
     /// Two concurrent callers that both miss may each call `build()`; the later
@@ -574,12 +582,12 @@ impl GasKillerEvmSketchDefault {
 ///
 /// # Returns
 /// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`
-#[tracing::instrument(name = "evmsketch.encode", skip_all, fields(block_number = %block, state_update_count = tracing::field::Empty))]
+#[tracing::instrument(name = "evmsketch.encode", skip_all, fields(block_number, state_update_count = tracing::field::Empty))]
 pub async fn call_to_encoded_state_updates_with_evmsketch(
     cache: &EvmSketchExecutorCache,
     rpc_url: impl AsRef<str>,
     tx_request: TransactionRequest,
-    block: BlockNumberOrTag,
+    block_number: u64,
 ) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
     let rpc_url = rpc_url.as_ref();
     let url = Url::parse(rpc_url).map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
@@ -594,18 +602,8 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 
     let caller_address = tx_request.from.unwrap_or_default();
 
-    let block_number = match block {
-        BlockNumberOrTag::Number(n) => n,
-        _ => {
-            return Err(anyhow!(
-                "executor cache requires a specific block number, got {:?}",
-                block
-            ));
-        }
-    };
-
     let provider = ProviderBuilder::new().connect_http(url);
-    let block_id = BlockId::Number(block);
+    let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
     let trace = get_trace_from_call(&provider, tx_request, block_id).await?;
     let (state_updates, skipped_opcodes, _call_gas_total) = compute_state_updates(trace)?;
     tracing::Span::current().record("state_update_count", state_updates.len());
@@ -649,24 +647,36 @@ mod tests {
         );
     }
 
-    /// A cache with capacity 1 must evict the old entry when a new key is inserted,
-    /// so a subsequent lookup of the evicted key misses and allocates a fresh Arc.
-    #[test]
-    fn test_executor_cache_lru_eviction() {
-        // We can only test the LRU capacity logic without a live RPC by checking
-        // that the underlying LruCache size stays bounded.  Use the lru crate
-        // directly here as a smoke-test for the capacity argument.
-        let mut lru: LruCache<(String, u64), u32> = LruCache::new(NonZeroUsize::new(2).unwrap());
-        lru.put(("rpc".into(), 1), 1);
-        lru.put(("rpc".into(), 2), 2);
-        lru.put(("rpc".into(), 3), 3); // evicts ("rpc", 1)
-        assert_eq!(lru.len(), 2);
-        assert!(
-            lru.get(&("rpc".into(), 1)).is_none(),
-            "oldest entry should be evicted"
+    /// A capacity-1 cache must evict the old entry when a new key is inserted,
+    /// so a subsequent lookup of the evicted key misses and rebuilds a fresh Arc.
+    #[tokio::test]
+    #[ignore = "requires RPC_URL env var"]
+    async fn test_executor_cache_lru_eviction() {
+        let rpc_url = std::env::var("RPC_URL").expect("RPC_URL must be set");
+        let cache = EvmSketchExecutorCache::new(1);
+
+        let provider = ProviderBuilder::new().connect_http(Url::parse(&rpc_url).unwrap());
+        let block_b = provider.get_block_number().await.unwrap();
+        let block_a = block_b.saturating_sub(1);
+
+        // Insert block_a — cache has 1 entry.
+        let arc_a1 = cache.get_or_build(&rpc_url, block_a).await.unwrap();
+        assert_eq!(cache.len(), 1);
+
+        // Insert block_b — evicts block_a, cache still has 1 entry.
+        cache.get_or_build(&rpc_url, block_b).await.unwrap();
+        assert_eq!(
+            cache.len(),
+            1,
+            "capacity-1 cache must not grow beyond 1 entry"
         );
-        assert!(lru.get(&("rpc".into(), 2)).is_some());
-        assert!(lru.get(&("rpc".into(), 3)).is_some());
+
+        // Re-request block_a — must be a miss, yielding a freshly built Arc.
+        let arc_a2 = cache.get_or_build(&rpc_url, block_a).await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&arc_a1, &arc_a2),
+            "block_a Arc must be rebuilt after eviction, not returned from cache"
+        );
     }
 
     #[test]
