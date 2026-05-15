@@ -471,11 +471,9 @@ impl DefaultEvmSketchExecutor {
         let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
         let mut cache_db = CacheDB::new(simple_db);
 
-        if !storage_hints.is_empty() {
-            prefetch_slots_into_cache(&mut cache_db, storage_hints)
-                .await
-                .context("storage slot prefetch failed")?;
-        }
+        prefetch_slots_into_cache(&mut cache_db, storage_hints)
+            .await
+            .context("storage slot prefetch failed")?;
 
         let sim_env = self.sim_env();
         gas_analyzer_estimator::estimate_state_changes_gas(
@@ -723,6 +721,33 @@ impl GasKillerEvmSketchDefault {
 // call_to_encoded_state_updates_with_evmsketch
 // ============================================================================
 
+/// Derive prefetch hints from a set of state updates.
+///
+/// - `Store`: the slot is at `contract_address`; batching all slots into one
+///   `eth_getProof` call returns every value in a single round-trip.
+/// - `Call`: the target address will be loaded by revm; an empty key list
+///   prefetches just account info (balance/nonce/code), eliminating one
+///   blocking `basic_ref` call during gas estimation.
+/// - `Log*`: carry no addressable state and produce no hints.
+fn hints_from_state_updates(
+    contract_address: Address,
+    state_updates: &[StateUpdate],
+) -> HashMap<Address, Vec<B256>> {
+    let mut hints: HashMap<Address, Vec<B256>> = HashMap::new();
+    for update in state_updates {
+        match update {
+            StateUpdate::Store(s) => {
+                hints.entry(contract_address).or_default().push(s.slot);
+            }
+            StateUpdate::Call(c) => {
+                hints.entry(c.target).or_default();
+            }
+            _ => {}
+        }
+    }
+    hints
+}
+
 /// Compute encoded state updates and gas estimate for a transaction call using EvmSketch.
 ///
 /// Simulates the call via `debug_traceCall` at the given block, extracts state updates,
@@ -784,18 +809,22 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 
     let storage_updates = encode_state_updates_to_abi(&state_updates);
 
-    let gas_estimate = if storage_hints.is_empty() {
-        executor.estimate_state_changes_gas(contract_address, caller_address, &state_updates)?
-    } else {
-        executor
-            .estimate_state_changes_gas_with_hints(
-                contract_address,
-                caller_address,
-                &state_updates,
-                &storage_hints,
-            )
-            .await?
-    };
+    // Merge access-list hints with slots derived from state_updates.
+    // Store slots all land at contract_address (one eth_getProof call for all of them).
+    // Call targets get account-info-only prefetch (empty key list).
+    let mut all_hints = hints_from_state_updates(contract_address, &state_updates);
+    for (addr, slots) in storage_hints {
+        all_hints.entry(addr).or_default().extend(slots);
+    }
+
+    let gas_estimate = executor
+        .estimate_state_changes_gas_with_hints(
+            contract_address,
+            caller_address,
+            &state_updates,
+            &all_hints,
+        )
+        .await?;
 
     Ok((storage_updates, gas_estimate, false, skipped_opcodes))
 }
@@ -809,6 +838,7 @@ mod tests {
     use super::*;
     use alloy::primitives::{address, bytes};
     use alloy::providers::ProviderBuilder;
+    use gas_analyzer_core::types::IStateUpdateTypes;
 
     /// `with_chain_id` must store the supplied value so `build` can bypass the
     /// `eth_chainId` probe.
@@ -1232,5 +1262,45 @@ mod tests {
             "mainnet at ts {} should still be SHANGHAI (Cancun activates at 1_710_338_135)",
             TS_BETWEEN_GNOSIS_AND_MAINNET_CANCUN,
         );
+    }
+
+    /// `hints_from_state_updates` must map Store slots to contract_address,
+    /// add Call targets with empty slot lists, and produce no entry for logs.
+    #[test]
+    fn test_hints_from_state_updates() {
+        use alloy::primitives::Bytes;
+
+        let contract = address!("0x000000000000000000000000000000000000DEAD");
+        let call_target = address!("0x000000000000000000000000000000000000BEEF");
+        let slot1 = B256::from(U256::from(1u64));
+        let slot2 = B256::from(U256::from(2u64));
+
+        let updates = vec![
+            StateUpdate::Store(IStateUpdateTypes::Store {
+                slot: slot1,
+                value: B256::ZERO,
+            }),
+            StateUpdate::Store(IStateUpdateTypes::Store {
+                slot: slot2,
+                value: B256::ZERO,
+            }),
+            StateUpdate::Call(IStateUpdateTypes::Call {
+                target: call_target,
+                value: U256::ZERO,
+                callargs: Bytes::new(),
+            }),
+            StateUpdate::Log0(IStateUpdateTypes::Log0 { data: Bytes::new() }),
+        ];
+
+        let hints = hints_from_state_updates(contract, &updates);
+
+        // Both Store slots map to contract_address.
+        assert_eq!(hints.get(&contract), Some(&vec![slot1, slot2]));
+
+        // Call target is present with an empty slot list (account-only prefetch).
+        assert_eq!(hints.get(&call_target), Some(&vec![]));
+
+        // Log produces no entry — only contract and call_target.
+        assert_eq!(hints.len(), 2);
     }
 }
