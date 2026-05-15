@@ -307,13 +307,33 @@ pub async fn prefetch_slots_into_cache(
                 );
                 break;
             }
-            Err(e) => return Err(anyhow::anyhow!("get_proof failed for {address}: {e}")),
+            // Any other eth_getProof failure (payload limit, transient error,
+            // etc.) is not fatal — the slot will be fetched on demand via
+            // eth_getStorageAt during EVM execution. Log a warning so the issue
+            // is visible but do not abort the estimation.
+            Err(e) => {
+                tracing::warn!(
+                    address = %address,
+                    error = %e,
+                    "eth_getProof failed during prefetch; slot will be fetched on demand"
+                );
+                continue;
+            }
         };
 
         let bytecode = if proof.code_hash != KECCAK_EMPTY {
             match code_res {
                 Ok(b) => Bytecode::new_raw(b),
-                Err(e) => return Err(anyhow::anyhow!("get_code_at failed for {address}: {e}")),
+                // If we can't fetch code, skip inserting this account — the
+                // EVM will fetch account info on demand via basic_ref.
+                Err(e) => {
+                    tracing::warn!(
+                        address = %address,
+                        error = %e,
+                        "get_code_at failed during prefetch; account will be fetched on demand"
+                    );
+                    continue;
+                }
             }
         } else {
             Bytecode::new_raw(Bytes::new())
