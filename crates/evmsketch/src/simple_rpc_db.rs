@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use alloy::primitives::{Address, B256, Bytes, U256};
@@ -5,6 +6,8 @@ use alloy::providers::Provider;
 use alloy::transports::TransportError;
 use alloy_provider::RootProvider;
 use alloy_provider::network::AnyNetwork;
+use anyhow::Context as _;
+use revm::database::CacheDB;
 use revm::database_interface::{DBErrorMarker, DatabaseRef};
 use revm::primitives::KECCAK_EMPTY;
 use revm::state::{AccountInfo, Bytecode};
@@ -237,12 +240,251 @@ impl SimpleRpcDb {
     }
 }
 
+/// Prefetch accounts and storage slots into `cache_db` via `eth_getProof`.
+///
+/// For each `(address, keys)` entry, `eth_getProof` and `eth_getCode` are
+/// issued concurrently via `tokio::join!`: the proof call returns account
+/// metadata and all listed storage values; the code call covers contract
+/// accounts (`code_hash != KECCAK_EMPTY`) and is joined in parallel to avoid
+/// a sequential second round-trip. For EOAs the code response is discarded.
+/// This replaces K per-slot `eth_getStorageAt` calls per address with two
+/// concurrent RPC calls regardless of K.
+///
+/// Duplicate keys within an address entry are deduplicated before the call
+/// to avoid inflating the proof payload.
+///
+/// The results are inserted into `cache_db` so that EVM execution reads them
+/// from the in-process cache without any further RPC calls. Cold-miss slots
+/// (accessed during execution but not present in `slots`) still fall back to
+/// individual `eth_getStorageAt` calls via `storage_ref`, so an incomplete
+/// hint set is safe.
+///
+/// If `eth_getProof` is not supported by the endpoint the `proof_supported`
+/// flag on the underlying `SimpleRpcDb` is cleared (matching the behaviour of
+/// `basic_ref`) and all remaining addresses are skipped — their storage slots
+/// will be fetched on demand.
+#[tracing::instrument(
+    name = "evmsketch.rpc.prefetch",
+    skip(cache_db, slots),
+    level = "debug",
+    fields(address_count = slots.len())
+)]
+pub async fn prefetch_slots_into_cache(
+    cache_db: &mut CacheDB<SimpleRpcDb>,
+    slots: &HashMap<Address, Vec<B256>>,
+) -> anyhow::Result<()> {
+    for (address, keys) in slots {
+        if keys.is_empty() {
+            continue;
+        }
+        if !cache_db.db.proof_supported.load(Ordering::Relaxed) {
+            // eth_getProof was already rejected; remaining slots fall back to
+            // on-demand eth_getStorageAt during EVM execution.
+            break;
+        }
+
+        let provider = cache_db.db.provider.clone();
+        let block = cache_db.db.block_number;
+
+        let unique_keys: Vec<B256> = {
+            let mut seen = std::collections::HashSet::new();
+            keys.iter().copied().filter(|k| seen.insert(*k)).collect()
+        };
+
+        let (proof_res, code_res) = tokio::join!(
+            provider.get_proof(*address, unique_keys).number(block),
+            provider.get_code_at(*address).number(block),
+        );
+
+        let proof = match proof_res {
+            Ok(p) => p,
+            Err(e) if is_method_not_found(&e) => {
+                cache_db.db.proof_supported.store(false, Ordering::Relaxed);
+                tracing::debug!(
+                    address = %address,
+                    "eth_getProof unsupported during prefetch; \
+                     storage slots will be fetched on demand"
+                );
+                break;
+            }
+            Err(e) => return Err(anyhow::anyhow!("get_proof failed for {address}: {e}")),
+        };
+
+        let bytecode = if proof.code_hash != KECCAK_EMPTY {
+            match code_res {
+                Ok(b) => Bytecode::new_raw(b),
+                Err(e) => return Err(anyhow::anyhow!("get_code_at failed for {address}: {e}")),
+            }
+        } else {
+            Bytecode::new_raw(Bytes::new())
+        };
+
+        cache_db.insert_account_info(
+            *address,
+            AccountInfo {
+                balance: proof.balance,
+                nonce: proof.nonce,
+                code_hash: proof.code_hash,
+                code: Some(bytecode),
+            },
+        );
+
+        for sp in &proof.storage_proof {
+            let slot = U256::from_be_bytes(sp.key.as_b256().0);
+            cache_db
+                .insert_account_storage(*address, slot, sp.value)
+                .with_context(|| format!("insert_account_storage {address}[{slot}]"))?;
+        }
+
+        tracing::debug!(
+            address = %address,
+            slot_count = proof.storage_proof.len(),
+            "prefetched account and storage via eth_getProof",
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_json_rpc::ErrorPayload;
     use alloy_transport::{RpcError, TransportError, TransportErrorKind};
 
     use super::*;
+
+    /// After `prefetch_slots_into_cache`, the declared slot must be present in
+    /// the CacheDB's in-process storage map, and the account info must reflect
+    /// the values from the proof — all without any `eth_getStorageAt` call.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_prefetch_inserts_proof_storage() {
+        use alloy_provider::RootProvider;
+        use alloy_provider::network::AnyNetwork;
+        use alloy_rpc_client::RpcClient;
+        use alloy_transport::mock::{Asserter, MockTransport};
+        use revm::primitives::U256;
+        use std::collections::HashMap;
+
+        use alloy::primitives::address;
+
+        let addr = address!("0000000000000000000000000000000000001234");
+        let slot_key = U256::from(5u64);
+        let expected_value = U256::from(0x2au64);
+
+        let asserter = Asserter::new();
+
+        // eth_getProof response: EOA with slot 5 = 0x2a
+        asserter.push_success(&serde_json::json!({
+            "address": format!("{addr:#x}"),
+            "balance": "0x0",
+            "codeHash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+            "nonce": "0x0",
+            "storageHash": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+            "accountProof": [],
+            "storageProof": [{
+                "key": format!("{:#066x}", slot_key),
+                "value": format!("{:#x}", expected_value),
+                "proof": []
+            }]
+        }));
+        // eth_getCode fires concurrently via tokio::join!; KECCAK_EMPTY account
+        // means the result is discarded, but the request still consumes a slot.
+        asserter.push_success(&"0x");
+
+        let transport = MockTransport::new(asserter.clone());
+        let client = RpcClient::new(transport, true);
+        let provider: RootProvider<AnyNetwork> = RootProvider::new(client);
+
+        let db = SimpleRpcDb::new(provider, 42);
+        let mut cache_db = CacheDB::new(db);
+
+        let mut hints = HashMap::new();
+        hints.insert(addr, vec![B256::from(slot_key)]);
+
+        prefetch_slots_into_cache(&mut cache_db, &hints)
+            .await
+            .expect("prefetch should succeed");
+
+        // Verify the slot is now in the CacheDB (no RPC call needed to serve it).
+        let cached = cache_db
+            .cache
+            .accounts
+            .get(&addr)
+            .and_then(|acc| acc.storage.get(&slot_key))
+            .copied();
+        assert_eq!(
+            cached,
+            Some(expected_value),
+            "slot 5 should be in the cache with value 0x2a"
+        );
+
+        // Both responses should have been consumed and no extras remain.
+        assert!(
+            asserter.pop_response().is_none(),
+            "unexpected extra RPC call after prefetch"
+        );
+    }
+
+    /// When `eth_getProof` returns a "method not found" error, prefetch must
+    /// clear `proof_supported`, return `Ok(())`, and leave storage empty so
+    /// cold-miss slots fall back to `eth_getStorageAt` during EVM execution.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_prefetch_skips_on_unsupported_method() {
+        use alloy_json_rpc::ErrorPayload;
+        use alloy_provider::RootProvider;
+        use alloy_provider::network::AnyNetwork;
+        use alloy_rpc_client::RpcClient;
+        use alloy_transport::mock::{Asserter, MockTransport};
+        use revm::primitives::U256;
+        use std::collections::HashMap;
+
+        use alloy::primitives::address;
+
+        let addr = address!("0000000000000000000000000000000000005678");
+
+        let asserter = Asserter::new();
+        // eth_getProof is unsupported — the classic JSON-RPC "method not found"
+        asserter.push_failure(ErrorPayload {
+            code: -32601,
+            message: "Method not found".into(),
+            data: None,
+        });
+        // eth_getCode also fires via tokio::join! and must be consumed.
+        asserter.push_success(&"0x");
+
+        let transport = MockTransport::new(asserter.clone());
+        let client = RpcClient::new(transport, true);
+        let provider: RootProvider<AnyNetwork> = RootProvider::new(client);
+
+        let db = SimpleRpcDb::new(provider, 42);
+        let mut cache_db = CacheDB::new(db);
+
+        let mut hints = HashMap::new();
+        hints.insert(addr, vec![B256::from(U256::from(7u64))]);
+
+        // prefetch must succeed (not propagate the -32601 error)
+        prefetch_slots_into_cache(&mut cache_db, &hints)
+            .await
+            .expect("prefetch must return Ok on unsupported method");
+
+        // proof_supported must be cleared so subsequent basic_ref calls skip eth_getProof
+        assert!(
+            !cache_db.db.proof_supported.load(Ordering::Relaxed),
+            "proof_supported must be cleared after -32601 response"
+        );
+
+        // No storage must be in the cache — cold-miss slots will be fetched
+        // individually by eth_getStorageAt via storage_ref during EVM execution.
+        let cached = cache_db
+            .cache
+            .accounts
+            .get(&addr)
+            .and_then(|acc| acc.storage.get(&U256::from(7u64)))
+            .copied();
+        assert_eq!(
+            cached, None,
+            "slot must not be in cache when proof is unsupported"
+        );
+    }
 
     fn error_resp(code: i64, message: &'static str) -> TransportError {
         RpcError::ErrorResp(ErrorPayload {
