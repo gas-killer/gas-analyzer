@@ -78,7 +78,6 @@ fn bench_end_to_end(c: &mut Criterion) {
             black_box(
                 gas_analyzer_evmsketch::call_to_encoded_state_updates_with_evmsketch(
                     &cache,
-                    &provider,
                     &rpc_url,
                     tx_request.clone(),
                     block,
