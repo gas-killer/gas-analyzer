@@ -8,7 +8,6 @@
 //! `gas-analyzer-estimator` crate which uses revm directly.
 
 use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
-use alloy::providers::ProviderBuilder;
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy_eips::BlockId;
 use alloy_eips::BlockNumberOrTag;
@@ -643,14 +642,23 @@ impl GasKillerEvmSketchDefault {
 /// # Returns
 /// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`
 #[tracing::instrument(name = "evmsketch.encode", skip_all, fields(block_number, state_update_count = tracing::field::Empty))]
-pub async fn call_to_encoded_state_updates_with_evmsketch(
+/// Compute encoded state updates and gas estimate for a transaction call using EvmSketch.
+///
+/// The caller is responsible for creating and reusing `provider` across calls to the
+/// same endpoint — a single `ProviderBuilder::new().connect_http(url)` instance
+/// shares its underlying HTTP connection pool across all invocations, avoiding
+/// repeated TCP/TLS handshakes.
+pub async fn call_to_encoded_state_updates_with_evmsketch<P>(
     cache: &EvmSketchExecutorCache,
+    provider: &P,
     rpc_url: impl AsRef<str>,
     tx_request: TransactionRequest,
     block_number: u64,
-) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
+) -> Result<(Bytes, u64, bool, HashSet<Opcode>)>
+where
+    P: Provider + DebugApi,
+{
     let rpc_url = rpc_url.as_ref();
-    let url = Url::parse(rpc_url).map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
 
     let contract_address = tx_request
         .to
@@ -676,7 +684,6 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
         }
     }
 
-    let provider = ProviderBuilder::new().connect_http(url);
     let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
 
     // Run debug_traceCall and executor cache lookup concurrently — they are
@@ -716,6 +723,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 mod tests {
     use super::*;
     use alloy::primitives::{address, bytes};
+    use alloy::providers::ProviderBuilder;
 
     /// Two `get_or_build` calls for the same key must return `Arc`s that point to the
     /// same allocation (i.e. the second call is a cache hit, not a new build).
