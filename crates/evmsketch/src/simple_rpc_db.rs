@@ -242,27 +242,30 @@ impl SimpleRpcDb {
 
 /// Prefetch accounts and storage slots into `cache_db` via `eth_getProof`.
 ///
-/// For each `(address, keys)` entry, `eth_getProof` and `eth_getCode` are
-/// issued concurrently via `tokio::join!`: the proof call returns account
-/// metadata and all listed storage values; the code call covers contract
-/// accounts (`code_hash != KECCAK_EMPTY`) and is joined in parallel to avoid
-/// a sequential second round-trip. For EOAs the code response is discarded.
-/// This replaces K per-slot `eth_getStorageAt` calls per address with two
-/// concurrent RPC calls regardless of K.
+/// All addresses are fetched concurrently in two phases:
 ///
-/// Duplicate keys within an address entry are deduplicated before the call
-/// to avoid inflating the proof payload.
+/// **Phase 1 — fan-out**: one `tokio::task` is spawned per address. Each task
+/// issues `eth_getProof` and `eth_getCode` in parallel via `tokio::join!`.
+/// `cache_db` is not captured by any task; only the cloned provider and
+/// primitive values are moved in, so the mutable borrow is free for Phase 2.
 ///
-/// The results are inserted into `cache_db` so that EVM execution reads them
-/// from the in-process cache without any further RPC calls. Cold-miss slots
-/// (accessed during execution but not present in `slots`) still fall back to
+/// **Phase 2 — collect**: tasks are joined one at a time and their results are
+/// inserted into `cache_db`. Total latency is bounded by the slowest single
+/// address rather than the sum of all addresses.
+///
+/// Addresses with an empty key list (e.g. `StateUpdate::Call` targets) are
+/// fetched with `eth_getProof(address, [])`, which returns account metadata
+/// (balance, nonce, code hash) without storage proofs — enough to warm the
+/// `basic_ref` cache and eliminate a blocking RPC call from revm execution.
+///
+/// Duplicate keys within an entry are deduplicated before the call. Cold-miss
+/// slots (accessed during execution but absent from `slots`) fall back to
 /// individual `eth_getStorageAt` calls via `storage_ref`, so an incomplete
 /// hint set is safe.
 ///
-/// If `eth_getProof` is not supported by the endpoint the `proof_supported`
-/// flag on the underlying `SimpleRpcDb` is cleared (matching the behaviour of
-/// `basic_ref`) and all remaining addresses are skipped — their storage slots
-/// will be fetched on demand.
+/// If `eth_getProof` is not supported by the endpoint, `proof_supported` is
+/// cleared and remaining tasks are aborted — their slots fall back to on-demand
+/// `eth_getStorageAt`.
 #[tracing::instrument(
     name = "evmsketch.rpc.prefetch",
     skip(cache_db, slots),
@@ -273,28 +276,33 @@ pub async fn prefetch_slots_into_cache(
     cache_db: &mut CacheDB<SimpleRpcDb>,
     slots: &HashMap<Address, Vec<B256>>,
 ) -> anyhow::Result<()> {
-    for (address, keys) in slots {
-        if keys.is_empty() {
-            continue;
-        }
-        if !cache_db.db.proof_supported.load(Ordering::Relaxed) {
-            // eth_getProof was already rejected; remaining slots fall back to
-            // on-demand eth_getStorageAt during EVM execution.
-            break;
-        }
+    if slots.is_empty() || !cache_db.db.proof_supported.load(Ordering::Relaxed) {
+        return Ok(());
+    }
 
-        let provider = cache_db.db.provider.clone();
-        let block = cache_db.db.block_number;
+    let provider = cache_db.db.provider.clone();
+    let block = cache_db.db.block_number;
 
+    // Phase 1: fan out all (eth_getProof, eth_getCode) pairs concurrently.
+    let mut set = tokio::task::JoinSet::new();
+    for (&address, keys) in slots {
+        let provider = provider.clone();
         let unique_keys: Vec<B256> = {
             let mut seen = std::collections::HashSet::new();
             keys.iter().copied().filter(|k| seen.insert(*k)).collect()
         };
+        set.spawn(async move {
+            let (proof_res, code_res) = tokio::join!(
+                provider.get_proof(address, unique_keys).number(block),
+                provider.get_code_at(address).number(block),
+            );
+            (address, proof_res, code_res)
+        });
+    }
 
-        let (proof_res, code_res) = tokio::join!(
-            provider.get_proof(*address, unique_keys).number(block),
-            provider.get_code_at(*address).number(block),
-        );
+    // Phase 2: collect results and insert into cache_db.
+    while let Some(task_res) = set.join_next().await {
+        let (address, proof_res, code_res) = task_res.context("prefetch task panicked")?;
 
         let proof = match proof_res {
             Ok(p) => p,
@@ -305,12 +313,12 @@ pub async fn prefetch_slots_into_cache(
                     "eth_getProof unsupported during prefetch; \
                      storage slots will be fetched on demand"
                 );
-                break;
+                set.abort_all();
+                return Ok(());
             }
             // Any other eth_getProof failure (payload limit, transient error,
             // etc.) is not fatal — the slot will be fetched on demand via
-            // eth_getStorageAt during EVM execution. Log a warning so the issue
-            // is visible but do not abort the estimation.
+            // eth_getStorageAt. Log a warning so the issue is visible.
             Err(e) => {
                 tracing::warn!(
                     address = %address,
@@ -324,8 +332,6 @@ pub async fn prefetch_slots_into_cache(
         let bytecode = if proof.code_hash != KECCAK_EMPTY {
             match code_res {
                 Ok(b) => Bytecode::new_raw(b),
-                // If we can't fetch code, skip inserting this account — the
-                // EVM will fetch account info on demand via basic_ref.
                 Err(e) => {
                     tracing::warn!(
                         address = %address,
@@ -340,7 +346,7 @@ pub async fn prefetch_slots_into_cache(
         };
 
         cache_db.insert_account_info(
-            *address,
+            address,
             AccountInfo {
                 balance: proof.balance,
                 nonce: proof.nonce,
@@ -352,7 +358,7 @@ pub async fn prefetch_slots_into_cache(
         for sp in &proof.storage_proof {
             let slot = U256::from_be_bytes(sp.key.as_b256().0);
             cache_db
-                .insert_account_storage(*address, slot, sp.value)
+                .insert_account_storage(address, slot, sp.value)
                 .with_context(|| format!("insert_account_storage {address}[{slot}]"))?;
         }
 
@@ -362,6 +368,7 @@ pub async fn prefetch_slots_into_cache(
             "prefetched account and storage via eth_getProof",
         );
     }
+
     Ok(())
 }
 
@@ -503,6 +510,67 @@ mod tests {
         assert_eq!(
             cached, None,
             "slot must not be in cache when proof is unsupported"
+        );
+    }
+
+    /// An address with an empty key list (e.g. from a `StateUpdate::Call` target)
+    /// must still have its account info prefetched — `eth_getProof(addr, [])` returns
+    /// balance/nonce/code_hash without storage proofs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_prefetch_account_only_empty_keys() {
+        use alloy_provider::RootProvider;
+        use alloy_provider::network::AnyNetwork;
+        use alloy_rpc_client::RpcClient;
+        use alloy_transport::mock::{Asserter, MockTransport};
+        use revm::primitives::U256;
+        use std::collections::HashMap;
+
+        use alloy::primitives::address;
+
+        let addr = address!("0000000000000000000000000000000000009abc");
+
+        let asserter = Asserter::new();
+        // eth_getProof with empty keys — returns account info, empty storage_proof.
+        asserter.push_success(&serde_json::json!({
+            "address": format!("{addr:#x}"),
+            "balance": "0x64",
+            "codeHash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+            "nonce": "0x1",
+            "storageHash": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+            "accountProof": [],
+            "storageProof": []
+        }));
+        // eth_getCode fires concurrently; KECCAK_EMPTY so result is discarded.
+        asserter.push_success(&"0x");
+
+        let transport = MockTransport::new(asserter.clone());
+        let client = RpcClient::new(transport, true);
+        let provider: RootProvider<AnyNetwork> = RootProvider::new(client);
+
+        let db = SimpleRpcDb::new(provider, 42);
+        let mut cache_db = CacheDB::new(db);
+
+        // Empty key list — account-only prefetch.
+        let mut hints = HashMap::new();
+        hints.insert(addr, vec![]);
+
+        prefetch_slots_into_cache(&mut cache_db, &hints)
+            .await
+            .expect("prefetch should succeed for empty-key address");
+
+        // Account info must be in the cache (balance = 0x64, nonce = 1).
+        let cached_account = cache_db.cache.accounts.get(&addr);
+        assert!(
+            cached_account.is_some(),
+            "account info should be prefetched even with empty key list"
+        );
+        let info = cached_account.unwrap().info.clone();
+        assert_eq!(info.balance, U256::from(0x64u64), "balance mismatch");
+        assert_eq!(info.nonce, 1, "nonce mismatch");
+
+        assert!(
+            asserter.pop_response().is_none(),
+            "unexpected extra RPC call after prefetch"
         );
     }
 
