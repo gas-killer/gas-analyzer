@@ -242,10 +242,16 @@ impl SimpleRpcDb {
 
 /// Prefetch accounts and storage slots into `cache_db` via `eth_getProof`.
 ///
-/// For each `(address, keys)` entry, a single `eth_getProof` request fetches
-/// account metadata and the listed storage values in one round-trip, replacing
-/// K per-slot `eth_getStorageAt` calls with a single call that returns all K
-/// values alongside the account's balance/nonce/code-hash.
+/// For each `(address, keys)` entry, `eth_getProof` and `eth_getCode` are
+/// issued concurrently via `tokio::join!`: the proof call returns account
+/// metadata and all listed storage values; the code call covers contract
+/// accounts (`code_hash != KECCAK_EMPTY`) and is joined in parallel to avoid
+/// a sequential second round-trip. For EOAs the code response is discarded.
+/// This replaces K per-slot `eth_getStorageAt` calls per address with two
+/// concurrent RPC calls regardless of K.
+///
+/// Duplicate keys within an address entry are deduplicated before the call
+/// to avoid inflating the proof payload.
 ///
 /// The results are inserted into `cache_db` so that EVM execution reads them
 /// from the in-process cache without any further RPC calls. Cold-miss slots
@@ -280,8 +286,13 @@ pub async fn prefetch_slots_into_cache(
         let provider = cache_db.db.provider.clone();
         let block = cache_db.db.block_number;
 
+        let unique_keys: Vec<B256> = {
+            let mut seen = std::collections::HashSet::new();
+            keys.iter().copied().filter(|k| seen.insert(*k)).collect()
+        };
+
         let (proof_res, code_res) = tokio::join!(
-            provider.get_proof(*address, keys.clone()).number(block),
+            provider.get_proof(*address, unique_keys).number(block),
             provider.get_code_at(*address).number(block),
         );
 
