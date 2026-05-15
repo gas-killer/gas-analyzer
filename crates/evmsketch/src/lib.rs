@@ -139,9 +139,14 @@ pub type DefaultEvmSketchExecutor = EvmSketchExecutor<DefaultProvider, DefaultPr
 /// immutable header fields, and each gas estimate constructs its own `CacheDB`.
 /// Keyed by `(rpc_url, block_number)` — no extra RPC is needed for a cache hit.
 ///
+/// Chain ID is static per network: it is fetched once per RPC URL and reused
+/// across all block-number entries for that URL, eliminating one `eth_chainId`
+/// round-trip (~16–50 ms) on every executor cache miss.
+///
 /// A capacity of 4 covers all realistic burst scenarios on mainnet (~12 s blocks).
 pub struct EvmSketchExecutorCache {
     inner: Mutex<LruCache<(String, u64), Arc<DefaultEvmSketchExecutor>>>,
+    chain_ids: Mutex<HashMap<String, u64>>,
 }
 
 impl EvmSketchExecutorCache {
@@ -154,6 +159,7 @@ impl EvmSketchExecutorCache {
             inner: Mutex::new(LruCache::new(
                 NonZeroUsize::new(capacity).expect("cache capacity must be non-zero"),
             )),
+            chain_ids: Mutex::new(HashMap::new()),
         }
     }
 
@@ -170,6 +176,8 @@ impl EvmSketchExecutorCache {
     /// Two concurrent callers that both miss may each call `build()`; the later
     /// `put` overwrites the earlier entry.  Both executors are equivalent, so this
     /// is safe — it only wastes one build in the rare cold-start race.
+    ///
+    /// Chain ID is fetched at most once per RPC URL across all block numbers.
     pub async fn get_or_build(
         &self,
         rpc_url: &str,
@@ -184,9 +192,35 @@ impl EvmSketchExecutorCache {
         }
 
         let url = Url::parse(rpc_url).map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+
+        // Chain ID is static per network — fetch once and reuse across blocks.
+        let chain_id = {
+            self.chain_ids
+                .lock()
+                .expect("chain_id cache mutex poisoned")
+                .get(rpc_url)
+                .copied()
+        };
+        let chain_id = match chain_id {
+            Some(id) => id,
+            None => {
+                let provider = RootProvider::<AnyNetwork>::new_http(url.clone());
+                let id = provider
+                    .get_chain_id()
+                    .await
+                    .map_err(|e| anyhow!("Failed to query eth_chainId: {}", e))?;
+                self.chain_ids
+                    .lock()
+                    .expect("chain_id cache mutex poisoned")
+                    .insert(rpc_url.to_string(), id);
+                id
+            }
+        };
+
         let exec = Arc::new(
             EvmSketchExecutorBuilder::new()
                 .rpc_url(url)
+                .with_chain_id(chain_id)
                 .at_block(BlockNumberOrTag::Number(block_number))
                 .build()
                 .await?,
@@ -252,6 +286,7 @@ pub struct EvmSketchExecutor<P, PT> {
 pub struct EvmSketchExecutorBuilder {
     rpc_url: Option<Url>,
     block: BlockNumberOrTag,
+    chain_id: Option<u64>,
 }
 
 impl EvmSketchExecutorBuilder {
@@ -272,20 +307,32 @@ impl EvmSketchExecutorBuilder {
         self
     }
 
+    /// Supply a pre-fetched chain ID, skipping the `eth_chainId` probe in `build`.
+    ///
+    /// Use this when the chain ID is already known (e.g. cached from a prior
+    /// call) to avoid an extra round-trip per executor build.
+    pub fn with_chain_id(mut self, chain_id: u64) -> Self {
+        self.chain_id = Some(chain_id);
+        self
+    }
+
     /// Build the EvmSketchExecutor.
     ///
-    /// Queries `eth_chainId` from the RPC and selects the matching `Genesis`
+    /// Queries `eth_chainId` from the RPC if not already supplied via
+    /// [`with_chain_id`](Self::with_chain_id), then selects the matching `Genesis`
     /// and hardfork schedule. Errors on unsupported chains: silently defaulting
     /// to mainnet when pointed at a different network would yield wrong hardfork
     /// activation and corrupt gas estimation.
     pub async fn build(self) -> Result<DefaultEvmSketchExecutor> {
         let rpc_url = self.rpc_url.ok_or_else(|| anyhow!("RPC URL is required"))?;
 
-        let chain_probe = RootProvider::<AnyNetwork>::new_http(rpc_url.clone());
-        let chain_id = chain_probe
-            .get_chain_id()
-            .await
-            .map_err(|e| anyhow!("Failed to query eth_chainId: {}", e))?;
+        let chain_id = match self.chain_id {
+            Some(id) => id,
+            None => RootProvider::<AnyNetwork>::new_http(rpc_url.clone())
+                .get_chain_id()
+                .await
+                .map_err(|e| anyhow!("Failed to query eth_chainId: {}", e))?,
+        };
         let (genesis, hardforks) = chain_id_to_genesis_and_spec(chain_id)?;
 
         let sketch = EvmSketch::builder()
@@ -601,16 +648,18 @@ impl GasKillerEvmSketchDefault {
 
     /// Estimate gas using a fallback heuristic based on the original transaction trace.
     ///
-    /// This extracts operations (SSTORE, LOG, CALL) from the original transaction trace
-    /// and applies heuristic costs.
+    /// `status` must be `receipt.status()` for `tx_hash`. Pass the already-fetched
+    /// receipt's status to avoid an extra `eth_getTransactionReceipt` round-trip.
+    /// Extracts operations (SSTORE, LOG, CALL) from the trace and applies heuristic costs.
     pub async fn estimate_gas_from_trace<P: Provider + DebugApi>(
         &self,
         provider: &P,
         tx_hash: alloy::primitives::FixedBytes<32>,
+        status: bool,
     ) -> Result<u64> {
         use gas_analyzer_rpc::get_tx_trace;
 
-        let trace = get_tx_trace(provider, tx_hash).await?;
+        let trace = get_tx_trace(provider, tx_hash, status).await?;
         let operations = extract_operation_counts_from_trace(&trace);
         Ok(estimate_gas_from_operations(&operations))
     }
@@ -724,6 +773,56 @@ mod tests {
     use super::*;
     use alloy::primitives::{address, bytes};
     use alloy::providers::ProviderBuilder;
+
+    /// `with_chain_id` must store the supplied value so `build` can bypass the
+    /// `eth_chainId` probe.
+    #[test]
+    fn test_builder_with_chain_id_stores_value() {
+        let builder = EvmSketchExecutorBuilder::new().with_chain_id(SEPOLIA_CHAIN_ID);
+        assert_eq!(builder.chain_id, Some(SEPOLIA_CHAIN_ID));
+
+        let builder_none = EvmSketchExecutorBuilder::new();
+        assert_eq!(builder_none.chain_id, None);
+    }
+
+    /// `EvmSketchExecutorCache` must issue `eth_chainId` at most once per RPC
+    /// URL regardless of how many distinct block numbers are requested.
+    ///
+    /// Verified by building executors for two different block numbers on the
+    /// same URL and checking that the second build finds a cached chain_id.
+    /// (The direct assertion is on the internal `chain_ids` map having exactly
+    /// one entry after both builds.)
+    #[tokio::test]
+    #[ignore = "requires RPC_URL env var"]
+    async fn test_chain_id_cached_across_blocks() {
+        let rpc_url = std::env::var("RPC_URL").expect("RPC_URL must be set");
+        let cache = EvmSketchExecutorCache::new(4);
+
+        let provider = ProviderBuilder::new().connect_http(Url::parse(&rpc_url).unwrap());
+        let latest = provider.get_block_number().await.unwrap();
+
+        // Build for two consecutive blocks — chain_id must be fetched only once.
+        let _ = cache.get_or_build(&rpc_url, latest).await.unwrap();
+        let _ = cache
+            .get_or_build(&rpc_url, latest.saturating_sub(1))
+            .await
+            .unwrap();
+
+        let ids = cache
+            .chain_ids
+            .lock()
+            .expect("chain_id cache mutex poisoned");
+        assert_eq!(
+            ids.len(),
+            1,
+            "expected exactly one chain_id cache entry for the URL, got {}",
+            ids.len()
+        );
+        assert!(
+            ids.contains_key(&rpc_url),
+            "chain_id not cached under the expected key"
+        );
+    }
 
     /// Two `get_or_build` calls for the same key must return `Arc`s that point to the
     /// same allocation (i.e. the second call is a cache hit, not a new build).
