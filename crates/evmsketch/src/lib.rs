@@ -8,7 +8,6 @@
 //! `gas-analyzer-estimator` crate which uses revm directly.
 
 use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
-use alloy::providers::ProviderBuilder;
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy_eips::BlockId;
 use alloy_eips::BlockNumberOrTag;
@@ -17,7 +16,7 @@ use alloy_hardforks::{EthereumChainHardforks, EthereumHardfork, ForkCondition};
 use alloy_provider::Provider;
 use alloy_provider::RootProvider;
 use alloy_provider::ext::DebugApi;
-use alloy_provider::network::AnyNetwork;
+use alloy_provider::network::{AnyNetwork, Ethereum};
 use anyhow::{Context as _, Result, anyhow};
 use lru::LruCache;
 use reth_primitives::EthPrimitives;
@@ -133,12 +132,16 @@ pub type DefaultEvmSketchExecutor = EvmSketchExecutor<DefaultProvider, DefaultPr
 // Executor Cache
 // ============================================================================
 
-/// Thread-safe LRU cache of pre-built [`DefaultEvmSketchExecutor`]s.
+/// Thread-safe LRU cache of pre-built [`DefaultEvmSketchExecutor`]s, with a
+/// companion provider cache so the same HTTP connection pool is reused across
+/// all `debug_traceCall` requests to the same endpoint.
 ///
 /// `build()` costs ~80–120 ms (2× `eth_getBlockByNumber`).  An executor is safe
 /// to reuse across requests at the same block height: `sim_env()` reads only
 /// immutable header fields, and each gas estimate constructs its own `CacheDB`.
-/// Keyed by `(rpc_url, block_number)` — no extra RPC is needed for a cache hit.
+/// Executors are keyed by `(rpc_url, block_number)`. Trace providers are keyed
+/// by `rpc_url` only — a single [`RootProvider`] is shared across all block
+/// heights for the same endpoint, avoiding repeated TCP/TLS handshakes.
 ///
 /// Chain ID is static per network: it is fetched once per RPC URL and reused
 /// across all block-number entries for that URL, eliminating one `eth_chainId`
@@ -148,6 +151,10 @@ pub type DefaultEvmSketchExecutor = EvmSketchExecutor<DefaultProvider, DefaultPr
 pub struct EvmSketchExecutorCache {
     inner: Mutex<LruCache<(String, u64), Arc<DefaultEvmSketchExecutor>>>,
     chain_ids: Mutex<HashMap<String, u64>>,
+    /// One `RootProvider<Ethereum>` per RPC URL, used for `debug_traceCall`.
+    /// `RootProvider` is `Clone` (Arc-backed), so callers share one HTTP
+    /// connection pool rather than creating a new one per invocation.
+    trace_providers: Mutex<HashMap<String, RootProvider<Ethereum>>>,
 }
 
 impl EvmSketchExecutorCache {
@@ -161,7 +168,41 @@ impl EvmSketchExecutorCache {
                 NonZeroUsize::new(capacity).expect("cache capacity must be non-zero"),
             )),
             chain_ids: Mutex::new(HashMap::new()),
+            trace_providers: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Return a cached trace provider for `rpc_url`, creating one if absent.
+    ///
+    /// The provider is a `RootProvider<Ethereum>` (built via
+    /// `ProviderBuilder::new().connect_http`) so it satisfies the
+    /// `Provider + DebugApi` bounds required by `get_trace_from_call`.
+    /// Subsequent calls for the same URL return a clone of the same underlying
+    /// provider — cheap Arc bump, shared connection pool.
+    fn get_or_create_trace_provider(&self, rpc_url: &str) -> Result<RootProvider<Ethereum>> {
+        {
+            let providers = self
+                .trace_providers
+                .lock()
+                .expect("trace_providers mutex poisoned");
+            if let Some(p) = providers.get(rpc_url) {
+                return Ok(p.clone());
+            }
+        }
+        let url = Url::parse(rpc_url).map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+        // RootProvider::new_http gives a plain provider without gas/nonce/chain-id
+        // fillers, which are unnecessary for debug_traceCall.
+        let provider = RootProvider::<Ethereum>::new_http(url);
+        {
+            let mut providers = self
+                .trace_providers
+                .lock()
+                .expect("trace_providers mutex poisoned");
+            providers
+                .entry(rpc_url.to_string())
+                .or_insert_with(|| provider.clone());
+        }
+        Ok(provider)
     }
 
     #[cfg(test)]
@@ -614,10 +655,12 @@ impl GasKillerEvmSketchDefault {
             let mut hints: HashMap<Address, Vec<B256>> = HashMap::new();
             for tx in preceding_txs {
                 for item in tx.access_list.iter() {
-                    hints
-                        .entry(item.address)
-                        .or_default()
-                        .extend(item.storage_keys.iter().copied());
+                    if !item.storage_keys.is_empty() {
+                        hints
+                            .entry(item.address)
+                            .or_default()
+                            .extend(item.storage_keys.iter().copied());
+                    }
                 }
             }
 
@@ -684,10 +727,10 @@ impl GasKillerEvmSketchDefault {
 ///
 /// Simulates the call via `debug_traceCall` at the given block, extracts state updates,
 /// encodes them to ABI, and estimates gas. The executor build step (~80–120 ms,
-/// 2× `eth_getBlockByNumber`) is skipped on cache hits.
-///
-/// Pass a persistent `EvmSketchExecutorCache` shared across requests for the best
-/// performance.  For one-shot use (benchmarks, CLI) pass `&EvmSketchExecutorCache::new(1)`.
+/// 2× `eth_getBlockByNumber`) is skipped on cache hits. The HTTP connection pool for
+/// `rpc_url` is managed by `cache` and shared across calls — pass a persistent
+/// `EvmSketchExecutorCache` for best performance; for one-shot use pass
+/// `&EvmSketchExecutorCache::new(1)`.
 ///
 /// # Returns
 /// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`
@@ -699,7 +742,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
     block_number: u64,
 ) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
     let rpc_url = rpc_url.as_ref();
-    let url = Url::parse(rpc_url).map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+    let provider = cache.get_or_create_trace_provider(rpc_url)?;
 
     let contract_address = tx_request
         .to
@@ -712,28 +755,35 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
     let caller_address = tx_request.from.unwrap_or_default();
 
     // Collect storage hints from the EIP-2930 access list before tx_request
-    // is consumed by get_trace_from_call. These are passed to the estimator so
-    // that each hinted slot is fetched via a single eth_getProof call rather
-    // than an individual eth_getStorageAt during EVM execution.
+    // is consumed by get_trace_from_call. Only entries with actual slot keys are
+    // included — address-only EIP-2930 entries have no storage to prefetch.
     let mut storage_hints: HashMap<Address, Vec<B256>> = HashMap::new();
     if let Some(al) = &tx_request.access_list {
         for item in al.iter() {
-            storage_hints
-                .entry(item.address)
-                .or_default()
-                .extend(item.storage_keys.iter().copied());
+            if !item.storage_keys.is_empty() {
+                storage_hints
+                    .entry(item.address)
+                    .or_default()
+                    .extend(item.storage_keys.iter().copied());
+            }
         }
     }
 
-    let provider = ProviderBuilder::new().connect_http(url);
     let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
-    let trace = get_trace_from_call(&provider, tx_request, block_id).await?;
+
+    // Run debug_traceCall and executor cache lookup concurrently — they are
+    // fully independent. On a cache miss this hides the entire executor build
+    // behind the trace fetch.
+    let (trace, executor) = tokio::try_join!(
+        get_trace_from_call(&provider, tx_request, block_id),
+        cache.get_or_build(rpc_url, block_number),
+    )?;
+
     let (state_updates, skipped_opcodes, _call_gas_total) = compute_state_updates(trace)?;
     tracing::Span::current().record("state_update_count", state_updates.len());
 
     let storage_updates = encode_state_updates_to_abi(&state_updates);
 
-    let executor = cache.get_or_build(rpc_url, block_number).await?;
     let gas_estimate = if storage_hints.is_empty() {
         executor.estimate_state_changes_gas(contract_address, caller_address, &state_updates)?
     } else {
@@ -758,6 +808,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 mod tests {
     use super::*;
     use alloy::primitives::{address, bytes};
+    use alloy::providers::ProviderBuilder;
 
     /// `with_chain_id` must store the supplied value so `build` can bypass the
     /// `eth_chainId` probe.

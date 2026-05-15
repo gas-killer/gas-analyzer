@@ -31,11 +31,13 @@ fn bench_end_to_end(c: &mut Criterion) {
 
     let rt = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");
 
+    // Single provider created once and reused across all benchmark iterations —
+    // the underlying reqwest connection pool is shared, avoiding repeated TCP/TLS
+    // handshakes per iteration.
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse().expect("invalid RPC_URL"));
+
     // Fetch tx details once outside the measured region.
     let (tx_request, block) = rt.block_on(async {
-        let provider =
-            ProviderBuilder::new().connect_http(rpc_url.parse().expect("invalid RPC_URL"));
-
         let hash: FixedBytes<32> = SEPOLIA_TX_HASH.parse().expect("invalid tx hash constant");
 
         let tx = provider
