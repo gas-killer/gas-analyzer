@@ -8,7 +8,6 @@
 //! `gas-analyzer-estimator` crate which uses revm directly.
 
 use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
-use alloy::providers::ProviderBuilder;
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy_eips::BlockId;
 use alloy_eips::BlockNumberOrTag;
@@ -17,15 +16,15 @@ use alloy_hardforks::{EthereumChainHardforks, EthereumHardfork, ForkCondition};
 use alloy_provider::Provider;
 use alloy_provider::RootProvider;
 use alloy_provider::ext::DebugApi;
-use alloy_provider::network::AnyNetwork;
-use anyhow::{Result, anyhow};
+use alloy_provider::network::{AnyNetwork, Ethereum};
+use anyhow::{Context as _, Result, anyhow};
 use lru::LruCache;
 use reth_primitives::EthPrimitives;
 use revm::database::CacheDB;
 use revm::primitives::hardfork::SpecId;
 use sp1_cc_client_executor::{ContractCalldata, ContractInput};
 use sp1_cc_host_executor::{EvmSketch, Genesis};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use url::Url;
@@ -109,7 +108,7 @@ fn gnosis_hardforks() -> EthereumChainHardforks {
 }
 
 pub mod simple_rpc_db;
-use simple_rpc_db::SimpleRpcDb;
+use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 
 use gas_analyzer_core::{
     Opcode, StateUpdate, compute_state_updates, encode_state_updates_to_abi,
@@ -133,16 +132,29 @@ pub type DefaultEvmSketchExecutor = EvmSketchExecutor<DefaultProvider, DefaultPr
 // Executor Cache
 // ============================================================================
 
-/// Thread-safe LRU cache of pre-built [`DefaultEvmSketchExecutor`]s.
+/// Thread-safe LRU cache of pre-built [`DefaultEvmSketchExecutor`]s, with a
+/// companion provider cache so the same HTTP connection pool is reused across
+/// all `debug_traceCall` requests to the same endpoint.
 ///
 /// `build()` costs ~50–70 ms (1× `eth_getBlockByNumber`).  An executor is safe
 /// to reuse across requests at the same block height: `sim_env()` reads only
 /// immutable header fields, and each gas estimate constructs its own `CacheDB`.
-/// Keyed by `(rpc_url, block_number)` — no extra RPC is needed for a cache hit.
+/// Executors are keyed by `(rpc_url, block_number)`. Trace providers are keyed
+/// by `rpc_url` only — a single [`RootProvider`] is shared across all block
+/// heights for the same endpoint, avoiding repeated TCP/TLS handshakes.
+///
+/// Chain ID is static per network: it is fetched once per RPC URL and reused
+/// across all block-number entries for that URL, eliminating one `eth_chainId`
+/// round-trip (~16–50 ms) on every executor cache miss.
 ///
 /// A capacity of 4 covers all realistic burst scenarios on mainnet (~12 s blocks).
 pub struct EvmSketchExecutorCache {
     inner: Mutex<LruCache<(String, u64), Arc<DefaultEvmSketchExecutor>>>,
+    chain_ids: Mutex<HashMap<String, u64>>,
+    /// One `RootProvider<Ethereum>` per RPC URL, used for `debug_traceCall`.
+    /// `RootProvider` is `Clone` (Arc-backed), so callers share one HTTP
+    /// connection pool rather than creating a new one per invocation.
+    trace_providers: Mutex<HashMap<String, RootProvider<Ethereum>>>,
 }
 
 impl EvmSketchExecutorCache {
@@ -155,7 +167,50 @@ impl EvmSketchExecutorCache {
             inner: Mutex::new(LruCache::new(
                 NonZeroUsize::new(capacity).expect("cache capacity must be non-zero"),
             )),
+            chain_ids: Mutex::new(HashMap::new()),
+            trace_providers: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Return a cached trace provider for `rpc_url`, creating one if absent.
+    ///
+    /// The provider is a `RootProvider<Ethereum>` (built via
+    /// `ProviderBuilder::new().connect_http`) so it satisfies the
+    /// `Provider + DebugApi` bounds required by `get_trace_from_call`.
+    /// Subsequent calls for the same URL return a clone of the same underlying
+    /// provider — cheap Arc bump, shared connection pool.
+    fn get_or_create_trace_provider(&self, rpc_url: &str) -> Result<RootProvider<Ethereum>> {
+        {
+            let providers = self
+                .trace_providers
+                .lock()
+                .expect("trace_providers mutex poisoned");
+            if let Some(p) = providers.get(rpc_url) {
+                return Ok(p.clone());
+            }
+        }
+        let url = Url::parse(rpc_url).map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+        // RootProvider::new_http gives a plain provider without gas/nonce/chain-id
+        // fillers, which are unnecessary for debug_traceCall.
+        let provider = RootProvider::<Ethereum>::new_http(url);
+        {
+            let mut providers = self
+                .trace_providers
+                .lock()
+                .expect("trace_providers mutex poisoned");
+            providers
+                .entry(rpc_url.to_string())
+                .or_insert_with(|| provider.clone());
+        }
+        Ok(provider)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("executor cache mutex poisoned")
+            .len()
     }
 
     /// Return a cached executor for `(rpc_url, block_number)`, building one if absent.
@@ -163,6 +218,8 @@ impl EvmSketchExecutorCache {
     /// Two concurrent callers that both miss may each call `build()`; the later
     /// `put` overwrites the earlier entry.  Both executors are equivalent, so this
     /// is safe — it only wastes one build in the rare cold-start race.
+    ///
+    /// Chain ID is fetched at most once per RPC URL across all block numbers.
     pub async fn get_or_build(
         &self,
         rpc_url: &str,
@@ -177,9 +234,35 @@ impl EvmSketchExecutorCache {
         }
 
         let url = Url::parse(rpc_url).map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+
+        // Chain ID is static per network — fetch once and reuse across blocks.
+        let chain_id = {
+            self.chain_ids
+                .lock()
+                .expect("chain_id cache mutex poisoned")
+                .get(rpc_url)
+                .copied()
+        };
+        let chain_id = match chain_id {
+            Some(id) => id,
+            None => {
+                let provider = RootProvider::<AnyNetwork>::new_http(url.clone());
+                let id = provider
+                    .get_chain_id()
+                    .await
+                    .map_err(|e| anyhow!("Failed to query eth_chainId: {}", e))?;
+                self.chain_ids
+                    .lock()
+                    .expect("chain_id cache mutex poisoned")
+                    .insert(rpc_url.to_string(), id);
+                id
+            }
+        };
+
         let exec = Arc::new(
             EvmSketchExecutorBuilder::new()
                 .rpc_url(url)
+                .with_chain_id(chain_id)
                 .at_block(BlockNumberOrTag::Number(block_number))
                 .build()
                 .await?,
@@ -245,6 +328,7 @@ pub struct EvmSketchExecutor<P, PT> {
 pub struct EvmSketchExecutorBuilder {
     rpc_url: Option<Url>,
     block: BlockNumberOrTag,
+    chain_id: Option<u64>,
 }
 
 impl EvmSketchExecutorBuilder {
@@ -265,20 +349,32 @@ impl EvmSketchExecutorBuilder {
         self
     }
 
+    /// Supply a pre-fetched chain ID, skipping the `eth_chainId` probe in `build`.
+    ///
+    /// Use this when the chain ID is already known (e.g. cached from a prior
+    /// call) to avoid an extra round-trip per executor build.
+    pub fn with_chain_id(mut self, chain_id: u64) -> Self {
+        self.chain_id = Some(chain_id);
+        self
+    }
+
     /// Build the EvmSketchExecutor.
     ///
-    /// Queries `eth_chainId` from the RPC and selects the matching `Genesis`
+    /// Queries `eth_chainId` from the RPC if not already supplied via
+    /// [`with_chain_id`](Self::with_chain_id), then selects the matching `Genesis`
     /// and hardfork schedule. Errors on unsupported chains: silently defaulting
     /// to mainnet when pointed at a different network would yield wrong hardfork
     /// activation and corrupt gas estimation.
     pub async fn build(self) -> Result<DefaultEvmSketchExecutor> {
         let rpc_url = self.rpc_url.ok_or_else(|| anyhow!("RPC URL is required"))?;
 
-        let chain_probe = RootProvider::<AnyNetwork>::new_http(rpc_url.clone());
-        let chain_id = chain_probe
-            .get_chain_id()
-            .await
-            .map_err(|e| anyhow!("Failed to query eth_chainId: {}", e))?;
+        let chain_id = match self.chain_id {
+            Some(id) => id,
+            None => RootProvider::<AnyNetwork>::new_http(rpc_url.clone())
+                .get_chain_id()
+                .await
+                .map_err(|e| anyhow!("Failed to query eth_chainId: {}", e))?,
+        };
         let (genesis, hardforks) = chain_id_to_genesis_and_spec(chain_id)?;
 
         let sketch = EvmSketch::builder()
@@ -344,6 +440,42 @@ impl DefaultEvmSketchExecutor {
         let state_block = self.anchor_block_number().saturating_sub(1);
         let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
         let mut cache_db = CacheDB::new(simple_db);
+        let sim_env = self.sim_env();
+        gas_analyzer_estimator::estimate_state_changes_gas(
+            &mut cache_db,
+            contract_address,
+            caller_address,
+            state_updates,
+            &sim_env,
+        )
+    }
+
+    /// Estimate gas for a set of state updates, prefetching storage slots first.
+    ///
+    /// Like `estimate_state_changes_gas` but accepts a map of `address →
+    /// storage keys` sourced from the transaction's EIP-2930 access list (or
+    /// any other prior knowledge). Before EVM execution begins, each address
+    /// in `storage_hints` is fetched via a single `eth_getProof` call that
+    /// returns both account metadata and the listed slot values, eliminating
+    /// the per-slot `eth_getStorageAt` round-trips for those keys.
+    ///
+    /// Cold-miss slots not present in `storage_hints` still fall back to
+    /// `eth_getStorageAt` during execution — an incomplete hint set is safe.
+    pub async fn estimate_state_changes_gas_with_hints(
+        &self,
+        contract_address: Address,
+        caller_address: Address,
+        state_updates: &[gas_analyzer_core::StateUpdate],
+        storage_hints: &HashMap<Address, Vec<B256>>,
+    ) -> Result<u64> {
+        let state_block = self.anchor_block_number().saturating_sub(1);
+        let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
+        let mut cache_db = CacheDB::new(simple_db);
+
+        prefetch_slots_into_cache(&mut cache_db, storage_hints)
+            .await
+            .context("storage slot prefetch failed")?;
+
         let sim_env = self.sim_env();
         gas_analyzer_estimator::estimate_state_changes_gas(
             &mut cache_db,
@@ -516,6 +648,30 @@ impl GasKillerEvmSketchDefault {
         let mut sim_env = self.executor.sim_env();
 
         if !preceding_txs.is_empty() {
+            // Prefetch storage slots declared in preceding-tx access lists so
+            // that replay_preceding_transactions reads from the in-process cache
+            // instead of issuing per-slot eth_getStorageAt calls.
+            let mut hints: HashMap<Address, Vec<B256>> = HashMap::new();
+            for tx in preceding_txs {
+                for item in tx.access_list.iter() {
+                    if !item.storage_keys.is_empty() {
+                        hints
+                            .entry(item.address)
+                            .or_default()
+                            .extend(item.storage_keys.iter().copied());
+                    }
+                }
+            }
+
+            if !hints.is_empty() {
+                let handle = tokio::runtime::Handle::try_current()
+                    .context("no tokio runtime for storage prefetch")?;
+                tokio::task::block_in_place(|| {
+                    handle.block_on(prefetch_slots_into_cache(&mut cache_db, &hints))
+                })
+                .context("prefetch storage slots for preceding txs")?;
+            }
+
             gas_analyzer_estimator::replay_preceding_transactions(
                 &mut cache_db,
                 preceding_txs,
@@ -535,16 +691,18 @@ impl GasKillerEvmSketchDefault {
 
     /// Estimate gas using a fallback heuristic based on the original transaction trace.
     ///
-    /// This extracts operations (SSTORE, LOG, CALL) from the original transaction trace
-    /// and applies heuristic costs.
+    /// `status` must be `receipt.status()` for `tx_hash`. Pass the already-fetched
+    /// receipt's status to avoid an extra `eth_getTransactionReceipt` round-trip.
+    /// Extracts operations (SSTORE, LOG, CALL) from the trace and applies heuristic costs.
     pub async fn estimate_gas_from_trace<P: Provider + DebugApi>(
         &self,
         provider: &P,
         tx_hash: alloy::primitives::FixedBytes<32>,
+        status: bool,
     ) -> Result<u64> {
         use gas_analyzer_rpc::get_tx_trace;
 
-        let trace = get_tx_trace(provider, tx_hash).await?;
+        let trace = get_tx_trace(provider, tx_hash, status).await?;
         let operations = extract_operation_counts_from_trace(&trace);
         Ok(estimate_gas_from_operations(&operations))
     }
@@ -564,26 +722,55 @@ impl GasKillerEvmSketchDefault {
 // call_to_encoded_state_updates_with_evmsketch
 // ============================================================================
 
+/// Derive prefetch hints from a set of state updates.
+///
+/// - `Store`: the slot is at `contract_address`; batching all slots into one
+///   `eth_getProof` call returns every value in a single round-trip.
+/// - `Call`: the target address will be loaded by revm; an empty key list
+///   prefetches just account info (balance/nonce/code), eliminating one
+///   blocking `basic_ref` call during gas estimation.
+/// - `Log*`: carry no addressable state and produce no hints.
+fn hints_from_state_updates(
+    contract_address: Address,
+    state_updates: &[StateUpdate],
+) -> HashMap<Address, Vec<B256>> {
+    let mut hints: HashMap<Address, Vec<B256>> = HashMap::new();
+    // Always prefetch contract_address account info even if there are no Store updates.
+    hints.entry(contract_address).or_default();
+    for update in state_updates {
+        match update {
+            StateUpdate::Store(s) => {
+                hints.entry(contract_address).or_default().push(s.slot);
+            }
+            StateUpdate::Call(c) => {
+                hints.entry(c.target).or_default();
+            }
+            _ => {}
+        }
+    }
+    hints
+}
+
 /// Compute encoded state updates and gas estimate for a transaction call using EvmSketch.
 ///
 /// Simulates the call via `debug_traceCall` at the given block, extracts state updates,
 /// encodes them to ABI, and estimates gas. The executor build step (~50–70 ms,
-/// 1× `eth_getBlockByNumber`) is skipped on cache hits.
-///
-/// Pass a persistent `EvmSketchExecutorCache` shared across requests for the best
-/// performance.  For one-shot use (benchmarks, CLI) pass `&EvmSketchExecutorCache::new(1)`.
+/// 1× `eth_getBlockByNumber`) is skipped on cache hits. The HTTP connection pool for
+/// `rpc_url` is managed by `cache` and shared across calls — pass a persistent
+/// `EvmSketchExecutorCache` for best performance; for one-shot use pass
+/// `&EvmSketchExecutorCache::new(1)`.
 ///
 /// # Returns
 /// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`
-#[tracing::instrument(name = "evmsketch.encode", skip_all, fields(block_number = %block, state_update_count = tracing::field::Empty))]
+#[tracing::instrument(name = "evmsketch.encode", skip_all, fields(block_number, state_update_count = tracing::field::Empty))]
 pub async fn call_to_encoded_state_updates_with_evmsketch(
     cache: &EvmSketchExecutorCache,
     rpc_url: impl AsRef<str>,
     tx_request: TransactionRequest,
-    block: BlockNumberOrTag,
+    block_number: u64,
 ) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
     let rpc_url = rpc_url.as_ref();
-    let url = Url::parse(rpc_url).map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+    let provider = cache.get_or_create_trace_provider(rpc_url)?;
 
     let contract_address = tx_request
         .to
@@ -595,27 +782,50 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 
     let caller_address = tx_request.from.unwrap_or_default();
 
-    let block_number = match block {
-        BlockNumberOrTag::Number(n) => n,
-        _ => {
-            return Err(anyhow!(
-                "executor cache requires a specific block number, got {:?}",
-                block
-            ));
+    // Collect storage hints from the EIP-2930 access list before tx_request
+    // is consumed by get_trace_from_call. Address-only entries (no storage keys)
+    // are included with an empty slot list so their account info is prefetched.
+    let mut storage_hints: HashMap<Address, Vec<B256>> = HashMap::new();
+    if let Some(al) = &tx_request.access_list {
+        for item in al.iter() {
+            storage_hints
+                .entry(item.address)
+                .or_default()
+                .extend(item.storage_keys.iter().copied());
         }
-    };
+    }
 
-    let provider = ProviderBuilder::new().connect_http(url);
-    let block_id = BlockId::Number(block);
-    let trace = get_trace_from_call(&provider, tx_request, block_id).await?;
+    let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
+
+    // Run debug_traceCall and executor cache lookup concurrently — they are
+    // fully independent. On a cache miss this hides the entire executor build
+    // behind the trace fetch.
+    let (trace, executor) = tokio::try_join!(
+        get_trace_from_call(&provider, tx_request, block_id),
+        cache.get_or_build(rpc_url, block_number),
+    )?;
+
     let (state_updates, skipped_opcodes, _call_gas_total) = compute_state_updates(trace)?;
     tracing::Span::current().record("state_update_count", state_updates.len());
 
     let storage_updates = encode_state_updates_to_abi(&state_updates);
 
-    let executor = cache.get_or_build(rpc_url, block_number).await?;
-    let gas_estimate =
-        executor.estimate_state_changes_gas(contract_address, caller_address, &state_updates)?;
+    // Merge access-list hints with slots derived from state_updates.
+    // Store slots all land at contract_address (one eth_getProof call for all of them).
+    // Call targets get account-info-only prefetch (empty key list).
+    let mut all_hints = hints_from_state_updates(contract_address, &state_updates);
+    for (addr, slots) in storage_hints {
+        all_hints.entry(addr).or_default().extend(slots);
+    }
+
+    let gas_estimate = executor
+        .estimate_state_changes_gas_with_hints(
+            contract_address,
+            caller_address,
+            &state_updates,
+            &all_hints,
+        )
+        .await?;
 
     Ok((storage_updates, gas_estimate, false, skipped_opcodes))
 }
@@ -628,6 +838,58 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 mod tests {
     use super::*;
     use alloy::primitives::{address, bytes};
+    use alloy::providers::ProviderBuilder;
+    use gas_analyzer_core::types::IStateUpdateTypes;
+
+    /// `with_chain_id` must store the supplied value so `build` can bypass the
+    /// `eth_chainId` probe.
+    #[test]
+    fn test_builder_with_chain_id_stores_value() {
+        let builder = EvmSketchExecutorBuilder::new().with_chain_id(SEPOLIA_CHAIN_ID);
+        assert_eq!(builder.chain_id, Some(SEPOLIA_CHAIN_ID));
+
+        let builder_none = EvmSketchExecutorBuilder::new();
+        assert_eq!(builder_none.chain_id, None);
+    }
+
+    /// `EvmSketchExecutorCache` must issue `eth_chainId` at most once per RPC
+    /// URL regardless of how many distinct block numbers are requested.
+    ///
+    /// Verified by building executors for two different block numbers on the
+    /// same URL and checking that the second build finds a cached chain_id.
+    /// (The direct assertion is on the internal `chain_ids` map having exactly
+    /// one entry after both builds.)
+    #[tokio::test]
+    #[ignore = "requires RPC_URL env var"]
+    async fn test_chain_id_cached_across_blocks() {
+        let rpc_url = std::env::var("RPC_URL").expect("RPC_URL must be set");
+        let cache = EvmSketchExecutorCache::new(4);
+
+        let provider = ProviderBuilder::new().connect_http(Url::parse(&rpc_url).unwrap());
+        let latest = provider.get_block_number().await.unwrap();
+
+        // Build for two consecutive blocks — chain_id must be fetched only once.
+        let _ = cache.get_or_build(&rpc_url, latest).await.unwrap();
+        let _ = cache
+            .get_or_build(&rpc_url, latest.saturating_sub(1))
+            .await
+            .unwrap();
+
+        let ids = cache
+            .chain_ids
+            .lock()
+            .expect("chain_id cache mutex poisoned");
+        assert_eq!(
+            ids.len(),
+            1,
+            "expected exactly one chain_id cache entry for the URL, got {}",
+            ids.len()
+        );
+        assert!(
+            ids.contains_key(&rpc_url),
+            "chain_id not cached under the expected key"
+        );
+    }
 
     /// Two `get_or_build` calls for the same key must return `Arc`s that point to the
     /// same allocation (i.e. the second call is a cache hit, not a new build).
@@ -650,24 +912,36 @@ mod tests {
         );
     }
 
-    /// A cache with capacity 1 must evict the old entry when a new key is inserted,
-    /// so a subsequent lookup of the evicted key misses and allocates a fresh Arc.
-    #[test]
-    fn test_executor_cache_lru_eviction() {
-        // We can only test the LRU capacity logic without a live RPC by checking
-        // that the underlying LruCache size stays bounded.  Use the lru crate
-        // directly here as a smoke-test for the capacity argument.
-        let mut lru: LruCache<(String, u64), u32> = LruCache::new(NonZeroUsize::new(2).unwrap());
-        lru.put(("rpc".into(), 1), 1);
-        lru.put(("rpc".into(), 2), 2);
-        lru.put(("rpc".into(), 3), 3); // evicts ("rpc", 1)
-        assert_eq!(lru.len(), 2);
-        assert!(
-            lru.get(&("rpc".into(), 1)).is_none(),
-            "oldest entry should be evicted"
+    /// A capacity-1 cache must evict the old entry when a new key is inserted,
+    /// so a subsequent lookup of the evicted key misses and rebuilds a fresh Arc.
+    #[tokio::test]
+    #[ignore = "requires RPC_URL env var"]
+    async fn test_executor_cache_lru_eviction() {
+        let rpc_url = std::env::var("RPC_URL").expect("RPC_URL must be set");
+        let cache = EvmSketchExecutorCache::new(1);
+
+        let provider = ProviderBuilder::new().connect_http(Url::parse(&rpc_url).unwrap());
+        let block_b = provider.get_block_number().await.unwrap();
+        let block_a = block_b.saturating_sub(1);
+
+        // Insert block_a — cache has 1 entry.
+        let arc_a1 = cache.get_or_build(&rpc_url, block_a).await.unwrap();
+        assert_eq!(cache.len(), 1);
+
+        // Insert block_b — evicts block_a, cache still has 1 entry.
+        cache.get_or_build(&rpc_url, block_b).await.unwrap();
+        assert_eq!(
+            cache.len(),
+            1,
+            "capacity-1 cache must not grow beyond 1 entry"
         );
-        assert!(lru.get(&("rpc".into(), 2)).is_some());
-        assert!(lru.get(&("rpc".into(), 3)).is_some());
+
+        // Re-request block_a — must be a miss, yielding a freshly built Arc.
+        let arc_a2 = cache.get_or_build(&rpc_url, block_a).await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&arc_a1, &arc_a2),
+            "block_a Arc must be rebuilt after eviction, not returned from cache"
+        );
     }
 
     #[test]
@@ -989,5 +1263,62 @@ mod tests {
             "mainnet at ts {} should still be SHANGHAI (Cancun activates at 1_710_338_135)",
             TS_BETWEEN_GNOSIS_AND_MAINNET_CANCUN,
         );
+    }
+
+    /// `hints_from_state_updates` must always include contract_address (even
+    /// with no Store updates), map Store slots to it, add Call targets with
+    /// empty slot lists, and produce no entry for logs.
+    #[test]
+    fn test_hints_from_state_updates() {
+        use alloy::primitives::Bytes;
+
+        let contract = address!("0x000000000000000000000000000000000000DEAD");
+        let call_target = address!("0x000000000000000000000000000000000000BEEF");
+        let slot1 = B256::from(U256::from(1u64));
+        let slot2 = B256::from(U256::from(2u64));
+
+        let updates = vec![
+            StateUpdate::Store(IStateUpdateTypes::Store {
+                slot: slot1,
+                value: B256::ZERO,
+            }),
+            StateUpdate::Store(IStateUpdateTypes::Store {
+                slot: slot2,
+                value: B256::ZERO,
+            }),
+            StateUpdate::Call(IStateUpdateTypes::Call {
+                target: call_target,
+                value: U256::ZERO,
+                callargs: Bytes::new(),
+            }),
+            StateUpdate::Log0(IStateUpdateTypes::Log0 { data: Bytes::new() }),
+        ];
+
+        let hints = hints_from_state_updates(contract, &updates);
+
+        // Both Store slots map to contract_address.
+        assert_eq!(hints.get(&contract), Some(&vec![slot1, slot2]));
+
+        // Call target is present with an empty slot list (account-only prefetch).
+        assert_eq!(hints.get(&call_target), Some(&vec![]));
+
+        // Log produces no entry — only contract and call_target.
+        assert_eq!(hints.len(), 2);
+    }
+
+    /// contract_address must be prefetched even when there are no Store updates.
+    #[test]
+    fn test_hints_from_state_updates_contract_always_present() {
+        use alloy::primitives::Bytes;
+
+        let contract = address!("0x000000000000000000000000000000000000DEAD");
+        let updates = vec![StateUpdate::Log0(IStateUpdateTypes::Log0 {
+            data: Bytes::new(),
+        })];
+
+        let hints = hints_from_state_updates(contract, &updates);
+
+        assert_eq!(hints.get(&contract), Some(&vec![]));
+        assert_eq!(hints.len(), 1);
     }
 }

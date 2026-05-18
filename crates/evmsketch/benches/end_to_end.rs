@@ -11,7 +11,6 @@ use std::time::Duration;
 use alloy::primitives::{FixedBytes, TxKind};
 use alloy::providers::ProviderBuilder;
 use alloy::rpc::types::eth::{TransactionInput, TransactionRequest};
-use alloy_eips::BlockNumberOrTag;
 use alloy_provider::Provider;
 use alloy_rpc_types::TransactionTrait;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
@@ -32,11 +31,13 @@ fn bench_end_to_end(c: &mut Criterion) {
 
     let rt = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");
 
+    // Single provider created once and reused across all benchmark iterations —
+    // the underlying reqwest connection pool is shared, avoiding repeated TCP/TLS
+    // handshakes per iteration.
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse().expect("invalid RPC_URL"));
+
     // Fetch tx details once outside the measured region.
     let (tx_request, block) = rt.block_on(async {
-        let provider =
-            ProviderBuilder::new().connect_http(rpc_url.parse().expect("invalid RPC_URL"));
-
         let hash: FixedBytes<32> = SEPOLIA_TX_HASH.parse().expect("invalid tx hash constant");
 
         let tx = provider
@@ -61,10 +62,10 @@ fn bench_end_to_end(c: &mut Criterion) {
             ..Default::default()
         };
 
-        (req, BlockNumberOrTag::Number(block_num))
+        (req, block_num)
     });
 
-    eprintln!("end_to_end: pinned to block {block:?}, tx {SEPOLIA_TX_HASH}");
+    eprintln!("end_to_end: pinned to block {block}, tx {SEPOLIA_TX_HASH}");
 
     let mut group = c.benchmark_group("end_to_end");
     group.sample_size(10);
