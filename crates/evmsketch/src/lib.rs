@@ -734,6 +734,8 @@ fn hints_from_state_updates(
     state_updates: &[StateUpdate],
 ) -> HashMap<Address, Vec<B256>> {
     let mut hints: HashMap<Address, Vec<B256>> = HashMap::new();
+    // Always prefetch contract_address account info even if there are no Store updates.
+    hints.entry(contract_address).or_default();
     for update in state_updates {
         match update {
             StateUpdate::Store(s) => {
@@ -780,17 +782,15 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
     let caller_address = tx_request.from.unwrap_or_default();
 
     // Collect storage hints from the EIP-2930 access list before tx_request
-    // is consumed by get_trace_from_call. Only entries with actual slot keys are
-    // included — address-only EIP-2930 entries have no storage to prefetch.
+    // is consumed by get_trace_from_call. Address-only entries (no storage keys)
+    // are included with an empty slot list so their account info is prefetched.
     let mut storage_hints: HashMap<Address, Vec<B256>> = HashMap::new();
     if let Some(al) = &tx_request.access_list {
         for item in al.iter() {
-            if !item.storage_keys.is_empty() {
-                storage_hints
-                    .entry(item.address)
-                    .or_default()
-                    .extend(item.storage_keys.iter().copied());
-            }
+            storage_hints
+                .entry(item.address)
+                .or_default()
+                .extend(item.storage_keys.iter().copied());
         }
     }
 
@@ -1264,8 +1264,9 @@ mod tests {
         );
     }
 
-    /// `hints_from_state_updates` must map Store slots to contract_address,
-    /// add Call targets with empty slot lists, and produce no entry for logs.
+    /// `hints_from_state_updates` must always include contract_address (even
+    /// with no Store updates), map Store slots to it, add Call targets with
+    /// empty slot lists, and produce no entry for logs.
     #[test]
     fn test_hints_from_state_updates() {
         use alloy::primitives::Bytes;
@@ -1302,5 +1303,21 @@ mod tests {
 
         // Log produces no entry — only contract and call_target.
         assert_eq!(hints.len(), 2);
+    }
+
+    /// contract_address must be prefetched even when there are no Store updates.
+    #[test]
+    fn test_hints_from_state_updates_contract_always_present() {
+        use alloy::primitives::Bytes;
+
+        let contract = address!("0x000000000000000000000000000000000000DEAD");
+        let updates = vec![StateUpdate::Log0(IStateUpdateTypes::Log0 {
+            data: Bytes::new(),
+        })];
+
+        let hints = hints_from_state_updates(contract, &updates);
+
+        assert_eq!(hints.get(&contract), Some(&vec![]));
+        assert_eq!(hints.len(), 1);
     }
 }
