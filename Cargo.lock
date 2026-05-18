@@ -8275,7 +8275,7 @@ dependencies = [
 [[package]]
 name = "sp1-cc-client-executor"
 version = "0.1.0"
-source = "git+https://github.com/BreadchainCoop/sp1-contract-call?branch=cancun-v1#5bd19eb3f73fb212c6f9365e24b2da462f601bc6"
+source = "git+https://github.com/BreadchainCoop/sp1-contract-call?branch=cancun-v1#b634853416e2d1ee4973e2c7d52ad9853eee1e9b"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -8310,7 +8310,7 @@ dependencies = [
 [[package]]
 name = "sp1-cc-host-executor"
 version = "0.1.0"
-source = "git+https://github.com/BreadchainCoop/sp1-contract-call?branch=cancun-v1#5bd19eb3f73fb212c6f9365e24b2da462f601bc6"
+source = "git+https://github.com/BreadchainCoop/sp1-contract-call?branch=cancun-v1#b634853416e2d1ee4973e2c7d52ad9853eee1e9b"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
