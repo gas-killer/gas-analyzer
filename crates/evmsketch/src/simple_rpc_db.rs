@@ -302,7 +302,7 @@ pub async fn prefetch_slots_into_cache(
 
     // Phase 2: collect results and insert into cache_db.
     while let Some(task_res) = set.join_next().await {
-        let (address, proof_res, code_res) = task_res.context("prefetch task panicked")?;
+        let (address, proof_res, code_res) = task_res.context("prefetch task failed")?;
 
         let proof = match proof_res {
             Ok(p) => p,
