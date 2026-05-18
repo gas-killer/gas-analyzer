@@ -136,16 +136,18 @@ pub type DefaultEvmSketchExecutor = EvmSketchExecutor<DefaultProvider, DefaultPr
 /// companion provider cache so the same HTTP connection pool is reused across
 /// all `debug_traceCall` requests to the same endpoint.
 ///
-/// `build()` costs ~50–70 ms (1× `eth_getBlockByNumber`).  An executor is safe
-/// to reuse across requests at the same block height: `sim_env()` reads only
-/// immutable header fields, and each gas estimate constructs its own `CacheDB`.
-/// Executors are keyed by `(rpc_url, block_number)`. Trace providers are keyed
-/// by `rpc_url` only — a single [`RootProvider`] is shared across all block
-/// heights for the same endpoint, avoiding repeated TCP/TLS handshakes.
+/// An executor cache miss costs ~50–70 ms (1× `eth_getBlockByNumber`) once the
+/// chain ID for that URL is known; the very first miss per URL also pays
+/// `eth_chainId` (~16–50 ms extra). An executor is safe to reuse across requests
+/// at the same block height: `sim_env()` reads only immutable header fields, and
+/// each gas estimate constructs its own `CacheDB`. Executors are keyed by
+/// `(rpc_url, block_number)`. Trace providers are keyed by `rpc_url` only — a
+/// single [`RootProvider`] is shared across all block heights for the same
+/// endpoint, avoiding repeated TCP/TLS handshakes.
 ///
 /// Chain ID is static per network: it is fetched once per RPC URL and reused
 /// across all block-number entries for that URL, eliminating one `eth_chainId`
-/// round-trip (~16–50 ms) on every executor cache miss.
+/// round-trip (~16–50 ms) on every subsequent executor cache miss.
 ///
 /// A capacity of 4 covers all realistic burst scenarios on mainnet (~12 s blocks).
 pub struct EvmSketchExecutorCache {
@@ -755,7 +757,8 @@ fn hints_from_state_updates(
 ///
 /// Simulates the call via `debug_traceCall` at the given block, extracts state updates,
 /// encodes them to ABI, and estimates gas. The executor build step (~50–70 ms,
-/// 1× `eth_getBlockByNumber`) is skipped on cache hits. The HTTP connection pool for
+/// 1× `eth_getBlockByNumber`; plus `eth_chainId` on the first miss per URL) is
+/// skipped on cache hits. The HTTP connection pool for
 /// `rpc_url` is managed by `cache` and shared across calls — pass a persistent
 /// `EvmSketchExecutorCache` for best performance; for one-shot use pass
 /// `&EvmSketchExecutorCache::new(1)`.
