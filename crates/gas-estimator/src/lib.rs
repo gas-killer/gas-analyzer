@@ -198,7 +198,7 @@ where
         contract_address,
         AccountInfo {
             balance: original_account.balance,
-            nonce: 0,
+            nonce: original_account.nonce,
             code_hash: B256::ZERO,
             code: Some(revm::state::Bytecode::new_raw(estimator_bytecode())),
         },
