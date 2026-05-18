@@ -57,7 +57,7 @@ pub fn parse_trace_memory(memory: Vec<String>) -> Vec<u8> {
 
 /// Extract a state update from a Geth StructLog entry.
 ///
-/// Returns `Ok(Some(opcode))` if the opcode should be skipped (CREATE, etc.),
+/// Returns `Ok(Some(opcode))` if the opcode is unsupported and was skipped (SELFDESTRUCT, TSTORE),
 /// `Ok(None)` if successfully processed or not a state-changing opcode,
 /// or an error if something unexpected happened.
 pub fn append_state_update_from_struct_log(
@@ -78,8 +78,28 @@ pub fn append_state_update_from_struct_log(
     };
 
     match struct_log.op.as_ref() {
-        "CREATE" | "CREATE2" | "SELFDESTRUCT" | "TSTORE" => {
+        "SELFDESTRUCT" | "TSTORE" => {
             return Ok(Some(struct_log.op.to_string()));
+        }
+        "CREATE" => {
+            // Stack: [value, offset, size] (top = index 0 after reverse)
+            let offset: usize = stack[1].try_into().expect("invalid CREATE offset");
+            let length: usize = stack[2].try_into().expect("invalid CREATE length");
+            let initcode = copy_memory(&memory, offset, length);
+            state_updates.push(StateUpdate::Create(IStateUpdateTypes::Create {
+                initcode: initcode.into(),
+            }));
+        }
+        "CREATE2" => {
+            // Stack: [value, offset, size, salt] (top = index 0 after reverse)
+            let offset: usize = stack[1].try_into().expect("invalid CREATE2 offset");
+            let length: usize = stack[2].try_into().expect("invalid CREATE2 length");
+            let salt = stack[3];
+            let initcode = copy_memory(&memory, offset, length);
+            state_updates.push(StateUpdate::Create2(IStateUpdateTypes::Create2 {
+                salt: salt.into(),
+                initcode: initcode.into(),
+            }));
         }
         "DELEGATECALL" | "CALLCODE" => {
             bail!(
@@ -219,7 +239,15 @@ pub fn compute_state_updates(
                 call_type_at_depth.insert(depth + 1, "DELEGATECALL");
             } else if matches!(
                 op.as_str(),
-                "CALL" | "SSTORE" | "LOG0" | "LOG1" | "LOG2" | "LOG3" | "LOG4"
+                "CALL"
+                    | "SSTORE"
+                    | "LOG0"
+                    | "LOG1"
+                    | "LOG2"
+                    | "LOG3"
+                    | "LOG4"
+                    | "CREATE"
+                    | "CREATE2"
             ) {
                 // Filter out all state-changing operations (CALL, SSTORE, LOG*) that are nested within any CALL
                 // (they'll be executed as part of the outer CALL, so we can't optimize them)
@@ -270,7 +298,87 @@ pub fn compute_state_updates(
 
 #[cfg(test)]
 mod tests {
+    use alloy_primitives::U256;
+
     use super::*;
+
+    fn make_struct_log(op: &str, stack: Vec<U256>, memory_words: Vec<&str>) -> StructLog {
+        StructLog {
+            pc: 0,
+            op: op.to_string().into(),
+            gas: 100_000,
+            gas_cost: 0,
+            depth: 1,
+            error: None,
+            stack: Some(stack),
+            return_data: None,
+            memory: Some(memory_words.iter().map(|s| s.to_string()).collect()),
+            memory_size: None,
+            storage: None,
+            refund_counter: None,
+        }
+    }
+
+    #[test]
+    fn create_extracts_initcode_from_memory() {
+        // Initcode: 0x6080604052 (5 bytes) placed at memory offset 0.
+        // Memory word: 5 bytes + 27 zero bytes = 32 bytes total.
+        let memory_word = "6080604052000000000000000000000000000000000000000000000000000000";
+
+        // Stack before CREATE (bottom→top): size=5, offset=0, value=0
+        // After stack.reverse(): stack[0]=value=0, stack[1]=offset=0, stack[2]=size=5
+        let stack = vec![
+            U256::from(5u64), // size (bottom, becomes stack[2] after reverse)
+            U256::from(0u64), // offset (becomes stack[1])
+            U256::from(0u64), // value (top, becomes stack[0])
+        ];
+
+        let mut updates = Vec::new();
+        let result = append_state_update_from_struct_log(
+            &mut updates,
+            make_struct_log("CREATE", stack, vec![memory_word]),
+        );
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "CREATE should not be skipped");
+        assert_eq!(updates.len(), 1);
+
+        let StateUpdate::Create(c) = &updates[0] else {
+            panic!("expected Create, got {:?}", updates[0]);
+        };
+        assert_eq!(&c.initcode[..], &[0x60, 0x80, 0x60, 0x40, 0x52]);
+    }
+
+    #[test]
+    fn create2_extracts_salt_and_initcode_from_memory() {
+        let memory_word = "6080604052000000000000000000000000000000000000000000000000000000";
+
+        // Stack before CREATE2 (bottom→top): salt, size=5, offset=0, value=0
+        // After stack.reverse(): stack[0]=value=0, stack[1]=offset=0, stack[2]=size=5, stack[3]=salt
+        let salt_val = U256::from(0xdeadbeef_u64);
+        let stack = vec![
+            salt_val,         // salt (bottom, becomes stack[3] after reverse)
+            U256::from(5u64), // size (becomes stack[2])
+            U256::from(0u64), // offset (becomes stack[1])
+            U256::from(0u64), // value (top, becomes stack[0])
+        ];
+
+        let mut updates = Vec::new();
+        let result = append_state_update_from_struct_log(
+            &mut updates,
+            make_struct_log("CREATE2", stack, vec![memory_word]),
+        );
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "CREATE2 should not be skipped");
+        assert_eq!(updates.len(), 1);
+
+        let StateUpdate::Create2(c) = &updates[0] else {
+            panic!("expected Create2, got {:?}", updates[0]);
+        };
+        assert_eq!(&c.initcode[..], &[0x60, 0x80, 0x60, 0x40, 0x52]);
+        assert_eq!(c.salt, alloy_primitives::B256::from(salt_val));
+    }
 
     #[test]
     fn parse_trace_memory_handles_both_prefixed_and_bare_hex() {

@@ -13,7 +13,9 @@ sol! {
         LOG1,
         LOG2,
         LOG3,
-        LOG4
+        LOG4,
+        CREATE,
+        CREATE2
     }
 
     #[derive(Debug)]
@@ -57,6 +59,15 @@ sol! {
             bytes32 topic2;
             bytes32 topic3;
             bytes32 topic4;
+        }
+
+        struct Create {
+            bytes initcode;
+        }
+
+        struct Create2 {
+            bytes32 salt;
+            bytes initcode;
         }
     }
 }
@@ -133,4 +144,6 @@ pub enum StateUpdate {
     Log2(IStateUpdateTypes::Log2),
     Log3(IStateUpdateTypes::Log3),
     Log4(IStateUpdateTypes::Log4),
+    Create(IStateUpdateTypes::Create),
+    Create2(IStateUpdateTypes::Create2),
 }
