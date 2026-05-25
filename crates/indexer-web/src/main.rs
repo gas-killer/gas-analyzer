@@ -91,6 +91,11 @@ struct Cli {
     #[arg(long, env = "LABELER_RETRY_DAYS", default_value_t = 7)]
     labeler_retry_days: i64,
 
+    /// Number of blocks the analyzer can fall behind the chain head before
+    /// /admin paints a red warning banner. 50 ≈ 5 min on Gnosis.
+    #[arg(long, env = "BLOCKS_BEHIND_WARN_THRESHOLD", default_value_t = 50)]
+    blocks_behind_warn_threshold: i64,
+
     // -------- AI diagnostics --------
     /// OpenRouter API key. Empty disables the diagnostics button.
     #[arg(long, env = "OPENROUTER_KEY", default_value = "")]
@@ -131,6 +136,8 @@ pub struct AppState {
     pub price_url: Arc<String>,
     pub labeler_batch_size: i64,
     pub labeler_retry_days: i64,
+    /// Banner threshold. `blocks_behind > threshold` paints red on /admin.
+    pub blocks_behind_warn_threshold: i64,
 
     // AI diagnostics. `llm` is None when no API key is configured.
     pub llm: Option<llm::LlmClient>,
@@ -219,6 +226,7 @@ async fn main() -> Result<()> {
         price_url: Arc::new(cli.price_url),
         labeler_batch_size: cli.labeler_batch_size,
         labeler_retry_days: cli.labeler_retry_days,
+        blocks_behind_warn_threshold: cli.blocks_behind_warn_threshold,
         llm,
         diagnose_cache: Arc::new(tokio::sync::Mutex::new(DiagnoseCache::default())),
         diagnose_rate_limit_secs: cli.diagnose_rate_limit_secs,

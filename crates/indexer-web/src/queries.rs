@@ -997,6 +997,67 @@ pub async fn resolved_label(
     Ok(row)
 }
 
+/// Heuristic-fallback share over the last 24h. Returns `None` when there
+/// are no analyses in the window (don't render anything).
+pub async fn heuristic_rate_24h(
+    pool: &PgPool,
+    chain_id: i64,
+) -> Result<Option<f64>, WebError> {
+    let row: (Option<i64>, Option<i64>) = sqlx::query_as(
+        r#"SELECT
+             count(*) FILTER (WHERE is_heuristic)::bigint AS heuristic_count,
+             count(*)::bigint                              AS total_count
+           FROM analysis
+           WHERE chain_id = $1
+             AND inserted_at >= now() - interval '24 hours'"#,
+    )
+    .bind(chain_id)
+    .fetch_one(pool)
+    .await?;
+    let total = row.1.unwrap_or(0);
+    if total == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(row.0.unwrap_or(0) as f64 / total as f64))
+    }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ErrorCategoryQueryRow {
+    pub category: String,
+    pub count: Option<i64>,
+}
+
+/// Categorize `failure_reason` strings into typed buckets via SQL CASE
+/// matching. Patterns lifted from operator-observed errors; extend as
+/// new shapes appear.
+pub async fn error_categories_24h(
+    pool: &PgPool,
+    chain_id: i64,
+) -> Result<Vec<ErrorCategoryQueryRow>, WebError> {
+    let rows = sqlx::query_as::<_, ErrorCategoryQueryRow>(
+        r#"SELECT
+             CASE
+                 WHEN failure_reason ILIKE '%rate limit%'   THEN 'rate_limit'
+                 WHEN failure_reason ILIKE '%timeout%'      THEN 'timeout'
+                 WHEN failure_reason ILIKE '%response size%' THEN 'response_too_large'
+                 WHEN failure_reason ILIKE '%429%'          THEN 'rate_limit'
+                 ELSE 'other'
+             END                                            AS category,
+             count(*)::bigint                               AS count
+           FROM analysis
+           WHERE chain_id = $1
+             AND failure_reason IS NOT NULL
+             AND inserted_at >= now() - interval '24 hours'
+           GROUP BY 1
+           ORDER BY count DESC"#,
+    )
+    .bind(chain_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 pub async fn analysis_health(pool: &PgPool, chain_id: i64) -> Result<AnalysisHealthRow, WebError> {
     let row = sqlx::query_as::<_, AnalysisHealthRow>(
         r#"SELECT

@@ -95,6 +95,16 @@ pre { background: #0a0d12; border: 1px solid var(--panel-border); padding: 12px;
 .paging a { text-decoration: none; padding: 4px 10px; border-radius: 4px; }
 .paging a:hover { background: var(--panel-border); }
 
+.alert-banner { background: rgba(220,80,80,0.15); border-left: 4px solid #c34a4a; padding: 10px 14px; margin-bottom: 14px; border-radius: 4px; color: #ffdada; font-weight: 500; }
+.metric-bad { color: #ff8888; }
+.data-table.compact td, .data-table.compact th { padding: 4px 8px; font-size: 12px; }
+.refresh-item { padding: 8px 0; border-bottom: 1px dashed var(--panel-border); }
+.refresh-item:last-child { border-bottom: 0; }
+.refresh-item p { margin: 4px 0 0 0; font-size: 12px; }
+.refresh-item .btn { display: inline-block; }
+.refresh-grid { display: flex; flex-direction: column; gap: 4px; }
+.btn-danger { background: #5a2222 !important; color: #ffdada !important; }
+
 .charts-row {
     display: grid;
     grid-template-columns: 2fr 1fr;
