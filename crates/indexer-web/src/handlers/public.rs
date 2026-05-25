@@ -97,8 +97,49 @@ pub struct OverviewPage {
     /// total scaled by 365/30. Both are shown as separate cards so BD
     /// doesn't have to do the multiplication on a call.
     pub projection: ProjectionView,
+    /// Active leaderboard pivot ("functions" / "contracts" / "projects").
+    /// Template branches off this; only the matching Vec is populated.
+    pub group: String,
+    pub explorer_address_url: String,
+    pub functions: Vec<FunctionLeaderView>,
+    pub contracts: Vec<ContractLeaderView>,
     pub leaderboard: Vec<LeaderRow>,
     pub daily_30d: Vec<DailyView>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OverviewQuery {
+    /// "functions" (default) | "contracts" | "projects"
+    pub group: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionLeaderView {
+    pub address_hex: String,
+    pub selector_hex: String,
+    pub project_slug: String,
+    pub project_display: String,
+    pub tx_count: i64,
+    pub usd_saved: String,
+    pub avg_savings_pct_pct: String,
+    pub median_savings_pct_pct: String,
+    pub savings_of_spend_pct: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContractLeaderView {
+    pub address_hex: String,
+    pub project_slug: String,
+    pub project_display: String,
+    pub tx_count: i64,
+    pub function_count: i64,
+    pub usd_saved: String,
+    pub avg_savings_pct_pct: String,
+    pub median_savings_pct_pct: String,
+    pub savings_of_spend_pct: String,
+    /// Only present when project_slug is unknown — gives the template
+    /// an address to wire the rename ✎ icon to.
+    pub unknown_address_hex: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,9 +188,17 @@ pub struct DailyView {
 pub async fn overview(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
+    Query(q): Query<OverviewQuery>,
 ) -> Result<Response, WebError> {
     let pool = state.store.pool();
     let chain_id = state.chain_id;
+
+    let group = match q.group.as_deref() {
+        Some("contracts") => "contracts",
+        Some("projects") => "projects",
+        _ => "functions",
+    }
+    .to_string();
 
     let totals_lifetime_raw = queries::overview_totals(pool, chain_id, queries::Window::Lifetime).await?;
     let totals_30d_raw = queries::overview_totals(pool, chain_id, queries::Window::Days(30)).await?;
@@ -170,37 +219,108 @@ pub async fn overview(
     let totals_7d = totals_view(totals_7d_raw);
     let totals_24h = totals_view(totals_24h_raw);
 
-    let lb = queries::leaderboard_30d(pool, chain_id, 50, 0).await?;
-    let leaderboard = lb
-        .into_iter()
-        .map(|r| {
-            let unknown_address_hex = r
-                .project_slug
-                .strip_prefix("unknown:0x")
-                .map(|hex| format!("0x{hex}"));
-            let tx_count = r.tx_count.unwrap_or(0);
-            let covered = r.covered_tx_count.unwrap_or(0);
-            let coverage = if tx_count > 0 {
-                Some(covered as f64 / tx_count as f64)
-            } else {
-                None
-            };
-            let savings_of_spend = ratio_bd(r.wei_saved_total.as_ref(), r.wei_spent_total.as_ref());
-            LeaderRow {
-                display_name: r
-                    .project_name
-                    .clone()
-                    .unwrap_or_else(|| r.project_slug.clone()),
-                tx_count,
-                avg_savings_pct_pct: format_pct(r.avg_savings_pct),
-                savings_of_spend_pct: format_pct(savings_of_spend),
-                coverage_pct: format_pct(coverage),
-                median_savings_pct_pct: format_pct(r.median_savings_pct_covered),
-                project_slug: r.project_slug,
-                unknown_address_hex,
-            }
-        })
-        .collect();
+    // Only fetch the leaderboard for the active pivot — the other two
+    // Vecs stay empty and the template branches off `group`.
+    let mut functions: Vec<FunctionLeaderView> = Vec::new();
+    let mut contracts: Vec<ContractLeaderView> = Vec::new();
+    let mut leaderboard: Vec<LeaderRow> = Vec::new();
+    match group.as_str() {
+        "functions" => {
+            functions = queries::leaderboard_functions_30d(pool, chain_id, 50, 0)
+                .await?
+                .into_iter()
+                .map(|r| {
+                    let savings_of_spend = ratio_bd(
+                        r.wei_saved_total.as_ref(),
+                        r.wei_spent_total.as_ref(),
+                    );
+                    let project_display = r
+                        .project_name
+                        .clone()
+                        .unwrap_or_else(|| r.project_slug.clone());
+                    FunctionLeaderView {
+                        address_hex: format!("0x{}", hex::encode(&r.to_address)),
+                        selector_hex: format!("0x{}", hex::encode(&r.function_selector)),
+                        project_slug: r.project_slug,
+                        project_display,
+                        tx_count: r.tx_count.unwrap_or(0),
+                        usd_saved: format_usd(r.usd_saved.as_ref()),
+                        avg_savings_pct_pct: format_pct(r.avg_savings_pct),
+                        median_savings_pct_pct: format_pct(r.median_savings_pct),
+                        savings_of_spend_pct: format_pct(savings_of_spend),
+                    }
+                })
+                .collect();
+        }
+        "contracts" => {
+            contracts = queries::leaderboard_contracts_30d(pool, chain_id, 50, 0)
+                .await?
+                .into_iter()
+                .map(|r| {
+                    let unknown_address_hex = r
+                        .project_slug
+                        .strip_prefix("unknown:0x")
+                        .map(|hex| format!("0x{hex}"));
+                    let savings_of_spend = ratio_bd(
+                        r.wei_saved_total.as_ref(),
+                        r.wei_spent_total.as_ref(),
+                    );
+                    let project_display = r
+                        .project_name
+                        .clone()
+                        .unwrap_or_else(|| r.project_slug.clone());
+                    ContractLeaderView {
+                        address_hex: format!("0x{}", hex::encode(&r.to_address)),
+                        project_slug: r.project_slug,
+                        project_display,
+                        tx_count: r.tx_count.unwrap_or(0),
+                        function_count: r.function_count.unwrap_or(0),
+                        usd_saved: format_usd(r.usd_saved.as_ref()),
+                        avg_savings_pct_pct: format_pct(r.avg_savings_pct),
+                        median_savings_pct_pct: format_pct(r.median_savings_pct),
+                        savings_of_spend_pct: format_pct(savings_of_spend),
+                        unknown_address_hex,
+                    }
+                })
+                .collect();
+        }
+        _ => {
+            leaderboard = queries::leaderboard_30d(pool, chain_id, 50, 0)
+                .await?
+                .into_iter()
+                .map(|r| {
+                    let unknown_address_hex = r
+                        .project_slug
+                        .strip_prefix("unknown:0x")
+                        .map(|hex| format!("0x{hex}"));
+                    let tx_count = r.tx_count.unwrap_or(0);
+                    let covered = r.covered_tx_count.unwrap_or(0);
+                    let coverage = if tx_count > 0 {
+                        Some(covered as f64 / tx_count as f64)
+                    } else {
+                        None
+                    };
+                    let savings_of_spend = ratio_bd(
+                        r.wei_saved_total.as_ref(),
+                        r.wei_spent_total.as_ref(),
+                    );
+                    LeaderRow {
+                        display_name: r
+                            .project_name
+                            .clone()
+                            .unwrap_or_else(|| r.project_slug.clone()),
+                        tx_count,
+                        avg_savings_pct_pct: format_pct(r.avg_savings_pct),
+                        savings_of_spend_pct: format_pct(savings_of_spend),
+                        coverage_pct: format_pct(coverage),
+                        median_savings_pct_pct: format_pct(r.median_savings_pct_covered),
+                        project_slug: r.project_slug,
+                        unknown_address_hex,
+                    }
+                })
+                .collect();
+        }
+    }
 
     let daily = queries::daily_overview(pool, chain_id, 30).await?;
     let daily_30d = daily
@@ -220,6 +340,10 @@ pub async fn overview(
         totals_7d,
         totals_24h,
         projection,
+        group,
+        explorer_address_url: state.explorer_address_url.as_str().to_string(),
+        functions,
+        contracts,
         leaderboard,
         daily_30d,
     };

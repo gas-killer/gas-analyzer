@@ -47,21 +47,105 @@
 </section>
 
 <section class="card">
-    <h3>Project leaderboard · last 30 days</h3>
-    <p class="muted" style="margin-top:-6px;margin-bottom:14px;">
+    <div class="leaderboard-header">
+        <h3 style="margin:0;">Leaderboard · last 30 days</h3>
+        <div class="pivot-toggle" role="tablist">
+            <a href="?group=functions" class="pivot-chip{% if group == "functions" %} active{% endif %}">Functions</a>
+            <a href="?group=contracts" class="pivot-chip{% if group == "contracts" %} active{% endif %}">Contracts</a>
+            <a href="?group=projects"  class="pivot-chip{% if group == "projects"  %} active{% endif %}">Projects</a>
+        </div>
+    </div>
+    <p class="muted" style="margin-top:10px;margin-bottom:14px;">
         <strong>% of gas bill</strong> = wei_saved / wei_spent — the dollar pitch.
-        <strong>Coverage</strong> = txs where gas-killer applied.
         <strong>Median</strong> = robust avg over covered txs only.
+        Default sort: USD saved (highest first).
     </p>
+
+    {% if group == "functions" %}
+    <table class="data-table" id="leaderboard">
+        <thead>
+            <tr>
+                <th>Function</th>
+                <th>Contract</th>
+                <th>Project</th>
+                <th class="right sortable" data-sort="num" data-col="3" data-default="desc">Txs <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="4" data-default="desc">USD saved <span class="sort-indicator">▼</span></th>
+                <th class="right sortable" data-sort="num" data-col="5" data-default="desc">Avg % <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="6" data-default="desc">Median % <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="7" data-default="desc">% of gas bill <span class="sort-indicator"></span></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for row in functions %}
+            <tr>
+                <td><code>{{ row.selector_hex }}</code></td>
+                <td><a href="{{ explorer_address_url }}{{ row.address_hex }}" rel="noopener" target="_blank"><code>{{ row.address_hex }}</code></a></td>
+                <td><a href="/projects/{{ row.project_slug }}">{{ row.project_display }}</a></td>
+                <td class="right">{{ row.tx_count }}</td>
+                <td class="right"><strong>{{ row.usd_saved }}</strong></td>
+                <td class="right">{{ row.avg_savings_pct_pct }}</td>
+                <td class="right">{{ row.median_savings_pct_pct }}</td>
+                <td class="right">{{ row.savings_of_spend_pct }}</td>
+            </tr>
+        {% else %}
+            <tr><td colspan="8" class="muted">No data yet.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else if group == "contracts" %}
+    <table class="data-table" id="leaderboard">
+        <thead>
+            <tr>
+                <th>Contract</th>
+                <th>Project</th>
+                <th class="right sortable" data-sort="num" data-col="2" data-default="desc">Funcs <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="3" data-default="desc">Txs <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="4" data-default="desc">USD saved <span class="sort-indicator">▼</span></th>
+                <th class="right sortable" data-sort="num" data-col="5" data-default="desc">Avg % <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="6" data-default="desc">Median % <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="7" data-default="desc">% of gas bill <span class="sort-indicator"></span></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for row in contracts %}
+            <tr>
+                <td><a href="{{ explorer_address_url }}{{ row.address_hex }}" rel="noopener" target="_blank"><code>{{ row.address_hex }}</code></a></td>
+                <td>
+                    {% match row.unknown_address_hex %}
+                        {% when Some with (addr) %}
+                            <span class="label-cell" id="label-cell-{{ addr }}">
+                                <a href="/projects/{{ row.project_slug }}" class="label-unknown">{{ row.project_display }}</a>
+                                <a class="label-edit-icon" href="#"
+                                   hx-get="/api/labels/edit?address={{ addr }}&chain_id={{ chain_id }}"
+                                   hx-target="#label-cell-{{ addr }}"
+                                   hx-swap="outerHTML"
+                                   title="Map to project">✎</a>
+                            </span>
+                        {% when None %}
+                            <a href="/projects/{{ row.project_slug }}">{{ row.project_display }}</a>
+                    {% endmatch %}
+                </td>
+                <td class="right">{{ row.function_count }}</td>
+                <td class="right">{{ row.tx_count }}</td>
+                <td class="right"><strong>{{ row.usd_saved }}</strong></td>
+                <td class="right">{{ row.avg_savings_pct_pct }}</td>
+                <td class="right">{{ row.median_savings_pct_pct }}</td>
+                <td class="right">{{ row.savings_of_spend_pct }}</td>
+            </tr>
+        {% else %}
+            <tr><td colspan="8" class="muted">No data yet.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
     <table class="data-table" id="leaderboard">
         <thead>
             <tr>
                 <th>Project</th>
                 <th class="right sortable" data-sort="num" data-col="1" data-default="desc">Txs <span class="sort-indicator"></span></th>
-                <th class="right sortable" data-sort="num" data-col="2" data-default="desc">Coverage <span class="sort-indicator"></span></th>
-                <th class="right sortable" data-sort="num" data-col="3" data-default="desc">Avg % <span class="sort-indicator"></span></th>
-                <th class="right sortable" data-sort="num" data-col="4" data-default="desc">Median % <span class="sort-indicator"></span></th>
-                <th class="right sortable" data-sort="num" data-col="5" data-default="desc">% of gas bill <span class="sort-indicator">▼</span></th>
+                <th class="right sortable" data-sort="num" data-col="2" data-default="desc">Avg % <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="3" data-default="desc">Median % <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="4" data-default="desc">% of gas bill <span class="sort-indicator">▼</span></th>
             </tr>
         </thead>
         <tbody>
@@ -90,16 +174,16 @@
                     {% endmatch %}
                 </td>
                 <td class="right">{{ row.tx_count }}</td>
-                <td class="right">{{ row.coverage_pct }}</td>
                 <td class="right">{{ row.avg_savings_pct_pct }}</td>
                 <td class="right">{{ row.median_savings_pct_pct }}</td>
                 <td class="right"><strong>{{ row.savings_of_spend_pct }}</strong></td>
             </tr>
         {% else %}
-            <tr><td colspan="6" class="muted">No data yet — once the indexer has been running for a few hours, projects will populate here.</td></tr>
+            <tr><td colspan="5" class="muted">No data yet.</td></tr>
         {% endfor %}
         </tbody>
     </table>
+    {% endif %}
 </section>
 
 <script id="daily-data" type="application/json">{

@@ -129,6 +129,137 @@ pub async fn leaderboard_30d(
     Ok(rows)
 }
 
+/// Function-level leaderboard row. One row per `(contract, selector)`
+/// tuple, joined to its parent project for display. Median savings is
+/// computed on the fly from `analysis` because medians don't compose
+/// across daily rollups.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FunctionLeaderRow {
+    pub to_address: Vec<u8>,
+    pub function_selector: Vec<u8>,
+    pub project_slug: String,
+    pub project_name: Option<String>,
+    pub tx_count: Option<i64>,
+    pub wei_saved_total: Option<BigDecimal>,
+    pub wei_spent_total: Option<BigDecimal>,
+    pub usd_saved: Option<BigDecimal>,
+    pub avg_savings_pct: Option<f64>,
+    pub median_savings_pct: Option<f64>,
+}
+
+pub async fn leaderboard_functions_30d(
+    pool: &PgPool,
+    chain_id: i64,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<FunctionLeaderRow>, WebError> {
+    let rows = sqlx::query_as::<_, FunctionLeaderRow>(
+        r#"SELECT
+             fd.to_address,
+             fd.function_selector,
+             fd.project_slug,
+             p.project_name,
+             SUM(fd.tx_count)::bigint         AS tx_count,
+             SUM(fd.wei_saved_total)::numeric AS wei_saved_total,
+             SUM(fd.wei_spent_total)::numeric AS wei_spent_total,
+             SUM(fd.usd_saved_total)::numeric AS usd_saved,
+             AVG(fd.avg_savings_pct)::float8  AS avg_savings_pct,
+             m.median_savings_pct
+           FROM function_daily fd
+           LEFT JOIN projects p ON p.project_slug = fd.project_slug
+           LEFT JOIN (
+             SELECT
+               to_address,
+               function_selector,
+               percentile_cont(0.5) WITHIN GROUP (
+                 ORDER BY gas_saved::float8 / NULLIF(gas_used, 0)::float8
+               ) AS median_savings_pct
+             FROM analysis
+             WHERE chain_id = $1
+               AND block_timestamp >= now() - interval '30 days'
+               AND cardinality(skipped_opcodes) = 0
+               AND gas_saved > 0
+             GROUP BY to_address, function_selector
+           ) m ON m.to_address = fd.to_address AND m.function_selector = fd.function_selector
+           WHERE fd.chain_id = $1
+             AND fd.day >= (now() - interval '30 days')::date
+           GROUP BY fd.to_address, fd.function_selector, fd.project_slug,
+                    p.project_name, m.median_savings_pct
+           ORDER BY wei_saved_total DESC NULLS LAST
+           LIMIT $2 OFFSET $3"#,
+    )
+    .bind(chain_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Contract-level leaderboard row. Same data as the function view but
+/// rolled up one level — useful when a BD wants to compare contracts
+/// without function granularity.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ContractLeaderRow {
+    pub to_address: Vec<u8>,
+    pub project_slug: String,
+    pub project_name: Option<String>,
+    pub tx_count: Option<i64>,
+    pub function_count: Option<i64>,
+    pub wei_saved_total: Option<BigDecimal>,
+    pub wei_spent_total: Option<BigDecimal>,
+    pub usd_saved: Option<BigDecimal>,
+    pub avg_savings_pct: Option<f64>,
+    pub median_savings_pct: Option<f64>,
+}
+
+pub async fn leaderboard_contracts_30d(
+    pool: &PgPool,
+    chain_id: i64,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<ContractLeaderRow>, WebError> {
+    let rows = sqlx::query_as::<_, ContractLeaderRow>(
+        r#"SELECT
+             fd.to_address,
+             fd.project_slug,
+             p.project_name,
+             SUM(fd.tx_count)::bigint                      AS tx_count,
+             COUNT(DISTINCT fd.function_selector)::bigint  AS function_count,
+             SUM(fd.wei_saved_total)::numeric              AS wei_saved_total,
+             SUM(fd.wei_spent_total)::numeric              AS wei_spent_total,
+             SUM(fd.usd_saved_total)::numeric              AS usd_saved,
+             AVG(fd.avg_savings_pct)::float8               AS avg_savings_pct,
+             m.median_savings_pct
+           FROM function_daily fd
+           LEFT JOIN projects p ON p.project_slug = fd.project_slug
+           LEFT JOIN (
+             SELECT
+               to_address,
+               percentile_cont(0.5) WITHIN GROUP (
+                 ORDER BY gas_saved::float8 / NULLIF(gas_used, 0)::float8
+               ) AS median_savings_pct
+             FROM analysis
+             WHERE chain_id = $1
+               AND block_timestamp >= now() - interval '30 days'
+               AND cardinality(skipped_opcodes) = 0
+               AND gas_saved > 0
+             GROUP BY to_address
+           ) m ON m.to_address = fd.to_address
+           WHERE fd.chain_id = $1
+             AND fd.day >= (now() - interval '30 days')::date
+           GROUP BY fd.to_address, fd.project_slug, p.project_name, m.median_savings_pct
+           ORDER BY wei_saved_total DESC NULLS LAST
+           LIMIT $2 OFFSET $3"#,
+    )
+    .bind(chain_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DailyPoint {
     pub day: NaiveDate,
