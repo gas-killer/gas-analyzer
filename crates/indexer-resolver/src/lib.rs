@@ -18,6 +18,7 @@ use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
 pub mod etherscan;
+pub mod fourbyte;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolverError {

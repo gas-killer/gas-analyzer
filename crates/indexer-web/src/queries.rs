@@ -139,6 +139,9 @@ pub struct FunctionLeaderRow {
     pub function_selector: Vec<u8>,
     pub project_slug: String,
     pub project_name: Option<String>,
+    /// 4byte-resolved name (e.g. "transfer"). NULL when not yet resolved.
+    pub function_name: Option<String>,
+    pub function_sig: Option<String>,
     pub tx_count: Option<i64>,
     pub wei_saved_total: Option<BigDecimal>,
     pub wei_spent_total: Option<BigDecimal>,
@@ -159,6 +162,8 @@ pub async fn leaderboard_functions_30d(
              fd.function_selector,
              fd.project_slug,
              p.project_name,
+             fs.primary_name AS function_name,
+             fs.primary_sig  AS function_sig,
              SUM(fd.tx_count)::bigint         AS tx_count,
              SUM(fd.wei_saved_total)::numeric AS wei_saved_total,
              SUM(fd.wei_spent_total)::numeric AS wei_spent_total,
@@ -167,6 +172,7 @@ pub async fn leaderboard_functions_30d(
              m.median_savings_pct
            FROM function_daily fd
            LEFT JOIN projects p ON p.project_slug = fd.project_slug
+           LEFT JOIN function_selectors fs ON fs.selector = fd.function_selector
            LEFT JOIN (
              SELECT
                to_address,
@@ -184,7 +190,7 @@ pub async fn leaderboard_functions_30d(
            WHERE fd.chain_id = $1
              AND fd.day >= (now() - interval '30 days')::date
            GROUP BY fd.to_address, fd.function_selector, fd.project_slug,
-                    p.project_name, m.median_savings_pct
+                    p.project_name, fs.primary_name, fs.primary_sig, m.median_savings_pct
            ORDER BY wei_saved_total DESC NULLS LAST
            LIMIT $2 OFFSET $3"#,
     )

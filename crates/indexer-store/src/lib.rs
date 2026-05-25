@@ -359,6 +359,74 @@ impl Store {
         Ok(())
     }
 
+    /// Selectors that appear in `analysis` but aren't yet in
+    /// `function_selectors`. Capped to `limit` highest-volume entries
+    /// (4byte resolves the popular ones first).
+    pub async fn unresolved_selectors(
+        &self,
+        chain_id: u64,
+        limit: i64,
+    ) -> Result<Vec<[u8; 4]>, StoreError> {
+        let rows: Vec<(Vec<u8>,)> = sqlx::query_as(
+            r#"SELECT a.function_selector
+               FROM analysis a
+               LEFT JOIN function_selectors fs
+                 ON fs.selector = a.function_selector
+               WHERE a.chain_id = $1
+                 AND fs.selector IS NULL
+                 AND a.gas_saved > 0
+                 AND cardinality(a.skipped_opcodes) = 0
+               GROUP BY a.function_selector
+               ORDER BY count(*) DESC
+               LIMIT $2"#,
+        )
+        .bind(chain_id as i64)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (b,) in rows {
+            if b.len() == 4 {
+                let mut sel = [0u8; 4];
+                sel.copy_from_slice(&b);
+                out.push(sel);
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn upsert_function_selector(
+        &self,
+        selector: [u8; 4],
+        primary_name: Option<&str>,
+        primary_sig: Option<&str>,
+        all_signatures: &[String],
+        source: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            INSERT INTO function_selectors
+                (selector, primary_name, primary_sig, all_signatures, source, fetched_at)
+            VALUES ($1, $2, $3, $4, $5, now())
+            ON CONFLICT (selector) DO UPDATE SET
+                primary_name   = EXCLUDED.primary_name,
+                primary_sig    = EXCLUDED.primary_sig,
+                all_signatures = EXCLUDED.all_signatures,
+                source         = EXCLUDED.source,
+                fetched_at     = now()
+            "#,
+        )
+        .bind(&selector[..])
+        .bind(primary_name)
+        .bind(primary_sig)
+        .bind(all_signatures)
+        .bind(source)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn refresh_rollups(&self) -> Result<(), StoreError> {
         // CONCURRENTLY needs the unique index, which both rollups declare.
         sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY project_daily")

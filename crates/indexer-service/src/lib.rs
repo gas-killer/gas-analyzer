@@ -6,6 +6,7 @@
 //! config without copy-paste.
 
 pub mod config;
+pub mod fourbyte_resolver;
 pub mod head_tracker;
 pub mod labeler;
 pub mod queue;
