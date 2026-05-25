@@ -1,10 +1,10 @@
 {% extends "base.html" %}
-{% block title %}Unknowns — Gas Killer Indexer{% endblock %}
+{% block title %}Triage — Gas Killer Indexer{% endblock %}
 {% block content %}
 
 <section class="card">
     <div class="leaderboard-header">
-        <h3 style="margin:0;">Unknowns · last 30 days</h3>
+        <h3 style="margin:0;">Triage · last 30 days</h3>
         <div class="pivot-toggle" role="tablist">
             <a href="?tab=contracts" class="pivot-chip{% if tab == "contracts" %} active{% endif %}">Unknown contracts</a>
             <a href="?tab=selectors" class="pivot-chip{% if tab == "selectors" %} active{% endif %}">Unresolved selectors</a>
@@ -50,7 +50,7 @@
         <thead>
             <tr>
                 <th>Address</th>
-                <th>Label</th>
+                <th>Display name</th>
                 <th class="right">Txs</th>
                 <th class="right">ETH saved</th>
                 <th class="right">Last seen</th>
@@ -70,7 +70,7 @@
                            hx-get="/api/labels/edit?address={{ r.address_hex }}&chain_id={{ chain_id }}"
                            hx-target="#label-cell-{{ r.address_hex }}"
                            hx-swap="outerHTML"
-                           title="Set label">✎</a>
+                           title="Map to project">✎</a>
                     </span>
                 </td>
                 <td class="right">{{ r.tx_count }}</td>
