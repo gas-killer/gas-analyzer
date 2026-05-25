@@ -39,10 +39,25 @@ pub struct HealthView {
     pub latest_analyzed_block: Option<i64>,
     pub blocks_behind: Option<i64>,
     pub head_stale: bool,
+    /// True when blocks_behind exceeds the env-tunable warn threshold.
+    /// Templates render a red banner when set.
+    pub falls_behind: bool,
+    pub blocks_behind_threshold: i64,
     pub pending_queue: i64,
     pub dead_letter: i64,
     pub last_insert_age_secs: Option<i64>,
     pub total_rows: i64,
+    /// Share of analyses in the last 24h that fell back to heuristic
+    /// estimation (1.0 = all heuristic; 0.0 = all deterministic).
+    pub heuristic_rate_24h: Option<f64>,
+    /// Counts of error categories in the last 24h, ordered by frequency.
+    pub error_categories: Vec<ErrorCategoryRow>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ErrorCategoryRow {
+    pub label: String,
+    pub count: i64,
 }
 
 pub async fn admin_page(
@@ -331,6 +346,15 @@ async fn collect_health(state: &AppState) -> Result<HealthView, WebError> {
     let pool = state.store.pool();
 
     let analysis = queries::analysis_health(pool, chain_id).await?;
+    let heuristic_rate_24h = queries::heuristic_rate_24h(pool, chain_id).await?;
+    let error_categories = queries::error_categories_24h(pool, chain_id)
+        .await?
+        .into_iter()
+        .map(|r| ErrorCategoryRow {
+            label: r.category,
+            count: r.count.unwrap_or(0),
+        })
+        .collect();
 
     let mut conn = state.redis.clone();
     let pending: i64 = conn
@@ -351,15 +375,21 @@ async fn collect_health(state: &AppState) -> Result<HealthView, WebError> {
         (Some(h), Some(a)) => Some(h - a),
         _ => None,
     };
+    let threshold = state.blocks_behind_warn_threshold;
+    let falls_behind = blocks_behind.map(|b| b > threshold).unwrap_or(false);
 
     Ok(HealthView {
         last_seen_block: last_head_raw,
         latest_analyzed_block: analysis.latest_block,
         blocks_behind,
         head_stale,
+        falls_behind,
+        blocks_behind_threshold: threshold,
         pending_queue: pending,
         dead_letter: dead,
         last_insert_age_secs: analysis.last_insert_age_secs.map(|s| s as i64),
         total_rows: analysis.total_rows.unwrap_or(0),
+        heuristic_rate_24h,
+        error_categories,
     })
 }

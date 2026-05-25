@@ -28,13 +28,28 @@
 
 <section class="card">
     <h3>Manual refresh</h3>
-    <p class="muted">Each button triggers the same job the refresher loop runs internally — useful when you want the dashboard to reflect a recent change without waiting for the next tick.</p>
+    <p class="muted">Each button triggers the same job the refresher loop runs internally — useful when you want the dashboard to reflect a recent change without waiting for the next tick. None of these are destructive: they re-read upstream data and re-aggregate, but never delete or rewrite history.</p>
     <div class="refresh-grid">
-        <button class="btn" hx-post="/admin/refresh/rollups"     hx-target="#refresh-banner" hx-swap="innerHTML">Refresh project_daily</button>
-        <button class="btn" hx-post="/admin/refresh/eth-price"   hx-target="#refresh-banner" hx-swap="innerHTML">Refresh ETH price</button>
-        <button class="btn" hx-post="/admin/refresh/resolver"    hx-target="#refresh-banner" hx-swap="innerHTML">Refresh resolver</button>
-        <button class="btn" hx-post="/admin/refresh/labeler"     hx-target="#refresh-banner" hx-swap="innerHTML">Tick labeler producer</button>
-        <button class="btn" hx-post="/admin/refresh/relabel"     hx-target="#refresh-banner" hx-swap="innerHTML">Relabel unknowns</button>
+        <div class="refresh-item">
+            <button class="btn" hx-post="/admin/refresh/rollups" hx-target="#refresh-banner" hx-swap="innerHTML">Refresh project_daily &amp; function_daily</button>
+            <p class="muted">Rebuilds the hourly rollups feeding leaderboards. Cheap — ~10s on a fresh deploy.</p>
+        </div>
+        <div class="refresh-item">
+            <button class="btn" hx-post="/admin/refresh/eth-price" hx-target="#refresh-banner" hx-swap="innerHTML">Refresh ETH price</button>
+            <p class="muted">Fetches today's ETH/USD from Coingecko and upserts. Fixes "USD missing" gaps.</p>
+        </div>
+        <div class="refresh-item">
+            <button class="btn" hx-post="/admin/refresh/resolver" hx-target="#refresh-banner" hx-swap="innerHTML">Refresh resolver</button>
+            <p class="muted">Re-reads the YAML overlay + DefiLlama protocol list, upserts projects, retro-relabels historical unknowns that now have mappings.</p>
+        </div>
+        <div class="refresh-item">
+            <button class="btn" hx-post="/admin/refresh/labeler" hx-target="#refresh-banner" hx-swap="innerHTML">Tick labeler producer</button>
+            <p class="muted">Pushes the next batch of top-savings unknown contracts into the Etherscan/Blockscout lookup queue.</p>
+        </div>
+        <div class="refresh-item">
+            <button class="btn" hx-post="/admin/refresh/relabel" hx-target="#refresh-banner" hx-swap="innerHTML">Relabel unknowns</button>
+            <p class="muted">Sweeps the analysis table: any row tagged <code>unknown:0x...</code> whose address has since been mapped gets its slug rewritten.</p>
+        </div>
     </div>
     <div id="refresh-banner"></div>
 </section>

@@ -1,5 +1,12 @@
+{% if health.falls_behind %}
+<div class="alert-banner">
+    ⚠ Indexer is {{ health.blocks_behind.unwrap_or(0) }} blocks behind chain head
+    (warn threshold: {{ health.blocks_behind_threshold }}). Recent data may be stale.
+</div>
+{% endif %}
+
 <div class="health-grid">
-    <div class="health-cell">
+    <div class="health-cell" title="Highest block_number that has been written to the analysis table.">
         <div class="muted">Latest analyzed block</div>
         <div class="metric">
             {% match health.latest_analyzed_block %}
@@ -8,7 +15,7 @@
             {% endmatch %}
         </div>
     </div>
-    <div class="health-cell">
+    <div class="health-cell" title="Last block number the head-tracker observed on the RPC. Stale ⇒ head-tracker isn't running.">
         <div class="muted">Head-tracker last seen</div>
         <div class="metric">
             {% match health.last_seen_block %}
@@ -17,24 +24,24 @@
             {% endmatch %}
         </div>
     </div>
-    <div class="health-cell">
+    <div class="health-cell" title="Chain head − latest analyzed block. Larger ⇒ workers are falling behind.">
         <div class="muted">Blocks behind head</div>
-        <div class="metric">
+        <div class="metric {% if health.falls_behind %}metric-bad{% endif %}">
             {% match health.blocks_behind %}
                 {% when Some with (b) %}{{ b }}
                 {% when None %}—
             {% endmatch %}
         </div>
     </div>
-    <div class="health-cell">
+    <div class="health-cell" title="Jobs waiting in the Redis queue for a worker to claim. Spikes ⇒ workers are saturated.">
         <div class="muted">Pending queue</div>
         <div class="metric">{{ health.pending_queue }}</div>
     </div>
-    <div class="health-cell">
+    <div class="health-cell" title="Jobs that failed all retries and were moved to the dead-letter list. Inspect via `LRANGE indexer:jobs:dead 0 -1` in redis-cli; replay via the tx-replay box below.">
         <div class="muted">Dead-letter</div>
         <div class="metric">{{ health.dead_letter }}</div>
     </div>
-    <div class="health-cell">
+    <div class="health-cell" title="Seconds since the most recent INSERT into analysis. Large ⇒ workers stopped persisting.">
         <div class="muted">Last insert</div>
         <div class="metric">
             {% match health.last_insert_age_secs %}
@@ -43,8 +50,31 @@
             {% endmatch %}
         </div>
     </div>
-    <div class="health-cell">
+    <div class="health-cell" title="Total analysis rows ever written, regardless of opcode-skipped or 0%-savings filters.">
         <div class="muted">Total rows</div>
         <div class="metric">{{ health.total_rows }}</div>
     </div>
+    <div class="health-cell" title="Share of last-24h analyses that fell back to the heuristic estimator (vs. measured EVM simulation). Climbing ⇒ the RPC is rejecting state diff calls.">
+        <div class="muted">Heuristic rate · 24h</div>
+        <div class="metric">
+            {% match health.heuristic_rate_24h %}
+                {% when Some with (r) %}{{ "{:.1}"|format(r * 100.0) }}%
+                {% when None %}—
+            {% endmatch %}
+        </div>
+    </div>
 </div>
+
+{% if !health.error_categories.is_empty() %}
+<div class="card" style="margin-top:14px;background:var(--bg);">
+    <h3 style="margin-bottom:8px;">Errors · last 24h</h3>
+    <table class="data-table compact">
+        <thead><tr><th>Category</th><th class="right">Count</th></tr></thead>
+        <tbody>
+        {% for e in health.error_categories %}
+            <tr><td>{{ e.label }}</td><td class="right">{{ e.count }}</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
