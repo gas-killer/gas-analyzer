@@ -858,40 +858,86 @@ pub struct UnknownsPage {
     pub user: String,
     pub chain_id: i64,
     pub explorer_address_url: String,
-    pub rows: Vec<UnknownView>,
+    pub tab: String,
+    pub contracts: Vec<UnknownContractView>,
+    pub selectors: Vec<UnresolvedSelectorView>,
 }
 
 #[derive(Debug, Clone)]
-pub struct UnknownView {
+pub struct UnknownContractView {
     pub address_hex: String,
     pub tx_count: i64,
     pub wei_saved: String,
     pub last_seen: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct UnresolvedSelectorView {
+    pub selector_hex: String,
+    pub example_address_hex: String,
+    pub tx_count: i64,
+    pub wei_saved: String,
+    pub usd_saved: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct UnknownsQuery {
+    /// "contracts" (default) | "selectors"
+    pub tab: Option<String>,
+}
+
 pub async fn unknowns(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
+    Query(q): Query<UnknownsQuery>,
 ) -> Result<Response, WebError> {
     let pool = state.store.pool();
-    let rows = queries::top_unknowns(pool, state.chain_id).await?;
-    let rows = rows
-        .into_iter()
-        .map(|r| UnknownView {
-            address_hex: format!("0x{}", hex::encode(&r.address)),
-            tx_count: r.tx_count.unwrap_or(0),
-            wei_saved: format_eth(r.wei_saved_total.as_ref()),
-            last_seen: r
-                .last_seen
-                .map(format_when)
-                .unwrap_or_else(|| "—".to_string()),
-        })
-        .collect();
+    let tab = match q.tab.as_deref() {
+        Some("selectors") => "selectors",
+        _ => "contracts",
+    }
+    .to_string();
+
+    let mut contracts: Vec<UnknownContractView> = Vec::new();
+    let mut selectors: Vec<UnresolvedSelectorView> = Vec::new();
+    match tab.as_str() {
+        "selectors" => {
+            selectors = queries::top_unresolved_selectors(pool, state.chain_id, 50)
+                .await?
+                .into_iter()
+                .map(|r| UnresolvedSelectorView {
+                    selector_hex: format!("0x{}", hex::encode(&r.selector)),
+                    example_address_hex: format!("0x{}", hex::encode(&r.example_address)),
+                    tx_count: r.tx_count.unwrap_or(0),
+                    wei_saved: format_eth(r.wei_saved_total.as_ref()),
+                    usd_saved: format_usd(r.usd_saved_total.as_ref()),
+                })
+                .collect();
+        }
+        _ => {
+            contracts = queries::top_unknowns(pool, state.chain_id)
+                .await?
+                .into_iter()
+                .map(|r| UnknownContractView {
+                    address_hex: format!("0x{}", hex::encode(&r.address)),
+                    tx_count: r.tx_count.unwrap_or(0),
+                    wei_saved: format_eth(r.wei_saved_total.as_ref()),
+                    last_seen: r
+                        .last_seen
+                        .map(format_when)
+                        .unwrap_or_else(|| "—".to_string()),
+                })
+                .collect();
+        }
+    }
+
     Ok(UnknownsPage {
         user,
         chain_id: state.chain_id,
         explorer_address_url: state.explorer_address_url.as_str().to_string(),
-        rows,
+        tab,
+        contracts,
+        selectors,
     }
     .into_response())
 }

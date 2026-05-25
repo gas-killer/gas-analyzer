@@ -893,6 +893,48 @@ pub async fn recent_txs_for_function(
     Ok(rows)
 }
 
+/// Top unresolved function selectors by 30d wei_saved. "Unresolved"
+/// means 4byte didn't find a signature for the selector — distinct
+/// from "unknown contract" (no project mapping). Surfaces are
+/// orthogonal: a contract can be labeled but use a selector 4byte
+/// has never seen.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UnresolvedSelectorRow {
+    pub selector: Vec<u8>,
+    pub example_address: Vec<u8>,
+    pub tx_count: Option<i64>,
+    pub wei_saved_total: Option<BigDecimal>,
+    pub usd_saved_total: Option<BigDecimal>,
+}
+
+pub async fn top_unresolved_selectors(
+    pool: &PgPool,
+    chain_id: i64,
+    limit: i64,
+) -> Result<Vec<UnresolvedSelectorRow>, WebError> {
+    let rows = sqlx::query_as::<_, UnresolvedSelectorRow>(
+        r#"SELECT
+             fd.function_selector AS selector,
+             (ARRAY_AGG(fd.to_address ORDER BY fd.wei_saved_total DESC))[1] AS example_address,
+             SUM(fd.tx_count)::bigint        AS tx_count,
+             SUM(fd.wei_saved_total)::numeric AS wei_saved_total,
+             SUM(fd.usd_saved_total)::numeric AS usd_saved_total
+           FROM function_daily fd
+           LEFT JOIN function_selectors fs ON fs.selector = fd.function_selector
+           WHERE fd.chain_id = $1
+             AND fd.day >= (now() - interval '30 days')::date
+             AND (fs.primary_name IS NULL OR fs.source = 'unresolved')
+           GROUP BY fd.function_selector
+           ORDER BY wei_saved_total DESC NULLS LAST
+           LIMIT $2"#,
+    )
+    .bind(chain_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct UnknownRow {
     pub address: Vec<u8>,
