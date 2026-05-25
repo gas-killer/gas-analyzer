@@ -524,6 +524,304 @@ pub async fn recent_txs_for_project(
     Ok(rows)
 }
 
+// ---------- Per-contract drilldown ----------
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ContractHeader {
+    pub project_slug: String,
+    pub project_name: Option<String>,
+}
+
+pub async fn contract_header(
+    pool: &PgPool,
+    chain_id: i64,
+    address: [u8; 20],
+) -> Result<ContractHeader, WebError> {
+    let row: Option<ContractHeader> = sqlx::query_as(
+        r#"SELECT ap.project_slug, p.project_name
+           FROM address_project ap
+           LEFT JOIN projects p ON p.project_slug = ap.project_slug
+           WHERE ap.chain_id = $1 AND ap.address = $2"#,
+    )
+    .bind(chain_id)
+    .bind(&address[..])
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.unwrap_or(ContractHeader {
+        project_slug: format!("unknown:0x{}", hex::encode(address)),
+        project_name: None,
+    }))
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ContractTotals {
+    pub usd_saved: Option<BigDecimal>,
+    pub wei_saved: Option<BigDecimal>,
+    pub tx_count: Option<i64>,
+    pub function_count: Option<i64>,
+    pub avg_savings_pct: Option<f64>,
+}
+
+pub async fn contract_totals(
+    pool: &PgPool,
+    chain_id: i64,
+    address: [u8; 20],
+    window: Window,
+) -> Result<ContractTotals, WebError> {
+    let q = match window.interval_clause() {
+        None => format!(
+            r#"SELECT
+                 COALESCE(SUM(usd_saved_total), 0)::numeric AS usd_saved,
+                 COALESCE(SUM(wei_saved_total), 0)::numeric AS wei_saved,
+                 COALESCE(SUM(tx_count), 0)::bigint         AS tx_count,
+                 COUNT(DISTINCT function_selector)::bigint  AS function_count,
+                 AVG(avg_savings_pct)::float8               AS avg_savings_pct
+               FROM function_daily
+               WHERE chain_id = $1 AND to_address = $2"#
+        ),
+        Some(i) => format!(
+            r#"SELECT
+                 COALESCE(SUM(usd_saved_total), 0)::numeric AS usd_saved,
+                 COALESCE(SUM(wei_saved_total), 0)::numeric AS wei_saved,
+                 COALESCE(SUM(tx_count), 0)::bigint         AS tx_count,
+                 COUNT(DISTINCT function_selector)::bigint  AS function_count,
+                 AVG(avg_savings_pct)::float8               AS avg_savings_pct
+               FROM function_daily
+               WHERE chain_id = $1 AND to_address = $2
+                 AND day >= (now() - interval '{i}')::date"#
+        ),
+    };
+    let row = sqlx::query_as::<_, ContractTotals>(&q)
+        .bind(chain_id)
+        .bind(&address[..])
+        .fetch_one(pool)
+        .await?;
+    Ok(row)
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ContractFunctionRow {
+    pub function_selector: Vec<u8>,
+    pub function_name: Option<String>,
+    pub tx_count: Option<i64>,
+    pub usd_saved: Option<BigDecimal>,
+    pub avg_savings_pct: Option<f64>,
+}
+
+pub async fn functions_for_contract(
+    pool: &PgPool,
+    chain_id: i64,
+    address: [u8; 20],
+) -> Result<Vec<ContractFunctionRow>, WebError> {
+    let rows = sqlx::query_as::<_, ContractFunctionRow>(
+        r#"SELECT
+             fd.function_selector,
+             fs.primary_name AS function_name,
+             SUM(fd.tx_count)::bigint         AS tx_count,
+             SUM(fd.usd_saved_total)::numeric AS usd_saved,
+             AVG(fd.avg_savings_pct)::float8  AS avg_savings_pct
+           FROM function_daily fd
+           LEFT JOIN function_selectors fs ON fs.selector = fd.function_selector
+           WHERE fd.chain_id = $1
+             AND fd.to_address = $2
+             AND fd.day >= (now() - interval '30 days')::date
+           GROUP BY fd.function_selector, fs.primary_name
+           ORDER BY usd_saved DESC NULLS LAST
+           LIMIT 50"#,
+    )
+    .bind(chain_id)
+    .bind(&address[..])
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn daily_for_contract(
+    pool: &PgPool,
+    chain_id: i64,
+    address: [u8; 20],
+    days: i32,
+) -> Result<Vec<DailyPoint>, WebError> {
+    let rows = sqlx::query_as::<_, DailyPoint>(
+        r#"SELECT
+             day,
+             SUM(usd_saved_total)::numeric AS usd_saved,
+             SUM(tx_count)::bigint         AS tx_count
+           FROM function_daily
+           WHERE chain_id = $1
+             AND to_address = $2
+             AND day >= (now() - make_interval(days => $3::int))::date
+           GROUP BY day
+           ORDER BY day"#,
+    )
+    .bind(chain_id)
+    .bind(&address[..])
+    .bind(days)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn recent_txs_for_contract(
+    pool: &PgPool,
+    chain_id: i64,
+    address: [u8; 20],
+    limit: i64,
+) -> Result<Vec<RecentTxRow>, WebError> {
+    let rows = sqlx::query_as::<_, RecentTxRow>(
+        r#"SELECT
+             block_number, tx_hash, gas_used, gas_saved, wei_saved, block_timestamp
+           FROM analysis
+           WHERE chain_id = $1 AND to_address = $2
+             AND gas_saved > 0
+             AND cardinality(skipped_opcodes) = 0
+           ORDER BY block_timestamp DESC
+           LIMIT $3"#,
+    )
+    .bind(chain_id)
+    .bind(&address[..])
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+// ---------- Per-function drilldown ----------
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FunctionHeader {
+    pub project_slug: String,
+    pub project_name: Option<String>,
+    pub function_name: Option<String>,
+    pub function_sig: Option<String>,
+}
+
+pub async fn function_header(
+    pool: &PgPool,
+    chain_id: i64,
+    address: [u8; 20],
+    selector: [u8; 4],
+) -> Result<FunctionHeader, WebError> {
+    let row: Option<FunctionHeader> = sqlx::query_as(
+        r#"SELECT
+             COALESCE(ap.project_slug, 'unknown:0x' || encode($2, 'hex')) AS project_slug,
+             p.project_name,
+             fs.primary_name AS function_name,
+             fs.primary_sig  AS function_sig
+           FROM (SELECT 1) _
+           LEFT JOIN address_project ap
+             ON ap.chain_id = $1 AND ap.address = $2
+           LEFT JOIN projects p ON p.project_slug = ap.project_slug
+           LEFT JOIN function_selectors fs ON fs.selector = $3"#,
+    )
+    .bind(chain_id)
+    .bind(&address[..])
+    .bind(&selector[..])
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.unwrap_or(FunctionHeader {
+        project_slug: format!("unknown:0x{}", hex::encode(address)),
+        project_name: None,
+        function_name: None,
+        function_sig: None,
+    }))
+}
+
+pub async fn function_totals(
+    pool: &PgPool,
+    chain_id: i64,
+    address: [u8; 20],
+    selector: [u8; 4],
+    window: Window,
+) -> Result<ContractTotals, WebError> {
+    let q = match window.interval_clause() {
+        None => format!(
+            r#"SELECT
+                 COALESCE(SUM(usd_saved_total), 0)::numeric AS usd_saved,
+                 COALESCE(SUM(wei_saved_total), 0)::numeric AS wei_saved,
+                 COALESCE(SUM(tx_count), 0)::bigint         AS tx_count,
+                 1::bigint                                  AS function_count,
+                 AVG(avg_savings_pct)::float8               AS avg_savings_pct
+               FROM function_daily
+               WHERE chain_id = $1 AND to_address = $2 AND function_selector = $3"#
+        ),
+        Some(i) => format!(
+            r#"SELECT
+                 COALESCE(SUM(usd_saved_total), 0)::numeric AS usd_saved,
+                 COALESCE(SUM(wei_saved_total), 0)::numeric AS wei_saved,
+                 COALESCE(SUM(tx_count), 0)::bigint         AS tx_count,
+                 1::bigint                                  AS function_count,
+                 AVG(avg_savings_pct)::float8               AS avg_savings_pct
+               FROM function_daily
+               WHERE chain_id = $1 AND to_address = $2 AND function_selector = $3
+                 AND day >= (now() - interval '{i}')::date"#
+        ),
+    };
+    let row = sqlx::query_as::<_, ContractTotals>(&q)
+        .bind(chain_id)
+        .bind(&address[..])
+        .bind(&selector[..])
+        .fetch_one(pool)
+        .await?;
+    Ok(row)
+}
+
+pub async fn daily_for_function(
+    pool: &PgPool,
+    chain_id: i64,
+    address: [u8; 20],
+    selector: [u8; 4],
+    days: i32,
+) -> Result<Vec<DailyPoint>, WebError> {
+    let rows = sqlx::query_as::<_, DailyPoint>(
+        r#"SELECT
+             day,
+             usd_saved_total::numeric AS usd_saved,
+             tx_count::bigint         AS tx_count
+           FROM function_daily
+           WHERE chain_id = $1
+             AND to_address = $2
+             AND function_selector = $3
+             AND day >= (now() - make_interval(days => $4::int))::date
+           ORDER BY day"#,
+    )
+    .bind(chain_id)
+    .bind(&address[..])
+    .bind(&selector[..])
+    .bind(days)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn recent_txs_for_function(
+    pool: &PgPool,
+    chain_id: i64,
+    address: [u8; 20],
+    selector: [u8; 4],
+    limit: i64,
+) -> Result<Vec<RecentTxRow>, WebError> {
+    let rows = sqlx::query_as::<_, RecentTxRow>(
+        r#"SELECT
+             block_number, tx_hash, gas_used, gas_saved, wei_saved, block_timestamp
+           FROM analysis
+           WHERE chain_id = $1
+             AND to_address = $2
+             AND function_selector = $3
+             AND gas_saved > 0
+             AND cardinality(skipped_opcodes) = 0
+           ORDER BY block_timestamp DESC
+           LIMIT $4"#,
+    )
+    .bind(chain_id)
+    .bind(&address[..])
+    .bind(&selector[..])
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct UnknownRow {
     pub address: Vec<u8>,

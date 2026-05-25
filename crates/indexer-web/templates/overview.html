@@ -79,6 +79,7 @@
         {% for row in functions %}
             <tr>
                 <td>
+                    <a href="/functions/{{ row.address_hex }}/{{ row.selector_hex }}">
                     {% if !row.function_name.is_empty() %}
                         <strong title="{{ row.function_sig }}">{{ row.function_name }}</strong>
                         <span class="muted" style="font-size:11px;"><code>{{ row.selector_hex }}</code></span>
@@ -86,8 +87,9 @@
                         <code>{{ row.selector_hex }}</code>
                         <span class="muted" style="font-size:11px;">?</span>
                     {% endif %}
+                    </a>
                 </td>
-                <td><a href="{{ explorer_address_url }}{{ row.address_hex }}" rel="noopener" target="_blank"><code>{{ row.address_hex }}</code></a></td>
+                <td><a href="/contracts/{{ row.address_hex }}"><code>{{ row.address_hex }}</code></a></td>
                 <td><a href="/projects/{{ row.project_slug }}">{{ row.project_display }}</a></td>
                 <td class="right">{{ row.tx_count }}</td>
                 <td class="right"><strong>{{ row.usd_saved }}</strong></td>
@@ -117,7 +119,7 @@
         <tbody>
         {% for row in contracts %}
             <tr>
-                <td><a href="{{ explorer_address_url }}{{ row.address_hex }}" rel="noopener" target="_blank"><code>{{ row.address_hex }}</code></a></td>
+                <td><a href="/contracts/{{ row.address_hex }}"><code>{{ row.address_hex }}</code></a></td>
                 <td>
                     {% match row.unknown_address_hex %}
                         {% when Some with (addr) %}

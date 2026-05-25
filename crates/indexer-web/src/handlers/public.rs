@@ -509,6 +509,244 @@ pub async fn project(
     Ok(page.into_response())
 }
 
+// ---------- Per-contract drilldown ----------
+
+#[derive(Template)]
+#[template(path = "contract.html")]
+pub struct ContractPage {
+    pub user: String,
+    pub chain_id: i64,
+    pub explorer_tx_url: String,
+    pub explorer_address_url: String,
+    pub address_hex: String,
+    pub project_slug: String,
+    pub project_display: String,
+    pub totals_lifetime: TotalsView,
+    pub totals_30d: TotalsView,
+    pub function_count: i64,
+    pub avg_savings_pct_30d: String,
+    pub daily_90d: Vec<DailyView>,
+    pub functions: Vec<ContractFunctionView>,
+    pub recent_txs: Vec<RecentTxView>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContractFunctionView {
+    pub selector_hex: String,
+    pub function_name: String,
+    pub tx_count: i64,
+    pub usd_saved: String,
+    pub avg_savings_pct_pct: String,
+}
+
+pub async fn contract_page(
+    AuthUser(user): AuthUser,
+    State(state): State<AppState>,
+    Path(address_hex): Path<String>,
+) -> Result<Response, WebError> {
+    let pool = state.store.pool();
+    let chain_id = state.chain_id;
+
+    let address = parse_address(&address_hex)
+        .ok_or_else(|| WebError::BadRequest("invalid address".into()))?;
+
+    let header = queries::contract_header(pool, chain_id, address).await?;
+    let totals_lifetime_raw = queries::contract_totals(pool, chain_id, address, queries::Window::Lifetime).await?;
+    let totals_30d_raw = queries::contract_totals(pool, chain_id, address, queries::Window::Days(30)).await?;
+
+    let totals_lifetime = TotalsView {
+        usd_saved: format_usd(totals_lifetime_raw.usd_saved.as_ref()),
+        eth_saved: format_eth(totals_lifetime_raw.wei_saved.as_ref()),
+        tx_count: totals_lifetime_raw.tx_count.unwrap_or(0),
+        project_count: 0,
+    };
+    let totals_30d = TotalsView {
+        usd_saved: format_usd(totals_30d_raw.usd_saved.as_ref()),
+        eth_saved: format_eth(totals_30d_raw.wei_saved.as_ref()),
+        tx_count: totals_30d_raw.tx_count.unwrap_or(0),
+        project_count: 0,
+    };
+    let function_count = totals_30d_raw.function_count.unwrap_or(0);
+    let avg_savings_pct_30d = format_pct(totals_30d_raw.avg_savings_pct);
+
+    let daily_90d = queries::daily_for_contract(pool, chain_id, address, 90)
+        .await?
+        .into_iter()
+        .map(|p| DailyView {
+            day: p.day.format("%Y-%m-%d").to_string(),
+            usd_saved: bd_to_f64(p.usd_saved.as_ref()),
+            tx_count: p.tx_count.unwrap_or(0),
+        })
+        .collect();
+
+    let functions = queries::functions_for_contract(pool, chain_id, address)
+        .await?
+        .into_iter()
+        .map(|r| ContractFunctionView {
+            selector_hex: format!("0x{}", hex::encode(&r.function_selector)),
+            function_name: r.function_name.unwrap_or_default(),
+            tx_count: r.tx_count.unwrap_or(0),
+            usd_saved: format_usd(r.usd_saved.as_ref()),
+            avg_savings_pct_pct: format_pct(r.avg_savings_pct),
+        })
+        .collect();
+
+    let recent_txs = queries::recent_txs_for_contract(pool, chain_id, address, 50)
+        .await?
+        .into_iter()
+        .map(|r| RecentTxView {
+            block_number: r.block_number,
+            tx_hash_hex: format!("0x{}", hex::encode(&r.tx_hash)),
+            gas_used: r.gas_used,
+            gas_saved: r.gas_saved,
+            wei_saved: format_eth(Some(&r.wei_saved)),
+            when: format_when(r.block_timestamp),
+        })
+        .collect();
+
+    let page = ContractPage {
+        user,
+        chain_id,
+        explorer_tx_url: state.explorer_tx_url.as_str().to_string(),
+        explorer_address_url: state.explorer_address_url.as_str().to_string(),
+        address_hex: format!("0x{}", hex::encode(address)),
+        project_display: header
+            .project_name
+            .clone()
+            .unwrap_or_else(|| header.project_slug.clone()),
+        project_slug: header.project_slug,
+        totals_lifetime,
+        totals_30d,
+        function_count,
+        avg_savings_pct_30d,
+        daily_90d,
+        functions,
+        recent_txs,
+    };
+    Ok(page.into_response())
+}
+
+// ---------- Per-function drilldown ----------
+
+#[derive(Template)]
+#[template(path = "function.html")]
+pub struct FunctionPage {
+    pub user: String,
+    pub chain_id: i64,
+    pub explorer_tx_url: String,
+    pub explorer_address_url: String,
+    pub address_hex: String,
+    pub selector_hex: String,
+    pub function_name: String,
+    pub function_sig: String,
+    pub project_slug: String,
+    pub project_display: String,
+    pub totals_lifetime: TotalsView,
+    pub totals_30d: TotalsView,
+    pub avg_savings_pct_30d: String,
+    pub daily_90d: Vec<DailyView>,
+    pub recent_txs: Vec<RecentTxView>,
+}
+
+pub async fn function_page(
+    AuthUser(user): AuthUser,
+    State(state): State<AppState>,
+    Path((address_hex, selector_hex)): Path<(String, String)>,
+) -> Result<Response, WebError> {
+    let pool = state.store.pool();
+    let chain_id = state.chain_id;
+
+    let address = parse_address(&address_hex)
+        .ok_or_else(|| WebError::BadRequest("invalid address".into()))?;
+    let selector = parse_selector(&selector_hex)
+        .ok_or_else(|| WebError::BadRequest("invalid selector".into()))?;
+
+    let header = queries::function_header(pool, chain_id, address, selector).await?;
+    let totals_lifetime_raw = queries::function_totals(pool, chain_id, address, selector, queries::Window::Lifetime).await?;
+    let totals_30d_raw = queries::function_totals(pool, chain_id, address, selector, queries::Window::Days(30)).await?;
+
+    let totals_lifetime = TotalsView {
+        usd_saved: format_usd(totals_lifetime_raw.usd_saved.as_ref()),
+        eth_saved: format_eth(totals_lifetime_raw.wei_saved.as_ref()),
+        tx_count: totals_lifetime_raw.tx_count.unwrap_or(0),
+        project_count: 0,
+    };
+    let totals_30d = TotalsView {
+        usd_saved: format_usd(totals_30d_raw.usd_saved.as_ref()),
+        eth_saved: format_eth(totals_30d_raw.wei_saved.as_ref()),
+        tx_count: totals_30d_raw.tx_count.unwrap_or(0),
+        project_count: 0,
+    };
+    let avg_savings_pct_30d = format_pct(totals_30d_raw.avg_savings_pct);
+
+    let daily_90d = queries::daily_for_function(pool, chain_id, address, selector, 90)
+        .await?
+        .into_iter()
+        .map(|p| DailyView {
+            day: p.day.format("%Y-%m-%d").to_string(),
+            usd_saved: bd_to_f64(p.usd_saved.as_ref()),
+            tx_count: p.tx_count.unwrap_or(0),
+        })
+        .collect();
+
+    let recent_txs = queries::recent_txs_for_function(pool, chain_id, address, selector, 50)
+        .await?
+        .into_iter()
+        .map(|r| RecentTxView {
+            block_number: r.block_number,
+            tx_hash_hex: format!("0x{}", hex::encode(&r.tx_hash)),
+            gas_used: r.gas_used,
+            gas_saved: r.gas_saved,
+            wei_saved: format_eth(Some(&r.wei_saved)),
+            when: format_when(r.block_timestamp),
+        })
+        .collect();
+
+    let page = FunctionPage {
+        user,
+        chain_id,
+        explorer_tx_url: state.explorer_tx_url.as_str().to_string(),
+        explorer_address_url: state.explorer_address_url.as_str().to_string(),
+        address_hex: format!("0x{}", hex::encode(address)),
+        selector_hex: format!("0x{}", hex::encode(selector)),
+        function_name: header.function_name.unwrap_or_default(),
+        function_sig: header.function_sig.unwrap_or_default(),
+        project_display: header
+            .project_name
+            .clone()
+            .unwrap_or_else(|| header.project_slug.clone()),
+        project_slug: header.project_slug,
+        totals_lifetime,
+        totals_30d,
+        avg_savings_pct_30d,
+        daily_90d,
+        recent_txs,
+    };
+    Ok(page.into_response())
+}
+
+fn parse_address(s: &str) -> Option<[u8; 20]> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(s).ok()?;
+    if bytes.len() != 20 {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&bytes);
+    Some(out)
+}
+
+fn parse_selector(s: &str) -> Option<[u8; 4]> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(s).ok()?;
+    if bytes.len() != 4 {
+        return None;
+    }
+    let mut out = [0u8; 4];
+    out.copy_from_slice(&bytes);
+    Some(out)
+}
+
 // ---------- Unknowns ----------
 
 #[derive(Template)]
