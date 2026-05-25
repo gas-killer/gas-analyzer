@@ -130,4 +130,19 @@ pub struct RefresherConfig {
         default_value = "/etc/indexer/known_names.yaml"
     )]
     pub known_names_path: PathBuf,
+
+    // -------- 4byte selector resolver --------
+    //
+    /// How often to scan for unresolved function selectors (seconds).
+    #[arg(long, env = "FOURBYTE_TICK_SECS", default_value_t = 3600)]
+    pub fourbyte_tick_secs: u64,
+
+    /// Max selectors fetched per tick.
+    #[arg(long, env = "FOURBYTE_BATCH_SIZE", default_value_t = 100)]
+    pub fourbyte_batch_size: i64,
+
+    /// Delay between consecutive 4byte requests (ms). The free API has no
+    /// documented rate limit but we throttle to be polite.
+    #[arg(long, env = "FOURBYTE_PER_REQ_DELAY_MS", default_value_t = 200)]
+    pub fourbyte_per_req_delay_ms: u64,
 }

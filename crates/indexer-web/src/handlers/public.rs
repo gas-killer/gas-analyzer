@@ -117,6 +117,11 @@ pub struct OverviewQuery {
 pub struct FunctionLeaderView {
     pub address_hex: String,
     pub selector_hex: String,
+    /// Resolved name or empty if 4byte hasn't fetched it yet. Templates
+    /// display this prominently when present and fall back to the raw
+    /// selector otherwise.
+    pub function_name: String,
+    pub function_sig: String,
     pub project_slug: String,
     pub project_display: String,
     pub tx_count: i64,
@@ -241,6 +246,8 @@ pub async fn overview(
                     FunctionLeaderView {
                         address_hex: format!("0x{}", hex::encode(&r.to_address)),
                         selector_hex: format!("0x{}", hex::encode(&r.function_selector)),
+                        function_name: r.function_name.unwrap_or_default(),
+                        function_sig: r.function_sig.unwrap_or_default(),
                         project_slug: r.project_slug,
                         project_display,
                         tx_count: r.tx_count.unwrap_or(0),

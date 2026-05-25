@@ -96,7 +96,14 @@ pub async fn run(common: CommonConfig, cfg: RefresherConfig) -> Result<()> {
         crate::labeler::run(common_d, cfg_d, store_d).await;
     });
 
-    let _ = tokio::try_join!(resolver_loop, price_loop, rollup_loop, labeler_loop);
+    let store_e = store.clone();
+    let common_e = common.clone();
+    let cfg_e = cfg.clone();
+    let fourbyte_loop = tokio::spawn(async move {
+        crate::fourbyte_resolver::run(common_e, cfg_e, store_e).await;
+    });
+
+    let _ = tokio::try_join!(resolver_loop, price_loop, rollup_loop, labeler_loop, fourbyte_loop);
     Ok(())
 }
 
