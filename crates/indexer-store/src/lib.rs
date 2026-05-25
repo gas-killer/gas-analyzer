@@ -427,6 +427,54 @@ impl Store {
         Ok(())
     }
 
+    pub async fn blacklist_add(
+        &self,
+        chain_id: u64,
+        address: [u8; 20],
+        selector: Option<[u8; 4]>,
+        reason: &str,
+        created_by: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"INSERT INTO analysis_exclusion
+                 (chain_id, address, selector, reason, created_by)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (chain_id, address, COALESCE(selector, ''::bytea))
+                 DO UPDATE SET
+                   reason     = EXCLUDED.reason,
+                   created_by = EXCLUDED.created_by,
+                   created_at = now()"#,
+        )
+        .bind(chain_id as i64)
+        .bind(&address[..])
+        .bind(selector.as_ref().map(|s| &s[..]))
+        .bind(reason)
+        .bind(created_by)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn blacklist_remove(
+        &self,
+        chain_id: u64,
+        address: [u8; 20],
+        selector: Option<[u8; 4]>,
+    ) -> Result<bool, StoreError> {
+        let res = sqlx::query(
+            r#"DELETE FROM analysis_exclusion
+               WHERE chain_id = $1
+                 AND address  = $2
+                 AND COALESCE(selector, ''::bytea) = COALESCE($3, ''::bytea)"#,
+        )
+        .bind(chain_id as i64)
+        .bind(&address[..])
+        .bind(selector.as_ref().map(|s| &s[..]))
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     pub async fn refresh_rollups(&self) -> Result<(), StoreError> {
         // CONCURRENTLY needs the unique index, which both rollups declare.
         sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY project_daily")

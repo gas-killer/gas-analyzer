@@ -173,6 +173,10 @@ pub async fn leaderboard_functions_30d(
            FROM function_daily fd
            LEFT JOIN projects p ON p.project_slug = fd.project_slug
            LEFT JOIN function_selectors fs ON fs.selector = fd.function_selector
+           LEFT JOIN analysis_exclusion x
+             ON x.chain_id = fd.chain_id
+            AND x.address  = fd.to_address
+            AND (x.selector IS NULL OR x.selector = fd.function_selector)
            LEFT JOIN (
              SELECT
                to_address,
@@ -189,6 +193,7 @@ pub async fn leaderboard_functions_30d(
            ) m ON m.to_address = fd.to_address AND m.function_selector = fd.function_selector
            WHERE fd.chain_id = $1
              AND fd.day >= (now() - interval '30 days')::date
+             AND x.address IS NULL
            GROUP BY fd.to_address, fd.function_selector, fd.project_slug,
                     p.project_name, fs.primary_name, fs.primary_sig, m.median_savings_pct
            ORDER BY wei_saved_total DESC NULLS LAST
@@ -239,6 +244,10 @@ pub async fn leaderboard_contracts_30d(
              m.median_savings_pct
            FROM function_daily fd
            LEFT JOIN projects p ON p.project_slug = fd.project_slug
+           LEFT JOIN analysis_exclusion x
+             ON x.chain_id = fd.chain_id
+            AND x.address  = fd.to_address
+            AND (x.selector IS NULL OR x.selector = fd.function_selector)
            LEFT JOIN (
              SELECT
                to_address,
@@ -254,6 +263,7 @@ pub async fn leaderboard_contracts_30d(
            ) m ON m.to_address = fd.to_address
            WHERE fd.chain_id = $1
              AND fd.day >= (now() - interval '30 days')::date
+             AND x.address IS NULL
            GROUP BY fd.to_address, fd.project_slug, p.project_name, m.median_savings_pct
            ORDER BY wei_saved_total DESC NULLS LAST
            LIMIT $2 OFFSET $3"#,
@@ -890,6 +900,34 @@ pub async fn recent_txs_for_function(
         query = query.bind(min);
     }
     let rows = query.bind(limit).bind(offset).fetch_all(pool).await?;
+    Ok(rows)
+}
+
+// ---------- Blacklist (analysis_exclusion) ----------
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct BlacklistRow {
+    pub chain_id: i64,
+    pub address: Vec<u8>,
+    pub selector: Option<Vec<u8>>,
+    pub reason: String,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+}
+
+pub async fn blacklist_list(
+    pool: &PgPool,
+    chain_id: i64,
+) -> Result<Vec<BlacklistRow>, WebError> {
+    let rows = sqlx::query_as::<_, BlacklistRow>(
+        r#"SELECT chain_id, address, selector, reason, created_by, created_at
+           FROM analysis_exclusion
+           WHERE chain_id = $1
+           ORDER BY created_at DESC"#,
+    )
+    .bind(chain_id)
+    .fetch_all(pool)
+    .await?;
     Ok(rows)
 }
 
