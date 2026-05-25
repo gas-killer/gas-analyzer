@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Organizations — Gas Killer Indexer{% endblock %}
+{% block content %}
+
+<h2>Organizations</h2>
+<p class="muted">Group multiple projects under a parent brand for the org-level leaderboard view.</p>
+
+<section class="card">
+    <h3>Create / rename</h3>
+    <form method="post" action="/admin/orgs/create" class="blacklist-form">
+        <label>Org slug <input type="text" name="org_slug" required placeholder="uniswap"></label>
+        <label>Display name <input type="text" name="org_name" required placeholder="Uniswap"></label>
+        <button type="submit" class="btn">Save</button>
+    </form>
+</section>
+
+<section class="card">
+    <h3>Existing orgs</h3>
+    <table class="data-table">
+        <thead><tr><th>Slug</th><th>Name</th></tr></thead>
+        <tbody>
+        {% for o in orgs %}
+            <tr><td><code>{{ o.org_slug }}</code></td><td>{{ o.org_name }}</td></tr>
+        {% else %}
+            <tr><td colspan="2" class="muted">No organizations yet.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<section class="card">
+    <h3>Project → Org assignment</h3>
+    <p class="muted">Change a project's org by picking one from the dropdown. Empty means "no org".</p>
+    <table class="data-table">
+        <thead><tr><th>Project</th><th>Current org</th><th>Reassign</th></tr></thead>
+        <tbody>
+        {% for p in projects %}
+            <tr>
+                <td><a href="/projects/{{ p.project_slug }}">{{ p.project_name }}</a> <span class="muted">({{ p.project_slug }})</span></td>
+                <td>{% if !p.org_slug.is_empty() %}<code>{{ p.org_slug }}</code>{% else %}<span class="muted">—</span>{% endif %}</td>
+                <td>
+                    <form method="post" action="/admin/orgs/assign" style="display:flex;gap:6px;align-items:center;">
+                        <input type="hidden" name="project_slug" value="{{ p.project_slug }}">
+                        <select name="org_slug">
+                            <option value=""{% if p.org_slug.is_empty() %} selected{% endif %}>— none —</option>
+                            {% for o in orgs %}
+                                <option value="{{ o.org_slug }}"{% if p.org_slug == o.org_slug %} selected{% endif %}>{{ o.org_name }}</option>
+                            {% endfor %}
+                        </select>
+                        <button type="submit" class="btn">Save</button>
+                    </form>
+                </td>
+            </tr>
+        {% else %}
+            <tr><td colspan="3" class="muted">No projects.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+{% endblock %}

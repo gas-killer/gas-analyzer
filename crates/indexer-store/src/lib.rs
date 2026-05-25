@@ -427,6 +427,34 @@ impl Store {
         Ok(())
     }
 
+    pub async fn org_upsert(&self, org_slug: &str, org_name: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"INSERT INTO organizations (org_slug, org_name)
+               VALUES ($1, $2)
+               ON CONFLICT (org_slug) DO UPDATE SET org_name = EXCLUDED.org_name"#,
+        )
+        .bind(org_slug)
+        .bind(org_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn project_assign_org(
+        &self,
+        project_slug: &str,
+        org_slug: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let res = sqlx::query(
+            r#"UPDATE projects SET org_slug = $2 WHERE project_slug = $1"#,
+        )
+        .bind(project_slug)
+        .bind(org_slug)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     pub async fn blacklist_add(
         &self,
         chain_id: u64,
