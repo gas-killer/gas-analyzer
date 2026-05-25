@@ -27,6 +27,7 @@ impl Window {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct OverviewTotals {
     pub usd_saved: Option<BigDecimal>,
+    pub wei_saved: Option<BigDecimal>,
     pub tx_count: Option<i64>,
     pub project_count: Option<i64>,
 }
@@ -39,9 +40,10 @@ pub async fn overview_totals(
     let row = match window.interval_clause() {
         None => sqlx::query_as::<_, OverviewTotals>(
             r#"SELECT
-                 COALESCE(SUM(usd_saved_total), 0)::numeric AS usd_saved,
-                 COALESCE(SUM(tx_count), 0)::bigint        AS tx_count,
-                 COUNT(DISTINCT project_slug)::bigint      AS project_count
+                 COALESCE(SUM(usd_saved_total), 0)::numeric  AS usd_saved,
+                 COALESCE(SUM(wei_saved_total), 0)::numeric  AS wei_saved,
+                 COALESCE(SUM(tx_count), 0)::bigint          AS tx_count,
+                 COUNT(DISTINCT project_slug)::bigint        AS project_count
                FROM project_daily
                WHERE chain_id = $1"#,
         )
@@ -50,9 +52,10 @@ pub async fn overview_totals(
         .await?,
         Some(interval) => sqlx::query_as::<_, OverviewTotals>(&format!(
             r#"SELECT
-                 COALESCE(SUM(usd_saved_total), 0)::numeric AS usd_saved,
-                 COALESCE(SUM(tx_count), 0)::bigint        AS tx_count,
-                 COUNT(DISTINCT project_slug)::bigint      AS project_count
+                 COALESCE(SUM(usd_saved_total), 0)::numeric  AS usd_saved,
+                 COALESCE(SUM(wei_saved_total), 0)::numeric  AS wei_saved,
+                 COALESCE(SUM(tx_count), 0)::bigint          AS tx_count,
+                 COUNT(DISTINCT project_slug)::bigint        AS project_count
                FROM project_daily
                WHERE chain_id = $1 AND day >= (now() - interval '{interval}')::date"#
         ))
@@ -233,6 +236,7 @@ pub async fn project_header(
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ProjectTotals {
     pub usd_saved: Option<BigDecimal>,
+    pub wei_saved: Option<BigDecimal>,
     pub tx_count: Option<i64>,
     pub avg_savings_pct: Option<f64>,
 }
@@ -247,6 +251,7 @@ pub async fn project_totals(
         None => format!(
             r#"SELECT
                  COALESCE(SUM(usd_saved_total), 0)::numeric AS usd_saved,
+                 COALESCE(SUM(wei_saved_total), 0)::numeric AS wei_saved,
                  COALESCE(SUM(tx_count), 0)::bigint         AS tx_count,
                  AVG(avg_savings_pct)::float8               AS avg_savings_pct
                FROM project_daily
@@ -255,6 +260,7 @@ pub async fn project_totals(
         Some(i) => format!(
             r#"SELECT
                  COALESCE(SUM(usd_saved_total), 0)::numeric AS usd_saved,
+                 COALESCE(SUM(wei_saved_total), 0)::numeric AS wei_saved,
                  COALESCE(SUM(tx_count), 0)::bigint         AS tx_count,
                  AVG(avg_savings_pct)::float8               AS avg_savings_pct
                FROM project_daily
