@@ -131,6 +131,11 @@ pub struct RefresherConfig {
     )]
     pub known_names_path: PathBuf,
 
+    /// Blockscout API v2 base URL (e.g. `https://gnosis.blockscout.com/api/v2`).
+    /// Used as a fallback when Etherscan returns Unverified. Empty disables.
+    #[arg(long, env = "BLOCKSCOUT_URL", default_value = "")]
+    pub blockscout_url: String,
+
     // -------- 4byte selector resolver --------
     //
     /// How often to scan for unresolved function selectors (seconds).
