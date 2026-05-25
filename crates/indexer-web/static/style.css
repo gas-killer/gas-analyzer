@@ -105,6 +105,10 @@ pre { background: #0a0d12; border: 1px solid var(--panel-border); padding: 12px;
 .refresh-grid { display: flex; flex-direction: column; gap: 4px; }
 .btn-danger { background: #5a2222 !important; color: #ffdada !important; }
 
+.blacklist-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
+.blacklist-form label { display: flex; flex-direction: column; font-size: 11px; color: var(--muted); gap: 3px; flex: 1 1 200px; }
+.blacklist-form input { background: var(--bg); border: 1px solid var(--panel-border); border-radius: 4px; color: var(--text); padding: 6px 8px; font: inherit; }
+
 .charts-row {
     display: grid;
     grid-template-columns: 2fr 1fr;

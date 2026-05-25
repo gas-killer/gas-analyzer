@@ -9,9 +9,11 @@ use std::time::Instant;
 
 use askama::Template;
 use askama_axum::IntoResponse;
+use axum::Form;
 use axum::extract::State;
-use axum::response::Response;
+use axum::response::{Redirect, Response};
 use redis::AsyncCommands;
+use serde::Deserialize;
 
 use crate::AppState;
 use crate::auth::AuthUser;
@@ -79,6 +81,135 @@ pub async fn health_partial(
 ) -> Result<Response, WebError> {
     let health = collect_health(&state).await?;
     Ok(HealthFragment { health }.into_response())
+}
+
+// ---------- Blacklist ----------
+
+#[derive(Template)]
+#[template(path = "admin_blacklist.html")]
+pub struct BlacklistPage {
+    pub user: String,
+    pub chain_id: i64,
+    pub rows: Vec<BlacklistRowView>,
+    pub flash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlacklistRowView {
+    pub address_hex: String,
+    pub selector_hex: String,
+    pub reason: String,
+    pub created_by: String,
+    pub when: String,
+}
+
+pub async fn blacklist_page(
+    AuthUser(user): AuthUser,
+    State(state): State<AppState>,
+) -> Result<Response, WebError> {
+    let rows = queries::blacklist_list(state.store.pool(), state.chain_id)
+        .await?
+        .into_iter()
+        .map(|r| BlacklistRowView {
+            address_hex: format!("0x{}", hex::encode(&r.address)),
+            selector_hex: r
+                .selector
+                .as_ref()
+                .map(|s| format!("0x{}", hex::encode(s)))
+                .unwrap_or_else(|| "(whole contract)".to_string()),
+            reason: r.reason,
+            created_by: r.created_by,
+            when: r.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
+        })
+        .collect();
+    Ok(BlacklistPage {
+        user,
+        chain_id: state.chain_id,
+        rows,
+        flash: String::new(),
+    }
+    .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BlacklistAddForm {
+    pub address: String,
+    pub selector: Option<String>,
+    pub reason: String,
+}
+
+pub async fn blacklist_add(
+    AuthUser(user): AuthUser,
+    State(state): State<AppState>,
+    Form(form): Form<BlacklistAddForm>,
+) -> Result<Response, WebError> {
+    let address = parse_hex_address(&form.address)
+        .ok_or_else(|| WebError::BadRequest("invalid address".into()))?;
+    let selector = match form.selector.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => Some(
+            parse_hex_selector(s).ok_or_else(|| WebError::BadRequest("invalid selector".into()))?,
+        ),
+        None => None,
+    };
+    let reason = form.reason.trim();
+    if reason.is_empty() {
+        return Err(WebError::BadRequest("reason is required".into()));
+    }
+    state
+        .store
+        .blacklist_add(state.chain_id as u64, address, selector, reason, &user)
+        .await
+        .map_err(|e| WebError::Internal(format!("blacklist add: {e}")))?;
+    Ok(Redirect::to("/admin/blacklist").into_response())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BlacklistRemoveForm {
+    pub address: String,
+    pub selector: Option<String>,
+}
+
+pub async fn blacklist_remove(
+    _user: AuthUser,
+    State(state): State<AppState>,
+    Form(form): Form<BlacklistRemoveForm>,
+) -> Result<Response, WebError> {
+    let address = parse_hex_address(&form.address)
+        .ok_or_else(|| WebError::BadRequest("invalid address".into()))?;
+    let selector = match form.selector.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => Some(
+            parse_hex_selector(s).ok_or_else(|| WebError::BadRequest("invalid selector".into()))?,
+        ),
+        None => None,
+    };
+    state
+        .store
+        .blacklist_remove(state.chain_id as u64, address, selector)
+        .await
+        .map_err(|e| WebError::Internal(format!("blacklist remove: {e}")))?;
+    Ok(Redirect::to("/admin/blacklist").into_response())
+}
+
+fn parse_hex_address(s: &str) -> Option<[u8; 20]> {
+    let s = s.trim().strip_prefix("0x").unwrap_or(s.trim());
+    let bytes = hex::decode(s).ok()?;
+    if bytes.len() != 20 {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&bytes);
+    Some(out)
+}
+
+fn parse_hex_selector(s: &str) -> Option<[u8; 4]> {
+    let s = s.trim().strip_prefix("0x").unwrap_or(s.trim());
+    let bytes = hex::decode(s).ok()?;
+    if bytes.len() != 4 {
+        return None;
+    }
+    let mut out = [0u8; 4];
+    out.copy_from_slice(&bytes);
+    Some(out)
 }
 
 // ---------- Refresh banners ----------
