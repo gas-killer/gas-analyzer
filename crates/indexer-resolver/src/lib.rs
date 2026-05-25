@@ -17,6 +17,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
+pub mod blockscout;
 pub mod etherscan;
 pub mod fourbyte;
 

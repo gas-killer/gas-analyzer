@@ -25,6 +25,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use indexer_resolver::blockscout::BlockscoutClient;
 use indexer_resolver::etherscan::{ContractMeta, EtherscanClient, NameDict};
 use indexer_store::Store;
 use redis::AsyncCommands;
@@ -45,6 +46,19 @@ pub async fn run(common: CommonConfig, cfg: RefresherConfig, store: Store) {
         Err(e) => {
             tracing::warn!(error = %e, "labeler disabled (etherscan client init failed)");
             return;
+        }
+    };
+
+    // Blockscout is best-effort — its absence shouldn't disable the labeler.
+    let blockscout: Option<Arc<BlockscoutClient>> = if cfg.blockscout_url.is_empty() {
+        None
+    } else {
+        match BlockscoutClient::new(cfg.blockscout_url.clone()) {
+            Ok(c) => Some(Arc::new(c)),
+            Err(e) => {
+                tracing::warn!(error = %e, "blockscout disabled (client init failed)");
+                None
+            }
         }
     };
 
@@ -89,8 +103,12 @@ pub async fn run(common: CommonConfig, cfg: RefresherConfig, store: Store) {
     let store_b = store.clone();
     let cfg_b = cfg.clone();
     let common_b = common.clone();
+    let blockscout_b = blockscout.clone();
     let consumer = tokio::spawn(async move {
-        consumer_loop(common_b, cfg_b, store_b, conn_for_consumer, client, names).await;
+        consumer_loop(
+            common_b, cfg_b, store_b, conn_for_consumer, client, blockscout_b, names,
+        )
+        .await;
     });
 
     let _ = tokio::join!(producer, consumer);
@@ -166,6 +184,7 @@ async fn consumer_loop(
     store: Store,
     mut conn: redis::aio::MultiplexedConnection,
     client: Arc<EtherscanClient>,
+    blockscout: Option<Arc<BlockscoutClient>>,
     names: Arc<NameDict>,
 ) {
     let min_delay = Duration::from_millis(cfg.labeler_min_delay_ms.max(50));
@@ -193,7 +212,7 @@ async fn consumer_loop(
             continue;
         };
 
-        process_address(&common, &store, &client, &names, addr, score).await;
+        process_address(&common, &store, &client, blockscout.as_deref(), &names, addr, score).await;
         sleep_until(next_after).await;
     }
 }
@@ -206,6 +225,7 @@ async fn process_address(
     common: &CommonConfig,
     store: &Store,
     client: &EtherscanClient,
+    blockscout: Option<&BlockscoutClient>,
     names: &NameDict,
     addr: [u8; 20],
     score: f64,
@@ -214,10 +234,25 @@ async fn process_address(
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(addr = %hex::encode(addr), error = %e, "labeler etherscan fetch failed");
-            let _ = store
-                .upsert_label_attempt(common.chain_id, addr, "error", None, None)
-                .await;
-            return;
+            // Try Blockscout before declaring transport failure — independent
+            // upstream may still answer.
+            if let Some(bs) = blockscout {
+                match bs.get_contract_name(&addr).await {
+                    Ok(m) => m,
+                    Err(e2) => {
+                        tracing::warn!(addr = %hex::encode(addr), error = %e2, "labeler blockscout fallback failed");
+                        let _ = store
+                            .upsert_label_attempt(common.chain_id, addr, "error", None, None)
+                            .await;
+                        return;
+                    }
+                }
+            } else {
+                let _ = store
+                    .upsert_label_attempt(common.chain_id, addr, "error", None, None)
+                    .await;
+                return;
+            }
         }
     };
 
@@ -228,11 +263,23 @@ async fn process_address(
             ..
         } => (name, implementation),
         ContractMeta::Unverified => {
-            tracing::debug!(addr = %hex::encode(addr), score, "labeler: unverified");
-            let _ = store
-                .upsert_label_attempt(common.chain_id, addr, "unverified", None, None)
-                .await;
-            return;
+            // Fall through to Blockscout before giving up — Etherscan and
+            // Blockscout often disagree on which contracts are "verified".
+            let bs_meta = if let Some(bs) = blockscout {
+                bs.get_contract_name(&addr).await.ok()
+            } else {
+                None
+            };
+            match bs_meta {
+                Some(ContractMeta::Verified { name, implementation, .. }) => (name, implementation),
+                _ => {
+                    tracing::debug!(addr = %hex::encode(addr), score, "labeler: unverified");
+                    let _ = store
+                        .upsert_label_attempt(common.chain_id, addr, "unverified", None, None)
+                        .await;
+                    return;
+                }
+            }
         }
     };
 
