@@ -360,8 +360,11 @@ impl Store {
     }
 
     pub async fn refresh_rollups(&self) -> Result<(), StoreError> {
-        // CONCURRENTLY needs the unique index, which we declared.
+        // CONCURRENTLY needs the unique index, which both rollups declare.
         sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY project_daily")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY function_daily")
             .execute(&self.pool)
             .await?;
         Ok(())
