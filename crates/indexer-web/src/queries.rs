@@ -495,32 +495,75 @@ pub struct RecentTxRow {
     pub block_timestamp: DateTime<Utc>,
 }
 
+/// Date and savings filters applied to tx-list queries. All fields are
+/// optional; an empty `TxFilters::default()` means no narrowing.
+#[derive(Debug, Clone, Default)]
+pub struct TxFilters {
+    /// Inclusive lower bound on `block_timestamp` (YYYY-MM-DD).
+    pub from: Option<chrono::NaiveDate>,
+    /// Exclusive upper bound on `block_timestamp` (YYYY-MM-DD).
+    pub to: Option<chrono::NaiveDate>,
+    /// Minimum `gas_saved` to include — lets BD strip tiny-savings noise.
+    pub min_gas_saved: Option<i64>,
+}
+
+impl TxFilters {
+    /// Build a SQL fragment + bind values. Returns the WHERE clause
+    /// addendum (always starts with " AND ") and the offsets where to
+    /// bind from/to/min — the caller binds in the same order.
+    fn where_clause(&self, next_idx: &mut usize) -> String {
+        let mut s = String::new();
+        if self.from.is_some() {
+            s.push_str(&format!(" AND block_timestamp >= ${}::timestamptz", next_idx));
+            *next_idx += 1;
+        }
+        if self.to.is_some() {
+            s.push_str(&format!(" AND block_timestamp <  ${}::timestamptz", next_idx));
+            *next_idx += 1;
+        }
+        if self.min_gas_saved.is_some() {
+            s.push_str(&format!(" AND gas_saved >= ${}::bigint", next_idx));
+            *next_idx += 1;
+        }
+        s
+    }
+}
+
 pub async fn recent_txs_for_project(
     pool: &PgPool,
     chain_id: i64,
     project_slug: &str,
     limit: i64,
+    offset: i64,
+    filters: &TxFilters,
 ) -> Result<Vec<RecentTxRow>, WebError> {
-    let rows = sqlx::query_as::<_, RecentTxRow>(
+    let mut idx = 3usize;
+    let extra = filters.where_clause(&mut idx);
+    let limit_param = idx;
+    let offset_param = idx + 1;
+    let q = format!(
         r#"SELECT
-             block_number,
-             tx_hash,
-             gas_used,
-             gas_saved,
-             wei_saved,
-             block_timestamp
+             block_number, tx_hash, gas_used, gas_saved, wei_saved, block_timestamp
            FROM analysis
            WHERE chain_id = $1 AND project_slug = $2
              AND gas_saved > 0
-             AND cardinality(skipped_opcodes) = 0
+             AND cardinality(skipped_opcodes) = 0{extra}
            ORDER BY block_timestamp DESC
-           LIMIT $3"#,
-    )
-    .bind(chain_id)
-    .bind(project_slug)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+           LIMIT ${limit_param} OFFSET ${offset_param}"#,
+    );
+    let mut query = sqlx::query_as::<_, RecentTxRow>(&q)
+        .bind(chain_id)
+        .bind(project_slug);
+    if let Some(from) = filters.from {
+        query = query.bind(from.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc());
+    }
+    if let Some(to) = filters.to {
+        query = query.bind(to.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc());
+    }
+    if let Some(min) = filters.min_gas_saved {
+        query = query.bind(min);
+    }
+    let rows = query.bind(limit).bind(offset).fetch_all(pool).await?;
     Ok(rows)
 }
 
@@ -667,22 +710,36 @@ pub async fn recent_txs_for_contract(
     chain_id: i64,
     address: [u8; 20],
     limit: i64,
+    offset: i64,
+    filters: &TxFilters,
 ) -> Result<Vec<RecentTxRow>, WebError> {
-    let rows = sqlx::query_as::<_, RecentTxRow>(
+    let mut idx = 3usize;
+    let extra = filters.where_clause(&mut idx);
+    let limit_param = idx;
+    let offset_param = idx + 1;
+    let q = format!(
         r#"SELECT
              block_number, tx_hash, gas_used, gas_saved, wei_saved, block_timestamp
            FROM analysis
            WHERE chain_id = $1 AND to_address = $2
              AND gas_saved > 0
-             AND cardinality(skipped_opcodes) = 0
+             AND cardinality(skipped_opcodes) = 0{extra}
            ORDER BY block_timestamp DESC
-           LIMIT $3"#,
-    )
-    .bind(chain_id)
-    .bind(&address[..])
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+           LIMIT ${limit_param} OFFSET ${offset_param}"#,
+    );
+    let mut query = sqlx::query_as::<_, RecentTxRow>(&q)
+        .bind(chain_id)
+        .bind(&address[..]);
+    if let Some(from) = filters.from {
+        query = query.bind(from.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc());
+    }
+    if let Some(to) = filters.to {
+        query = query.bind(to.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc());
+    }
+    if let Some(min) = filters.min_gas_saved {
+        query = query.bind(min);
+    }
+    let rows = query.bind(limit).bind(offset).fetch_all(pool).await?;
     Ok(rows)
 }
 
@@ -800,8 +857,14 @@ pub async fn recent_txs_for_function(
     address: [u8; 20],
     selector: [u8; 4],
     limit: i64,
+    offset: i64,
+    filters: &TxFilters,
 ) -> Result<Vec<RecentTxRow>, WebError> {
-    let rows = sqlx::query_as::<_, RecentTxRow>(
+    let mut idx = 4usize;
+    let extra = filters.where_clause(&mut idx);
+    let limit_param = idx;
+    let offset_param = idx + 1;
+    let q = format!(
         r#"SELECT
              block_number, tx_hash, gas_used, gas_saved, wei_saved, block_timestamp
            FROM analysis
@@ -809,16 +872,24 @@ pub async fn recent_txs_for_function(
              AND to_address = $2
              AND function_selector = $3
              AND gas_saved > 0
-             AND cardinality(skipped_opcodes) = 0
+             AND cardinality(skipped_opcodes) = 0{extra}
            ORDER BY block_timestamp DESC
-           LIMIT $4"#,
-    )
-    .bind(chain_id)
-    .bind(&address[..])
-    .bind(&selector[..])
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+           LIMIT ${limit_param} OFFSET ${offset_param}"#,
+    );
+    let mut query = sqlx::query_as::<_, RecentTxRow>(&q)
+        .bind(chain_id)
+        .bind(&address[..])
+        .bind(&selector[..]);
+    if let Some(from) = filters.from {
+        query = query.bind(from.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc());
+    }
+    if let Some(to) = filters.to {
+        query = query.bind(to.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc());
+    }
+    if let Some(min) = filters.min_gas_saved {
+        query = query.bind(min);
+    }
+    let rows = query.bind(limit).bind(offset).fetch_all(pool).await?;
     Ok(rows)
 }
 
