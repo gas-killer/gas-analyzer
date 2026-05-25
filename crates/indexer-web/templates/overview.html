@@ -2,26 +2,40 @@
 {% block title %}Overview — Gas Killer Indexer{% endblock %}
 {% block content %}
 
+<section class="card hero-card">
+    <h3>Total gas saved · lifetime</h3>
+    <div class="metric hero-metric">{{ totals_lifetime.usd_saved }}</div>
+    <div class="muted">{{ totals_lifetime.eth_saved }} · {{ totals_lifetime.tx_count }} txs across {{ totals_lifetime.project_count }} projects</div>
+</section>
+
 <section class="totals-grid">
     <div class="card">
-        <h3>Lifetime</h3>
-        <div class="metric">{{ totals_lifetime.tx_count }} txs</div>
-        <div class="muted">{{ totals_lifetime.project_count }} projects</div>
-    </div>
-    <div class="card">
         <h3>Last 30d</h3>
-        <div class="metric">{{ totals_30d.tx_count }} txs</div>
-        <div class="muted">{{ totals_30d.project_count }} projects</div>
+        <div class="metric">{{ totals_30d.usd_saved }}</div>
+        <div class="muted">{{ totals_30d.eth_saved }} · {{ totals_30d.tx_count }} txs</div>
     </div>
     <div class="card">
         <h3>Last 7d</h3>
-        <div class="metric">{{ totals_7d.tx_count }} txs</div>
-        <div class="muted">&nbsp;</div>
+        <div class="metric">{{ totals_7d.usd_saved }}</div>
+        <div class="muted">{{ totals_7d.eth_saved }} · {{ totals_7d.tx_count }} txs</div>
     </div>
     <div class="card">
         <h3>Last 24h</h3>
-        <div class="metric">{{ totals_24h.tx_count }} txs</div>
-        <div class="muted">&nbsp;</div>
+        <div class="metric">{{ totals_24h.usd_saved }}</div>
+        <div class="muted">{{ totals_24h.eth_saved }} · {{ totals_24h.tx_count }} txs</div>
+    </div>
+</section>
+
+<section class="totals-grid projection-grid">
+    <div class="card projection-card">
+        <h3>Projected monthly</h3>
+        <div class="metric">{{ projection.monthly_usd }}</div>
+        <div class="muted">{{ projection.monthly_eth }} <span class="extrapolated">· extrapolated from last 30d</span></div>
+    </div>
+    <div class="card projection-card">
+        <h3>Projected yearly</h3>
+        <div class="metric">{{ projection.yearly_usd }}</div>
+        <div class="muted">{{ projection.yearly_eth }} <span class="extrapolated">· extrapolated from last 30d × 12.17</span></div>
     </div>
 </section>
 

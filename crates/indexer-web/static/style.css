@@ -73,6 +73,13 @@ pre { background: #0a0d12; border: 1px solid var(--panel-border); padding: 12px;
 }
 .totals-grid .card { margin-bottom: 0; }
 
+.hero-card { padding: 24px 28px; }
+.hero-metric { font-size: 44px; line-height: 1.05; }
+.projection-grid { grid-template-columns: 1fr 1fr; }
+.projection-card .metric { font-size: 24px; }
+.extrapolated { opacity: 0.7; font-style: italic; }
+@media (max-width: 700px) { .projection-grid { grid-template-columns: 1fr; } }
+
 .charts-row {
     display: grid;
     grid-template-columns: 2fr 1fr;

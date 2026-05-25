@@ -92,6 +92,11 @@ pub struct OverviewPage {
     pub totals_30d: TotalsView,
     pub totals_7d: TotalsView,
     pub totals_24h: TotalsView,
+    /// USD/ETH extrapolations from the 30d window. "Monthly" is the 30d
+    /// total verbatim (a 30-day window IS a month); "yearly" is the 30d
+    /// total scaled by 365/30. Both are shown as separate cards so BD
+    /// doesn't have to do the multiplication on a call.
+    pub projection: ProjectionView,
     pub leaderboard: Vec<LeaderRow>,
     pub daily_30d: Vec<DailyView>,
 }
@@ -99,8 +104,17 @@ pub struct OverviewPage {
 #[derive(Debug, Clone)]
 pub struct TotalsView {
     pub usd_saved: String,
+    pub eth_saved: String,
     pub tx_count: i64,
     pub project_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectionView {
+    pub monthly_usd: String,
+    pub monthly_eth: String,
+    pub yearly_usd: String,
+    pub yearly_eth: String,
 }
 
 #[derive(Debug, Clone)]
@@ -137,10 +151,24 @@ pub async fn overview(
     let pool = state.store.pool();
     let chain_id = state.chain_id;
 
-    let totals_lifetime = totals_view(queries::overview_totals(pool, chain_id, queries::Window::Lifetime).await?);
-    let totals_30d = totals_view(queries::overview_totals(pool, chain_id, queries::Window::Days(30)).await?);
-    let totals_7d = totals_view(queries::overview_totals(pool, chain_id, queries::Window::Days(7)).await?);
-    let totals_24h = totals_view(queries::overview_totals(pool, chain_id, queries::Window::Days(1)).await?);
+    let totals_lifetime_raw = queries::overview_totals(pool, chain_id, queries::Window::Lifetime).await?;
+    let totals_30d_raw = queries::overview_totals(pool, chain_id, queries::Window::Days(30)).await?;
+    let totals_7d_raw = queries::overview_totals(pool, chain_id, queries::Window::Days(7)).await?;
+    let totals_24h_raw = queries::overview_totals(pool, chain_id, queries::Window::Days(1)).await?;
+
+    let usd_30d = bd_to_f64(totals_30d_raw.usd_saved.as_ref());
+    let eth_30d = bd_to_f64(totals_30d_raw.wei_saved.as_ref()) / 1e18;
+    let projection = ProjectionView {
+        monthly_usd: format_usd_value(usd_30d),
+        monthly_eth: format_eth_value(eth_30d),
+        yearly_usd: format_usd_value(usd_30d * (365.0 / 30.0)),
+        yearly_eth: format_eth_value(eth_30d * (365.0 / 30.0)),
+    };
+
+    let totals_lifetime = totals_view(totals_lifetime_raw);
+    let totals_30d = totals_view(totals_30d_raw);
+    let totals_7d = totals_view(totals_7d_raw);
+    let totals_24h = totals_view(totals_24h_raw);
 
     let lb = queries::leaderboard_30d(pool, chain_id, 50, 0).await?;
     let leaderboard = lb
@@ -191,6 +219,7 @@ pub async fn overview(
         totals_30d,
         totals_7d,
         totals_24h,
+        projection,
         leaderboard,
         daily_30d,
     };
@@ -260,11 +289,13 @@ pub async fn project(
 
     let totals_lifetime = TotalsView {
         usd_saved: format_usd(totals_lifetime_raw.usd_saved.as_ref()),
+        eth_saved: format_eth(totals_lifetime_raw.wei_saved.as_ref()),
         tx_count: totals_lifetime_raw.tx_count.unwrap_or(0),
         project_count: 0,
     };
     let totals_30d = TotalsView {
         usd_saved: format_usd(totals_30d_raw.usd_saved.as_ref()),
+        eth_saved: format_eth(totals_30d_raw.wei_saved.as_ref()),
         tx_count: totals_30d_raw.tx_count.unwrap_or(0),
         project_count: 0,
     };
@@ -398,6 +429,7 @@ pub async fn unknowns(
 fn totals_view(t: queries::OverviewTotals) -> TotalsView {
     TotalsView {
         usd_saved: format_usd(t.usd_saved.as_ref()),
+        eth_saved: format_eth(t.wei_saved.as_ref()),
         tx_count: t.tx_count.unwrap_or(0),
         project_count: t.project_count.unwrap_or(0),
     }
@@ -410,7 +442,10 @@ fn bd_to_f64(b: Option<&BigDecimal>) -> f64 {
 }
 
 fn format_usd(b: Option<&BigDecimal>) -> String {
-    let v = bd_to_f64(b);
+    format_usd_value(bd_to_f64(b))
+}
+
+fn format_usd_value(v: f64) -> String {
     if v >= 1_000_000.0 {
         format!("${:.2}M", v / 1_000_000.0)
     } else if v >= 1_000.0 {
@@ -421,9 +456,12 @@ fn format_usd(b: Option<&BigDecimal>) -> String {
 }
 
 fn format_eth(b: Option<&BigDecimal>) -> String {
-    let v = bd_to_f64(b) / 1e18;
+    format_eth_value(bd_to_f64(b) / 1e18)
+}
+
+fn format_eth_value(v: f64) -> String {
     if v == 0.0 {
-        "0".to_string()
+        "0 ETH".to_string()
     } else if v < 0.0001 {
         format!("{:.6e} ETH", v)
     } else if v < 1.0 {
