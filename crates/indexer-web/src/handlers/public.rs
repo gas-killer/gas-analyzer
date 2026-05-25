@@ -103,8 +103,21 @@ pub struct OverviewPage {
     pub explorer_address_url: String,
     pub functions: Vec<FunctionLeaderView>,
     pub contracts: Vec<ContractLeaderView>,
+    pub orgs: Vec<OrgLeaderView>,
     pub leaderboard: Vec<LeaderRow>,
     pub daily_30d: Vec<DailyView>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrgLeaderView {
+    pub org_slug: String,
+    pub org_name: String,
+    pub project_count: i64,
+    pub contract_count: i64,
+    pub tx_count: i64,
+    pub usd_saved: String,
+    pub avg_savings_pct_pct: String,
+    pub savings_of_spend_pct: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -274,6 +287,7 @@ pub async fn overview(
     let group = match q.group.as_deref() {
         Some("contracts") => "contracts",
         Some("projects") => "projects",
+        Some("orgs") => "orgs",
         _ => "functions",
     }
     .to_string();
@@ -297,10 +311,11 @@ pub async fn overview(
     let totals_7d = totals_view(totals_7d_raw);
     let totals_24h = totals_view(totals_24h_raw);
 
-    // Only fetch the leaderboard for the active pivot — the other two
+    // Only fetch the leaderboard for the active pivot — the other
     // Vecs stay empty and the template branches off `group`.
     let mut functions: Vec<FunctionLeaderView> = Vec::new();
     let mut contracts: Vec<ContractLeaderView> = Vec::new();
+    let mut orgs: Vec<OrgLeaderView> = Vec::new();
     let mut leaderboard: Vec<LeaderRow> = Vec::new();
     match group.as_str() {
         "functions" => {
@@ -327,6 +342,28 @@ pub async fn overview(
                         usd_saved: format_usd(r.usd_saved.as_ref()),
                         avg_savings_pct_pct: format_pct(r.avg_savings_pct),
                         median_savings_pct_pct: format_pct(r.median_savings_pct),
+                        savings_of_spend_pct: format_pct(savings_of_spend),
+                    }
+                })
+                .collect();
+        }
+        "orgs" => {
+            orgs = queries::leaderboard_orgs_30d(pool, chain_id, 50, 0)
+                .await?
+                .into_iter()
+                .map(|r| {
+                    let savings_of_spend = ratio_bd(
+                        r.wei_saved_total.as_ref(),
+                        r.wei_spent_total.as_ref(),
+                    );
+                    OrgLeaderView {
+                        org_slug: r.org_slug,
+                        org_name: r.org_name,
+                        project_count: r.project_count.unwrap_or(0),
+                        contract_count: r.contract_count.unwrap_or(0),
+                        tx_count: r.tx_count.unwrap_or(0),
+                        usd_saved: format_usd(r.usd_saved.as_ref()),
+                        avg_savings_pct_pct: format_pct(r.avg_savings_pct),
                         savings_of_spend_pct: format_pct(savings_of_spend),
                     }
                 })
@@ -424,6 +461,7 @@ pub async fn overview(
         explorer_address_url: state.explorer_address_url.as_str().to_string(),
         functions,
         contracts,
+        orgs,
         leaderboard,
         daily_30d,
     };

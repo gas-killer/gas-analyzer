@@ -903,6 +903,91 @@ pub async fn recent_txs_for_function(
     Ok(rows)
 }
 
+// ---------- Organizations ----------
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct OrgLeaderRow {
+    pub org_slug: String,
+    pub org_name: String,
+    pub project_count: Option<i64>,
+    pub contract_count: Option<i64>,
+    pub tx_count: Option<i64>,
+    pub usd_saved: Option<BigDecimal>,
+    pub wei_saved_total: Option<BigDecimal>,
+    pub wei_spent_total: Option<BigDecimal>,
+    pub avg_savings_pct: Option<f64>,
+}
+
+pub async fn leaderboard_orgs_30d(
+    pool: &PgPool,
+    chain_id: i64,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<OrgLeaderRow>, WebError> {
+    let rows = sqlx::query_as::<_, OrgLeaderRow>(
+        r#"SELECT
+             o.org_slug,
+             o.org_name,
+             COUNT(DISTINCT pd.project_slug)::bigint AS project_count,
+             COUNT(DISTINCT fd.to_address)::bigint   AS contract_count,
+             SUM(pd.tx_count)::bigint                AS tx_count,
+             SUM(pd.usd_saved_total)::numeric        AS usd_saved,
+             SUM(pd.wei_saved_total)::numeric        AS wei_saved_total,
+             SUM(pd.wei_spent_total)::numeric        AS wei_spent_total,
+             AVG(pd.avg_savings_pct)::float8         AS avg_savings_pct
+           FROM organizations o
+           JOIN projects p     ON p.org_slug = o.org_slug
+           JOIN project_daily pd ON pd.project_slug = p.project_slug
+           LEFT JOIN function_daily fd ON fd.project_slug = p.project_slug
+                                     AND fd.day = pd.day
+                                     AND fd.chain_id = pd.chain_id
+           WHERE pd.chain_id = $1
+             AND pd.day >= (now() - interval '30 days')::date
+           GROUP BY o.org_slug, o.org_name
+           ORDER BY wei_saved_total DESC NULLS LAST
+           LIMIT $2 OFFSET $3"#,
+    )
+    .bind(chain_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct OrgRow {
+    pub org_slug: String,
+    pub org_name: String,
+}
+
+pub async fn list_orgs(pool: &PgPool) -> Result<Vec<OrgRow>, WebError> {
+    let rows = sqlx::query_as::<_, OrgRow>(
+        r#"SELECT org_slug, org_name FROM organizations ORDER BY org_name"#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ProjectListRow {
+    pub project_slug: String,
+    pub project_name: Option<String>,
+    pub org_slug: Option<String>,
+}
+
+pub async fn list_projects(pool: &PgPool) -> Result<Vec<ProjectListRow>, WebError> {
+    let rows = sqlx::query_as::<_, ProjectListRow>(
+        r#"SELECT project_slug, project_name, org_slug
+           FROM projects
+           ORDER BY project_name NULLS LAST, project_slug"#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 // ---------- Blacklist (analysis_exclusion) ----------
 
 #[derive(Debug, Clone, sqlx::FromRow)]

@@ -83,6 +83,101 @@ pub async fn health_partial(
     Ok(HealthFragment { health }.into_response())
 }
 
+// ---------- Organizations ----------
+
+#[derive(Template)]
+#[template(path = "admin_orgs.html")]
+pub struct OrgsPage {
+    pub user: String,
+    pub chain_id: i64,
+    pub orgs: Vec<OrgRowView>,
+    pub projects: Vec<ProjectAssignView>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrgRowView {
+    pub org_slug: String,
+    pub org_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectAssignView {
+    pub project_slug: String,
+    pub project_name: String,
+    pub org_slug: String,
+}
+
+pub async fn orgs_page(
+    AuthUser(user): AuthUser,
+    State(state): State<AppState>,
+) -> Result<Response, WebError> {
+    let pool = state.store.pool();
+    let orgs = queries::list_orgs(pool)
+        .await?
+        .into_iter()
+        .map(|r| OrgRowView { org_slug: r.org_slug, org_name: r.org_name })
+        .collect();
+    let projects = queries::list_projects(pool)
+        .await?
+        .into_iter()
+        .map(|r| ProjectAssignView {
+            project_slug: r.project_slug.clone(),
+            project_name: r.project_name.unwrap_or(r.project_slug),
+            org_slug: r.org_slug.unwrap_or_default(),
+        })
+        .collect();
+    Ok(OrgsPage { user, chain_id: state.chain_id, orgs, projects }.into_response())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OrgCreateForm {
+    pub org_slug: String,
+    pub org_name: String,
+}
+
+pub async fn orgs_create(
+    _user: AuthUser,
+    State(state): State<AppState>,
+    Form(form): Form<OrgCreateForm>,
+) -> Result<Response, WebError> {
+    let slug = form.org_slug.trim();
+    let name = form.org_name.trim();
+    if slug.is_empty() || name.is_empty() {
+        return Err(WebError::BadRequest("org_slug and org_name required".into()));
+    }
+    state
+        .store
+        .org_upsert(slug, name)
+        .await
+        .map_err(|e| WebError::Internal(format!("org upsert: {e}")))?;
+    Ok(Redirect::to("/admin/orgs").into_response())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OrgAssignForm {
+    pub project_slug: String,
+    pub org_slug: String,
+}
+
+pub async fn orgs_assign(
+    _user: AuthUser,
+    State(state): State<AppState>,
+    Form(form): Form<OrgAssignForm>,
+) -> Result<Response, WebError> {
+    let org = form.org_slug.trim();
+    let project = form.project_slug.trim();
+    if project.is_empty() {
+        return Err(WebError::BadRequest("project_slug required".into()));
+    }
+    let assigned = if org.is_empty() { None } else { Some(org) };
+    state
+        .store
+        .project_assign_org(project, assigned)
+        .await
+        .map_err(|e| WebError::Internal(format!("project assign org: {e}")))?;
+    Ok(Redirect::to("/admin/orgs").into_response())
+}
+
 // ---------- Blacklist ----------
 
 #[derive(Template)]

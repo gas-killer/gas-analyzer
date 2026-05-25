@@ -53,6 +53,7 @@
             <a href="?group=functions" class="pivot-chip{% if group == "functions" %} active{% endif %}">Functions</a>
             <a href="?group=contracts" class="pivot-chip{% if group == "contracts" %} active{% endif %}">Contracts</a>
             <a href="?group=projects"  class="pivot-chip{% if group == "projects"  %} active{% endif %}">Projects</a>
+            <a href="?group=orgs"      class="pivot-chip{% if group == "orgs"      %} active{% endif %}">Orgs</a>
         </div>
     </div>
     <p class="muted" style="margin-top:10px;margin-bottom:14px;">
@@ -61,7 +62,36 @@
         Default sort: USD saved (highest first).
     </p>
 
-    {% if group == "functions" %}
+    {% if group == "orgs" %}
+    <table class="data-table" id="leaderboard">
+        <thead>
+            <tr>
+                <th>Organization</th>
+                <th class="right sortable" data-sort="num" data-col="1" data-default="desc">Projects <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="2" data-default="desc">Contracts <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="3" data-default="desc">Txs <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="4" data-default="desc">USD saved <span class="sort-indicator">▼</span></th>
+                <th class="right sortable" data-sort="num" data-col="5" data-default="desc">Avg % <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="6" data-default="desc">% of gas bill <span class="sort-indicator"></span></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for row in orgs %}
+            <tr>
+                <td><strong>{{ row.org_name }}</strong></td>
+                <td class="right">{{ row.project_count }}</td>
+                <td class="right">{{ row.contract_count }}</td>
+                <td class="right">{{ row.tx_count }}</td>
+                <td class="right"><strong>{{ row.usd_saved }}</strong></td>
+                <td class="right">{{ row.avg_savings_pct_pct }}</td>
+                <td class="right">{{ row.savings_of_spend_pct }}</td>
+            </tr>
+        {% else %}
+            <tr><td colspan="7" class="muted">No organizations defined yet — assign projects to orgs via <a href="/admin/orgs">/admin/orgs</a>.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else if group == "functions" %}
     <table class="data-table" id="leaderboard">
         <thead>
             <tr>
