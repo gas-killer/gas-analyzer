@@ -68,6 +68,13 @@
 
 <section class="card">
     <h3>Recent transactions</h3>
+    <form method="get" class="tx-filter-bar">
+        <label>From <input type="date" name="from" value="{{ paging.from }}"></label>
+        <label>To <input type="date" name="to" value="{{ paging.to }}"></label>
+        <label>Min gas saved <input type="number" name="min_gas_saved" min="0" value="{{ paging.min_gas_saved }}" placeholder="any"></label>
+        <button type="submit">Apply</button>
+        <a href="?" class="muted">Reset</a>
+    </form>
     <table class="data-table">
         <thead>
             <tr>
@@ -90,10 +97,15 @@
                 <td class="right">{{ t.when }}</td>
             </tr>
         {% else %}
-            <tr><td colspan="6" class="muted">No transactions persisted yet for this contract.</td></tr>
+            <tr><td colspan="6" class="muted">No transactions match.</td></tr>
         {% endfor %}
         </tbody>
     </table>
+    <nav class="paging">
+        {% if paging.has_prev %}<a href="?{{ paging.prev_qs }}">← Prev</a>{% else %}<span class="muted">← Prev</span>{% endif %}
+        <span class="muted">Page {{ paging.page }}</span>
+        {% if paging.has_next %}<a href="?{{ paging.next_qs }}">Next →</a>{% else %}<span class="muted">Next →</span>{% endif %}
+    </nav>
 </section>
 
 <script id="contract-daily-data" type="application/json">{

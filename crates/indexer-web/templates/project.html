@@ -33,52 +33,57 @@
     <canvas id="projectDailyChart"></canvas>
 </section>
 
-<section class="two-col">
-    <div class="card">
-        <h3>Top contracts · last 30d</h3>
-        <table class="data-table">
-            <thead>
-                <tr><th>Address</th><th class="right">Txs</th><th class="right">Gas saved</th><th class="right">ETH saved</th></tr>
-            </thead>
-            <tbody>
-            {% for c in top_contracts %}
-                <tr>
-                    <td><a href="{{ explorer_address_url }}{{ c.address_hex }}" target="_blank" rel="noopener"><code>{{ c.address_hex }}</code></a></td>
-                    <td class="right">{{ c.tx_count }}</td>
-                    <td class="right">{{ c.gas_saved_total }}</td>
-                    <td class="right">{{ c.wei_saved_total }}</td>
-                </tr>
-            {% else %}
-                <tr><td colspan="4" class="muted">No txs in window.</td></tr>
-            {% endfor %}
-            </tbody>
-        </table>
-    </div>
+{% if top_contracts.len() > 1 %}
+<section class="card">
+    <h3>Contracts in this project · last 30d</h3>
+    <table class="data-table">
+        <thead>
+            <tr><th>Address</th><th class="right">Txs</th><th class="right">Gas saved</th><th class="right">ETH saved</th></tr>
+        </thead>
+        <tbody>
+        {% for c in top_contracts %}
+            <tr>
+                <td><a href="/contracts/{{ c.address_hex }}"><code>{{ c.address_hex }}</code></a></td>
+                <td class="right">{{ c.tx_count }}</td>
+                <td class="right">{{ c.gas_saved_total }}</td>
+                <td class="right">{{ c.wei_saved_total }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
 
-    <div class="card">
-        <h3>Top function selectors · last 30d</h3>
-        <table class="data-table">
-            <thead>
-                <tr><th>Selector</th><th class="right">Txs</th><th class="right">Gas saved</th><th class="right">ETH saved</th></tr>
-            </thead>
-            <tbody>
-            {% for s in top_selectors %}
-                <tr>
-                    <td><code>{{ s.selector_hex }}</code></td>
-                    <td class="right">{{ s.tx_count }}</td>
-                    <td class="right">{{ s.gas_saved_total }}</td>
-                    <td class="right">{{ s.wei_saved_total }}</td>
-                </tr>
-            {% else %}
-                <tr><td colspan="4" class="muted">No txs in window.</td></tr>
-            {% endfor %}
-            </tbody>
-        </table>
-    </div>
+<section class="card">
+    <h3>Top function selectors · last 30d</h3>
+    <table class="data-table">
+        <thead>
+            <tr><th>Selector</th><th class="right">Txs</th><th class="right">Gas saved</th><th class="right">ETH saved</th></tr>
+        </thead>
+        <tbody>
+        {% for s in top_selectors %}
+            <tr>
+                <td><code>{{ s.selector_hex }}</code></td>
+                <td class="right">{{ s.tx_count }}</td>
+                <td class="right">{{ s.gas_saved_total }}</td>
+                <td class="right">{{ s.wei_saved_total }}</td>
+            </tr>
+        {% else %}
+            <tr><td colspan="4" class="muted">No txs in window.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
 </section>
 
 <section class="card">
     <h3>Recent transactions</h3>
+    <form method="get" class="tx-filter-bar">
+        <label>From <input type="date" name="from" value="{{ paging.from }}"></label>
+        <label>To <input type="date" name="to" value="{{ paging.to }}"></label>
+        <label>Min gas saved <input type="number" name="min_gas_saved" min="0" value="{{ paging.min_gas_saved }}" placeholder="any"></label>
+        <button type="submit">Apply</button>
+        <a href="?" class="muted">Reset</a>
+    </form>
     <table class="data-table">
         <thead>
             <tr>
@@ -101,10 +106,15 @@
                 <td class="right">{{ t.when }}</td>
             </tr>
         {% else %}
-            <tr><td colspan="6" class="muted">No transactions persisted yet for this project.</td></tr>
+            <tr><td colspan="6" class="muted">No transactions match.</td></tr>
         {% endfor %}
         </tbody>
     </table>
+    <nav class="paging">
+        {% if paging.has_prev %}<a href="?{{ paging.prev_qs }}">← Prev</a>{% else %}<span class="muted">← Prev</span>{% endif %}
+        <span class="muted">Page {{ paging.page }}</span>
+        {% if paging.has_next %}<a href="?{{ paging.next_qs }}">Next →</a>{% else %}<span class="muted">Next →</span>{% endif %}
+    </nav>
 </section>
 
 <script id="project-daily-data" type="application/json">{

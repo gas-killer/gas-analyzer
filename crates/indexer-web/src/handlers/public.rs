@@ -113,6 +113,79 @@ pub struct OverviewQuery {
     pub group: Option<String>,
 }
 
+/// Pagination + filters for the recent-txs tables on project / contract /
+/// function drilldowns. `page` is 1-indexed. Filters default to "no
+/// narrowing" — empty form = all txs (still excluding 0% and opcode-skipped).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct TxQuery {
+    pub page: Option<u32>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    /// Minimum gas saved per tx — accepts plain integer (e.g. `10000`).
+    pub min_gas_saved: Option<i64>,
+}
+
+/// Wraps a parsed `TxQuery` into per-handler state — current page, filters
+/// to pass to the query, plus the rendered "next page available?" hint
+/// derived from rows-returned.
+#[derive(Debug, Clone)]
+pub struct TxPagingView {
+    pub page: u32,
+    pub page_size: u32,
+    pub has_prev: bool,
+    pub has_next: bool,
+    pub from: String,
+    pub to: String,
+    pub min_gas_saved: String,
+    /// Pre-composed query-string suffix (`page=2&from=...&to=...`) for
+    /// prev/next links so templates don't have to assemble it.
+    pub prev_qs: String,
+    pub next_qs: String,
+}
+
+const TX_PAGE_SIZE: u32 = 50;
+
+fn build_tx_filters(q: &TxQuery) -> queries::TxFilters {
+    queries::TxFilters {
+        from: q.from.as_deref().and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()),
+        to:   q.to.as_deref().and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()),
+        min_gas_saved: q.min_gas_saved,
+    }
+}
+
+fn paging_view(q: &TxQuery, rows_returned: usize) -> TxPagingView {
+    let page = q.page.unwrap_or(1).max(1);
+    let mut params: Vec<(String, String)> = Vec::new();
+    if let Some(from) = q.from.as_deref().filter(|s| !s.is_empty()) {
+        params.push(("from".into(), from.into()));
+    }
+    if let Some(to) = q.to.as_deref().filter(|s| !s.is_empty()) {
+        params.push(("to".into(), to.into()));
+    }
+    if let Some(m) = q.min_gas_saved {
+        params.push(("min_gas_saved".into(), m.to_string()));
+    }
+    let qs = |p: u32| {
+        let mut all: Vec<(String, String)> = params.clone();
+        all.push(("page".into(), p.to_string()));
+        all.into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&")
+    };
+    TxPagingView {
+        page,
+        page_size: TX_PAGE_SIZE,
+        has_prev: page > 1,
+        has_next: rows_returned as u32 >= TX_PAGE_SIZE,
+        from: q.from.clone().unwrap_or_default(),
+        to: q.to.clone().unwrap_or_default(),
+        min_gas_saved: q.min_gas_saved.map(|n| n.to_string()).unwrap_or_default(),
+        prev_qs: qs(page.saturating_sub(1).max(1)),
+        next_qs: qs(page + 1),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FunctionLeaderView {
     pub address_hex: String,
@@ -378,6 +451,7 @@ pub struct ProjectPage {
     pub top_contracts: Vec<ContractRowView>,
     pub top_selectors: Vec<SelectorRowView>,
     pub recent_txs: Vec<RecentTxView>,
+    pub paging: TxPagingView,
 }
 
 #[derive(Debug, Clone)]
@@ -410,6 +484,7 @@ pub async fn project(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
     Path(slug): Path<String>,
+    Query(tx_q): Query<TxQuery>,
 ) -> Result<Response, WebError> {
     let pool = state.store.pool();
     let chain_id = state.chain_id;
@@ -464,8 +539,15 @@ pub async fn project(
         })
         .collect();
 
-    let recent = queries::recent_txs_for_project(pool, chain_id, &slug, 50)
-        .await?
+    let filters = build_tx_filters(&tx_q);
+    let page = tx_q.page.unwrap_or(1).max(1);
+    let offset = (page as i64 - 1) * TX_PAGE_SIZE as i64;
+    let recent_rows = queries::recent_txs_for_project(
+        pool, chain_id, &slug, TX_PAGE_SIZE as i64, offset, &filters,
+    )
+    .await?;
+    let paging = paging_view(&tx_q, recent_rows.len());
+    let recent = recent_rows
         .into_iter()
         .map(|r| RecentTxView {
             block_number: r.block_number,
@@ -505,6 +587,7 @@ pub async fn project(
         top_contracts,
         top_selectors,
         recent_txs: recent,
+        paging,
     };
     Ok(page.into_response())
 }
@@ -528,6 +611,7 @@ pub struct ContractPage {
     pub daily_90d: Vec<DailyView>,
     pub functions: Vec<ContractFunctionView>,
     pub recent_txs: Vec<RecentTxView>,
+    pub paging: TxPagingView,
 }
 
 #[derive(Debug, Clone)]
@@ -543,6 +627,7 @@ pub async fn contract_page(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
     Path(address_hex): Path<String>,
+    Query(tx_q): Query<TxQuery>,
 ) -> Result<Response, WebError> {
     let pool = state.store.pool();
     let chain_id = state.chain_id;
@@ -591,8 +676,15 @@ pub async fn contract_page(
         })
         .collect();
 
-    let recent_txs = queries::recent_txs_for_contract(pool, chain_id, address, 50)
-        .await?
+    let filters = build_tx_filters(&tx_q);
+    let cur_page = tx_q.page.unwrap_or(1).max(1);
+    let offset = (cur_page as i64 - 1) * TX_PAGE_SIZE as i64;
+    let recent_rows = queries::recent_txs_for_contract(
+        pool, chain_id, address, TX_PAGE_SIZE as i64, offset, &filters,
+    )
+    .await?;
+    let paging = paging_view(&tx_q, recent_rows.len());
+    let recent_txs = recent_rows
         .into_iter()
         .map(|r| RecentTxView {
             block_number: r.block_number,
@@ -622,6 +714,7 @@ pub async fn contract_page(
         daily_90d,
         functions,
         recent_txs,
+        paging,
     };
     Ok(page.into_response())
 }
@@ -646,12 +739,14 @@ pub struct FunctionPage {
     pub avg_savings_pct_30d: String,
     pub daily_90d: Vec<DailyView>,
     pub recent_txs: Vec<RecentTxView>,
+    pub paging: TxPagingView,
 }
 
 pub async fn function_page(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
     Path((address_hex, selector_hex)): Path<(String, String)>,
+    Query(tx_q): Query<TxQuery>,
 ) -> Result<Response, WebError> {
     let pool = state.store.pool();
     let chain_id = state.chain_id;
@@ -689,8 +784,15 @@ pub async fn function_page(
         })
         .collect();
 
-    let recent_txs = queries::recent_txs_for_function(pool, chain_id, address, selector, 50)
-        .await?
+    let filters = build_tx_filters(&tx_q);
+    let cur_page = tx_q.page.unwrap_or(1).max(1);
+    let offset = (cur_page as i64 - 1) * TX_PAGE_SIZE as i64;
+    let recent_rows = queries::recent_txs_for_function(
+        pool, chain_id, address, selector, TX_PAGE_SIZE as i64, offset, &filters,
+    )
+    .await?;
+    let paging = paging_view(&tx_q, recent_rows.len());
+    let recent_txs = recent_rows
         .into_iter()
         .map(|r| RecentTxView {
             block_number: r.block_number,
@@ -721,6 +823,7 @@ pub async fn function_page(
         avg_savings_pct_30d,
         daily_90d,
         recent_txs,
+        paging,
     };
     Ok(page.into_response())
 }
