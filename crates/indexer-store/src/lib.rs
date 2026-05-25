@@ -95,9 +95,9 @@ impl Store {
                 from_address, to_address, function_selector, project_slug,
                 gas_used, effective_gas_price_wei, gaskiller_gas_estimate,
                 gas_saved, wei_saved, is_heuristic, failure_reason,
-                state_update_count
+                state_update_count, skipped_opcodes
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
             )
             ON CONFLICT (chain_id, block_number, tx_index) DO NOTHING
             "#,
@@ -119,6 +119,7 @@ impl Store {
         .bind(report.is_heuristic)
         .bind(report.failure_reason.as_deref())
         .bind(report.state_update_count as i32)
+        .bind(&report.skipped_opcodes)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -302,6 +303,8 @@ impl Store {
              AND l.address  = a.to_address
             WHERE a.chain_id = $1
               AND a.project_slug LIKE 'unknown:%'
+              AND a.gas_saved > 0
+              AND cardinality(a.skipped_opcodes) = 0
               AND (
                 l.last_attempted_at IS NULL
                 -- Transient failures (rate limit, transport) are retried on

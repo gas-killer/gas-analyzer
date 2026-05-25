@@ -109,6 +109,7 @@ pub async fn leaderboard_30d(
              FROM analysis
              WHERE chain_id = $1
                AND block_timestamp >= now() - interval '30 days'
+               AND cardinality(skipped_opcodes) = 0
              GROUP BY project_slug
            ) m ON m.project_slug = pd.project_slug
            WHERE pd.chain_id = $1
@@ -292,6 +293,8 @@ pub async fn top_contracts_for_project(
            WHERE chain_id = $1
              AND project_slug = $2
              AND block_timestamp >= now() - interval '30 days'
+             AND gas_saved > 0
+             AND cardinality(skipped_opcodes) = 0
            GROUP BY to_address
            ORDER BY wei_saved_total DESC NULLS LAST
            LIMIT 10"#,
@@ -326,6 +329,8 @@ pub async fn top_selectors_for_project(
            WHERE chain_id = $1
              AND project_slug = $2
              AND block_timestamp >= now() - interval '30 days'
+             AND gas_saved > 0
+             AND cardinality(skipped_opcodes) = 0
            GROUP BY function_selector
            ORDER BY wei_saved_total DESC NULLS LAST
            LIMIT 10"#,
@@ -363,6 +368,8 @@ pub async fn recent_txs_for_project(
              block_timestamp
            FROM analysis
            WHERE chain_id = $1 AND project_slug = $2
+             AND gas_saved > 0
+             AND cardinality(skipped_opcodes) = 0
            ORDER BY block_timestamp DESC
            LIMIT $3"#,
     )
@@ -396,6 +403,8 @@ pub async fn top_unknowns(
            WHERE chain_id = $1
              AND project_slug LIKE 'unknown:%'
              AND block_timestamp >= now() - interval '30 days'
+             AND gas_saved > 0
+             AND cardinality(skipped_opcodes) = 0
            GROUP BY to_address
            ORDER BY wei_saved_total DESC NULLS LAST
            LIMIT 20"#,
