@@ -229,6 +229,8 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/", get(handlers::public::overview))
         .route("/projects/:slug", get(handlers::public::project))
+        .route("/contracts/:address", get(handlers::public::contract_page))
+        .route("/functions/:address/:selector", get(handlers::public::function_page))
         .route("/unknowns", get(handlers::public::unknowns))
         .route("/admin", get(admin::admin_page))
         .route("/admin/health", get(admin::health_partial))

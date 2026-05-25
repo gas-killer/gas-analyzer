@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}{% if !function_name.is_empty() %}{{ function_name }}{% else %}{{ selector_hex }}{% endif %} — Gas Killer Indexer{% endblock %}
+{% block content %}
+
+<header class="project-header">
+    <h2>
+        {% if !function_name.is_empty() %}
+            {{ function_name }}
+            <span class="muted" style="font-size:14px;">· {{ function_sig }}</span>
+        {% else %}
+            <code>{{ selector_hex }}</code>
+            <span class="muted" style="font-size:14px;">· unresolved selector</span>
+        {% endif %}
+    </h2>
+    <div class="muted">
+        contract <a href="/contracts/{{ address_hex }}"><code>{{ address_hex }}</code></a> ·
+        project <a href="/projects/{{ project_slug }}">{{ project_display }}</a> ·
+        <a href="{{ explorer_address_url }}{{ address_hex }}" rel="noopener" target="_blank">explorer ↗</a>
+    </div>
+</header>
+
+<section class="totals-grid">
+    <div class="card">
+        <h3>Lifetime</h3>
+        <div class="metric">{{ totals_lifetime.usd_saved }}</div>
+        <div class="muted">{{ totals_lifetime.eth_saved }} · {{ totals_lifetime.tx_count }} txs</div>
+    </div>
+    <div class="card">
+        <h3>Last 30d</h3>
+        <div class="metric">{{ totals_30d.usd_saved }}</div>
+        <div class="muted">{{ totals_30d.eth_saved }} · {{ totals_30d.tx_count }} txs</div>
+    </div>
+    <div class="card">
+        <h3>Avg savings · 30d</h3>
+        <div class="metric">{{ avg_savings_pct_30d }}</div>
+    </div>
+</section>
+
+<section class="card chart-card">
+    <h3>USD saved · last 90 days</h3>
+    <canvas id="functionDailyChart"></canvas>
+</section>
+
+<section class="card">
+    <h3>Recent transactions</h3>
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Block</th>
+                <th>Tx hash</th>
+                <th class="right">Gas used</th>
+                <th class="right">Gas saved</th>
+                <th class="right">ETH saved</th>
+                <th class="right">When</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for t in recent_txs %}
+            <tr>
+                <td>{{ t.block_number }}</td>
+                <td><a href="{{ explorer_tx_url }}{{ t.tx_hash_hex }}" target="_blank" rel="noopener"><code>{{ t.tx_hash_hex }}</code></a></td>
+                <td class="right">{{ t.gas_used }}</td>
+                <td class="right">{{ t.gas_saved }}</td>
+                <td class="right">{{ t.wei_saved }}</td>
+                <td class="right">{{ t.when }}</td>
+            </tr>
+        {% else %}
+            <tr><td colspan="6" class="muted">No transactions persisted yet for this function.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<script id="function-daily-data" type="application/json">{
+    "labels": [{% for p in daily_90d %}"{{ p.day }}"{% if !loop.last %},{% endif %}{% endfor %}],
+    "values": [{% for p in daily_90d %}{{ p.usd_saved }}{% if !loop.last %},{% endif %}{% endfor %}]
+}</script>
+<script>
+window.addEventListener("DOMContentLoaded", () => {
+    const d = JSON.parse(document.getElementById("function-daily-data").textContent);
+    new Chart(document.getElementById("functionDailyChart"), {
+        type: "line",
+        data: { labels: d.labels, datasets: [{ label: "USD saved", data: d.values, borderColor: "#7ec8a4", backgroundColor: "rgba(126,200,164,0.18)", tension: 0.25, fill: true }] },
+        options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { ticks: { callback: v => "$" + Number(v).toLocaleString() } } } }
+    });
+});
+</script>
+{% endblock %}
