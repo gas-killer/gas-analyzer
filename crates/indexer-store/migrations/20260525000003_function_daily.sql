@@ -35,9 +35,12 @@ WHERE cardinality(a.skipped_opcodes) = 0
 GROUP BY a.chain_id, a.to_address, a.function_selector, a.project_slug,
          date_trunc('day', a.block_timestamp)::date, p.usd_per_eth;
 
--- CONCURRENTLY refresh needs a unique index.
+-- CONCURRENTLY refresh needs a unique index. Must include project_slug —
+-- when an address is relabeled mid-day (e.g. an `unknown:0x…` row gets
+-- mapped to a known project) the MV legitimately holds one row per slug
+-- for that (address, selector, day).
 CREATE UNIQUE INDEX IF NOT EXISTS function_daily_unique_idx
-    ON function_daily (chain_id, to_address, function_selector, day);
+    ON function_daily (chain_id, to_address, function_selector, project_slug, day);
 
 -- Common access patterns: leaderboard by chain (recent window).
 CREATE INDEX IF NOT EXISTS function_daily_chain_day_idx
