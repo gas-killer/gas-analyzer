@@ -3,41 +3,49 @@
 {% block content %}
 
 <h2>Organizations</h2>
-<p class="muted">Group multiple projects under a parent brand for the org-level leaderboard view.</p>
+<p class="muted">An organization is a parent brand (e.g. "Uniswap") that groups several projects together, so the leaderboard can show one combined "X ETH saved across N contracts" line per brand. Create a brand below, then assign projects to it.</p>
 
 <section class="card">
-    <h3>Create / rename</h3>
+    <h3>Add an organization</h3>
     <form method="post" action="/admin/orgs/create" class="blacklist-form">
-        <label>Org slug <input type="text" name="org_slug" required placeholder="uniswap"></label>
-        <label>Display name <input type="text" name="org_name" required placeholder="Uniswap"></label>
-        <button type="submit" class="btn">Save</button>
+        <label>Organization name <input type="text" name="org_name" required placeholder="Uniswap"></label>
+        <button type="submit" class="btn">Add</button>
     </form>
+    <p class="muted">Just the brand name — an internal id is generated for you automatically.</p>
 </section>
 
 <section class="card">
-    <h3>Existing orgs</h3>
+    <h3>Your organizations</h3>
+    <p class="muted">Edit a name to rename a brand; its assignments are kept.</p>
     <table class="data-table">
-        <thead><tr><th>Slug</th><th>Name</th></tr></thead>
+        <thead><tr><th>Organization</th><th></th></tr></thead>
         <tbody>
         {% for o in orgs %}
-            <tr><td><code>{{ o.org_slug }}</code></td><td>{{ o.org_name }}</td></tr>
+            <tr>
+                <td colspan="2">
+                    <form method="post" action="/admin/orgs/create" style="display:flex;gap:6px;align-items:center;">
+                        <input type="hidden" name="org_slug" value="{{ o.org_slug }}">
+                        <input type="text" name="org_name" value="{{ o.org_name }}" required style="flex:1;max-width:320px;">
+                        <button type="submit" class="btn">Rename</button>
+                    </form>
+                </td>
+            </tr>
         {% else %}
-            <tr><td colspan="2" class="muted">No organizations yet.</td></tr>
+            <tr><td colspan="2" class="muted">No organizations yet — add one above.</td></tr>
         {% endfor %}
         </tbody>
     </table>
 </section>
 
 <section class="card">
-    <h3>Project → Org assignment</h3>
-    <p class="muted">Change a project's org by picking one from the dropdown. Empty means "no org".</p>
+    <h3>Assign projects</h3>
+    <p class="muted">Pick the brand each project belongs to. "— none —" leaves it ungrouped.</p>
     <table class="data-table">
-        <thead><tr><th>Project</th><th>Current org</th><th>Reassign</th></tr></thead>
+        <thead><tr><th>Project</th><th>Organization</th></tr></thead>
         <tbody>
         {% for p in projects %}
             <tr>
-                <td><a href="/projects/{{ p.project_slug }}">{{ p.project_name }}</a> <span class="muted">({{ p.project_slug }})</span></td>
-                <td>{% if !p.org_slug.is_empty() %}<code>{{ p.org_slug }}</code>{% else %}<span class="muted">—</span>{% endif %}</td>
+                <td><a href="/projects/{{ p.project_slug }}">{{ p.project_name }}</a></td>
                 <td>
                     <form method="post" action="/admin/orgs/assign" style="display:flex;gap:6px;align-items:center;">
                         <input type="hidden" name="project_slug" value="{{ p.project_slug }}">
@@ -52,7 +60,7 @@
                 </td>
             </tr>
         {% else %}
-            <tr><td colspan="3" class="muted">No projects.</td></tr>
+            <tr><td colspan="2" class="muted">No projects.</td></tr>
         {% endfor %}
         </tbody>
     </table>

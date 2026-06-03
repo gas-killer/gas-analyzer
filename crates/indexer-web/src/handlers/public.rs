@@ -997,7 +997,7 @@ fn bd_to_f64(b: Option<&BigDecimal>) -> f64 {
         .unwrap_or(0.0)
 }
 
-fn format_usd(b: Option<&BigDecimal>) -> String {
+pub(crate) fn format_usd(b: Option<&BigDecimal>) -> String {
     format_usd_value(bd_to_f64(b))
 }
 
@@ -1011,7 +1011,7 @@ fn format_usd_value(v: f64) -> String {
     }
 }
 
-fn format_eth(b: Option<&BigDecimal>) -> String {
+pub(crate) fn format_eth(b: Option<&BigDecimal>) -> String {
     format_eth_value(bd_to_f64(b) / 1e18)
 }
 
@@ -1042,7 +1042,7 @@ fn ratio_bd(num: Option<&BigDecimal>, denom: Option<&BigDecimal>) -> Option<f64>
     if d == 0.0 { None } else { Some(n / d) }
 }
 
-fn format_when(ts: DateTime<Utc>) -> String {
+pub(crate) fn format_when(ts: DateTime<Utc>) -> String {
     let now = Utc::now();
     let delta = now - ts;
     let secs = delta.num_seconds();

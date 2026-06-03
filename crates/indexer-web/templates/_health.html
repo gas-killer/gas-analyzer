@@ -6,7 +6,7 @@
 {% endif %}
 
 <div class="health-grid">
-    <div class="health-cell" title="Highest block_number that has been written to the analysis table.">
+    <div class="health-cell" data-tip="The most recent block of transactions we've finished analyzing for gas savings.">
         <div class="muted">Latest analyzed block</div>
         <div class="metric">
             {% match health.latest_analyzed_block %}
@@ -15,8 +15,8 @@
             {% endmatch %}
         </div>
     </div>
-    <div class="health-cell" title="Last block number the head-tracker observed on the RPC. Stale ⇒ head-tracker isn't running.">
-        <div class="muted">Head-tracker last seen</div>
+    <div class="health-cell" data-tip="The latest block currently live on the blockchain. If this stops moving, the indexer has lost its connection to the chain.">
+        <div class="muted">Latest block on chain</div>
         <div class="metric">
             {% match health.last_seen_block %}
                 {% when Some with (b) %}{{ b }}
@@ -24,8 +24,8 @@
             {% endmatch %}
         </div>
     </div>
-    <div class="health-cell" title="Chain head − latest analyzed block. Larger ⇒ workers are falling behind.">
-        <div class="muted">Blocks behind head</div>
+    <div class="health-cell" data-tip="How far our analysis is behind the live blockchain. Small is healthy; a large or growing number means recent transactions aren't reflected in the figures yet.">
+        <div class="muted">Blocks behind</div>
         <div class="metric {% if health.falls_behind %}metric-bad{% endif %}">
             {% match health.blocks_behind %}
                 {% when Some with (b) %}{{ b }}
@@ -33,16 +33,16 @@
             {% endmatch %}
         </div>
     </div>
-    <div class="health-cell" title="Jobs waiting in the Redis queue for a worker to claim. Spikes ⇒ workers are saturated.">
-        <div class="muted">Pending queue</div>
+    <div class="health-cell" data-tip="Transactions lined up and waiting to be analyzed. A short-lived backlog is normal; a number that stays high means analysis can't keep up with chain activity.">
+        <div class="muted">Waiting to analyze</div>
         <div class="metric">{{ health.pending_queue }}</div>
     </div>
-    <div class="health-cell" title="Jobs that failed all retries and were moved to the dead-letter list. Inspect via `LRANGE indexer:jobs:dead 0 -1` in redis-cli; replay via the tx-replay box below.">
-        <div class="muted">Dead-letter</div>
+    <div class="health-cell" data-tip="Transactions we couldn't analyze even after several automatic retries — usually a temporary data-provider hiccup. These are not counted in any savings figure. A handful is normal; a steadily rising number means the figures may be missing some activity.">
+        <div class="muted">Failed to analyze</div>
         <div class="metric">{{ health.dead_letter }}</div>
     </div>
-    <div class="health-cell" title="Seconds since the most recent INSERT into analysis. Large ⇒ workers stopped persisting.">
-        <div class="muted">Last insert</div>
+    <div class="health-cell" data-tip="How long ago we last recorded a newly analyzed transaction. If this keeps climbing, analysis has stalled.">
+        <div class="muted">Last analyzed</div>
         <div class="metric">
             {% match health.last_insert_age_secs %}
                 {% when Some with (s) %}{{ s }}s ago
@@ -50,12 +50,12 @@
             {% endmatch %}
         </div>
     </div>
-    <div class="health-cell" title="Total analysis rows ever written, regardless of opcode-skipped or 0%-savings filters.">
-        <div class="muted">Total rows</div>
+    <div class="health-cell" data-tip="Total transactions analyzed so far. Includes some that are later excluded from the savings figures (for example zero-savings or unsupported transactions).">
+        <div class="muted">Total analyzed</div>
         <div class="metric">{{ health.total_rows }}</div>
     </div>
-    <div class="health-cell" title="Share of last-24h analyses that fell back to the heuristic estimator (vs. measured EVM simulation). Climbing ⇒ the RPC is rejecting state diff calls.">
-        <div class="muted">Heuristic rate · 24h</div>
+    <div class="health-cell" data-tip="Share of the last 24 hours' transactions where savings were estimated rather than measured exactly. A higher number means less precise figures, usually caused by data-provider limits.">
+        <div class="muted">Estimated · 24h</div>
         <div class="metric">
             {% match health.heuristic_rate_24h %}
                 {% when Some with (r) %}{{ "{:.1}"|format(r * 100.0) }}%

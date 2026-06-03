@@ -1093,6 +1093,67 @@ pub async fn top_unknowns(
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CandidateRow {
+    pub address: Vec<u8>,
+    pub first_seen: Option<DateTime<Utc>>,
+    pub last_seen: Option<DateTime<Utc>>,
+    pub tx_count: Option<i64>,
+    pub wei_saved_total: Option<BigDecimal>,
+    pub usd_saved_total: Option<BigDecimal>,
+}
+
+/// Newly-appearing high-savings candidates: still-unlabeled contracts whose
+/// *first* analyzed tx landed within the last `days`, ranked by lifetime
+/// wei_saved, keeping only those clearing `min_wei`. These are fresh
+/// gas-killer candidates worth researching/labeling. Blacklisted contracts
+/// (whole-contract `analysis_exclusion` rows) and the usual opcode-skipped /
+/// 0%-savings rows are excluded, matching every other BD-visible aggregate.
+///
+/// Queried against `analysis` directly (not the daily MV) because we need a
+/// true cross-history `min(block_timestamp)` for the "newly appeared" test.
+pub async fn new_high_savings_candidates(
+    pool: &PgPool,
+    chain_id: i64,
+    days: i64,
+    min_wei: BigDecimal,
+    limit: i64,
+) -> Result<Vec<CandidateRow>, WebError> {
+    let rows = sqlx::query_as::<_, CandidateRow>(
+        r#"SELECT
+             a.to_address               AS address,
+             MIN(a.block_timestamp)     AS first_seen,
+             MAX(a.block_timestamp)     AS last_seen,
+             COUNT(*)::bigint           AS tx_count,
+             SUM(a.wei_saved)::numeric  AS wei_saved_total,
+             COALESCE(SUM(a.wei_saved / 1e18 * p.usd_per_eth), 0)::numeric AS usd_saved_total
+           FROM analysis a
+           LEFT JOIN eth_prices p
+             ON p.day = date_trunc('day', a.block_timestamp)::date
+           LEFT JOIN analysis_exclusion x
+             ON x.chain_id = a.chain_id
+            AND x.address  = a.to_address
+            AND x.selector IS NULL
+           WHERE a.chain_id = $1
+             AND a.project_slug LIKE 'unknown:%'
+             AND a.gas_saved > 0
+             AND cardinality(a.skipped_opcodes) = 0
+             AND x.address IS NULL
+           GROUP BY a.to_address
+           HAVING MIN(a.block_timestamp) >= now() - make_interval(days => $2::int)
+              AND SUM(a.wei_saved) >= $3
+           ORDER BY wei_saved_total DESC NULLS LAST
+           LIMIT $4"#,
+    )
+    .bind(chain_id)
+    .bind(days)
+    .bind(min_wei)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct AnalysisHealthRow {
     pub total_rows: Option<i64>,
     pub latest_block: Option<i64>,
