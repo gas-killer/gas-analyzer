@@ -5,13 +5,15 @@
 //! fragment with status + duration so the admin page can swap a banner in
 //! place without a full reload.
 
+use std::str::FromStr;
 use std::time::Instant;
 
 use askama::Template;
 use askama_axum::IntoResponse;
 use axum::Form;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::{Redirect, Response};
+use bigdecimal::BigDecimal;
 use redis::AsyncCommands;
 use serde::Deserialize;
 
@@ -19,6 +21,7 @@ use crate::AppState;
 use crate::auth::AuthUser;
 use crate::diagnostics;
 use crate::error::WebError;
+use crate::handlers::public::{format_eth, format_usd, format_when};
 use crate::queries;
 
 #[derive(Template)]
@@ -33,6 +36,32 @@ pub struct AdminPage {
 #[template(path = "_health.html")]
 pub struct HealthFragment {
     pub health: HealthView,
+}
+
+#[derive(Template)]
+#[template(path = "_candidates.html")]
+pub struct CandidatesFragment {
+    pub candidates: Vec<CandidateView>,
+    pub days: i64,
+    pub min_eth: f64,
+    pub explorer_address_url: String,
+}
+
+pub struct CandidateView {
+    pub address_hex: String,
+    pub first_seen: String,
+    pub last_seen: String,
+    pub tx_count: i64,
+    pub eth_saved: String,
+    pub usd_saved: String,
+}
+
+/// Query params for the high-savings-candidates panel. Both optional; the
+/// handler clamps to sane bounds and falls back to defaults.
+#[derive(Debug, Deserialize)]
+pub struct CandidatesQuery {
+    pub days: Option<i64>,
+    pub min_eth: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +112,44 @@ pub async fn health_partial(
     Ok(HealthFragment { health }.into_response())
 }
 
+/// Newly-appearing high-savings candidates panel (htmx fragment). Surfaces
+/// still-unlabeled contracts that first showed up recently and look like
+/// strong gas-killer candidates worth researching — issue #10 §5.
+pub async fn candidates_partial(
+    _user: AuthUser,
+    State(state): State<AppState>,
+    Query(q): Query<CandidatesQuery>,
+) -> Result<Response, WebError> {
+    let days = q.days.unwrap_or(14).clamp(1, 365);
+    let min_eth = q.min_eth.unwrap_or(0.0).max(0.0);
+    // ETH → wei as an integer-valued BigDecimal for the SUM(wei_saved) >= $ test.
+    let min_wei = BigDecimal::from_str(&format!("{:.0}", min_eth * 1e18))
+        .unwrap_or_else(|_| BigDecimal::from(0));
+
+    let rows =
+        queries::new_high_savings_candidates(state.store.pool(), state.chain_id, days, min_wei, 25)
+            .await?;
+    let candidates = rows
+        .into_iter()
+        .map(|r| CandidateView {
+            address_hex: format!("0x{}", hex::encode(&r.address)),
+            first_seen: r.first_seen.map(format_when).unwrap_or_else(|| "—".into()),
+            last_seen: r.last_seen.map(format_when).unwrap_or_else(|| "—".into()),
+            tx_count: r.tx_count.unwrap_or(0),
+            eth_saved: format_eth(r.wei_saved_total.as_ref()),
+            usd_saved: format_usd(r.usd_saved_total.as_ref()),
+        })
+        .collect();
+
+    Ok(CandidatesFragment {
+        candidates,
+        days,
+        min_eth,
+        explorer_address_url: state.explorer_address_url.to_string(),
+    }
+    .into_response())
+}
+
 // ---------- Organizations ----------
 
 #[derive(Template)]
@@ -131,8 +198,31 @@ pub async fn orgs_page(
 
 #[derive(Debug, Deserialize)]
 pub struct OrgCreateForm {
+    /// Stable internal ID. Empty when adding a new org (we derive it from the
+    /// name); set to the existing slug when renaming an org in place.
+    #[serde(default)]
     pub org_slug: String,
     pub org_name: String,
+}
+
+/// Derive a stable, URL/DB-safe id from a human organization name:
+/// lowercase, runs of non-alphanumerics collapse to a single hyphen, ends
+/// trimmed. "Uniswap Labs" → "uniswap-labs". The BD never types or sees this.
+fn slugify(name: &str) -> String {
+    let mut out = String::new();
+    let mut pending_dash = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_dash && !out.is_empty() {
+                out.push('-');
+            }
+            pending_dash = false;
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            pending_dash = true;
+        }
+    }
+    out
 }
 
 pub async fn orgs_create(
@@ -140,14 +230,25 @@ pub async fn orgs_create(
     State(state): State<AppState>,
     Form(form): Form<OrgCreateForm>,
 ) -> Result<Response, WebError> {
-    let slug = form.org_slug.trim();
     let name = form.org_name.trim();
-    if slug.is_empty() || name.is_empty() {
-        return Err(WebError::BadRequest("org_slug and org_name required".into()));
+    if name.is_empty() {
+        return Err(WebError::BadRequest("organization name required".into()));
+    }
+    // Renaming an existing org carries its slug through (hidden field); a new
+    // org has no slug yet, so we derive a stable one from the name.
+    let slug = if form.org_slug.trim().is_empty() {
+        slugify(name)
+    } else {
+        form.org_slug.trim().to_string()
+    };
+    if slug.is_empty() {
+        return Err(WebError::BadRequest(
+            "couldn't build an id from that name — include some letters or numbers".into(),
+        ));
     }
     state
         .store
-        .org_upsert(slug, name)
+        .org_upsert(&slug, name)
         .await
         .map_err(|e| WebError::Internal(format!("org upsert: {e}")))?;
     Ok(Redirect::to("/admin/orgs").into_response())

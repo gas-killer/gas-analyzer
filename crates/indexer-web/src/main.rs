@@ -251,6 +251,7 @@ async fn main() -> Result<()> {
         .route("/unknowns", get(handlers::public::unknowns))
         .route("/admin", get(admin::admin_page))
         .route("/admin/health", get(admin::health_partial))
+        .route("/admin/candidates", get(admin::candidates_partial))
         .route("/admin/refresh/rollups",   post(admin::refresh_rollups))
         .route("/admin/refresh/eth-price", post(admin::refresh_eth_price))
         .route("/admin/refresh/eth-price-backfill", post(admin::backfill_eth_prices))

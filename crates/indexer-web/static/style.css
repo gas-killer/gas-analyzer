@@ -146,8 +146,44 @@ pre { background: #0a0d12; border: 1px solid var(--panel-border); padding: 12px;
     border: 1px solid var(--panel-border);
     border-radius: 6px;
     padding: 12px;
+    cursor: help;
+    position: relative;          /* anchor for the tooltip bubble */
 }
 .health-cell .metric { font-size: 22px; }
+/* Each cell carries an explanatory `data-tip`. Mark the label so it's
+   discoverable (dotted underline + ⓘ), then render the tip ourselves as a
+   styled bubble on hover — the native `title` tooltip was slow and easy to
+   miss. */
+.health-cell .muted {
+    display: inline-block;
+    border-bottom: 1px dotted var(--muted);
+}
+.health-cell .muted::after {
+    content: " ⓘ";
+    opacity: 0.6;
+    font-size: 11px;
+}
+.health-cell[data-tip]:hover::after {
+    content: attr(data-tip);
+    position: absolute;
+    left: 12px;
+    right: 12px;
+    top: calc(100% - 4px);
+    z-index: 30;
+    white-space: normal;
+    background: #11161d;
+    color: var(--text);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    padding: 9px 11px;
+    font-size: 12px;
+    line-height: 1.45;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+    pointer-events: none;
+}
+
+.candidates-filter { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; color: var(--muted); font-size: 13px; }
+.candidates-filter input { width: 90px; background: #0a0d12; border: 1px solid var(--panel-border); border-radius: 4px; padding: 6px 8px; color: var(--text); font-size: 13px; margin: 0 4px; }
 
 .replay-form { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; }
 .replay-form label { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 280px; color: var(--muted); font-size: 12px; }

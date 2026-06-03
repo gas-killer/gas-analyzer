@@ -15,6 +15,25 @@
 </section>
 
 <section class="card">
+    <h3>High-savings candidates</h3>
+    <p class="muted">Still-unlabeled contracts that <em>first appeared recently</em> and are saving meaningful gas — fresh gas-killer candidates worth researching and labeling. Blacklisted contracts and unsupported-opcode / 0%-savings rows are excluded.</p>
+    <form class="candidates-filter"
+          hx-get="/admin/candidates"
+          hx-target="#candidates-region"
+          hx-swap="innerHTML"
+          hx-trigger="load, submit">
+        <label>New within
+            <input type="number" name="days" value="14" min="1" max="365"> days
+        </label>
+        <label>Min saved
+            <input type="number" name="min_eth" value="0" min="0" step="0.0001"> ETH
+        </label>
+        <button class="btn" type="submit">Apply</button>
+    </form>
+    <div id="candidates-region" class="muted">loading…</div>
+</section>
+
+<section class="card">
     <h3>AI diagnostics</h3>
     <p class="muted">Bundles current counters + recent error events and asks an LLM (via OpenRouter) to summarize what's wrong, what's healthy, and what to do next.</p>
     <button class="btn"
