@@ -108,6 +108,15 @@ fn print_report(report: &StateUpdateReport) {
                 println!("  Topic4: {:?}", log.topic4);
                 println!("  Data length: {} bytes", log.data.len());
             }
+            StateUpdate::Create(c) => {
+                println!("  Type: CREATE");
+                println!("  Initcode length: {} bytes", c.initcode.len());
+            }
+            StateUpdate::Create2(c) => {
+                println!("  Type: CREATE2");
+                println!("  Salt: {:?}", c.salt);
+                println!("  Initcode length: {} bytes", c.initcode.len());
+            }
         }
     }
 }

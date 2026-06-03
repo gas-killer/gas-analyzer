@@ -13,6 +13,11 @@ pub const WARM_SSTORE_COST: u64 = 5_000;
 pub const LOG_BASE_COST: u64 = 375;
 pub const LOG_TOPIC_COST: u64 = 375;
 pub const LOG_DATA_COST_PER_BYTE: u64 = 8;
+/// EIP-3860: 2 gas per 32-byte word of initcode
+pub const CREATE_BASE_COST: u64 = 32_000;
+pub const INITCODE_WORD_COST: u64 = 2;
+/// keccak256 word cost used by CREATE2 to hash initcode
+pub const KECCAK_WORD_COST: u64 = 6;
 
 /// Operations and gas data extracted from a trace
 #[derive(Debug, Default)]
@@ -60,6 +65,14 @@ pub fn estimate_gas_from_state_updates(
             }
             StateUpdate::Log4(log) => {
                 LOG_BASE_COST + LOG_TOPIC_COST * 4 + log.data.len() as u64 * LOG_DATA_COST_PER_BYTE
+            }
+            StateUpdate::Create(c) => {
+                let words = (c.initcode.len() as u64).div_ceil(32);
+                CREATE_BASE_COST + words * INITCODE_WORD_COST
+            }
+            StateUpdate::Create2(c) => {
+                let words = (c.initcode.len() as u64).div_ceil(32);
+                CREATE_BASE_COST + words * INITCODE_WORD_COST + words * KECCAK_WORD_COST
             }
         };
     }
