@@ -39,6 +39,10 @@
             <p class="muted">Fetches today's ETH/USD from Coingecko and upserts. Fixes "USD missing" gaps.</p>
         </div>
         <div class="refresh-item">
+            <button class="btn" hx-post="/admin/refresh/eth-price-backfill" hx-target="#refresh-banner" hx-swap="innerHTML" hx-confirm="Fetch historical ETH/USD prices from Coingecko for every day in the analysis range that doesn't already have one?">Backfill historical ETH prices</button>
+            <p class="muted">One HTTP call to Coingecko's <code>market_chart/range</code> covering <code>min(block_timestamp)</code> through today, daily granularity. Existing rows are preserved. Run once after a fresh deploy, or after a long outage in the refresher's price loop.</p>
+        </div>
+        <div class="refresh-item">
             <button class="btn" hx-post="/admin/refresh/resolver" hx-target="#refresh-banner" hx-swap="innerHTML">Refresh resolver</button>
             <p class="muted">Re-reads the YAML overlay + DefiLlama protocol list, upserts projects, retro-relabels historical unknowns that now have mappings.</p>
         </div>

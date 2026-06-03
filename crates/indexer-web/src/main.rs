@@ -85,6 +85,13 @@ struct Cli {
           default_value = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd")]
     price_url: String,
 
+    /// Coingecko API base URL (no trailing slash). Used by the one-shot
+    /// historical-price backfill admin button. Separate from `PRICE_URL`
+    /// because that one is a fully-qualified simple-price endpoint with
+    /// query params baked in.
+    #[arg(long, env = "COINGECKO_BASE_URL", default_value = "https://api.coingecko.com/api/v3")]
+    coingecko_base_url: String,
+
     #[arg(long, env = "LABELER_BATCH_SIZE", default_value_t = 200)]
     labeler_batch_size: i64,
 
@@ -134,6 +141,7 @@ pub struct AppState {
     pub overlay_path: Arc<PathBuf>,
     pub defillama_url: Arc<String>,
     pub price_url: Arc<String>,
+    pub coingecko_base_url: Arc<String>,
     pub labeler_batch_size: i64,
     pub labeler_retry_days: i64,
     /// Banner threshold. `blocks_behind > threshold` paints red on /admin.
@@ -224,6 +232,7 @@ async fn main() -> Result<()> {
         overlay_path: Arc::new(cli.overlay_path),
         defillama_url: Arc::new(cli.defillama_url),
         price_url: Arc::new(cli.price_url),
+        coingecko_base_url: Arc::new(cli.coingecko_base_url),
         labeler_batch_size: cli.labeler_batch_size,
         labeler_retry_days: cli.labeler_retry_days,
         blocks_behind_warn_threshold: cli.blocks_behind_warn_threshold,
@@ -244,6 +253,7 @@ async fn main() -> Result<()> {
         .route("/admin/health", get(admin::health_partial))
         .route("/admin/refresh/rollups",   post(admin::refresh_rollups))
         .route("/admin/refresh/eth-price", post(admin::refresh_eth_price))
+        .route("/admin/refresh/eth-price-backfill", post(admin::backfill_eth_prices))
         .route("/admin/refresh/resolver",  post(admin::refresh_resolver))
         .route("/admin/refresh/labeler",   post(admin::refresh_labeler))
         .route("/admin/refresh/relabel",   post(admin::refresh_relabel))

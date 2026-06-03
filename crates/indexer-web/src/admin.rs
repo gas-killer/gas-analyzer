@@ -371,6 +371,41 @@ pub async fn refresh_eth_price(
     }
 }
 
+pub async fn backfill_eth_prices(
+    _user: AuthUser,
+    State(state): State<AppState>,
+) -> Response {
+    let t = Instant::now();
+    let range = match state.store.analysis_day_range().await {
+        Ok(Some(r)) => r,
+        Ok(None) => return err("ETH price backfill", "analysis table is empty".into(), t),
+        Err(e) => return err("ETH price backfill", format!("{e}"), t),
+    };
+    let today = chrono::Utc::now().date_naive();
+    let to_day = range.1.max(today);
+    match indexer_service::refresher::backfill_eth_prices_now(
+        &state.store,
+        &state.coingecko_base_url,
+        range.0,
+        to_day,
+    )
+    .await
+    {
+        Ok(outcome) => ok(
+            "ETH price backfill",
+            format!(
+                "{} days inserted, {} already present (range {} → {})",
+                outcome.days_inserted,
+                outcome.days_skipped,
+                outcome.min_day.map(|d| d.to_string()).unwrap_or_default(),
+                outcome.max_day.map(|d| d.to_string()).unwrap_or_default(),
+            ),
+            t,
+        ),
+        Err(e) => err("ETH price backfill", format!("{e}"), t),
+    }
+}
+
 pub async fn refresh_resolver(
     _user: AuthUser,
     State(state): State<AppState>,

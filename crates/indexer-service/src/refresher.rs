@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use bigdecimal::BigDecimal;
-use chrono::Utc;
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use indexer_resolver::Resolver;
 use indexer_store::{Project, Store};
 use serde::Deserialize;
@@ -245,4 +245,119 @@ pub async fn refresh_eth_price_now(store: &Store, price_url: &str) -> Result<Big
         .map_err(|e| anyhow::anyhow!("upsert_eth_price failed: {e}"))?;
     tracing::info!(day = %day, usd = ?price, "eth price stored");
     Ok(price)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BackfillOutcome {
+    pub days_inserted: usize,
+    pub days_skipped: usize,
+    pub min_day: Option<NaiveDate>,
+    pub max_day: Option<NaiveDate>,
+}
+
+#[derive(Deserialize)]
+struct MarketChartRange {
+    /// Each inner element is `[unix_ms_timestamp, price_usd]`.
+    prices: Vec<[f64; 2]>,
+}
+
+/// Backfill `eth_prices` for every day in `[from_day, to_day]` that does not
+/// already have a row. One HTTP call to coingecko's `market_chart/range`
+/// covers the whole window; ranges > 90 days are returned at daily
+/// granularity which is exactly what we want. Existing rows are preserved
+/// (we only insert missing days), so this is safe to run repeatedly.
+pub async fn backfill_eth_prices_now(
+    store: &Store,
+    coingecko_base_url: &str,
+    from_day: NaiveDate,
+    to_day: NaiveDate,
+) -> Result<BackfillOutcome> {
+    if from_day > to_day {
+        return Err(anyhow::anyhow!(
+            "from_day {from_day} is after to_day {to_day}"
+        ));
+    }
+    if coingecko_base_url.is_empty() {
+        return Err(anyhow::anyhow!("coingecko_base_url is empty"));
+    }
+    // Pad both ends by a day so coingecko's bucket boundaries don't drop the
+    // edges. Granularity is daily for any range > 90 days; for narrower
+    // windows we extend below.
+    let from_ts = Utc
+        .from_utc_datetime(&from_day.and_hms_opt(0, 0, 0).expect("valid time"))
+        .timestamp();
+    let to_ts = Utc
+        .from_utc_datetime(&to_day.and_hms_opt(23, 59, 59).expect("valid time"))
+        .timestamp();
+    // Coingecko returns hourly data for ranges <= 90 days; we then dedup to one
+    // sample per day. For > 90 days it returns daily already.
+    let url = format!(
+        "{}/coins/ethereum/market_chart/range?vs_currency=usd&from={}&to={}",
+        coingecko_base_url.trim_end_matches('/'),
+        from_ts,
+        to_ts
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| anyhow::anyhow!("backfill client build failed: {e}"))?;
+    let resp: MarketChartRange = client
+        .get(&url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| anyhow::anyhow!("backfill fetch failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("backfill json decode failed: {e}"))?;
+
+    // Bucket by day, taking the first sample we see (coingecko returns them
+    // in ascending order; daily buckets will only have one anyway).
+    let mut by_day: std::collections::BTreeMap<NaiveDate, f64> =
+        std::collections::BTreeMap::new();
+    for [ts_ms, price] in resp.prices {
+        let secs = (ts_ms / 1000.0) as i64;
+        let dt: DateTime<Utc> = match Utc.timestamp_opt(secs, 0).single() {
+            Some(d) => d,
+            None => continue,
+        };
+        let day = dt.date_naive();
+        by_day.entry(day).or_insert(price);
+    }
+
+    let existing: std::collections::HashSet<NaiveDate> =
+        store.list_eth_price_days().await?.into_iter().collect();
+
+    let mut inserted = 0usize;
+    let mut skipped = 0usize;
+    let mut min_day: Option<NaiveDate> = None;
+    let mut max_day: Option<NaiveDate> = None;
+    for (day, price) in by_day {
+        if day < from_day || day > to_day {
+            continue;
+        }
+        if existing.contains(&day) {
+            skipped += 1;
+            continue;
+        }
+        let bd = BigDecimal::from_str(&format!("{:.8}", price))
+            .unwrap_or_else(|_| BigDecimal::from(0));
+        store.upsert_eth_price(day, bd).await?;
+        inserted += 1;
+        min_day = Some(min_day.map_or(day, |d| d.min(day)));
+        max_day = Some(max_day.map_or(day, |d| d.max(day)));
+    }
+    tracing::info!(
+        inserted,
+        skipped,
+        ?min_day,
+        ?max_day,
+        "eth price backfill complete"
+    );
+    Ok(BackfillOutcome {
+        days_inserted: inserted,
+        days_skipped: skipped,
+        min_day,
+        max_day,
+    })
 }
