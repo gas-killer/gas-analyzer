@@ -26,6 +26,8 @@ pub fn encode_state_updates_to_sol(
             StateUpdate::Log2(_) => StateUpdateType::LOG2,
             StateUpdate::Log3(_) => StateUpdateType::LOG3,
             StateUpdate::Log4(_) => StateUpdateType::LOG4,
+            StateUpdate::Create(_) => StateUpdateType::CREATE,
+            StateUpdate::Create2(_) => StateUpdateType::CREATE2,
         })
         .collect::<Vec<_>>();
 
@@ -41,6 +43,8 @@ pub fn encode_state_updates_to_sol(
                 StateUpdate::Log2(x) => x.abi_encode_sequence(),
                 StateUpdate::Log3(x) => x.abi_encode_sequence(),
                 StateUpdate::Log4(x) => x.abi_encode_sequence(),
+                StateUpdate::Create(x) => x.abi_encode_sequence(),
+                StateUpdate::Create2(x) => x.abi_encode_sequence(),
             })
         })
         .collect::<Vec<_>>();
