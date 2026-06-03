@@ -18,25 +18,37 @@ use crate::types::{IStateUpdateTypes, Opcode, StateUpdate};
 
 /// Copy memory with bounds checking, zero-padding if needed.
 pub fn copy_memory(memory: &[u8], offset: usize, length: usize) -> Vec<u8> {
-    if memory.len() >= offset + length {
-        memory[offset..offset + length].to_vec()
+    let end = offset.saturating_add(length);
+    if memory.len() >= end {
+        memory[offset..end].to_vec()
     } else {
-        let mut result = memory.to_vec();
-        result.resize(offset + length, 0);
-        result[offset..offset + length].to_vec()
+        let mut result = vec![0u8; length];
+        if offset < memory.len() {
+            let copy_len = (memory.len() - offset).min(length);
+            result[..copy_len].copy_from_slice(&memory[offset..offset + copy_len]);
+        }
+        result
     }
 }
 
 /// Parse trace memory from Geth format (hex strings) to bytes.
+///
+/// Accepts entries with or without an `0x` prefix — Anvil began emitting prefixed
+/// memory words after revm-inspectors v0.38.1 (Foundry v1.7.0), while geth/erigon
+/// and older Anvil emit bare hex.
 pub fn parse_trace_memory(memory: Vec<String>) -> Vec<u8> {
-    memory
-        .join("")
-        .chars()
-        .collect::<Vec<char>>()
-        .chunks(2)
-        .map(|c| c.iter().collect::<String>())
-        .map(|s| u8::from_str_radix(&s, 16).expect("invalid hex"))
-        .collect::<Vec<u8>>()
+    let total_bytes: usize = memory
+        .iter()
+        .map(|s| s.strip_prefix("0x").unwrap_or(s).len() / 2)
+        .sum();
+    let mut result = Vec::with_capacity(total_bytes);
+    for s in &memory {
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        let start = result.len();
+        result.resize(start + s.len() / 2, 0);
+        hex::decode_to_slice(s, &mut result[start..]).expect("invalid hex");
+    }
+    result
 }
 
 // ============================================================================
@@ -159,10 +171,11 @@ pub fn append_state_update_from_struct_log(
 ///
 /// Returns: (state_updates, skipped_opcodes, call_gas_total)
 /// - `call_gas_total` is the total gas cost of all CALL operations in state_updates
+#[tracing::instrument(name = "gas.trace_parse", skip_all, fields(state_update_count = tracing::field::Empty))]
 pub fn compute_state_updates(
     trace: DefaultFrame,
 ) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64)> {
-    let mut state_updates: Vec<StateUpdate> = Vec::new();
+    let mut state_updates: Vec<StateUpdate> = Vec::with_capacity(trace.struct_logs.len() / 4);
     let mut target_depth = 1u64;
     let mut skipped_opcodes = HashSet::new();
     // Stack of (depth, call_index) for CALLs we're inside. Call index is 1-based for display.
@@ -251,5 +264,35 @@ pub fn compute_state_updates(
         );
     }
 
+    tracing::Span::current().record("state_update_count", state_updates.len());
     Ok((state_updates, skipped_opcodes, total_call_gas))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_trace_memory_handles_both_prefixed_and_bare_hex() {
+        let bare = vec![
+            "00000000000000000000000000000000000000000000000000000000000000ff".to_string(),
+            "1100000000000000000000000000000000000000000000000000000000000000".to_string(),
+        ];
+        let prefixed = vec![
+            "0x00000000000000000000000000000000000000000000000000000000000000ff".to_string(),
+            "0x1100000000000000000000000000000000000000000000000000000000000000".to_string(),
+        ];
+        let mixed = vec![
+            "0x00000000000000000000000000000000000000000000000000000000000000ff".to_string(),
+            "1100000000000000000000000000000000000000000000000000000000000000".to_string(),
+        ];
+
+        let expected = parse_trace_memory(bare);
+        assert_eq!(expected.len(), 64);
+        assert_eq!(expected[31], 0xff);
+        assert_eq!(expected[32], 0x11);
+
+        assert_eq!(parse_trace_memory(prefixed), expected);
+        assert_eq!(parse_trace_memory(mixed), expected);
+    }
 }

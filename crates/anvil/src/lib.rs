@@ -449,7 +449,7 @@ pub async fn get_trace_from_call(
         bail!("transaction failed");
     }
     let tx_hash = tx_receipt.transaction_hash;
-    get_tx_trace(&provider, tx_hash).await
+    get_tx_trace(&provider, tx_hash, tx_receipt.status()).await
 }
 
 // ============================================================================
@@ -572,7 +572,7 @@ pub async fn gaskiller_reporter(
     receipt: &TransactionReceipt,
     function_selector: FixedBytes<4>,
 ) -> Result<ReportDetails> {
-    let trace = get_tx_trace(&provider, tx_hash).await?;
+    let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
     let (state_updates, skipped_opcodes_set, _call_gas_total) = compute_state_updates(trace)?;
     let skipped_opcodes = skipped_opcodes_set
         .into_iter()
@@ -643,8 +643,12 @@ impl<P: Provider + DebugApi> TxStateExtractor<P> {
 
     /// Extract state updates from a transaction hash
     pub async fn extract_state_updates(&self, tx_hash: FixedBytes<32>) -> Result<Vec<StateUpdate>> {
-        // Use existing get_tx_trace function
-        let trace = get_tx_trace(&self.provider, tx_hash).await?;
+        let receipt = self
+            .provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow!("could not get receipt for tx {}", tx_hash))?;
+        let trace = get_tx_trace(&self.provider, tx_hash, receipt.status()).await?;
 
         // Use existing compute_state_updates function
         let (state_updates, _skipped, _call_gas_total) = compute_state_updates(trace)?;
@@ -673,7 +677,7 @@ impl<P: Provider + DebugApi> TxStateExtractor<P> {
             return Err(anyhow!("Transaction failed"));
         }
 
-        let trace = get_tx_trace(&self.provider, tx_hash).await?;
+        let trace = get_tx_trace(&self.provider, tx_hash, receipt.status()).await?;
         let (state_updates, _skipped, _call_gas_total) = compute_state_updates(trace)?;
 
         Ok(StateUpdateReport {
@@ -890,14 +894,18 @@ mod tests {
         let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
 
         let tx_hash = SIMPLE_STORAGE_SET_TX_HASH;
-        let trace = get_tx_trace(&provider, tx_hash).await?;
+        let receipt = provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
+        let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let (state_updates, _, _) = compute_state_updates(trace)?;
 
         let gk = GasKillerDefault::new(rpc_url, None).await?;
         let gas_estimate = gk
             .estimate_state_changes_gas(SIMPLE_STORAGE_ADDRESS, &state_updates)
             .await?;
-        assert_eq!(gas_estimate, 32549);
+        assert_eq!(gas_estimate, 32525);
         Ok(())
     }
 
@@ -911,14 +919,18 @@ mod tests {
         let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
 
         let tx_hash = ACCESS_CONTROL_MAIN_RUN_TX_HASH;
-        let trace = get_tx_trace(&provider, tx_hash).await?;
+        let receipt = provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
+        let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let (state_updates, _, _) = compute_state_updates(trace)?;
 
         let gk = GasKillerDefault::new(rpc_url, None).await?;
         let gas_estimate = gk
             .estimate_state_changes_gas(ACCESS_CONTROL_MAIN_ADDRESS, &state_updates)
             .await?;
-        assert_eq!(gas_estimate, 37185);
+        assert_eq!(gas_estimate, 37161);
         Ok(())
     }
 
@@ -932,7 +944,11 @@ mod tests {
         let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
 
         let tx_hash = ACCESS_CONTROL_MAIN_RUN_TX_HASH;
-        let trace = get_tx_trace(&provider, tx_hash).await?;
+        let receipt = provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
+        let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let (state_updates, _, _) = compute_state_updates(trace)?;
 
         let gk = GasKillerDefault::new(rpc_url, None).await?;
@@ -960,7 +976,11 @@ mod tests {
         let provider = ProviderBuilder::new().connect_http(rpc_url);
 
         let tx_hash = SIMPLE_STORAGE_SET_TX_HASH;
-        let trace = get_tx_trace(&provider, tx_hash).await?;
+        let receipt = provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
+        let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let (state_updates, _, _) = compute_state_updates(trace)?;
 
         assert_eq!(state_updates.len(), 2);
@@ -1003,7 +1023,11 @@ mod tests {
         let provider = ProviderBuilder::new().connect_http(rpc_url);
 
         let tx_hash = SIMPLE_STORAGE_DEPOSIT_TX_HASH;
-        let trace = get_tx_trace(&provider, tx_hash).await?;
+        let receipt = provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
+        let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let (state_updates, _, _) = compute_state_updates(trace)?;
 
         assert_eq!(state_updates.len(), 2);
@@ -1050,7 +1074,11 @@ mod tests {
         let provider = ProviderBuilder::new().connect_http(rpc_url);
 
         let tx_hash = DELEGATECALL_CONTRACT_MAIN_RUN_TX_HASH;
-        let trace = get_tx_trace(&provider, tx_hash).await?;
+        let receipt = provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
+        let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let (state_updates, _, _) = compute_state_updates(trace)?;
 
         assert_eq!(state_updates.len(), 4);
@@ -1115,7 +1143,11 @@ mod tests {
         let provider = ProviderBuilder::new().connect_http(rpc_url);
 
         let tx_hash = SIMPLE_STORAGE_CALL_EXTERNAL_TX_HASH;
-        let trace = get_tx_trace(&provider, tx_hash).await?;
+        let receipt = provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
+        let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let (state_updates, _, _) = compute_state_updates(trace)?;
 
         assert_eq!(state_updates.len(), 1);

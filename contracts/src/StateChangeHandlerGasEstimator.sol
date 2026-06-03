@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.13;
 
-import { StateChangeHandlerLib, StateUpdateType } from "../lib/gas-killer-avs-sol/src/StateChangeHandlerLib.sol";
+import { StateChangeHandlerLib, StateUpdateType } from "../lib/solidity-sdk/src/StateChangeHandlerLib.sol";
 
 /// @notice Gas estimator with transparent-proxy fallback.
 ///
@@ -28,7 +28,7 @@ contract StateChangeHandlerGasEstimator {
         }
     }
 
-    function runStateUpdatesCall(StateUpdateType[] memory types, bytes[] memory args) external {
+    function runStateUpdatesCall(StateUpdateType[] memory types, bytes[] memory args) external payable {
         StateChangeHandlerLib._runStateUpdates(types, args);
     }
 
