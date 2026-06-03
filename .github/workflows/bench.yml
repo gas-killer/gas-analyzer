@@ -1,0 +1,110 @@
+name: Benchmarks
+
+on:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────
+  # On every PR: bench the PR branch and the base branch back-to-back on the
+  # same runner, post a sticky comment with the regression report, and fail
+  # if any offline metric regresses beyond 15 %.
+  #
+  # Running both measurements in one job eliminates cross-machine variance.
+  # The candidate runs FIRST so that any warm-cache ordering bias works
+  # against the candidate rather than masking regressions.
+  # Fixtures are pulled once from LFS after the initial checkout; they
+  # persist on disk through the branch switch since target/ is gitignored.
+  #
+  # end_to_end is excluded — it requires a live Sepolia node and is dominated
+  # by network latency, making it unsuitable for threshold-based regression
+  # detection.
+  # ────────────────────────────────────────────────────────────────────────
+  bench:
+    name: Benchmark regression check
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Pull bench fixtures from LFS
+        continue-on-error: true
+        run: git lfs pull --include "crates/evmsketch/benches/fixtures/"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clear any stale Criterion data
+        run: rm -rf target/criterion/
+
+      - name: Bench PR branch (candidate)
+        run: make bench-save-baseline BASELINE=candidate
+
+      - name: Switch to base branch
+        run: git checkout ${{ github.event.pull_request.base.sha }}
+
+      - name: Flush page cache and allocator
+        run: |
+          sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+          python3 -c "import ctypes; ctypes.CDLL('libc.so.6').malloc_trim(0)"
+
+      - name: Bench base branch (baseline)
+        run: make bench-save-baseline
+
+      - name: Check regressions and generate report
+        id: regcheck
+        continue-on-error: true
+        run: |
+          python3 .github/scripts/check_regressions.py \
+            --threshold 15 \
+            --criterion-dir target/criterion \
+            --candidate candidate \
+            --output-file regression-report.md
+
+      - name: Post PR comment
+        if: always()
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.existsSync('regression-report.md')
+              ? fs.readFileSync('regression-report.md', 'utf8')
+              : '## Benchmark Results\n\n> Report generation failed — check the workflow logs.';
+
+            const marker = '<!-- bench-ci -->';
+            const body = `${marker}\n${report}`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+            });
+            const existing = comments.find(c => c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body,
+              });
+            }
+
+      - name: Fail on regressions
+        if: steps.regcheck.outcome == 'failure'
+        run: |
+          echo "::error::Benchmark regressions detected — see the PR comment for details."
+          exit 1

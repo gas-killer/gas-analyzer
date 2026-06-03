@@ -14,25 +14,24 @@ use alloy::rpc::types::trace::geth::{
 use alloy_eips::BlockId;
 use alloy_provider::Provider;
 use alloy_provider::ext::DebugApi;
+use alloy_rpc_types::TransactionTrait;
 use anyhow::{Result, anyhow, bail};
 
 use gas_analyzer_core::trace::compute_state_updates;
 use gas_analyzer_core::types::{Opcode, StateUpdate};
+use gas_analyzer_estimator::PrecedingTx;
 
 /// Get transaction trace from a provider using debug_traceTransaction.
 ///
-/// This fetches the actual historical trace from an already-executed transaction,
-/// ensuring we get the exact values that were stored during the original execution.
+/// `status` must be the receipt status for `tx_hash` (`receipt.status()`).
+/// Pass the already-fetched receipt's status to avoid a redundant RPC call.
+/// Returns an error immediately if `status` is `false` (transaction reverted).
 pub async fn get_tx_trace<P: Provider + DebugApi>(
     provider: &P,
     tx_hash: FixedBytes<32>,
+    status: bool,
 ) -> Result<DefaultFrame> {
-    let tx_receipt = provider
-        .get_transaction_receipt(tx_hash)
-        .await?
-        .ok_or_else(|| anyhow!("could not get receipt for tx {}", tx_hash))?;
-
-    if !tx_receipt.status() {
+    if !status {
         bail!("transaction failed");
     }
 
@@ -70,6 +69,7 @@ where
         tracing_options: GethDebugTracingOptions {
             config: GethDefaultTracingOptions {
                 enable_memory: Some(true),
+                disable_storage: Some(true),
                 ..Default::default()
             },
             ..Default::default()
@@ -90,15 +90,17 @@ where
 
 /// Compute state updates from an existing transaction using its actual trace.
 ///
-/// This is a convenience function that combines `get_tx_trace` and `compute_state_updates`.
+/// `status` must be `receipt.status()` for `tx_hash`. Pass the already-fetched
+/// receipt's status to avoid an extra `eth_getTransactionReceipt` round-trip.
 ///
 /// Returns: (state_updates, skipped_opcodes, call_gas_total)
 pub async fn compute_state_updates_from_tx<P: Provider + DebugApi>(
     provider: &P,
     tx_hash: FixedBytes<32>,
+    status: bool,
 ) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64)> {
     // Primary path: use the historical trace via debug_traceTransaction.
-    let trace = get_tx_trace(provider, tx_hash).await?;
+    let trace = get_tx_trace(provider, tx_hash, status).await?;
     let struct_logs_len = trace.struct_logs.len();
     if struct_logs_len > 0 {
         return compute_state_updates(trace);
@@ -110,4 +112,75 @@ pub async fn compute_state_updates_from_tx<P: Provider + DebugApi>(
          When using Anvil, start it with --steps-tracing to enable debug_traceTransaction support.",
         tx_hash
     )
+}
+
+// ============================================================================
+// Block Transaction Fetching
+// ============================================================================
+
+/// Fetch preceding transactions from a block for replay.
+///
+/// Calls `eth_getBlockByNumber(block_number, true)` to get the block with
+/// full transaction objects, then converts transactions at indices `0..tx_index`
+/// into `PrecedingTx` structs suitable for replay in revm.
+///
+/// Returns an empty vec if `tx_index` is 0 (first in block).
+pub async fn get_preceding_transactions<P: Provider>(
+    provider: &P,
+    block_number: u64,
+    tx_index: u64,
+) -> Result<Vec<PrecedingTx>> {
+    if tx_index == 0 {
+        return Ok(Vec::new());
+    }
+
+    let block = provider
+        .get_block_by_number(block_number.into())
+        .full()
+        .await?
+        .ok_or_else(|| anyhow!("Block {} not found", block_number))?;
+
+    let base_fee = block.header.base_fee_per_gas;
+    let txs: Vec<_> = block.transactions.into_transactions().collect();
+
+    if (tx_index as usize) >= txs.len() {
+        bail!(
+            "Transaction index {} exceeds block transaction count {}",
+            tx_index,
+            txs.len()
+        );
+    }
+
+    let preceding: Vec<PrecedingTx> = txs[..tx_index as usize]
+        .iter()
+        .map(|tx| {
+            let kind = match tx.inner.to() {
+                Some(addr) => revm::primitives::TxKind::Call(addr),
+                None => revm::primitives::TxKind::Create,
+            };
+            // EIP-2930 access list pre-warms slots/addresses; without it
+            // replay sees higher gas costs than the original tx and can
+            // OOG-halt, dropping storage writes from the CacheDB.
+            let access_list = tx.inner.access_list().cloned().unwrap_or_default();
+            // EIP-7702 set-code authorizations; only present on type-4 txs.
+            let authorization_list = tx
+                .inner
+                .authorization_list()
+                .map(<[_]>::to_vec)
+                .unwrap_or_default();
+            PrecedingTx {
+                from: tx.inner.signer(),
+                kind,
+                input: tx.inner.input().clone(),
+                value: tx.inner.value(),
+                gas_limit: tx.inner.gas_limit(),
+                nonce: tx.inner.nonce(),
+                gas_price: tx.inner.effective_gas_price(base_fee),
+                access_list,
+                authorization_list,
+            }
+        })
+        .collect();
+
+    Ok(preceding)
 }

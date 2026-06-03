@@ -7,31 +7,114 @@
 //! via `debug_traceTransaction`, and gas estimation is delegated to the
 //! `gas-analyzer-estimator` crate which uses revm directly.
 
-use alloy::primitives::{Address, B256, Bytes, TxKind};
-use alloy::providers::ProviderBuilder;
+use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy_eips::BlockId;
 use alloy_eips::BlockNumberOrTag;
+use alloy_genesis::ChainConfig;
+use alloy_hardforks::{EthereumChainHardforks, EthereumHardfork, ForkCondition};
 use alloy_provider::Provider;
 use alloy_provider::RootProvider;
 use alloy_provider::ext::DebugApi;
-use alloy_provider::network::AnyNetwork;
-use anyhow::{Result, anyhow};
+use alloy_provider::network::{AnyNetwork, Ethereum};
+use anyhow::{Context as _, Result, anyhow};
+use lru::LruCache;
 use reth_primitives::EthPrimitives;
 use revm::database::CacheDB;
+use revm::primitives::hardfork::SpecId;
 use sp1_cc_client_executor::{ContractCalldata, ContractInput};
-use sp1_cc_host_executor::EvmSketch;
-use std::collections::HashSet;
+use sp1_cc_host_executor::{EvmSketch, Genesis};
+use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use url::Url;
 
+/// Ethereum mainnet chain ID.
+pub const MAINNET_CHAIN_ID: u64 = 1;
+/// Ethereum Sepolia chain ID.
+pub const SEPOLIA_CHAIN_ID: u64 = 11_155_111;
+/// Gnosis Chain chain ID.
+pub const GNOSIS_CHAIN_ID: u64 = 100;
+
+/// Map a chain ID to the corresponding `Genesis` for `EvmSketch` and the
+/// matching `EthereumChainHardforks` for spec derivation.
+///
+/// Unsupported chain IDs return an error rather than silently defaulting to
+/// mainnet, which would produce a wrong `SpecId` whenever the active hardfork
+/// on the target chain differs from mainnet at the same height/timestamp.
+pub fn chain_id_to_genesis_and_spec(chain_id: u64) -> Result<(Genesis, EthereumChainHardforks)> {
+    match chain_id {
+        MAINNET_CHAIN_ID => Ok((Genesis::Mainnet, EthereumChainHardforks::mainnet())),
+        SEPOLIA_CHAIN_ID => Ok((Genesis::Sepolia, EthereumChainHardforks::sepolia())),
+        GNOSIS_CHAIN_ID => Ok((Genesis::Custom(gnosis_chain_config()), gnosis_hardforks())),
+        other => Err(anyhow!(
+            "unsupported chain id {other}: only mainnet ({}), sepolia ({}), and gnosis ({}) are supported",
+            MAINNET_CHAIN_ID,
+            SEPOLIA_CHAIN_ID,
+            GNOSIS_CHAIN_ID,
+        )),
+    }
+}
+
+fn gnosis_chain_config() -> ChainConfig {
+    ChainConfig {
+        chain_id: GNOSIS_CHAIN_ID,
+        homestead_block: Some(0),
+        eip150_block: Some(0),
+        eip155_block: Some(0),
+        eip158_block: Some(0),
+        byzantium_block: Some(0),
+        constantinople_block: Some(0),
+        petersburg_block: Some(0),
+        istanbul_block: Some(0),
+        berlin_block: Some(16_101_500),
+        london_block: Some(19_040_000),
+        shanghai_time: Some(1_690_889_660),
+        cancun_time: Some(1_710_181_820),
+        prague_time: Some(1_746_021_820),
+        ..Default::default()
+    }
+}
+
+fn gnosis_hardforks() -> EthereumChainHardforks {
+    // Paris (Merge, Dec-08-2022) is omitted: its TTD-based ForkCondition has no
+    // fork_block, so is_paris_active_at_block always returns false. This is
+    // harmless because all current Gnosis blocks are post-Shanghai, and
+    // spec_by_timestamp_and_block_number checks timestamp forks first.
+    EthereumChainHardforks::new([
+        (EthereumHardfork::Frontier, ForkCondition::Block(0)),
+        (EthereumHardfork::Homestead, ForkCondition::Block(0)),
+        (EthereumHardfork::Tangerine, ForkCondition::Block(0)),
+        (EthereumHardfork::SpuriousDragon, ForkCondition::Block(0)),
+        (EthereumHardfork::Byzantium, ForkCondition::Block(0)),
+        (EthereumHardfork::Constantinople, ForkCondition::Block(0)),
+        (EthereumHardfork::Petersburg, ForkCondition::Block(0)),
+        (EthereumHardfork::Istanbul, ForkCondition::Block(0)),
+        (EthereumHardfork::Berlin, ForkCondition::Block(16_101_500)),
+        (EthereumHardfork::London, ForkCondition::Block(19_040_000)),
+        (
+            EthereumHardfork::Shanghai,
+            ForkCondition::Timestamp(1_690_889_660),
+        ),
+        (
+            EthereumHardfork::Cancun,
+            ForkCondition::Timestamp(1_710_181_820),
+        ),
+        (
+            EthereumHardfork::Prague,
+            ForkCondition::Timestamp(1_746_021_820),
+        ),
+    ])
+}
+
 pub mod simple_rpc_db;
-use simple_rpc_db::SimpleRpcDb;
+use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 
 use gas_analyzer_core::{
     Opcode, StateUpdate, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_operations, extract_operation_counts_from_trace,
 };
-use gas_analyzer_estimator::SimEnvOpts;
+use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
 use gas_analyzer_rpc::get_trace_from_call;
 
 // ============================================================================
@@ -44,6 +127,155 @@ pub type DefaultProvider = RootProvider<AnyNetwork>;
 pub type DefaultPrimitives = EthPrimitives;
 /// The default executor type
 pub type DefaultEvmSketchExecutor = EvmSketchExecutor<DefaultProvider, DefaultPrimitives>;
+
+// ============================================================================
+// Executor Cache
+// ============================================================================
+
+/// Thread-safe LRU cache of pre-built [`DefaultEvmSketchExecutor`]s, with a
+/// companion provider cache so the same HTTP connection pool is reused across
+/// all `debug_traceCall` requests to the same endpoint.
+///
+/// An executor cache miss costs ~50–70 ms (1× `eth_getBlockByNumber`) once the
+/// chain ID for that URL is known; the very first miss per URL also pays
+/// `eth_chainId` (~16–50 ms extra). An executor is safe to reuse across requests
+/// at the same block height: `sim_env()` reads only immutable header fields, and
+/// each gas estimate constructs its own `CacheDB`. Executors are keyed by
+/// `(rpc_url, block_number)`. Trace providers are keyed by `rpc_url` only — a
+/// single [`RootProvider`] is shared across all block heights for the same
+/// endpoint, avoiding repeated TCP/TLS handshakes.
+///
+/// Chain ID is static per network: it is fetched once per RPC URL and reused
+/// across all block-number entries for that URL, eliminating one `eth_chainId`
+/// round-trip (~16–50 ms) on every subsequent executor cache miss.
+///
+/// A capacity of 4 covers all realistic burst scenarios on mainnet (~12 s blocks).
+pub struct EvmSketchExecutorCache {
+    inner: Mutex<LruCache<(String, u64), Arc<DefaultEvmSketchExecutor>>>,
+    chain_ids: Mutex<HashMap<String, u64>>,
+    /// One `RootProvider<Ethereum>` per RPC URL, used for `debug_traceCall`.
+    /// `RootProvider` is `Clone` (Arc-backed), so callers share one HTTP
+    /// connection pool rather than creating a new one per invocation.
+    trace_providers: Mutex<HashMap<String, RootProvider<Ethereum>>>,
+}
+
+impl EvmSketchExecutorCache {
+    /// Create a new cache with the given capacity.
+    ///
+    /// # Panics
+    /// Panics if `capacity` is zero.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(LruCache::new(
+                NonZeroUsize::new(capacity).expect("cache capacity must be non-zero"),
+            )),
+            chain_ids: Mutex::new(HashMap::new()),
+            trace_providers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Return a cached trace provider for `rpc_url`, creating one if absent.
+    ///
+    /// The provider is a `RootProvider<Ethereum>` (built via
+    /// `ProviderBuilder::new().connect_http`) so it satisfies the
+    /// `Provider + DebugApi` bounds required by `get_trace_from_call`.
+    /// Subsequent calls for the same URL return a clone of the same underlying
+    /// provider — cheap Arc bump, shared connection pool.
+    fn get_or_create_trace_provider(&self, rpc_url: &str) -> Result<RootProvider<Ethereum>> {
+        {
+            let providers = self
+                .trace_providers
+                .lock()
+                .expect("trace_providers mutex poisoned");
+            if let Some(p) = providers.get(rpc_url) {
+                return Ok(p.clone());
+            }
+        }
+        let url = Url::parse(rpc_url).map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+        // RootProvider::new_http gives a plain provider without gas/nonce/chain-id
+        // fillers, which are unnecessary for debug_traceCall.
+        let provider = RootProvider::<Ethereum>::new_http(url);
+        {
+            let mut providers = self
+                .trace_providers
+                .lock()
+                .expect("trace_providers mutex poisoned");
+            providers
+                .entry(rpc_url.to_string())
+                .or_insert_with(|| provider.clone());
+        }
+        Ok(provider)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("executor cache mutex poisoned")
+            .len()
+    }
+
+    /// Return a cached executor for `(rpc_url, block_number)`, building one if absent.
+    ///
+    /// Two concurrent callers that both miss may each call `build()`; the later
+    /// `put` overwrites the earlier entry.  Both executors are equivalent, so this
+    /// is safe — it only wastes one build in the rare cold-start race.
+    ///
+    /// Chain ID is fetched at most once per RPC URL across all block numbers.
+    pub async fn get_or_build(
+        &self,
+        rpc_url: &str,
+        block_number: u64,
+    ) -> Result<Arc<DefaultEvmSketchExecutor>> {
+        let key = (rpc_url.to_string(), block_number);
+        {
+            let mut cache = self.inner.lock().expect("executor cache mutex poisoned");
+            if let Some(exec) = cache.get(&key) {
+                return Ok(Arc::clone(exec));
+            }
+        }
+
+        let url = Url::parse(rpc_url).map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+
+        // Chain ID is static per network — fetch once and reuse across blocks.
+        let chain_id = {
+            self.chain_ids
+                .lock()
+                .expect("chain_id cache mutex poisoned")
+                .get(rpc_url)
+                .copied()
+        };
+        let chain_id = match chain_id {
+            Some(id) => id,
+            None => {
+                let provider = RootProvider::<AnyNetwork>::new_http(url.clone());
+                let id = provider
+                    .get_chain_id()
+                    .await
+                    .map_err(|e| anyhow!("Failed to query eth_chainId: {}", e))?;
+                self.chain_ids
+                    .lock()
+                    .expect("chain_id cache mutex poisoned")
+                    .insert(rpc_url.to_string(), id);
+                id
+            }
+        };
+
+        let exec = Arc::new(
+            EvmSketchExecutorBuilder::new()
+                .rpc_url(url)
+                .with_chain_id(chain_id)
+                .at_block(BlockNumberOrTag::Number(block_number))
+                .build()
+                .await?,
+        );
+        {
+            let mut cache = self.inner.lock().expect("executor cache mutex poisoned");
+            cache.put(key, Arc::clone(&exec));
+        }
+        Ok(exec)
+    }
+}
 
 // ============================================================================
 // Transaction Request Conversion
@@ -86,6 +318,11 @@ pub fn tx_request_to_contract_input(tx_request: &TransactionRequest) -> Result<C
 pub struct EvmSketchExecutor<P, PT> {
     /// The underlying EvmSketch instance
     pub sketch: EvmSketch<P, PT>,
+    /// The chain ID detected from the RPC at build time.
+    pub chain_id: u64,
+    /// The EVM spec (hardfork) for the anchored block, computed once at build
+    /// time from the chain's hardfork schedule and the anchor header.
+    pub spec: SpecId,
 }
 
 /// Builder for EvmSketchExecutor
@@ -93,6 +330,7 @@ pub struct EvmSketchExecutor<P, PT> {
 pub struct EvmSketchExecutorBuilder {
     rpc_url: Option<Url>,
     block: BlockNumberOrTag,
+    chain_id: Option<u64>,
 }
 
 impl EvmSketchExecutorBuilder {
@@ -113,18 +351,50 @@ impl EvmSketchExecutorBuilder {
         self
     }
 
+    /// Supply a pre-fetched chain ID, skipping the `eth_chainId` probe in `build`.
+    ///
+    /// Use this when the chain ID is already known (e.g. cached from a prior
+    /// call) to avoid an extra round-trip per executor build.
+    pub fn with_chain_id(mut self, chain_id: u64) -> Self {
+        self.chain_id = Some(chain_id);
+        self
+    }
+
     /// Build the EvmSketchExecutor.
+    ///
+    /// Queries `eth_chainId` from the RPC if not already supplied via
+    /// [`with_chain_id`](Self::with_chain_id), then selects the matching `Genesis`
+    /// and hardfork schedule. Errors on unsupported chains: silently defaulting
+    /// to mainnet when pointed at a different network would yield wrong hardfork
+    /// activation and corrupt gas estimation.
     pub async fn build(self) -> Result<DefaultEvmSketchExecutor> {
         let rpc_url = self.rpc_url.ok_or_else(|| anyhow!("RPC URL is required"))?;
+
+        let chain_id = match self.chain_id {
+            Some(id) => id,
+            None => RootProvider::<AnyNetwork>::new_http(rpc_url.clone())
+                .get_chain_id()
+                .await
+                .map_err(|e| anyhow!("Failed to query eth_chainId: {}", e))?,
+        };
+        let (genesis, hardforks) = chain_id_to_genesis_and_spec(chain_id)?;
 
         let sketch = EvmSketch::builder()
             .at_block(self.block)
             .el_rpc_url(rpc_url)
+            .with_genesis(genesis)
+            .without_state_root_seed()
             .build()
             .await
             .map_err(|e| anyhow!("Failed to build EvmSketch: {}", e))?;
 
-        Ok(EvmSketchExecutor { sketch })
+        let spec = alloy_evm::spec(&hardforks, sketch.anchor.header());
+
+        Ok(EvmSketchExecutor {
+            sketch,
+            chain_id,
+            spec,
+        })
     }
 }
 
@@ -132,6 +402,11 @@ impl DefaultEvmSketchExecutor {
     /// Estimate gas for executing a set of state updates using pre-built calldata.
     ///
     /// Delegates to the shared gas-analyzer-estimator crate which uses revm directly.
+    ///
+    /// Storage is read at `block_number - 1` via `SimpleRpcDb`, matching the
+    /// other estimation entry points. Anchoring to `block_number` itself
+    /// returns post-block state from `eth_getStorageAt` — the analyzed tx
+    /// would observe its own writes already applied.
     pub fn estimate_state_changes_gas_raw(
         &self,
         contract_address: Address,
@@ -139,7 +414,9 @@ impl DefaultEvmSketchExecutor {
         calldata: Bytes,
         gas_price: u128,
     ) -> Result<u64> {
-        let mut cache_db = CacheDB::new(&self.sketch.rpc_db);
+        let state_block = self.anchor_block_number().saturating_sub(1);
+        let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
+        let mut cache_db = CacheDB::new(simple_db);
         let mut sim_env = self.sim_env();
         sim_env.gas_price = gas_price;
         gas_analyzer_estimator::estimate_gas_raw(
@@ -151,10 +428,73 @@ impl DefaultEvmSketchExecutor {
         )
     }
 
+    /// Estimate gas for a set of state updates at the anchor block.
+    ///
+    /// Constructs a fresh `CacheDB` backed by `SimpleRpcDb` at `block_number - 1`
+    /// (pre-block state) so each call is independent of any prior estimation on
+    /// this executor.
+    pub fn estimate_state_changes_gas(
+        &self,
+        contract_address: Address,
+        caller_address: Address,
+        state_updates: &[gas_analyzer_core::StateUpdate],
+    ) -> Result<u64> {
+        let state_block = self.anchor_block_number().saturating_sub(1);
+        let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
+        let mut cache_db = CacheDB::new(simple_db);
+        let sim_env = self.sim_env();
+        gas_analyzer_estimator::estimate_state_changes_gas(
+            &mut cache_db,
+            contract_address,
+            caller_address,
+            state_updates,
+            &sim_env,
+        )
+    }
+
+    /// Estimate gas for a set of state updates, prefetching storage slots first.
+    ///
+    /// Like `estimate_state_changes_gas` but accepts a map of `address →
+    /// storage keys` sourced from the transaction's EIP-2930 access list (or
+    /// any other prior knowledge). Before EVM execution begins, each address
+    /// in `storage_hints` is fetched via a single `eth_getProof` call that
+    /// returns both account metadata and the listed slot values, eliminating
+    /// the per-slot `eth_getStorageAt` round-trips for those keys.
+    ///
+    /// Cold-miss slots not present in `storage_hints` still fall back to
+    /// `eth_getStorageAt` during execution — an incomplete hint set is safe.
+    pub async fn estimate_state_changes_gas_with_hints(
+        &self,
+        contract_address: Address,
+        caller_address: Address,
+        state_updates: &[gas_analyzer_core::StateUpdate],
+        storage_hints: &HashMap<Address, Vec<B256>>,
+    ) -> Result<u64> {
+        let state_block = self.anchor_block_number().saturating_sub(1);
+        let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
+        let mut cache_db = CacheDB::new(simple_db);
+
+        prefetch_slots_into_cache(&mut cache_db, storage_hints)
+            .await
+            .context("storage slot prefetch failed")?;
+
+        let sim_env = self.sim_env();
+        gas_analyzer_estimator::estimate_state_changes_gas(
+            &mut cache_db,
+            contract_address,
+            caller_address,
+            state_updates,
+            &sim_env,
+        )
+    }
+
     /// Build a `SimEnv` from the anchored block header.
     ///
     /// `gas_price` defaults to 0 since it is a transaction-level field;
     /// callers with access to the original transaction can override it.
+    /// `basefee` comes from the header (0 for pre-EIP-1559 blocks).
+    /// `spec` is the pre-computed `SpecId` stored at build time;
+    /// `difficulty` carries the legacy PoW value (zero post-Merge).
     pub fn sim_env(&self) -> SimEnvOpts {
         let header = self.sketch.anchor.header();
         SimEnvOpts {
@@ -164,7 +504,16 @@ impl DefaultEvmSketchExecutor {
             coinbase: header.beneficiary,
             prevrandao: header.mix_hash,
             gas_price: 0,
+            basefee: header.base_fee_per_gas.unwrap_or(0),
+            difficulty: header.difficulty,
+            spec: self.spec,
+            value: U256::ZERO,
         }
+    }
+
+    /// Returns the chain ID detected from the RPC at build time.
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
     }
 
     /// Get the block hash that the executor is anchored to.
@@ -210,6 +559,7 @@ impl GasKillerEvmSketchBuilder {
     }
 
     /// Build the GasKillerEvmSketch instance.
+    #[tracing::instrument(name = "evmsketch.build", skip(self), fields(block_number = %self.block))]
     pub async fn build(self) -> Result<GasKillerEvmSketchDefault> {
         let executor = EvmSketchExecutorBuilder::new()
             .rpc_url(self.rpc_url)
@@ -241,6 +591,7 @@ impl GasKillerEvmSketchDefault {
     /// backed by standard RPC calls (`eth_getStorageAt`, `eth_getBalance`, etc.)
     /// instead of sp1-cc's `BasicRpcDb` which requires `eth_getProof`. This avoids
     /// the "proof window" limitation on Reth and other nodes.
+    #[tracing::instrument(name = "evmsketch.estimate", skip_all, fields(block_number = self.executor.anchor_block_number(), state_update_count = state_updates.len()))]
     pub fn estimate_state_changes_gas(
         &self,
         contract_address: Address,
@@ -249,10 +600,7 @@ impl GasKillerEvmSketchDefault {
     ) -> Result<u64> {
         // Use block_number - 1 (pre-transaction state), matching the Anvil path.
         let state_block = self.executor.anchor_block_number().saturating_sub(1);
-        let simple_db = SimpleRpcDb {
-            provider: self.executor.sketch.provider.clone(),
-            block_number: state_block,
-        };
+        let simple_db = SimpleRpcDb::new(self.executor.sketch.provider.clone(), state_block);
         let mut cache_db = CacheDB::new(simple_db);
         let sim_env = self.executor.sim_env();
         gas_analyzer_estimator::estimate_state_changes_gas(
@@ -264,18 +612,99 @@ impl GasKillerEvmSketchDefault {
         )
     }
 
+    /// Estimate gas for state changes, replaying preceding transactions first.
+    ///
+    /// Creates a single CacheDB, replays all preceding transactions to bring
+    /// it to the correct mid-block state, then runs gas estimation on that
+    /// state. This ensures the simulation sees the same state the original
+    /// transaction executed against.
+    ///
+    /// If `preceding_txs` is empty (first-in-block), this behaves identically
+    /// to `estimate_state_changes_gas`.
+    pub fn estimate_state_changes_gas_with_preceding(
+        &self,
+        contract_address: Address,
+        caller_address: Address,
+        state_updates: &[StateUpdate],
+        preceding_txs: &[PrecedingTx],
+        tx_value: U256,
+    ) -> Result<u64> {
+        // Source storage from block N-1 (pre-block state). Anchoring to
+        // `block_number` itself makes RPC reads return state at the *end* of
+        // block N — after every tx in that block (including the one we're
+        // analyzing) has already been applied. `replay_preceding_transactions`
+        // would then re-apply txs `[0..tx_index)` on top of post-block state,
+        // compounding the error.
+        //
+        // Reading from N-1 puts the DB in the correct pre-block state, and
+        // the subsequent replay brings it to the right mid-block point.
+        //
+        // The most visible failure mode is any replayed call whose logic
+        // depends on state mutated earlier in the same block — e.g. an
+        // EIP-2612 `permit` whose nonce was already consumed by the original
+        // tx, causing signature recovery to mismatch and the call to revert
+        // with "invalid signature".
+        let state_block = self.executor.anchor_block_number().saturating_sub(1);
+        let simple_db = SimpleRpcDb::new(self.executor.sketch.provider.clone(), state_block);
+        let mut cache_db = CacheDB::new(simple_db);
+        let mut sim_env = self.executor.sim_env();
+
+        if !preceding_txs.is_empty() {
+            // Prefetch storage slots declared in preceding-tx access lists so
+            // that replay_preceding_transactions reads from the in-process cache
+            // instead of issuing per-slot eth_getStorageAt calls.
+            let mut hints: HashMap<Address, Vec<B256>> = HashMap::new();
+            for tx in preceding_txs {
+                for item in tx.access_list.iter() {
+                    if !item.storage_keys.is_empty() {
+                        hints
+                            .entry(item.address)
+                            .or_default()
+                            .extend(item.storage_keys.iter().copied());
+                    }
+                }
+            }
+
+            if !hints.is_empty() {
+                let handle = tokio::runtime::Handle::try_current()
+                    .context("no tokio runtime for storage prefetch")?;
+                tokio::task::block_in_place(|| {
+                    handle.block_on(prefetch_slots_into_cache(&mut cache_db, &hints))
+                })
+                .context("prefetch storage slots for preceding txs")?;
+            }
+
+            gas_analyzer_estimator::replay_preceding_transactions(
+                &mut cache_db,
+                preceding_txs,
+                &sim_env,
+            )?;
+        }
+
+        sim_env.value = tx_value;
+        gas_analyzer_estimator::estimate_state_changes_gas(
+            &mut cache_db,
+            contract_address,
+            caller_address,
+            state_updates,
+            &sim_env,
+        )
+    }
+
     /// Estimate gas using a fallback heuristic based on the original transaction trace.
     ///
-    /// This extracts operations (SSTORE, LOG, CALL) from the original transaction trace
-    /// and applies heuristic costs.
+    /// `status` must be `receipt.status()` for `tx_hash`. Pass the already-fetched
+    /// receipt's status to avoid an extra `eth_getTransactionReceipt` round-trip.
+    /// Extracts operations (SSTORE, LOG, CALL) from the trace and applies heuristic costs.
     pub async fn estimate_gas_from_trace<P: Provider + DebugApi>(
         &self,
         provider: &P,
         tx_hash: alloy::primitives::FixedBytes<32>,
+        status: bool,
     ) -> Result<u64> {
         use gas_analyzer_rpc::get_tx_trace;
 
-        let trace = get_tx_trace(provider, tx_hash).await?;
+        let trace = get_tx_trace(provider, tx_hash, status).await?;
         let operations = extract_operation_counts_from_trace(&trace);
         Ok(estimate_gas_from_operations(&operations))
     }
@@ -295,21 +724,56 @@ impl GasKillerEvmSketchDefault {
 // call_to_encoded_state_updates_with_evmsketch
 // ============================================================================
 
+/// Derive prefetch hints from a set of state updates.
+///
+/// - `Store`: the slot is at `contract_address`; batching all slots into one
+///   `eth_getProof` call returns every value in a single round-trip.
+/// - `Call`: the target address will be loaded by revm; an empty key list
+///   prefetches just account info (balance/nonce/code), eliminating one
+///   blocking `basic_ref` call during gas estimation.
+/// - `Log*`: carry no addressable state and produce no hints.
+fn hints_from_state_updates(
+    contract_address: Address,
+    state_updates: &[StateUpdate],
+) -> HashMap<Address, Vec<B256>> {
+    let mut hints: HashMap<Address, Vec<B256>> = HashMap::new();
+    // Always prefetch contract_address account info even if there are no Store updates.
+    hints.entry(contract_address).or_default();
+    for update in state_updates {
+        match update {
+            StateUpdate::Store(s) => {
+                hints.entry(contract_address).or_default().push(s.slot);
+            }
+            StateUpdate::Call(c) => {
+                hints.entry(c.target).or_default();
+            }
+            _ => {}
+        }
+    }
+    hints
+}
+
 /// Compute encoded state updates and gas estimate for a transaction call using EvmSketch.
 ///
 /// Simulates the call via `debug_traceCall` at the given block, extracts state updates,
-/// encodes them to ABI, and estimates gas using EvmSketch. Use this for validator-style
-/// analysis without Anvil.
+/// encodes them to ABI, and estimates gas. The executor build step (~50–70 ms,
+/// 1× `eth_getBlockByNumber`; plus `eth_chainId` on the first miss per URL) is
+/// skipped on cache hits. The HTTP connection pool for
+/// `rpc_url` is managed by `cache` and shared across calls — pass a persistent
+/// `EvmSketchExecutorCache` for best performance; for one-shot use pass
+/// `&EvmSketchExecutorCache::new(1)`.
 ///
 /// # Returns
 /// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`
+#[tracing::instrument(name = "evmsketch.encode", skip_all, fields(block_number, state_update_count = tracing::field::Empty))]
 pub async fn call_to_encoded_state_updates_with_evmsketch(
+    cache: &EvmSketchExecutorCache,
     rpc_url: impl AsRef<str>,
     tx_request: TransactionRequest,
-    block: BlockNumberOrTag,
+    block_number: u64,
 ) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
     let rpc_url = rpc_url.as_ref();
-    let url = Url::parse(rpc_url).map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+    let provider = cache.get_or_create_trace_provider(rpc_url)?;
 
     let contract_address = tx_request
         .to
@@ -321,19 +785,50 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 
     let caller_address = tx_request.from.unwrap_or_default();
 
-    let provider = ProviderBuilder::new().connect_http(url.clone());
-    let block_id = BlockId::Number(block);
-    let trace = get_trace_from_call(&provider, tx_request, block_id).await?;
+    // Collect storage hints from the EIP-2930 access list before tx_request
+    // is consumed by get_trace_from_call. Address-only entries (no storage keys)
+    // are included with an empty slot list so their account info is prefetched.
+    let mut storage_hints: HashMap<Address, Vec<B256>> = HashMap::new();
+    if let Some(al) = &tx_request.access_list {
+        for item in al.iter() {
+            storage_hints
+                .entry(item.address)
+                .or_default()
+                .extend(item.storage_keys.iter().copied());
+        }
+    }
+
+    let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
+
+    // Run debug_traceCall and executor cache lookup concurrently — they are
+    // fully independent. On a cache miss this hides the entire executor build
+    // behind the trace fetch.
+    let (trace, executor) = tokio::try_join!(
+        get_trace_from_call(&provider, tx_request, block_id),
+        cache.get_or_build(rpc_url, block_number),
+    )?;
+
     let (state_updates, skipped_opcodes, _call_gas_total) = compute_state_updates(trace)?;
+    tracing::Span::current().record("state_update_count", state_updates.len());
 
     let storage_updates = encode_state_updates_to_abi(&state_updates);
 
-    let gk = GasKillerEvmSketchDefault::builder(url)
-        .at_block(block)
-        .build()
+    // Merge access-list hints with slots derived from state_updates.
+    // Store slots all land at contract_address (one eth_getProof call for all of them).
+    // Call targets get account-info-only prefetch (empty key list).
+    let mut all_hints = hints_from_state_updates(contract_address, &state_updates);
+    for (addr, slots) in storage_hints {
+        all_hints.entry(addr).or_default().extend(slots);
+    }
+
+    let gas_estimate = executor
+        .estimate_state_changes_gas_with_hints(
+            contract_address,
+            caller_address,
+            &state_updates,
+            &all_hints,
+        )
         .await?;
-    let gas_estimate =
-        gk.estimate_state_changes_gas(contract_address, caller_address, &state_updates)?;
 
     Ok((storage_updates, gas_estimate, false, skipped_opcodes))
 }
@@ -346,6 +841,111 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 mod tests {
     use super::*;
     use alloy::primitives::{address, bytes};
+    use alloy::providers::ProviderBuilder;
+    use gas_analyzer_core::types::IStateUpdateTypes;
+
+    /// `with_chain_id` must store the supplied value so `build` can bypass the
+    /// `eth_chainId` probe.
+    #[test]
+    fn test_builder_with_chain_id_stores_value() {
+        let builder = EvmSketchExecutorBuilder::new().with_chain_id(SEPOLIA_CHAIN_ID);
+        assert_eq!(builder.chain_id, Some(SEPOLIA_CHAIN_ID));
+
+        let builder_none = EvmSketchExecutorBuilder::new();
+        assert_eq!(builder_none.chain_id, None);
+    }
+
+    /// `EvmSketchExecutorCache` must issue `eth_chainId` at most once per RPC
+    /// URL regardless of how many distinct block numbers are requested.
+    ///
+    /// Verified by building executors for two different block numbers on the
+    /// same URL and checking that the second build finds a cached chain_id.
+    /// (The direct assertion is on the internal `chain_ids` map having exactly
+    /// one entry after both builds.)
+    #[tokio::test]
+    #[ignore = "requires RPC_URL env var"]
+    async fn test_chain_id_cached_across_blocks() {
+        let rpc_url = std::env::var("RPC_URL").expect("RPC_URL must be set");
+        let cache = EvmSketchExecutorCache::new(4);
+
+        let provider = ProviderBuilder::new().connect_http(Url::parse(&rpc_url).unwrap());
+        let latest = provider.get_block_number().await.unwrap();
+
+        // Build for two consecutive blocks — chain_id must be fetched only once.
+        let _ = cache.get_or_build(&rpc_url, latest).await.unwrap();
+        let _ = cache
+            .get_or_build(&rpc_url, latest.saturating_sub(1))
+            .await
+            .unwrap();
+
+        let ids = cache
+            .chain_ids
+            .lock()
+            .expect("chain_id cache mutex poisoned");
+        assert_eq!(
+            ids.len(),
+            1,
+            "expected exactly one chain_id cache entry for the URL, got {}",
+            ids.len()
+        );
+        assert!(
+            ids.contains_key(&rpc_url),
+            "chain_id not cached under the expected key"
+        );
+    }
+
+    /// Two `get_or_build` calls for the same key must return `Arc`s that point to the
+    /// same allocation (i.e. the second call is a cache hit, not a new build).
+    #[tokio::test]
+    #[ignore = "requires RPC_URL env var"]
+    async fn test_executor_cache_hit_returns_same_arc() {
+        let rpc_url = std::env::var("RPC_URL").expect("RPC_URL must be set");
+        let cache = EvmSketchExecutorCache::new(4);
+
+        // Fetch the latest block number so we have a concrete number to key on.
+        let provider = ProviderBuilder::new().connect_http(Url::parse(&rpc_url).unwrap());
+        let block_number = provider.get_block_number().await.unwrap();
+
+        let first = cache.get_or_build(&rpc_url, block_number).await.unwrap();
+        let second = cache.get_or_build(&rpc_url, block_number).await.unwrap();
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "second get_or_build must return the cached Arc, not a newly built executor"
+        );
+    }
+
+    /// A capacity-1 cache must evict the old entry when a new key is inserted,
+    /// so a subsequent lookup of the evicted key misses and rebuilds a fresh Arc.
+    #[tokio::test]
+    #[ignore = "requires RPC_URL env var"]
+    async fn test_executor_cache_lru_eviction() {
+        let rpc_url = std::env::var("RPC_URL").expect("RPC_URL must be set");
+        let cache = EvmSketchExecutorCache::new(1);
+
+        let provider = ProviderBuilder::new().connect_http(Url::parse(&rpc_url).unwrap());
+        let block_b = provider.get_block_number().await.unwrap();
+        let block_a = block_b.saturating_sub(1);
+
+        // Insert block_a — cache has 1 entry.
+        let arc_a1 = cache.get_or_build(&rpc_url, block_a).await.unwrap();
+        assert_eq!(cache.len(), 1);
+
+        // Insert block_b — evicts block_a, cache still has 1 entry.
+        cache.get_or_build(&rpc_url, block_b).await.unwrap();
+        assert_eq!(
+            cache.len(),
+            1,
+            "capacity-1 cache must not grow beyond 1 entry"
+        );
+
+        // Re-request block_a — must be a miss, yielding a freshly built Arc.
+        let arc_a2 = cache.get_or_build(&rpc_url, block_a).await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&arc_a1, &arc_a2),
+            "block_a Arc must be rebuilt after eviction, not returned from cache"
+        );
+    }
 
     #[test]
     fn test_tx_request_to_contract_input() {
@@ -379,5 +979,349 @@ mod tests {
         let tx_request = TransactionRequest::default();
         let result = tx_request_to_contract_input(&tx_request);
         assert!(result.is_err());
+    }
+
+    /// `SimEnvOpts::spec` must reflect the mainnet hardfork active at the
+    /// anchored block. Synthesized headers at known mainnet
+    /// Berlin/London/Paris/Shanghai/Cancun heights are fed through the
+    /// same `alloy_evm::spec(&EthSpec::mainnet(), ...)` call `sim_env()`
+    /// uses; an accidental chainspec swap (e.g. to Sepolia, where these
+    /// heights differ) would surface as a wrong `SpecId`.
+    #[test]
+    fn test_sim_env_spec_derivation_against_mainnet() {
+        use alloy_consensus::Header;
+        use alloy_evm::eth::spec::EthSpec;
+        use revm::primitives::hardfork::SpecId;
+
+        let mainnet = EthSpec::mainnet();
+
+        // Mainnet historical fork heights / timestamps. Hardcoded so the
+        // test fails loudly if the chainspec is ever swapped (e.g. for
+        // Sepolia, where these heights are different).
+        let cases: &[(&str, u64, u64, SpecId)] = &[
+            ("Berlin", 12_244_000, 0, SpecId::BERLIN),
+            ("London", 12_965_000, 0, SpecId::LONDON),
+            ("Paris", 15_537_394, 0, SpecId::MERGE),
+            ("Shanghai", 17_034_870, 1_681_338_455, SpecId::SHANGHAI),
+            ("Cancun", 19_426_587, 1_710_338_135, SpecId::CANCUN),
+        ];
+
+        for &(name, number, timestamp, expected) in cases {
+            let header = Header {
+                number,
+                timestamp,
+                ..Default::default()
+            };
+            let actual = alloy_evm::spec(&mainnet, &header);
+            assert_eq!(
+                actual, expected,
+                "{name} header (block {number}, ts {timestamp}) mapped to {actual:?}, \
+                 expected {expected:?} — sim_env() may be using the wrong chainspec",
+            );
+        }
+
+        // A wildly future timestamp should map to the latest known spec
+        // (at least Prague — chainspec library may have rolled forward).
+        let future = Header {
+            number: 50_000_000,
+            timestamp: 5_000_000_000,
+            ..Default::default()
+        };
+        let fut_spec = alloy_evm::spec(&mainnet, &future);
+        assert!(
+            fut_spec >= SpecId::PRAGUE,
+            "future block should map to at least Prague, got {:?}",
+            fut_spec
+        );
+    }
+
+    /// `SimpleRpcDb::storage_ref` must issue `eth_getStorageAt` with its
+    /// configured `block_number` as the block tag — the gas estimators rely
+    /// on this to anchor reads at block N-1 (pre-block state) rather than
+    /// at the post-block state of the anchor itself. A recording
+    /// `tower::Service` captures the JSON-RPC params so the block tag can
+    /// be asserted directly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simple_rpc_db_queries_at_configured_block() {
+        use alloy_json_rpc::{RequestPacket, Response, ResponsePacket};
+        use alloy_provider::RootProvider;
+        use alloy_provider::network::AnyNetwork;
+        use alloy_rpc_client::RpcClient;
+        use alloy_transport::{TransportError, TransportFut, mock::Asserter};
+        use revm::database_interface::DatabaseRef;
+        use std::sync::{Arc, Mutex};
+        use std::task::{Context, Poll};
+        use tower::Service;
+
+        use crate::simple_rpc_db::SimpleRpcDb;
+        use alloy::primitives::{U256, address};
+
+        /// A tower::Service that records every JSON-RPC request and pulls
+        /// canned responses from an `Asserter`.
+        #[derive(Clone)]
+        struct RecordingTransport {
+            asserter: Asserter,
+            requests: Arc<Mutex<Vec<(String, String)>>>,
+        }
+
+        impl Service<RequestPacket> for RecordingTransport {
+            type Response = ResponsePacket;
+            type Error = TransportError;
+            type Future = TransportFut<'static>;
+
+            fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, req: RequestPacket) -> Self::Future {
+                let me = self.clone();
+                Box::pin(async move {
+                    match req {
+                        RequestPacket::Single(r) => {
+                            let method = r.method().to_string();
+                            let params =
+                                r.params().map(|p| p.get().to_string()).unwrap_or_default();
+                            me.requests.lock().unwrap().push((method, params));
+                            let payload = me.asserter.pop_response().expect("response queue empty");
+                            Ok(ResponsePacket::Single(Response {
+                                id: r.id().clone(),
+                                payload,
+                            }))
+                        }
+                        RequestPacket::Batch(_) => unreachable!("batch not used in this test"),
+                    }
+                })
+            }
+        }
+
+        let asserter = Asserter::new();
+        // `eth_getStorageAt` returns a 32-byte hex value. Push 0x...42.
+        asserter.push_success(&format!("0x{:0>64}", "42"));
+
+        let transport = RecordingTransport {
+            asserter,
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let recorded = transport.requests.clone();
+        let client = RpcClient::new(transport, true);
+        let provider: RootProvider<AnyNetwork> = RootProvider::new(client);
+
+        let db = SimpleRpcDb::new(provider, 99);
+
+        // SimpleRpcDb's storage_ref blocks the current thread; spawn_blocking
+        // gives it the worker thread it needs under multi_thread runtime.
+        let val = tokio::task::spawn_blocking(move || {
+            db.storage_ref(
+                address!("0x0000000000000000000000000000000000001234"),
+                U256::from(7u64),
+            )
+        })
+        .await
+        .expect("join")
+        .expect("storage_ref");
+
+        assert_eq!(val, U256::from(0x42u64));
+
+        let reqs = recorded.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 1, "expected exactly one RPC call");
+        assert_eq!(reqs[0].0, "eth_getStorageAt", "wrong RPC method");
+        // 99 = 0x63. Block tag is the third positional param.
+        assert!(
+            reqs[0].1.contains("\"0x63\""),
+            "request params {:?} did not carry block tag 0x63 (=99) — \
+             SimpleRpcDb is ignoring its configured block_number, which \
+             would defeat N-1 anchoring in the gas estimators",
+            reqs[0].1
+        );
+    }
+
+    /// `chain_id_to_genesis_and_spec` must accept mainnet (1), Sepolia
+    /// (11_155_111), and Gnosis (100) and reject anything else. Silently
+    /// mapping an unknown chain ID to mainnet would let `sim_env()` derive
+    /// the wrong `SpecId` for any non-mainnet target.
+    #[test]
+    fn test_chain_id_to_genesis_and_spec_supported_and_rejected_chains() {
+        use alloy_hardforks::{EthereumHardfork, EthereumHardforks, ForkCondition};
+
+        let (mainnet_genesis, mainnet_spec) =
+            chain_id_to_genesis_and_spec(MAINNET_CHAIN_ID).expect("mainnet should be supported");
+        assert!(matches!(mainnet_genesis, Genesis::Mainnet));
+        // Sanity-check: mainnet activates Cancun at 1_710_338_135. If this
+        // drifts the upstream chainspec changed.
+        assert_eq!(
+            mainnet_spec.ethereum_fork_activation(EthereumHardfork::Cancun),
+            ForkCondition::Timestamp(1_710_338_135),
+        );
+
+        let (sepolia_genesis, sepolia_spec) =
+            chain_id_to_genesis_and_spec(SEPOLIA_CHAIN_ID).expect("sepolia should be supported");
+        assert!(matches!(sepolia_genesis, Genesis::Sepolia));
+        assert_eq!(
+            sepolia_spec.ethereum_fork_activation(EthereumHardfork::Cancun),
+            ForkCondition::Timestamp(1_706_655_072),
+        );
+
+        let (gnosis_genesis, gnosis_spec) =
+            chain_id_to_genesis_and_spec(GNOSIS_CHAIN_ID).expect("gnosis should be supported");
+        assert!(matches!(gnosis_genesis, Genesis::Custom(_)));
+        assert_eq!(
+            gnosis_spec.ethereum_fork_activation(EthereumHardfork::Cancun),
+            ForkCondition::Timestamp(1_710_181_820),
+        );
+        assert_eq!(
+            gnosis_spec.ethereum_fork_activation(EthereumHardfork::Prague),
+            ForkCondition::Timestamp(1_746_021_820),
+        );
+
+        // Holesky (17_000) and Anvil (31_337) must error rather than silently
+        // pretending to be mainnet — the wrong chainspec produces wrong
+        // hardfork activation, which corrupts gas estimation.
+        assert!(chain_id_to_genesis_and_spec(17_000).is_err());
+        assert!(chain_id_to_genesis_and_spec(31_337).is_err());
+        assert!(chain_id_to_genesis_and_spec(0).is_err());
+    }
+
+    /// At a header with a timestamp that falls *between* the Sepolia and
+    /// mainnet Cancun activation timestamps, `alloy_evm::spec` must return
+    /// different `SpecId`s for the two chains. This pins the fact that
+    /// chain selection is load-bearing — picking the wrong `EthSpec` here
+    /// would silently misclassify Sepolia headers as Shanghai when they
+    /// are already Cancun (or vice versa for the symmetric range).
+    #[test]
+    fn test_sepolia_spec_diverges_from_mainnet() {
+        use alloy_consensus::Header;
+        use alloy_evm::eth::spec::EthSpec;
+        use revm::primitives::hardfork::SpecId;
+
+        // Sepolia Cancun: 1_706_655_072. Mainnet Cancun: 1_710_338_135.
+        // Pick a timestamp strictly inside that window.
+        const TS_BETWEEN_SEPOLIA_AND_MAINNET_CANCUN: u64 = 1_708_000_000;
+
+        let header = Header {
+            // Block number high enough to be post-Shanghai on both networks.
+            number: 18_000_000,
+            timestamp: TS_BETWEEN_SEPOLIA_AND_MAINNET_CANCUN,
+            ..Default::default()
+        };
+
+        let mainnet_spec = alloy_evm::spec(&EthSpec::mainnet(), &header);
+        let sepolia_spec = alloy_evm::spec(&EthSpec::sepolia(), &header);
+
+        assert_eq!(
+            mainnet_spec,
+            SpecId::SHANGHAI,
+            "mainnet at ts {} should still be Shanghai (Cancun activates at 1_710_338_135)",
+            TS_BETWEEN_SEPOLIA_AND_MAINNET_CANCUN,
+        );
+        assert_eq!(
+            sepolia_spec,
+            SpecId::CANCUN,
+            "sepolia at ts {} should already be Cancun (activated at 1_706_655_072)",
+            TS_BETWEEN_SEPOLIA_AND_MAINNET_CANCUN,
+        );
+        assert_ne!(
+            mainnet_spec, sepolia_spec,
+            "specs must differ across chains in the inter-activation window — \
+             a hardcoded mainnet EthSpec would silently break Sepolia analysis here",
+        );
+    }
+
+    /// Gnosis Cancun activated at 1_710_181_820 — ~156 s before mainnet
+    /// (1_710_338_135). A header timestamped inside that window must resolve
+    /// to CANCUN on Gnosis but SHANGHAI on mainnet, proving that
+    /// `gnosis_hardforks()` is wired correctly and is not just an alias for
+    /// `EthereumChainHardforks::mainnet()`.
+    #[test]
+    fn test_gnosis_spec_diverges_from_mainnet() {
+        use alloy_consensus::Header;
+        use revm::primitives::hardfork::SpecId;
+
+        // Strictly between Gnosis Cancun (1_710_181_820) and mainnet Cancun
+        // (1_710_338_135).
+        const TS_BETWEEN_GNOSIS_AND_MAINNET_CANCUN: u64 = 1_710_260_000;
+
+        let header = Header {
+            number: 33_000_000,
+            timestamp: TS_BETWEEN_GNOSIS_AND_MAINNET_CANCUN,
+            ..Default::default()
+        };
+
+        let (_, gnosis_hardforks) =
+            chain_id_to_genesis_and_spec(GNOSIS_CHAIN_ID).expect("gnosis supported");
+        let (_, mainnet_hardforks) =
+            chain_id_to_genesis_and_spec(MAINNET_CHAIN_ID).expect("mainnet supported");
+
+        let gnosis_spec = alloy_evm::spec(&gnosis_hardforks, &header);
+        let mainnet_spec = alloy_evm::spec(&mainnet_hardforks, &header);
+
+        assert_eq!(
+            gnosis_spec,
+            SpecId::CANCUN,
+            "gnosis at ts {} should be CANCUN (activated at 1_710_181_820)",
+            TS_BETWEEN_GNOSIS_AND_MAINNET_CANCUN,
+        );
+        assert_eq!(
+            mainnet_spec,
+            SpecId::SHANGHAI,
+            "mainnet at ts {} should still be SHANGHAI (Cancun activates at 1_710_338_135)",
+            TS_BETWEEN_GNOSIS_AND_MAINNET_CANCUN,
+        );
+    }
+
+    /// `hints_from_state_updates` must always include contract_address (even
+    /// with no Store updates), map Store slots to it, add Call targets with
+    /// empty slot lists, and produce no entry for logs.
+    #[test]
+    fn test_hints_from_state_updates() {
+        use alloy::primitives::Bytes;
+
+        let contract = address!("0x000000000000000000000000000000000000DEAD");
+        let call_target = address!("0x000000000000000000000000000000000000BEEF");
+        let slot1 = B256::from(U256::from(1u64));
+        let slot2 = B256::from(U256::from(2u64));
+
+        let updates = vec![
+            StateUpdate::Store(IStateUpdateTypes::Store {
+                slot: slot1,
+                value: B256::ZERO,
+            }),
+            StateUpdate::Store(IStateUpdateTypes::Store {
+                slot: slot2,
+                value: B256::ZERO,
+            }),
+            StateUpdate::Call(IStateUpdateTypes::Call {
+                target: call_target,
+                value: U256::ZERO,
+                callargs: Bytes::new(),
+            }),
+            StateUpdate::Log0(IStateUpdateTypes::Log0 { data: Bytes::new() }),
+        ];
+
+        let hints = hints_from_state_updates(contract, &updates);
+
+        // Both Store slots map to contract_address.
+        assert_eq!(hints.get(&contract), Some(&vec![slot1, slot2]));
+
+        // Call target is present with an empty slot list (account-only prefetch).
+        assert_eq!(hints.get(&call_target), Some(&vec![]));
+
+        // Log produces no entry — only contract and call_target.
+        assert_eq!(hints.len(), 2);
+    }
+
+    /// contract_address must be prefetched even when there are no Store updates.
+    #[test]
+    fn test_hints_from_state_updates_contract_always_present() {
+        use alloy::primitives::Bytes;
+
+        let contract = address!("0x000000000000000000000000000000000000DEAD");
+        let updates = vec![StateUpdate::Log0(IStateUpdateTypes::Log0 {
+            data: Bytes::new(),
+        })];
+
+        let hints = hints_from_state_updates(contract, &updates);
+
+        assert_eq!(hints.get(&contract), Some(&vec![]));
+        assert_eq!(hints.len(), 1);
     }
 }
