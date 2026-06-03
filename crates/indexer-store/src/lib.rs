@@ -239,6 +239,32 @@ impl Store {
         Ok(row.map(|r| r.0).unwrap_or(false))
     }
 
+    /// Days already present in `eth_prices`. Used by the backfill flow to
+    /// skip days we've already priced.
+    pub async fn list_eth_price_days(&self) -> Result<Vec<NaiveDate>, StoreError> {
+        let rows: Vec<(NaiveDate,)> =
+            sqlx::query_as("SELECT day FROM eth_prices ORDER BY day")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().map(|(d,)| d).collect())
+    }
+
+    /// `(min, max)` day spanned by the `analysis` table, or `None` if empty.
+    /// Used by the backfill flow to size the coingecko range request.
+    pub async fn analysis_day_range(
+        &self,
+    ) -> Result<Option<(NaiveDate, NaiveDate)>, StoreError> {
+        let row: Option<(Option<NaiveDate>, Option<NaiveDate>)> = sqlx::query_as(
+            "SELECT min(block_timestamp)::date, max(block_timestamp)::date FROM analysis",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(lo, hi)| match (lo, hi) {
+            (Some(l), Some(h)) => Some((l, h)),
+            _ => None,
+        }))
+    }
+
     pub async fn upsert_eth_price(
         &self,
         day: NaiveDate,
