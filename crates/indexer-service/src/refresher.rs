@@ -21,6 +21,14 @@ use tokio::time::interval;
 
 use crate::config::{CommonConfig, RefresherConfig};
 
+/// User-Agent sent on every CoinGecko request. CoinGecko's Cloudflare front
+/// returns 403 to requests carrying the default `reqwest/x.y` agent (and to an
+/// empty agent), while a browser-like string passes — same reason a plain
+/// `curl` succeeds from the same host. Without this the price refresh and
+/// historical backfill both fail with 403.
+const COINGECKO_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+
 /// Counts returned by `refresh_resolver_now` so callers (loop, admin button)
 /// can report what changed.
 #[derive(Debug, Clone, Copy, Default)]
@@ -225,6 +233,7 @@ pub async fn refresh_eth_price_now(store: &Store, price_url: &str) -> Result<Big
     }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
+        .user_agent(COINGECKO_USER_AGENT)
         .build()
         .map_err(|e| anyhow::anyhow!("price client build failed: {e}"))?;
     let resp: CoingeckoResp = client
@@ -299,6 +308,7 @@ pub async fn backfill_eth_prices_now(
     );
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .user_agent(COINGECKO_USER_AGENT)
         .build()
         .map_err(|e| anyhow::anyhow!("backfill client build failed: {e}"))?;
     let resp: MarketChartRange = client
