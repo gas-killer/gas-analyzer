@@ -62,11 +62,13 @@ sol! {
         }
 
         struct Create {
+            uint256 value;
             bytes initcode;
         }
 
         struct Create2 {
             bytes32 salt;
+            uint256 value;
             bytes initcode;
         }
     }

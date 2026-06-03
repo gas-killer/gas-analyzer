@@ -83,21 +83,25 @@ pub fn append_state_update_from_struct_log(
         }
         "CREATE" => {
             // Stack: [value, offset, size] (top = index 0 after reverse)
+            let value = stack[0];
             let offset: usize = stack[1].try_into().expect("invalid CREATE offset");
             let length: usize = stack[2].try_into().expect("invalid CREATE length");
             let initcode = copy_memory(&memory, offset, length);
             state_updates.push(StateUpdate::Create(IStateUpdateTypes::Create {
+                value,
                 initcode: initcode.into(),
             }));
         }
         "CREATE2" => {
             // Stack: [value, offset, size, salt] (top = index 0 after reverse)
+            let value = stack[0];
             let offset: usize = stack[1].try_into().expect("invalid CREATE2 offset");
             let length: usize = stack[2].try_into().expect("invalid CREATE2 length");
             let salt = stack[3];
             let initcode = copy_memory(&memory, offset, length);
             state_updates.push(StateUpdate::Create2(IStateUpdateTypes::Create2 {
                 salt: salt.into(),
+                value,
                 initcode: initcode.into(),
             }));
         }
@@ -325,12 +329,12 @@ mod tests {
         // Memory word: 5 bytes + 27 zero bytes = 32 bytes total.
         let memory_word = "6080604052000000000000000000000000000000000000000000000000000000";
 
-        // Stack before CREATE (bottom→top): size=5, offset=0, value=0
-        // After stack.reverse(): stack[0]=value=0, stack[1]=offset=0, stack[2]=size=5
+        // Stack before CREATE (bottom→top): size=5, offset=0, value=0x3e8
+        // After stack.reverse(): stack[0]=value=0x3e8, stack[1]=offset=0, stack[2]=size=5
         let stack = vec![
-            U256::from(5u64), // size (bottom, becomes stack[2] after reverse)
-            U256::from(0u64), // offset (becomes stack[1])
-            U256::from(0u64), // value (top, becomes stack[0])
+            U256::from(5u64),     // size (bottom, becomes stack[2] after reverse)
+            U256::from(0u64),     // offset (becomes stack[1])
+            U256::from(1_000u64), // value (top, becomes stack[0])
         ];
 
         let mut updates = Vec::new();
@@ -347,20 +351,21 @@ mod tests {
             panic!("expected Create, got {:?}", updates[0]);
         };
         assert_eq!(&c.initcode[..], &[0x60, 0x80, 0x60, 0x40, 0x52]);
+        assert_eq!(c.value, U256::from(1_000u64), "endowment value extracted");
     }
 
     #[test]
     fn create2_extracts_salt_and_initcode_from_memory() {
         let memory_word = "6080604052000000000000000000000000000000000000000000000000000000";
 
-        // Stack before CREATE2 (bottom→top): salt, size=5, offset=0, value=0
-        // After stack.reverse(): stack[0]=value=0, stack[1]=offset=0, stack[2]=size=5, stack[3]=salt
+        // Stack before CREATE2 (bottom→top): salt, size=5, offset=0, value=0x3e8
+        // After stack.reverse(): stack[0]=value, stack[1]=offset=0, stack[2]=size=5, stack[3]=salt
         let salt_val = U256::from(0xdeadbeef_u64);
         let stack = vec![
-            salt_val,         // salt (bottom, becomes stack[3] after reverse)
-            U256::from(5u64), // size (becomes stack[2])
-            U256::from(0u64), // offset (becomes stack[1])
-            U256::from(0u64), // value (top, becomes stack[0])
+            salt_val,             // salt (bottom, becomes stack[3] after reverse)
+            U256::from(5u64),     // size (becomes stack[2])
+            U256::from(0u64),     // offset (becomes stack[1])
+            U256::from(1_000u64), // value (top, becomes stack[0])
         ];
 
         let mut updates = Vec::new();
@@ -377,6 +382,7 @@ mod tests {
             panic!("expected Create2, got {:?}", updates[0]);
         };
         assert_eq!(&c.initcode[..], &[0x60, 0x80, 0x60, 0x40, 0x52]);
+        assert_eq!(c.value, U256::from(1_000u64), "endowment value extracted");
         assert_eq!(c.salt, alloy_primitives::B256::from(salt_val));
     }
 
