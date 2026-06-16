@@ -15,6 +15,28 @@
 </section>
 
 <section class="card">
+    <h3>Data start date</h3>
+    <p class="muted">Ignore everything before this date across the whole dashboard — totals, leaderboards, charts, contract pages and candidates. Use it to hide unreliable early data (savings recorded before the analysis method was finalised) so the figures you show only count trustworthy results. Leave the date empty to include all history.</p>
+    <form class="candidates-filter"
+          hx-post="/admin/data-floor"
+          hx-target="#data-floor-banner"
+          hx-swap="innerHTML">
+        <label>Start from
+            <input type="date" name="floor" value="{{ data_floor }}">
+        </label>
+        <button class="btn" type="submit">Apply</button>
+    </form>
+    <p class="muted" style="margin-top:6px;">
+        {% if data_floor.is_empty() %}
+            Currently including <strong>all history</strong>.
+        {% else %}
+            Currently ignoring everything before <strong>{{ data_floor }}</strong>.
+        {% endif %}
+    </p>
+    <div id="data-floor-banner"></div>
+</section>
+
+<section class="card">
     <h3>High-savings candidates</h3>
     <p class="muted">Still-unlabeled contracts that <em>first appeared recently</em> and are saving meaningful gas — fresh gas-killer candidates worth researching and labeling. Blacklisted contracts and unsupported-opcode / 0%-savings rows are excluded.</p>
     <form class="candidates-filter"

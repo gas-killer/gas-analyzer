@@ -2,11 +2,46 @@
 //! view. All queries take a `chain_id` so a future per-chain deployment story
 //! is not painted-into-corner.
 
+use std::sync::RwLock;
+
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::PgPool;
 
 use crate::error::WebError;
+
+/// Global "ignore everything before this calendar date" floor. Mutable at
+/// runtime so the admin UI can change it without a restart; persisted in Redis
+/// by the caller so the choice survives restarts. `None` disables the floor.
+/// Used to drop pre-fix historical data (e.g. CREATE-opcode-skewed rows
+/// analyzed before opcode handling shipped) from every BD-visible figure
+/// without deleting anything.
+static DATA_FLOOR: RwLock<Option<NaiveDate>> = RwLock::new(None);
+
+/// Replace the active data floor. `None` disables it. Cheap; called at startup
+/// and whenever an admin submits the data-floor form.
+pub fn set_data_floor(floor: Option<NaiveDate>) {
+    if let Ok(mut w) = DATA_FLOOR.write() {
+        *w = floor;
+    }
+}
+
+/// The currently active data floor (for display in the admin form).
+pub fn current_data_floor() -> Option<NaiveDate> {
+    DATA_FLOOR.read().ok().and_then(|g| *g)
+}
+
+/// SQL predicate fragment flooring a date/timestamp column at the active
+/// data-floor date, or "" when no floor is set. The bound is a validated
+/// `NaiveDate` rendered as an ISO literal, so inlining it carries no injection
+/// risk. Works for both `block_timestamp` (analysis, timestamptz) and `day`
+/// (the daily rollups, date) — Postgres promotes the DATE literal as needed.
+fn floor(col: &str) -> String {
+    match current_data_floor() {
+        Some(d) => format!(" AND {col} >= DATE '{d}'"),
+        None => String::new(),
+    }
+}
 
 /// Time window helper. Mirrors `now() - interval ...` for sqlx.
 #[derive(Debug, Clone, Copy)]
@@ -37,16 +72,17 @@ pub async fn overview_totals(
     chain_id: i64,
     window: Window,
 ) -> Result<OverviewTotals, WebError> {
+    let floor_day = floor("day");
     let row = match window.interval_clause() {
-        None => sqlx::query_as::<_, OverviewTotals>(
+        None => sqlx::query_as::<_, OverviewTotals>(&format!(
             r#"SELECT
                  COALESCE(SUM(usd_saved_total), 0)::numeric  AS usd_saved,
                  COALESCE(SUM(wei_saved_total), 0)::numeric  AS wei_saved,
                  COALESCE(SUM(tx_count), 0)::bigint          AS tx_count,
                  COUNT(DISTINCT project_slug)::bigint        AS project_count
                FROM project_daily
-               WHERE chain_id = $1"#,
-        )
+               WHERE chain_id = $1{floor_day}"#
+        ))
         .bind(chain_id)
         .fetch_one(pool)
         .await?,
@@ -57,7 +93,7 @@ pub async fn overview_totals(
                  COALESCE(SUM(tx_count), 0)::bigint          AS tx_count,
                  COUNT(DISTINCT project_slug)::bigint        AS project_count
                FROM project_daily
-               WHERE chain_id = $1 AND day >= (now() - interval '{interval}')::date"#
+               WHERE chain_id = $1 AND day >= (now() - interval '{interval}')::date{floor_day}"#
         ))
         .bind(chain_id)
         .fetch_one(pool)
@@ -89,7 +125,9 @@ pub async fn leaderboard_30d(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<LeaderboardRow>, WebError> {
-    let rows = sqlx::query_as::<_, LeaderboardRow>(
+    let floor_pd = floor("pd.day");
+    let floor_a = floor("block_timestamp");
+    let rows = sqlx::query_as::<_, LeaderboardRow>(&format!(
         r#"SELECT
              pd.project_slug,
              p.project_name,
@@ -112,15 +150,15 @@ pub async fn leaderboard_30d(
              FROM analysis
              WHERE chain_id = $1
                AND block_timestamp >= now() - interval '30 days'
-               AND cardinality(skipped_opcodes) = 0
+               AND cardinality(skipped_opcodes) = 0{floor_a}
              GROUP BY project_slug
            ) m ON m.project_slug = pd.project_slug
            WHERE pd.chain_id = $1
-             AND pd.day >= (now() - interval '30 days')::date
+             AND pd.day >= (now() - interval '30 days')::date{floor_pd}
            GROUP BY pd.project_slug, p.project_name, p.category, m.median_savings_pct_covered
            ORDER BY tx_count DESC NULLS LAST
-           LIMIT $2 OFFSET $3"#,
-    )
+           LIMIT $2 OFFSET $3"#
+    ))
     .bind(chain_id)
     .bind(limit)
     .bind(offset)
@@ -156,7 +194,9 @@ pub async fn leaderboard_functions_30d(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<FunctionLeaderRow>, WebError> {
-    let rows = sqlx::query_as::<_, FunctionLeaderRow>(
+    let floor_fd = floor("fd.day");
+    let floor_a = floor("block_timestamp");
+    let rows = sqlx::query_as::<_, FunctionLeaderRow>(&format!(
         r#"SELECT
              fd.to_address,
              fd.function_selector,
@@ -188,17 +228,17 @@ pub async fn leaderboard_functions_30d(
              WHERE chain_id = $1
                AND block_timestamp >= now() - interval '30 days'
                AND cardinality(skipped_opcodes) = 0
-               AND gas_saved > 0
+               AND gas_saved > 0{floor_a}
              GROUP BY to_address, function_selector
            ) m ON m.to_address = fd.to_address AND m.function_selector = fd.function_selector
            WHERE fd.chain_id = $1
-             AND fd.day >= (now() - interval '30 days')::date
+             AND fd.day >= (now() - interval '30 days')::date{floor_fd}
              AND x.address IS NULL
            GROUP BY fd.to_address, fd.function_selector, fd.project_slug,
                     p.project_name, fs.primary_name, fs.primary_sig, m.median_savings_pct
            ORDER BY wei_saved_total DESC NULLS LAST
-           LIMIT $2 OFFSET $3"#,
-    )
+           LIMIT $2 OFFSET $3"#
+    ))
     .bind(chain_id)
     .bind(limit)
     .bind(offset)
@@ -230,7 +270,9 @@ pub async fn leaderboard_contracts_30d(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<ContractLeaderRow>, WebError> {
-    let rows = sqlx::query_as::<_, ContractLeaderRow>(
+    let floor_fd = floor("fd.day");
+    let floor_a = floor("block_timestamp");
+    let rows = sqlx::query_as::<_, ContractLeaderRow>(&format!(
         r#"SELECT
              fd.to_address,
              fd.project_slug,
@@ -258,16 +300,16 @@ pub async fn leaderboard_contracts_30d(
              WHERE chain_id = $1
                AND block_timestamp >= now() - interval '30 days'
                AND cardinality(skipped_opcodes) = 0
-               AND gas_saved > 0
+               AND gas_saved > 0{floor_a}
              GROUP BY to_address
            ) m ON m.to_address = fd.to_address
            WHERE fd.chain_id = $1
-             AND fd.day >= (now() - interval '30 days')::date
+             AND fd.day >= (now() - interval '30 days')::date{floor_fd}
              AND x.address IS NULL
            GROUP BY fd.to_address, fd.project_slug, p.project_name, m.median_savings_pct
            ORDER BY wei_saved_total DESC NULLS LAST
-           LIMIT $2 OFFSET $3"#,
-    )
+           LIMIT $2 OFFSET $3"#
+    ))
     .bind(chain_id)
     .bind(limit)
     .bind(offset)
@@ -288,13 +330,14 @@ pub async fn daily_overview(
     chain_id: i64,
     days: i32,
 ) -> Result<Vec<DailyPoint>, WebError> {
+    let floor_day = floor("day");
     let q = format!(
         r#"SELECT
              day,
              SUM(usd_saved_total)::numeric AS usd_saved,
              SUM(tx_count)::bigint         AS tx_count
            FROM project_daily
-           WHERE chain_id = $1 AND day >= (now() - interval '{days} days')::date
+           WHERE chain_id = $1 AND day >= (now() - interval '{days} days')::date{floor_day}
            GROUP BY day
            ORDER BY day"#
     );
@@ -311,6 +354,7 @@ pub async fn daily_for_project(
     project_slug: &str,
     days: i32,
 ) -> Result<Vec<DailyPoint>, WebError> {
+    let floor_day = floor("day");
     let q = format!(
         r#"SELECT
              day,
@@ -319,7 +363,7 @@ pub async fn daily_for_project(
            FROM project_daily
            WHERE chain_id = $1
              AND project_slug = $2
-             AND day >= (now() - interval '{days} days')::date
+             AND day >= (now() - interval '{days} days')::date{floor_day}
            ORDER BY day"#
     );
     let rows = sqlx::query_as::<_, DailyPoint>(&q)
@@ -340,17 +384,18 @@ pub async fn category_breakdown_30d(
     pool: &PgPool,
     chain_id: i64,
 ) -> Result<Vec<CategoryRow>, WebError> {
-    let rows = sqlx::query_as::<_, CategoryRow>(
+    let floor_pd = floor("pd.day");
+    let rows = sqlx::query_as::<_, CategoryRow>(&format!(
         r#"SELECT
              p.category,
              SUM(pd.usd_saved_total)::numeric AS usd_saved
            FROM project_daily pd
            LEFT JOIN projects p ON p.project_slug = pd.project_slug
            WHERE pd.chain_id = $1
-             AND pd.day >= (now() - interval '30 days')::date
+             AND pd.day >= (now() - interval '30 days')::date{floor_pd}
            GROUP BY p.category
-           ORDER BY usd_saved DESC NULLS LAST"#,
-    )
+           ORDER BY usd_saved DESC NULLS LAST"#
+    ))
     .bind(chain_id)
     .fetch_all(pool)
     .await?;
@@ -394,6 +439,7 @@ pub async fn project_totals(
     project_slug: &str,
     window: Window,
 ) -> Result<ProjectTotals, WebError> {
+    let floor_day = floor("day");
     let q = match window.interval_clause() {
         None => format!(
             r#"SELECT
@@ -402,7 +448,7 @@ pub async fn project_totals(
                  COALESCE(SUM(tx_count), 0)::bigint         AS tx_count,
                  AVG(avg_savings_pct)::float8               AS avg_savings_pct
                FROM project_daily
-               WHERE chain_id = $1 AND project_slug = $2"#
+               WHERE chain_id = $1 AND project_slug = $2{floor_day}"#
         ),
         Some(i) => format!(
             r#"SELECT
@@ -412,7 +458,7 @@ pub async fn project_totals(
                  AVG(avg_savings_pct)::float8               AS avg_savings_pct
                FROM project_daily
                WHERE chain_id = $1 AND project_slug = $2
-                 AND day >= (now() - interval '{i}')::date"#
+                 AND day >= (now() - interval '{i}')::date{floor_day}"#
         ),
     };
     let row = sqlx::query_as::<_, ProjectTotals>(&q)
@@ -436,7 +482,8 @@ pub async fn top_contracts_for_project(
     chain_id: i64,
     project_slug: &str,
 ) -> Result<Vec<TopAddressRow>, WebError> {
-    let rows = sqlx::query_as::<_, TopAddressRow>(
+    let floor_ts = floor("block_timestamp");
+    let rows = sqlx::query_as::<_, TopAddressRow>(&format!(
         r#"SELECT
              to_address       AS address,
              COUNT(*)::bigint AS tx_count,
@@ -447,11 +494,11 @@ pub async fn top_contracts_for_project(
              AND project_slug = $2
              AND block_timestamp >= now() - interval '30 days'
              AND gas_saved > 0
-             AND cardinality(skipped_opcodes) = 0
+             AND cardinality(skipped_opcodes) = 0{floor_ts}
            GROUP BY to_address
            ORDER BY wei_saved_total DESC NULLS LAST
-           LIMIT 10"#,
-    )
+           LIMIT 10"#
+    ))
     .bind(chain_id)
     .bind(project_slug)
     .fetch_all(pool)
@@ -472,7 +519,8 @@ pub async fn top_selectors_for_project(
     chain_id: i64,
     project_slug: &str,
 ) -> Result<Vec<TopSelectorRow>, WebError> {
-    let rows = sqlx::query_as::<_, TopSelectorRow>(
+    let floor_ts = floor("block_timestamp");
+    let rows = sqlx::query_as::<_, TopSelectorRow>(&format!(
         r#"SELECT
              function_selector,
              COUNT(*)::bigint AS tx_count,
@@ -483,11 +531,11 @@ pub async fn top_selectors_for_project(
              AND project_slug = $2
              AND block_timestamp >= now() - interval '30 days'
              AND gas_saved > 0
-             AND cardinality(skipped_opcodes) = 0
+             AND cardinality(skipped_opcodes) = 0{floor_ts}
            GROUP BY function_selector
            ORDER BY wei_saved_total DESC NULLS LAST
-           LIMIT 10"#,
-    )
+           LIMIT 10"#
+    ))
     .bind(chain_id)
     .bind(project_slug)
     .fetch_all(pool)
@@ -551,13 +599,14 @@ pub async fn recent_txs_for_project(
     let extra = filters.where_clause(&mut idx);
     let limit_param = idx;
     let offset_param = idx + 1;
+    let floor_ts = floor("block_timestamp");
     let q = format!(
         r#"SELECT
              block_number, tx_hash, gas_used, gas_saved, wei_saved, block_timestamp
            FROM analysis
            WHERE chain_id = $1 AND project_slug = $2
              AND gas_saved > 0
-             AND cardinality(skipped_opcodes) = 0{extra}
+             AND cardinality(skipped_opcodes) = 0{extra}{floor_ts}
            ORDER BY block_timestamp DESC
            LIMIT ${limit_param} OFFSET ${offset_param}"#,
     );
@@ -621,6 +670,7 @@ pub async fn contract_totals(
     address: [u8; 20],
     window: Window,
 ) -> Result<ContractTotals, WebError> {
+    let floor_day = floor("day");
     let q = match window.interval_clause() {
         None => format!(
             r#"SELECT
@@ -630,7 +680,7 @@ pub async fn contract_totals(
                  COUNT(DISTINCT function_selector)::bigint  AS function_count,
                  AVG(avg_savings_pct)::float8               AS avg_savings_pct
                FROM function_daily
-               WHERE chain_id = $1 AND to_address = $2"#
+               WHERE chain_id = $1 AND to_address = $2{floor_day}"#
         ),
         Some(i) => format!(
             r#"SELECT
@@ -641,7 +691,7 @@ pub async fn contract_totals(
                  AVG(avg_savings_pct)::float8               AS avg_savings_pct
                FROM function_daily
                WHERE chain_id = $1 AND to_address = $2
-                 AND day >= (now() - interval '{i}')::date"#
+                 AND day >= (now() - interval '{i}')::date{floor_day}"#
         ),
     };
     let row = sqlx::query_as::<_, ContractTotals>(&q)
@@ -666,7 +716,8 @@ pub async fn functions_for_contract(
     chain_id: i64,
     address: [u8; 20],
 ) -> Result<Vec<ContractFunctionRow>, WebError> {
-    let rows = sqlx::query_as::<_, ContractFunctionRow>(
+    let floor_fd = floor("fd.day");
+    let rows = sqlx::query_as::<_, ContractFunctionRow>(&format!(
         r#"SELECT
              fd.function_selector,
              fs.primary_name AS function_name,
@@ -677,11 +728,11 @@ pub async fn functions_for_contract(
            LEFT JOIN function_selectors fs ON fs.selector = fd.function_selector
            WHERE fd.chain_id = $1
              AND fd.to_address = $2
-             AND fd.day >= (now() - interval '30 days')::date
+             AND fd.day >= (now() - interval '30 days')::date{floor_fd}
            GROUP BY fd.function_selector, fs.primary_name
            ORDER BY usd_saved DESC NULLS LAST
-           LIMIT 50"#,
-    )
+           LIMIT 50"#
+    ))
     .bind(chain_id)
     .bind(&address[..])
     .fetch_all(pool)
@@ -695,7 +746,8 @@ pub async fn daily_for_contract(
     address: [u8; 20],
     days: i32,
 ) -> Result<Vec<DailyPoint>, WebError> {
-    let rows = sqlx::query_as::<_, DailyPoint>(
+    let floor_day = floor("day");
+    let rows = sqlx::query_as::<_, DailyPoint>(&format!(
         r#"SELECT
              day,
              SUM(usd_saved_total)::numeric AS usd_saved,
@@ -703,10 +755,10 @@ pub async fn daily_for_contract(
            FROM function_daily
            WHERE chain_id = $1
              AND to_address = $2
-             AND day >= (now() - make_interval(days => $3::int))::date
+             AND day >= (now() - make_interval(days => $3::int))::date{floor_day}
            GROUP BY day
-           ORDER BY day"#,
-    )
+           ORDER BY day"#
+    ))
     .bind(chain_id)
     .bind(&address[..])
     .bind(days)
@@ -727,13 +779,14 @@ pub async fn recent_txs_for_contract(
     let extra = filters.where_clause(&mut idx);
     let limit_param = idx;
     let offset_param = idx + 1;
+    let floor_ts = floor("block_timestamp");
     let q = format!(
         r#"SELECT
              block_number, tx_hash, gas_used, gas_saved, wei_saved, block_timestamp
            FROM analysis
            WHERE chain_id = $1 AND to_address = $2
              AND gas_saved > 0
-             AND cardinality(skipped_opcodes) = 0{extra}
+             AND cardinality(skipped_opcodes) = 0{extra}{floor_ts}
            ORDER BY block_timestamp DESC
            LIMIT ${limit_param} OFFSET ${offset_param}"#,
     );
@@ -801,6 +854,7 @@ pub async fn function_totals(
     selector: [u8; 4],
     window: Window,
 ) -> Result<ContractTotals, WebError> {
+    let floor_day = floor("day");
     let q = match window.interval_clause() {
         None => format!(
             r#"SELECT
@@ -810,7 +864,7 @@ pub async fn function_totals(
                  1::bigint                                  AS function_count,
                  AVG(avg_savings_pct)::float8               AS avg_savings_pct
                FROM function_daily
-               WHERE chain_id = $1 AND to_address = $2 AND function_selector = $3"#
+               WHERE chain_id = $1 AND to_address = $2 AND function_selector = $3{floor_day}"#
         ),
         Some(i) => format!(
             r#"SELECT
@@ -821,7 +875,7 @@ pub async fn function_totals(
                  AVG(avg_savings_pct)::float8               AS avg_savings_pct
                FROM function_daily
                WHERE chain_id = $1 AND to_address = $2 AND function_selector = $3
-                 AND day >= (now() - interval '{i}')::date"#
+                 AND day >= (now() - interval '{i}')::date{floor_day}"#
         ),
     };
     let row = sqlx::query_as::<_, ContractTotals>(&q)
@@ -840,7 +894,8 @@ pub async fn daily_for_function(
     selector: [u8; 4],
     days: i32,
 ) -> Result<Vec<DailyPoint>, WebError> {
-    let rows = sqlx::query_as::<_, DailyPoint>(
+    let floor_day = floor("day");
+    let rows = sqlx::query_as::<_, DailyPoint>(&format!(
         r#"SELECT
              day,
              usd_saved_total::numeric AS usd_saved,
@@ -849,9 +904,9 @@ pub async fn daily_for_function(
            WHERE chain_id = $1
              AND to_address = $2
              AND function_selector = $3
-             AND day >= (now() - make_interval(days => $4::int))::date
-           ORDER BY day"#,
-    )
+             AND day >= (now() - make_interval(days => $4::int))::date{floor_day}
+           ORDER BY day"#
+    ))
     .bind(chain_id)
     .bind(&address[..])
     .bind(&selector[..])
@@ -874,6 +929,7 @@ pub async fn recent_txs_for_function(
     let extra = filters.where_clause(&mut idx);
     let limit_param = idx;
     let offset_param = idx + 1;
+    let floor_ts = floor("block_timestamp");
     let q = format!(
         r#"SELECT
              block_number, tx_hash, gas_used, gas_saved, wei_saved, block_timestamp
@@ -882,7 +938,7 @@ pub async fn recent_txs_for_function(
              AND to_address = $2
              AND function_selector = $3
              AND gas_saved > 0
-             AND cardinality(skipped_opcodes) = 0{extra}
+             AND cardinality(skipped_opcodes) = 0{extra}{floor_ts}
            ORDER BY block_timestamp DESC
            LIMIT ${limit_param} OFFSET ${offset_param}"#,
     );
@@ -924,7 +980,8 @@ pub async fn leaderboard_orgs_30d(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<OrgLeaderRow>, WebError> {
-    let rows = sqlx::query_as::<_, OrgLeaderRow>(
+    let floor_pd = floor("pd.day");
+    let rows = sqlx::query_as::<_, OrgLeaderRow>(&format!(
         r#"SELECT
              o.org_slug,
              o.org_name,
@@ -942,11 +999,11 @@ pub async fn leaderboard_orgs_30d(
                                      AND fd.day = pd.day
                                      AND fd.chain_id = pd.chain_id
            WHERE pd.chain_id = $1
-             AND pd.day >= (now() - interval '30 days')::date
+             AND pd.day >= (now() - interval '30 days')::date{floor_pd}
            GROUP BY o.org_slug, o.org_name
            ORDER BY wei_saved_total DESC NULLS LAST
-           LIMIT $2 OFFSET $3"#,
-    )
+           LIMIT $2 OFFSET $3"#
+    ))
     .bind(chain_id)
     .bind(limit)
     .bind(offset)
@@ -1035,7 +1092,8 @@ pub async fn top_unresolved_selectors(
     chain_id: i64,
     limit: i64,
 ) -> Result<Vec<UnresolvedSelectorRow>, WebError> {
-    let rows = sqlx::query_as::<_, UnresolvedSelectorRow>(
+    let floor_fd = floor("fd.day");
+    let rows = sqlx::query_as::<_, UnresolvedSelectorRow>(&format!(
         r#"SELECT
              fd.function_selector AS selector,
              (ARRAY_AGG(fd.to_address ORDER BY fd.wei_saved_total DESC))[1] AS example_address,
@@ -1045,12 +1103,12 @@ pub async fn top_unresolved_selectors(
            FROM function_daily fd
            LEFT JOIN function_selectors fs ON fs.selector = fd.function_selector
            WHERE fd.chain_id = $1
-             AND fd.day >= (now() - interval '30 days')::date
+             AND fd.day >= (now() - interval '30 days')::date{floor_fd}
              AND (fs.primary_name IS NULL OR fs.source = 'unresolved')
            GROUP BY fd.function_selector
            ORDER BY wei_saved_total DESC NULLS LAST
-           LIMIT $2"#,
-    )
+           LIMIT $2"#
+    ))
     .bind(chain_id)
     .bind(limit)
     .fetch_all(pool)
@@ -1070,7 +1128,8 @@ pub async fn top_unknowns(
     pool: &PgPool,
     chain_id: i64,
 ) -> Result<Vec<UnknownRow>, WebError> {
-    let rows = sqlx::query_as::<_, UnknownRow>(
+    let floor_ts = floor("block_timestamp");
+    let rows = sqlx::query_as::<_, UnknownRow>(&format!(
         r#"SELECT
              to_address       AS address,
              COUNT(*)::bigint AS tx_count,
@@ -1081,11 +1140,11 @@ pub async fn top_unknowns(
              AND project_slug LIKE 'unknown:%'
              AND block_timestamp >= now() - interval '30 days'
              AND gas_saved > 0
-             AND cardinality(skipped_opcodes) = 0
+             AND cardinality(skipped_opcodes) = 0{floor_ts}
            GROUP BY to_address
            ORDER BY wei_saved_total DESC NULLS LAST
-           LIMIT 20"#,
-    )
+           LIMIT 20"#
+    ))
     .bind(chain_id)
     .fetch_all(pool)
     .await?;
@@ -1118,7 +1177,8 @@ pub async fn new_high_savings_candidates(
     min_wei: BigDecimal,
     limit: i64,
 ) -> Result<Vec<CandidateRow>, WebError> {
-    let rows = sqlx::query_as::<_, CandidateRow>(
+    let floor_a = floor("a.block_timestamp");
+    let rows = sqlx::query_as::<_, CandidateRow>(&format!(
         r#"SELECT
              a.to_address               AS address,
              MIN(a.block_timestamp)     AS first_seen,
@@ -1136,14 +1196,14 @@ pub async fn new_high_savings_candidates(
            WHERE a.chain_id = $1
              AND a.project_slug LIKE 'unknown:%'
              AND a.gas_saved > 0
-             AND cardinality(a.skipped_opcodes) = 0
+             AND cardinality(a.skipped_opcodes) = 0{floor_a}
              AND x.address IS NULL
            GROUP BY a.to_address
            HAVING MIN(a.block_timestamp) >= now() - make_interval(days => $2::int)
               AND SUM(a.wei_saved) >= $3
            ORDER BY wei_saved_total DESC NULLS LAST
-           LIMIT $4"#,
-    )
+           LIMIT $4"#
+    ))
     .bind(chain_id)
     .bind(days)
     .bind(min_wei)

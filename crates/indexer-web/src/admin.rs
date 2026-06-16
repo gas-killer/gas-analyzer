@@ -14,7 +14,9 @@ use axum::Form;
 use axum::extract::{Query, State};
 use axum::response::{Redirect, Response};
 use bigdecimal::BigDecimal;
+use chrono::NaiveDate;
 use redis::AsyncCommands;
+use redis::aio::ConnectionManager;
 use serde::Deserialize;
 
 use crate::AppState;
@@ -30,6 +32,88 @@ pub struct AdminPage {
     pub user: String,
     pub health: HealthView,
     pub chain_id: i64,
+    /// Active data floor as YYYY-MM-DD, or "" when disabled. Prefills the
+    /// data-floor form so the BD sees and can edit the current cutoff.
+    pub data_floor: String,
+}
+
+/// Redis key persisting the BD-managed data floor across restarts.
+pub const DATA_FLOOR_KEY: &str = "analyzer:config:data_floor";
+/// Default floor when none has been set: the date the unsupported-opcode
+/// suppression (skipped_opcodes column) shipped, before which historical
+/// figures can be CREATE-opcode-skewed. See issue #10 §9.
+pub const DEFAULT_DATA_FLOOR: &str = "2026-05-25";
+
+/// Resolve the active data floor from Redis. Missing key → the default floor
+/// is active. An explicit empty/"none" value → floor disabled. Garbage falls
+/// back to the default rather than silently disabling.
+pub async fn load_data_floor(redis: &mut ConnectionManager) -> Option<NaiveDate> {
+    let raw: Option<String> = redis.get(DATA_FLOOR_KEY).await.unwrap_or(None);
+    match raw {
+        None => DEFAULT_DATA_FLOOR.parse().ok(),
+        Some(s) => {
+            let s = s.trim();
+            if s.is_empty() || s.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                s.parse::<NaiveDate>()
+                    .ok()
+                    .or_else(|| DEFAULT_DATA_FLOOR.parse().ok())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DataFloorForm {
+    /// YYYY-MM-DD, or empty to disable the floor.
+    #[serde(default)]
+    pub floor: String,
+}
+
+/// Admin control: set or clear the data floor. Persists to Redis and updates
+/// the in-process global the read queries consult, so the change is visible
+/// immediately with no restart or rollup refresh.
+pub async fn set_data_floor(
+    _user: AuthUser,
+    State(state): State<AppState>,
+    Form(form): Form<DataFloorForm>,
+) -> Response {
+    let t = Instant::now();
+    let mut conn = state.redis.clone();
+    let raw = form.floor.trim();
+
+    if raw.is_empty() {
+        if let Err(e) = conn.set::<_, _, ()>(DATA_FLOOR_KEY, "none").await {
+            return err("Data floor", format!("could not save: {e}"), t);
+        }
+        queries::set_data_floor(None);
+        return ok(
+            "Data floor",
+            "cleared — every analyzed date is now included".to_string(),
+            t,
+        );
+    }
+
+    let date = match raw.parse::<NaiveDate>() {
+        Ok(d) => d,
+        Err(_) => {
+            return err(
+                "Data floor",
+                format!("'{raw}' isn't a valid date — use YYYY-MM-DD"),
+                t,
+            );
+        }
+    };
+    if let Err(e) = conn.set::<_, _, ()>(DATA_FLOOR_KEY, date.to_string()).await {
+        return err("Data floor", format!("could not save: {e}"), t);
+    }
+    queries::set_data_floor(Some(date));
+    ok(
+        "Data floor",
+        format!("set — figures now ignore everything before {date}"),
+        t,
+    )
 }
 
 #[derive(Template)]
@@ -100,6 +184,9 @@ pub async fn admin_page(
         user,
         health,
         chain_id: state.chain_id,
+        data_floor: queries::current_data_floor()
+            .map(|d| d.to_string())
+            .unwrap_or_default(),
     };
     Ok(page.into_response())
 }
