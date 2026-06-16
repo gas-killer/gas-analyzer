@@ -247,8 +247,18 @@ window.addEventListener("DOMContentLoaded", () => {
     const tbody = table.tBodies[0];
     const headers = table.querySelectorAll("th.sortable");
     const parseNum = (s) => {
-        const n = parseFloat((s || "").replace(/[^0-9.\-]/g, ""));
-        return isNaN(n) ? -Infinity : n;
+        // Cells are formatted for humans ($1.23M, $45.60K, 12.3%, 1,234), so
+        // parse the mantissa AND honour any K/M/B magnitude suffix — otherwise
+        // "$1.23M" would parse to 1.23 and sort below "$999".
+        const t = (s || "").trim();
+        const n = parseFloat(t.replace(/[^0-9.\-]/g, ""));
+        if (isNaN(n)) return -Infinity;
+        const suffix = t.replace(/[0-9.,$%\s\-]/g, "").toUpperCase();
+        const mult = suffix.includes("B") ? 1e9
+                   : suffix.includes("M") ? 1e6
+                   : suffix.includes("K") ? 1e3
+                   : 1;
+        return n * mult;
     };
     const sortBy = (col, dir) => {
         const rows = Array.from(tbody.querySelectorAll("tr")).filter(r => r.children.length > 1);
