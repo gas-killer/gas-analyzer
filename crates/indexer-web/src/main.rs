@@ -189,9 +189,20 @@ async fn main() -> Result<()> {
         .context("connect postgres")?;
 
     let redis_client = redis::Client::open(cli.redis_url.as_str()).context("redis client")?;
-    let redis = ConnectionManager::new(redis_client)
+    let mut redis = ConnectionManager::new(redis_client)
         .await
         .context("redis connection")?;
+
+    // Load the data floor (the "ignore everything before this date" cutoff the
+    // BD manages from /admin). Persisted in Redis so it survives restarts; when
+    // unset we fall back to the default. Either way it's installed into the
+    // global the read queries consult.
+    let data_floor = admin::load_data_floor(&mut redis).await;
+    queries::set_data_floor(data_floor);
+    match data_floor {
+        Some(d) => tracing::info!(floor = %d, "data floor active — ignoring all data before this date"),
+        None => tracing::info!("data floor disabled — all history included"),
+    }
 
     let llm = if cli.openrouter_key.trim().is_empty() {
         tracing::info!("AI diagnostics disabled (OPENROUTER_KEY not set)");
@@ -252,6 +263,7 @@ async fn main() -> Result<()> {
         .route("/admin", get(admin::admin_page))
         .route("/admin/health", get(admin::health_partial))
         .route("/admin/candidates", get(admin::candidates_partial))
+        .route("/admin/data-floor", post(admin::set_data_floor))
         .route("/admin/refresh/rollups",   post(admin::refresh_rollups))
         .route("/admin/refresh/eth-price", post(admin::refresh_eth_price))
         .route("/admin/refresh/eth-price-backfill", post(admin::backfill_eth_prices))
