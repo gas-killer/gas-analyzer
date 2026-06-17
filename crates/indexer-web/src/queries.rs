@@ -110,10 +110,7 @@ pub async fn overview_totals(
 pub struct LeaderboardRow {
     pub project_slug: String,
     pub project_name: Option<String>,
-    pub category: Option<String>,
-    pub usd_saved: Option<BigDecimal>,
     pub tx_count: Option<i64>,
-    pub covered_tx_count: Option<i64>,
     pub wei_saved_total: Option<BigDecimal>,
     pub wei_spent_total: Option<BigDecimal>,
     pub avg_savings_pct: Option<f64>,
@@ -375,34 +372,6 @@ pub async fn daily_for_project(
         .bind(project_slug)
         .fetch_all(pool)
         .await?;
-    Ok(rows)
-}
-
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct CategoryRow {
-    pub category: Option<String>,
-    pub usd_saved: Option<BigDecimal>,
-}
-
-pub async fn category_breakdown_30d(
-    pool: &PgPool,
-    chain_id: i64,
-) -> Result<Vec<CategoryRow>, WebError> {
-    let floor_pd = floor("pd.day");
-    let rows = sqlx::query_as::<_, CategoryRow>(&format!(
-        r#"SELECT
-             p.category,
-             SUM(pd.usd_saved_total)::numeric AS usd_saved
-           FROM project_daily pd
-           LEFT JOIN projects p ON p.project_slug = pd.project_slug
-           WHERE pd.chain_id = $1
-             AND pd.day >= (now() - interval '30 days')::date{floor_pd}
-           GROUP BY p.category
-           ORDER BY usd_saved DESC NULLS LAST"#
-    ))
-    .bind(chain_id)
-    .fetch_all(pool)
-    .await?;
     Ok(rows)
 }
 
@@ -973,7 +942,6 @@ pub async fn recent_txs_for_function(
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct OrgLeaderRow {
-    pub org_slug: String,
     pub org_name: String,
     pub project_count: Option<i64>,
     pub contract_count: Option<i64>,
@@ -1059,7 +1027,6 @@ pub async fn list_projects(pool: &PgPool) -> Result<Vec<ProjectListRow>, WebErro
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct BlacklistRow {
-    pub chain_id: i64,
     pub address: Vec<u8>,
     pub selector: Option<Vec<u8>>,
     pub reason: String,

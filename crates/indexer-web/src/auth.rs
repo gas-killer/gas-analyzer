@@ -80,9 +80,7 @@ impl AuthState {
     pub fn verify_token(&self, token: &str) -> Option<String> {
         let raw = URL_SAFE_NO_PAD.decode(token.as_bytes()).ok()?;
         let raw = std::str::from_utf8(&raw).ok()?;
-        let mut parts = raw.rsplitn(2, '|');
-        let sig = parts.next()?;
-        let payload = parts.next()?;
+        let (payload, sig) = raw.rsplit_once('|')?;
         let expected = self.sign(payload);
         if expected.as_bytes().ct_eq(sig.as_bytes()).unwrap_u8() != 1 {
             return None;

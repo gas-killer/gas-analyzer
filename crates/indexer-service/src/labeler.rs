@@ -21,7 +21,6 @@
 //!   - `no-match`    — verified, but the name didn't map to any slug
 //!   - `error`       — transport failure; will retry on next producer cycle
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 

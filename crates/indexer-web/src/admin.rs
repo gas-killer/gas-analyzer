@@ -153,7 +153,6 @@ pub struct HealthView {
     pub last_seen_block: Option<i64>,
     pub latest_analyzed_block: Option<i64>,
     pub blocks_behind: Option<i64>,
-    pub head_stale: bool,
     /// True when blocks_behind exceeds the env-tunable warn threshold.
     /// Templates render a red banner when set.
     pub falls_behind: bool,
@@ -383,7 +382,6 @@ pub struct BlacklistPage {
     pub user: String,
     pub chain_id: i64,
     pub rows: Vec<BlacklistRowView>,
-    pub flash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -418,7 +416,6 @@ pub async fn blacklist_page(
         user,
         chain_id: state.chain_id,
         rows,
-        flash: String::new(),
     }
     .into_response())
 }
@@ -679,19 +676,19 @@ pub async fn diagnose(_user: AuthUser, State(state): State<AppState>) -> Respons
     // Cache + rate-limit gate.
     {
         let mut cache = state.diagnose_cache.lock().await;
-        if let Some((at, body)) = cache.last_response.as_ref() {
-            if at.elapsed().as_secs() < state.diagnose_cache_ttl_secs {
-                let html = render_markdown(body);
-                return DiagnoseFragment {
-                    html,
-                    model: client.model().to_string(),
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    duration_ms: started.elapsed().as_millis(),
-                    cached: true,
-                }
-                .into_response();
+        if let Some((at, body)) = cache.last_response.as_ref()
+            && at.elapsed().as_secs() < state.diagnose_cache_ttl_secs
+        {
+            let html = render_markdown(body);
+            return DiagnoseFragment {
+                html,
+                model: client.model().to_string(),
+                tokens_in: 0,
+                tokens_out: 0,
+                duration_ms: started.elapsed().as_millis(),
+                cached: true,
             }
+            .into_response();
         }
         if let Some(last) = cache.last_call_at {
             let elapsed = last.elapsed().as_secs();
@@ -817,7 +814,6 @@ async fn collect_health(state: &AppState) -> Result<HealthView, WebError> {
         .get::<_, Option<i64>>(indexer_service::state::LAST_HEAD_KEY)
         .await
         .unwrap_or(None);
-    let head_stale = last_head_raw.is_none();
 
     let blocks_behind = match (last_head_raw, analysis.latest_block) {
         (Some(h), Some(a)) => Some(h - a),
@@ -830,7 +826,6 @@ async fn collect_health(state: &AppState) -> Result<HealthView, WebError> {
         last_seen_block: last_head_raw,
         latest_analyzed_block: analysis.latest_block,
         blocks_behind,
-        head_stale,
         falls_behind,
         blocks_behind_threshold: threshold,
         pending_queue: pending,
