@@ -12,6 +12,12 @@ use sqlx::PgPool;
 use crate::AppState;
 use crate::queries;
 
+/// A row from `address_label_attempt`: (address, last_result, contract_name, matched_slug).
+type LabelerOutcomeRow = (Vec<u8>, String, Option<String>, Option<String>);
+
+/// A raw Redis stream entry: (id, field key/value pairs).
+type RedisStreamEntries = redis::RedisResult<Vec<(String, Vec<(String, String)>)>>;
+
 /// One Postgres + Redis snapshot, serializable as JSON for the LLM prompt.
 #[derive(Debug, Serialize)]
 pub struct DiagnosticsBundle {
@@ -184,7 +190,7 @@ async fn collect_top_unknowns(pool: &PgPool, chain_id: i64, limit: i64) -> Vec<U
 }
 
 async fn collect_labeler_outcomes(pool: &PgPool, chain_id: i64, limit: i64) -> Vec<LabelerOutcome> {
-    let rows: Vec<(Vec<u8>, String, Option<String>, Option<String>)> = sqlx::query_as(
+    let rows: Vec<LabelerOutcomeRow> = sqlx::query_as(
         r#"SELECT address, last_result, contract_name, matched_slug
            FROM address_label_attempt
            WHERE chain_id = $1
@@ -217,7 +223,7 @@ async fn collect_recent_events(
 ) -> Vec<RecentEvent> {
     // XREVRANGE returns newest-first. Each entry is a (id, fields) tuple;
     // fields are key/value pairs we serialized at publish time.
-    let raw: redis::RedisResult<Vec<(String, Vec<(String, String)>)>> = redis::cmd("XREVRANGE")
+    let raw: RedisStreamEntries = redis::cmd("XREVRANGE")
         .arg("indexer:events")
         .arg("+")
         .arg("-")

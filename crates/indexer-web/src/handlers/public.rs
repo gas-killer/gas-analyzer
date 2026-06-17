@@ -100,7 +100,6 @@ pub struct OverviewPage {
     /// Active leaderboard pivot ("functions" / "contracts" / "projects").
     /// Template branches off this; only the matching Vec is populated.
     pub group: String,
-    pub explorer_address_url: String,
     pub functions: Vec<FunctionLeaderView>,
     pub contracts: Vec<ContractLeaderView>,
     pub orgs: Vec<OrgLeaderView>,
@@ -110,7 +109,6 @@ pub struct OverviewPage {
 
 #[derive(Debug, Clone)]
 pub struct OrgLeaderView {
-    pub org_slug: String,
     pub org_name: String,
     pub project_count: i64,
     pub contract_count: i64,
@@ -144,7 +142,6 @@ pub struct TxQuery {
 #[derive(Debug, Clone)]
 pub struct TxPagingView {
     pub page: u32,
-    pub page_size: u32,
     pub has_prev: bool,
     pub has_next: bool,
     pub from: String,
@@ -194,7 +191,6 @@ fn paging_view(q: &TxQuery, rows_returned: usize) -> TxPagingView {
     };
     TxPagingView {
         page,
-        page_size: TX_PAGE_SIZE,
         has_prev: page > 1,
         has_next: rows_returned as u32 >= TX_PAGE_SIZE,
         from: q.from.clone().unwrap_or_default(),
@@ -264,8 +260,6 @@ pub struct LeaderRow {
     /// % of total gas spend the project would have saved over the window.
     /// `wei_saved / wei_spent` — the headline BD metric.
     pub savings_of_spend_pct: String,
-    /// % of the project's txs where gas-killer produced any savings.
-    pub coverage_pct: String,
     /// Median (gas_saved / gas_used) over covered txs — robust to the
     /// many-zero-savings-txs skew that breaks the plain average.
     pub median_savings_pct_pct: String,
@@ -361,7 +355,6 @@ pub async fn overview(
                     let savings_of_spend =
                         ratio_bd(r.wei_saved_total.as_ref(), r.wei_spent_total.as_ref());
                     OrgLeaderView {
-                        org_slug: r.org_slug,
                         org_name: r.org_name,
                         project_count: r.project_count.unwrap_or(0),
                         contract_count: r.contract_count.unwrap_or(0),
@@ -413,12 +406,6 @@ pub async fn overview(
                         .strip_prefix("unknown:0x")
                         .map(|hex| format!("0x{hex}"));
                     let tx_count = r.tx_count.unwrap_or(0);
-                    let covered = r.covered_tx_count.unwrap_or(0);
-                    let coverage = if tx_count > 0 {
-                        Some(covered as f64 / tx_count as f64)
-                    } else {
-                        None
-                    };
                     let savings_of_spend =
                         ratio_bd(r.wei_saved_total.as_ref(), r.wei_spent_total.as_ref());
                     LeaderRow {
@@ -429,7 +416,6 @@ pub async fn overview(
                         tx_count,
                         avg_savings_pct_pct: format_pct(r.avg_savings_pct),
                         savings_of_spend_pct: format_pct(savings_of_spend),
-                        coverage_pct: format_pct(coverage),
                         median_savings_pct_pct: format_pct(r.median_savings_pct_covered),
                         project_slug: r.project_slug,
                         unknown_address_hex,
@@ -458,7 +444,6 @@ pub async fn overview(
         totals_24h,
         projection,
         group,
-        explorer_address_url: state.explorer_address_url.as_str().to_string(),
         functions,
         contracts,
         orgs,
@@ -476,7 +461,6 @@ pub struct ProjectPage {
     pub user: String,
     pub chain_id: i64,
     pub explorer_tx_url: String,
-    pub explorer_address_url: String,
     pub project_slug: String,
     pub project_name: String,
     pub category: String,
@@ -616,7 +600,6 @@ pub async fn project(
         user,
         chain_id,
         explorer_tx_url: state.explorer_tx_url.as_str().to_string(),
-        explorer_address_url: state.explorer_address_url.as_str().to_string(),
         project_name: header
             .project_name
             .clone()
