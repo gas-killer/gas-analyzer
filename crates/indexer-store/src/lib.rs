@@ -203,11 +203,7 @@ impl Store {
     /// Rename a project (display-name only — the slug is the stable key).
     /// Returns whether a row was updated, so callers can distinguish
     /// "renamed" from "no such slug" without an extra SELECT.
-    pub async fn rename_project(
-        &self,
-        slug: &str,
-        new_name: &str,
-    ) -> Result<bool, StoreError> {
+    pub async fn rename_project(&self, slug: &str, new_name: &str) -> Result<bool, StoreError> {
         let res = sqlx::query(
             r#"UPDATE projects
                SET project_name = $2,
@@ -242,18 +238,15 @@ impl Store {
     /// Days already present in `eth_prices`. Used by the backfill flow to
     /// skip days we've already priced.
     pub async fn list_eth_price_days(&self) -> Result<Vec<NaiveDate>, StoreError> {
-        let rows: Vec<(NaiveDate,)> =
-            sqlx::query_as("SELECT day FROM eth_prices ORDER BY day")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows: Vec<(NaiveDate,)> = sqlx::query_as("SELECT day FROM eth_prices ORDER BY day")
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows.into_iter().map(|(d,)| d).collect())
     }
 
     /// `(min, max)` day spanned by the `analysis` table, or `None` if empty.
     /// Used by the backfill flow to size the coingecko range request.
-    pub async fn analysis_day_range(
-        &self,
-    ) -> Result<Option<(NaiveDate, NaiveDate)>, StoreError> {
+    pub async fn analysis_day_range(&self) -> Result<Option<(NaiveDate, NaiveDate)>, StoreError> {
         let row: Option<(Option<NaiveDate>, Option<NaiveDate>)> = sqlx::query_as(
             "SELECT min(block_timestamp)::date, max(block_timestamp)::date FROM analysis",
         )
@@ -471,13 +464,11 @@ impl Store {
         project_slug: &str,
         org_slug: Option<&str>,
     ) -> Result<bool, StoreError> {
-        let res = sqlx::query(
-            r#"UPDATE projects SET org_slug = $2 WHERE project_slug = $1"#,
-        )
-        .bind(project_slug)
-        .bind(org_slug)
-        .execute(&self.pool)
-        .await?;
+        let res = sqlx::query(r#"UPDATE projects SET org_slug = $2 WHERE project_slug = $1"#)
+            .bind(project_slug)
+            .bind(org_slug)
+            .execute(&self.pool)
+            .await?;
         Ok(res.rows_affected() > 0)
     }
 

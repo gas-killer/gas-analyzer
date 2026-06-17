@@ -106,7 +106,13 @@ pub async fn run(common: CommonConfig, cfg: RefresherConfig, store: Store) {
     let blockscout_b = blockscout.clone();
     let consumer = tokio::spawn(async move {
         consumer_loop(
-            common_b, cfg_b, store_b, conn_for_consumer, client, blockscout_b, names,
+            common_b,
+            cfg_b,
+            store_b,
+            conn_for_consumer,
+            client,
+            blockscout_b,
+            names,
         )
         .await;
     });
@@ -212,7 +218,16 @@ async fn consumer_loop(
             continue;
         };
 
-        process_address(&common, &store, &client, blockscout.as_deref(), &names, addr, score).await;
+        process_address(
+            &common,
+            &store,
+            &client,
+            blockscout.as_deref(),
+            &names,
+            addr,
+            score,
+        )
+        .await;
         sleep_until(next_after).await;
     }
 }
@@ -271,7 +286,11 @@ async fn process_address(
                 None
             };
             match bs_meta {
-                Some(ContractMeta::Verified { name, implementation, .. }) => (name, implementation),
+                Some(ContractMeta::Verified {
+                    name,
+                    implementation,
+                    ..
+                }) => (name, implementation),
                 _ => {
                     tracing::debug!(addr = %hex::encode(addr), score, "labeler: unverified");
                     let _ = store

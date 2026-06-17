@@ -119,16 +119,20 @@ where
         let auth = AuthState::from_ref(state);
         let cookies = Cookies::from_request_parts(parts, state)
             .await
-            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "cookies layer missing").into_response())?;
-        let token = cookies
-            .get(SESSION_COOKIE)
-            .map(|c| c.value().to_string());
+            .map_err(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "cookies layer missing").into_response()
+            })?;
+        let token = cookies.get(SESSION_COOKIE).map(|c| c.value().to_string());
         let username = token.and_then(|t| auth.verify_token(&t));
         match username {
             Some(u) => Ok(AuthUser(u)),
             None => {
                 let next = parts.uri.path().to_string();
-                let q = parts.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+                let q = parts
+                    .uri
+                    .query()
+                    .map(|q| format!("?{q}"))
+                    .unwrap_or_default();
                 let target = format!("/login?next={}{}", urlencode(&next), urlencode(&q));
                 Err(Redirect::to(&target).into_response())
             }
@@ -142,7 +146,9 @@ pub fn session_cookie(token: String) -> tower_cookies::Cookie<'static> {
     c.set_http_only(true);
     c.set_same_site(SameSite::Strict);
     c.set_path("/");
-    c.set_max_age(tower_cookies::cookie::time::Duration::seconds(SESSION_TTL_SECS));
+    c.set_max_age(tower_cookies::cookie::time::Duration::seconds(
+        SESSION_TTL_SECS,
+    ));
     c
 }
 
@@ -205,7 +211,10 @@ mod tests {
     #[test]
     fn password_verify() {
         let auth = auth_with_user("alice", "hunter2");
-        assert_eq!(auth.verify_password("alice", "hunter2").as_deref(), Some("alice"));
+        assert_eq!(
+            auth.verify_password("alice", "hunter2").as_deref(),
+            Some("alice")
+        );
         assert!(auth.verify_password("alice", "wrong").is_none());
         assert!(auth.verify_password("bob", "hunter2").is_none());
     }

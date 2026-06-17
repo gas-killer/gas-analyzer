@@ -160,8 +160,14 @@ const TX_PAGE_SIZE: u32 = 50;
 
 fn build_tx_filters(q: &TxQuery) -> queries::TxFilters {
     queries::TxFilters {
-        from: q.from.as_deref().and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()),
-        to:   q.to.as_deref().and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()),
+        from: q
+            .from
+            .as_deref()
+            .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()),
+        to: q
+            .to
+            .as_deref()
+            .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()),
         min_gas_saved: q.min_gas_saved,
     }
 }
@@ -292,8 +298,10 @@ pub async fn overview(
     }
     .to_string();
 
-    let totals_lifetime_raw = queries::overview_totals(pool, chain_id, queries::Window::Lifetime).await?;
-    let totals_30d_raw = queries::overview_totals(pool, chain_id, queries::Window::Days(30)).await?;
+    let totals_lifetime_raw =
+        queries::overview_totals(pool, chain_id, queries::Window::Lifetime).await?;
+    let totals_30d_raw =
+        queries::overview_totals(pool, chain_id, queries::Window::Days(30)).await?;
     let totals_7d_raw = queries::overview_totals(pool, chain_id, queries::Window::Days(7)).await?;
     let totals_24h_raw = queries::overview_totals(pool, chain_id, queries::Window::Days(1)).await?;
 
@@ -323,10 +331,8 @@ pub async fn overview(
                 .await?
                 .into_iter()
                 .map(|r| {
-                    let savings_of_spend = ratio_bd(
-                        r.wei_saved_total.as_ref(),
-                        r.wei_spent_total.as_ref(),
-                    );
+                    let savings_of_spend =
+                        ratio_bd(r.wei_saved_total.as_ref(), r.wei_spent_total.as_ref());
                     let project_display = r
                         .project_name
                         .clone()
@@ -352,10 +358,8 @@ pub async fn overview(
                 .await?
                 .into_iter()
                 .map(|r| {
-                    let savings_of_spend = ratio_bd(
-                        r.wei_saved_total.as_ref(),
-                        r.wei_spent_total.as_ref(),
-                    );
+                    let savings_of_spend =
+                        ratio_bd(r.wei_saved_total.as_ref(), r.wei_spent_total.as_ref());
                     OrgLeaderView {
                         org_slug: r.org_slug,
                         org_name: r.org_name,
@@ -378,10 +382,8 @@ pub async fn overview(
                         .project_slug
                         .strip_prefix("unknown:0x")
                         .map(|hex| format!("0x{hex}"));
-                    let savings_of_spend = ratio_bd(
-                        r.wei_saved_total.as_ref(),
-                        r.wei_spent_total.as_ref(),
-                    );
+                    let savings_of_spend =
+                        ratio_bd(r.wei_saved_total.as_ref(), r.wei_spent_total.as_ref());
                     let project_display = r
                         .project_name
                         .clone()
@@ -417,10 +419,8 @@ pub async fn overview(
                     } else {
                         None
                     };
-                    let savings_of_spend = ratio_bd(
-                        r.wei_saved_total.as_ref(),
-                        r.wei_spent_total.as_ref(),
-                    );
+                    let savings_of_spend =
+                        ratio_bd(r.wei_saved_total.as_ref(), r.wei_spent_total.as_ref());
                     LeaderRow {
                         display_name: r
                             .project_name
@@ -528,8 +528,10 @@ pub async fn project(
     let chain_id = state.chain_id;
 
     let header = queries::project_header(pool, &slug).await?;
-    let totals_lifetime_raw = queries::project_totals(pool, chain_id, &slug, queries::Window::Lifetime).await?;
-    let totals_30d_raw = queries::project_totals(pool, chain_id, &slug, queries::Window::Days(30)).await?;
+    let totals_lifetime_raw =
+        queries::project_totals(pool, chain_id, &slug, queries::Window::Lifetime).await?;
+    let totals_30d_raw =
+        queries::project_totals(pool, chain_id, &slug, queries::Window::Days(30)).await?;
 
     let totals_lifetime = TotalsView {
         usd_saved: format_usd(totals_lifetime_raw.usd_saved.as_ref()),
@@ -581,7 +583,12 @@ pub async fn project(
     let page = tx_q.page.unwrap_or(1).max(1);
     let offset = (page as i64 - 1) * TX_PAGE_SIZE as i64;
     let recent_rows = queries::recent_txs_for_project(
-        pool, chain_id, &slug, TX_PAGE_SIZE as i64, offset, &filters,
+        pool,
+        chain_id,
+        &slug,
+        TX_PAGE_SIZE as i64,
+        offset,
+        &filters,
     )
     .await?;
     let paging = paging_view(&tx_q, recent_rows.len());
@@ -674,8 +681,10 @@ pub async fn contract_page(
         .ok_or_else(|| WebError::BadRequest("invalid address".into()))?;
 
     let header = queries::contract_header(pool, chain_id, address).await?;
-    let totals_lifetime_raw = queries::contract_totals(pool, chain_id, address, queries::Window::Lifetime).await?;
-    let totals_30d_raw = queries::contract_totals(pool, chain_id, address, queries::Window::Days(30)).await?;
+    let totals_lifetime_raw =
+        queries::contract_totals(pool, chain_id, address, queries::Window::Lifetime).await?;
+    let totals_30d_raw =
+        queries::contract_totals(pool, chain_id, address, queries::Window::Days(30)).await?;
 
     let totals_lifetime = TotalsView {
         usd_saved: format_usd(totals_lifetime_raw.usd_saved.as_ref()),
@@ -718,7 +727,12 @@ pub async fn contract_page(
     let cur_page = tx_q.page.unwrap_or(1).max(1);
     let offset = (cur_page as i64 - 1) * TX_PAGE_SIZE as i64;
     let recent_rows = queries::recent_txs_for_contract(
-        pool, chain_id, address, TX_PAGE_SIZE as i64, offset, &filters,
+        pool,
+        chain_id,
+        address,
+        TX_PAGE_SIZE as i64,
+        offset,
+        &filters,
     )
     .await?;
     let paging = paging_view(&tx_q, recent_rows.len());
@@ -795,8 +809,12 @@ pub async fn function_page(
         .ok_or_else(|| WebError::BadRequest("invalid selector".into()))?;
 
     let header = queries::function_header(pool, chain_id, address, selector).await?;
-    let totals_lifetime_raw = queries::function_totals(pool, chain_id, address, selector, queries::Window::Lifetime).await?;
-    let totals_30d_raw = queries::function_totals(pool, chain_id, address, selector, queries::Window::Days(30)).await?;
+    let totals_lifetime_raw =
+        queries::function_totals(pool, chain_id, address, selector, queries::Window::Lifetime)
+            .await?;
+    let totals_30d_raw =
+        queries::function_totals(pool, chain_id, address, selector, queries::Window::Days(30))
+            .await?;
 
     let totals_lifetime = TotalsView {
         usd_saved: format_usd(totals_lifetime_raw.usd_saved.as_ref()),
@@ -826,7 +844,13 @@ pub async fn function_page(
     let cur_page = tx_q.page.unwrap_or(1).max(1);
     let offset = (cur_page as i64 - 1) * TX_PAGE_SIZE as i64;
     let recent_rows = queries::recent_txs_for_function(
-        pool, chain_id, address, selector, TX_PAGE_SIZE as i64, offset, &filters,
+        pool,
+        chain_id,
+        address,
+        selector,
+        TX_PAGE_SIZE as i64,
+        offset,
+        &filters,
     )
     .await?;
     let paging = paging_view(&tx_q, recent_rows.len());

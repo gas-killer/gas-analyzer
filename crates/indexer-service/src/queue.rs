@@ -64,9 +64,8 @@ impl Queue {
     pub async fn claim(&self, timeout: Duration) -> Result<Option<AnalyzeTxJob>, QueueError> {
         let mut conn = self.conn.clone();
         // BLPOP returns Option<(key, value)>; we discard the key.
-        let result: Option<(String, Vec<u8>)> = conn
-            .blpop(QUEUE_KEY, timeout.as_secs_f64())
-            .await?;
+        let result: Option<(String, Vec<u8>)> =
+            conn.blpop(QUEUE_KEY, timeout.as_secs_f64()).await?;
         match result {
             Some((_, payload)) => {
                 let job: AnalyzeTxJob = serde_json::from_slice(&payload)?;

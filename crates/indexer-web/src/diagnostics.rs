@@ -159,11 +159,7 @@ async fn count_since(pool: &PgPool, chain_id: i64, interval: &str) -> i64 {
         .unwrap_or(0)
 }
 
-async fn collect_top_unknowns(
-    pool: &PgPool,
-    chain_id: i64,
-    limit: i64,
-) -> Vec<UnknownEntry> {
+async fn collect_top_unknowns(pool: &PgPool, chain_id: i64, limit: i64) -> Vec<UnknownEntry> {
     let rows: Vec<(Vec<u8>, i64, sqlx::types::BigDecimal)> = sqlx::query_as(
         r#"SELECT to_address, COUNT(*)::bigint, COALESCE(SUM(wei_saved),0)::numeric
            FROM analysis
@@ -187,11 +183,7 @@ async fn collect_top_unknowns(
         .collect()
 }
 
-async fn collect_labeler_outcomes(
-    pool: &PgPool,
-    chain_id: i64,
-    limit: i64,
-) -> Vec<LabelerOutcome> {
+async fn collect_labeler_outcomes(pool: &PgPool, chain_id: i64, limit: i64) -> Vec<LabelerOutcome> {
     let rows: Vec<(Vec<u8>, String, Option<String>, Option<String>)> = sqlx::query_as(
         r#"SELECT address, last_result, contract_name, matched_slug
            FROM address_label_attempt
@@ -225,15 +217,14 @@ async fn collect_recent_events(
 ) -> Vec<RecentEvent> {
     // XREVRANGE returns newest-first. Each entry is a (id, fields) tuple;
     // fields are key/value pairs we serialized at publish time.
-    let raw: redis::RedisResult<Vec<(String, Vec<(String, String)>)>> =
-        redis::cmd("XREVRANGE")
-            .arg("indexer:events")
-            .arg("+")
-            .arg("-")
-            .arg("COUNT")
-            .arg(limit)
-            .query_async(conn)
-            .await;
+    let raw: redis::RedisResult<Vec<(String, Vec<(String, String)>)>> = redis::cmd("XREVRANGE")
+        .arg("indexer:events")
+        .arg("+")
+        .arg("-")
+        .arg("COUNT")
+        .arg(limit)
+        .query_async(conn)
+        .await;
     let entries = match raw {
         Ok(v) => v,
         Err(_) => return Vec::new(),

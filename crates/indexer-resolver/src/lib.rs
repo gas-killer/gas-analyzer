@@ -172,7 +172,8 @@ async fn load_overlay(path: &Path, into: &mut ResolverSnapshot) -> Result<(), Re
             contact_email: email,
             contact_url: url,
         };
-        into.addresses.insert((entry.chain_id, address), info.clone());
+        into.addresses
+            .insert((entry.chain_id, address), info.clone());
         into.projects.entry(entry.project_slug).or_insert(info);
     }
     Ok(())
@@ -204,7 +205,9 @@ async fn load_defillama(url: &str, into: &mut ResolverSnapshot) -> Result<(), Re
             contact_url: None,
         };
         // Don't overwrite overlay project metadata.
-        into.projects.entry(p.slug.clone()).or_insert_with(|| info.clone());
+        into.projects
+            .entry(p.slug.clone())
+            .or_insert_with(|| info.clone());
 
         // The bulk /protocols endpoint already exposes the protocol's "main"
         // address (usually the governance token). We only consume Ethereum
@@ -218,7 +221,10 @@ async fn load_defillama(url: &str, into: &mut ResolverSnapshot) -> Result<(), Re
         }
     }
 
-    tracing::info!(addresses = harvested_addresses, "defillama addresses harvested");
+    tracing::info!(
+        addresses = harvested_addresses,
+        "defillama addresses harvested"
+    );
     Ok(())
 }
 
@@ -246,8 +252,8 @@ fn parse_defillama_address(raw: Option<&str>) -> Option<(u64, [u8; 20])> {
 
 fn parse_address(s: &str) -> Result<[u8; 20], ResolverError> {
     let stripped = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(stripped)
-        .map_err(|e| ResolverError::Address(s.to_string(), e.to_string()))?;
+    let bytes =
+        hex::decode(stripped).map_err(|e| ResolverError::Address(s.to_string(), e.to_string()))?;
     if bytes.len() != 20 {
         return Err(ResolverError::Address(
             s.to_string(),

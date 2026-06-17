@@ -19,8 +19,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::extract::FromRef;
-use axum::routing::{get, post};
 use axum::response::Redirect;
+use axum::routing::{get, post};
 use clap::Parser;
 use indexer_store::Store;
 use redis::aio::ConnectionManager;
@@ -32,7 +32,10 @@ use tracing_subscriber::EnvFilter;
 use crate::auth::AuthState;
 
 #[derive(Debug, Parser)]
-#[command(name = "indexer-web", about = "BD dashboard for the gas-killer indexer")]
+#[command(
+    name = "indexer-web",
+    about = "BD dashboard for the gas-killer indexer"
+)]
 struct Cli {
     /// Postgres connection string.
     #[arg(long, env = "DATABASE_URL")]
@@ -47,7 +50,11 @@ struct Cli {
     session_secret: String,
 
     /// Path to the YAML allowlist of (username, bcrypt_hash) pairs.
-    #[arg(long, env = "AUTH_ALLOWLIST_PATH", default_value = "/etc/indexer/users.yaml")]
+    #[arg(
+        long,
+        env = "AUTH_ALLOWLIST_PATH",
+        default_value = "/etc/indexer/users.yaml"
+    )]
     auth_allowlist_path: PathBuf,
 
     /// Bind address.
@@ -60,11 +67,19 @@ struct Cli {
     chain_id: i64,
 
     /// Block-explorer base URL for tx links (trailing slash included).
-    #[arg(long, env = "EXPLORER_TX_URL", default_value = "https://etherscan.io/tx/")]
+    #[arg(
+        long,
+        env = "EXPLORER_TX_URL",
+        default_value = "https://etherscan.io/tx/"
+    )]
     explorer_tx_url: String,
 
     /// Block-explorer base URL for address links (trailing slash included).
-    #[arg(long, env = "EXPLORER_ADDRESS_URL", default_value = "https://etherscan.io/address/")]
+    #[arg(
+        long,
+        env = "EXPLORER_ADDRESS_URL",
+        default_value = "https://etherscan.io/address/"
+    )]
     explorer_address_url: String,
 
     /// Static-file directory served at `/static`.
@@ -75,21 +90,36 @@ struct Cli {
     //
     // Mirror the relevant CommonConfig / RefresherConfig env vars so the
     // admin "refresh now" buttons can hit the same endpoints the loop hits.
-    #[arg(long, env = "OVERLAY_PATH", default_value = "/etc/indexer/overlay.yaml")]
+    #[arg(
+        long,
+        env = "OVERLAY_PATH",
+        default_value = "/etc/indexer/overlay.yaml"
+    )]
     overlay_path: PathBuf,
 
-    #[arg(long, env = "DEFILLAMA_URL", default_value = "https://api.llama.fi/protocols")]
+    #[arg(
+        long,
+        env = "DEFILLAMA_URL",
+        default_value = "https://api.llama.fi/protocols"
+    )]
     defillama_url: String,
 
-    #[arg(long, env = "PRICE_URL",
-          default_value = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd")]
+    #[arg(
+        long,
+        env = "PRICE_URL",
+        default_value = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd"
+    )]
     price_url: String,
 
     /// Coingecko API base URL (no trailing slash). Used by the one-shot
     /// historical-price backfill admin button. Separate from `PRICE_URL`
     /// because that one is a fully-qualified simple-price endpoint with
     /// query params baked in.
-    #[arg(long, env = "COINGECKO_BASE_URL", default_value = "https://api.coingecko.com/api/v3")]
+    #[arg(
+        long,
+        env = "COINGECKO_BASE_URL",
+        default_value = "https://api.coingecko.com/api/v3"
+    )]
     coingecko_base_url: String,
 
     #[arg(long, env = "LABELER_BATCH_SIZE", default_value_t = 200)]
@@ -109,11 +139,19 @@ struct Cli {
     openrouter_key: String,
 
     /// OpenRouter model identifier.
-    #[arg(long, env = "OPENROUTER_MODEL", default_value = "anthropic/claude-sonnet-4-6")]
+    #[arg(
+        long,
+        env = "OPENROUTER_MODEL",
+        default_value = "anthropic/claude-sonnet-4-6"
+    )]
     openrouter_model: String,
 
     /// OpenRouter base URL (no trailing slash).
-    #[arg(long, env = "OPENROUTER_BASE_URL", default_value = "https://openrouter.ai/api/v1")]
+    #[arg(
+        long,
+        env = "OPENROUTER_BASE_URL",
+        default_value = "https://openrouter.ai/api/v1"
+    )]
     openrouter_base_url: String,
 
     /// Cache TTL for the most recent diagnose response (seconds). Repeat
@@ -175,7 +213,9 @@ impl FromRef<AppState> for AuthState {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(true)
         .init();
 
@@ -200,7 +240,9 @@ async fn main() -> Result<()> {
     let data_floor = admin::load_data_floor(&mut redis).await;
     queries::set_data_floor(data_floor);
     match data_floor {
-        Some(d) => tracing::info!(floor = %d, "data floor active — ignoring all data before this date"),
+        Some(d) => {
+            tracing::info!(floor = %d, "data floor active — ignoring all data before this date")
+        }
         None => tracing::info!("data floor disabled — all history included"),
     }
 
@@ -258,35 +300,47 @@ async fn main() -> Result<()> {
         .route("/", get(handlers::public::overview))
         .route("/projects/:slug", get(handlers::public::project))
         .route("/contracts/:address", get(handlers::public::contract_page))
-        .route("/functions/:address/:selector", get(handlers::public::function_page))
+        .route(
+            "/functions/:address/:selector",
+            get(handlers::public::function_page),
+        )
         .route("/unknowns", get(handlers::public::unknowns))
         .route("/admin", get(admin::admin_page))
         .route("/admin/health", get(admin::health_partial))
         .route("/admin/candidates", get(admin::candidates_partial))
         .route("/admin/data-floor", post(admin::set_data_floor))
-        .route("/admin/refresh/rollups",   post(admin::refresh_rollups))
+        .route("/admin/refresh/rollups", post(admin::refresh_rollups))
         .route("/admin/refresh/eth-price", post(admin::refresh_eth_price))
-        .route("/admin/refresh/eth-price-backfill", post(admin::backfill_eth_prices))
-        .route("/admin/refresh/resolver",  post(admin::refresh_resolver))
-        .route("/admin/refresh/labeler",   post(admin::refresh_labeler))
-        .route("/admin/refresh/relabel",   post(admin::refresh_relabel))
-        .route("/admin/diagnose",          post(admin::diagnose))
-        .route("/admin/blacklist",         get(admin::blacklist_page))
-        .route("/admin/blacklist/add",     post(admin::blacklist_add))
-        .route("/admin/blacklist/remove",  post(admin::blacklist_remove))
-        .route("/admin/orgs",              get(admin::orgs_page))
-        .route("/admin/orgs/create",       post(admin::orgs_create))
-        .route("/admin/orgs/assign",       post(admin::orgs_assign))
-        .route("/api/labels/cell",         get(labels::label_cell))
-        .route("/api/labels/edit",         get(labels::label_edit))
-        .route("/api/labels/override",     post(labels::label_override))
-        .route("/api/projects/cell",       get(labels::project_cell))
-        .route("/api/projects/edit",       get(labels::project_edit))
-        .route("/api/projects/rename",     post(labels::project_rename))
-        .route("/login", get(handlers::public::login_get).post(handlers::public::login_post))
+        .route(
+            "/admin/refresh/eth-price-backfill",
+            post(admin::backfill_eth_prices),
+        )
+        .route("/admin/refresh/resolver", post(admin::refresh_resolver))
+        .route("/admin/refresh/labeler", post(admin::refresh_labeler))
+        .route("/admin/refresh/relabel", post(admin::refresh_relabel))
+        .route("/admin/diagnose", post(admin::diagnose))
+        .route("/admin/blacklist", get(admin::blacklist_page))
+        .route("/admin/blacklist/add", post(admin::blacklist_add))
+        .route("/admin/blacklist/remove", post(admin::blacklist_remove))
+        .route("/admin/orgs", get(admin::orgs_page))
+        .route("/admin/orgs/create", post(admin::orgs_create))
+        .route("/admin/orgs/assign", post(admin::orgs_assign))
+        .route("/api/labels/cell", get(labels::label_cell))
+        .route("/api/labels/edit", get(labels::label_edit))
+        .route("/api/labels/override", post(labels::label_override))
+        .route("/api/projects/cell", get(labels::project_cell))
+        .route("/api/projects/edit", get(labels::project_edit))
+        .route("/api/projects/rename", post(labels::project_rename))
+        .route(
+            "/login",
+            get(handlers::public::login_get).post(handlers::public::login_post),
+        )
         .route("/logout", get(handlers::public::logout))
         .route("/healthz", get(|| async { "ok" }))
-        .nest_service("/static", tower_http::services::ServeDir::new(&cli.static_dir))
+        .nest_service(
+            "/static",
+            tower_http::services::ServeDir::new(&cli.static_dir),
+        )
         .fallback(get(|| async { Redirect::to("/") }))
         .layer(CookieManagerLayer::new())
         .layer(CompressionLayer::new())

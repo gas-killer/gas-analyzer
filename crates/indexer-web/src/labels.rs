@@ -142,7 +142,10 @@ async fn build_cell(
         }
         None => {
             let synthetic = format!("unknown:0x{}", hex::encode(addr));
-            (synthetic.clone(), format!("Unknown (0x{})", hex::encode(addr)))
+            (
+                synthetic.clone(),
+                format!("Unknown (0x{})", hex::encode(addr)),
+            )
         }
     };
     Ok(LabelCell {
@@ -155,11 +158,7 @@ async fn build_cell(
     })
 }
 
-async fn current_slug(
-    state: &AppState,
-    chain_id: i64,
-    addr: [u8; 20],
-) -> Result<String, WebError> {
+async fn current_slug(state: &AppState, chain_id: i64, addr: [u8; 20]) -> Result<String, WebError> {
     let resolved = queries::resolved_label(state.store.pool(), chain_id, addr).await?;
     Ok(match resolved {
         Some((s, _)) if !s.starts_with("unknown:") => s,
@@ -169,8 +168,8 @@ async fn current_slug(
 
 fn parse_addr(s: &str) -> Result<[u8; 20], WebError> {
     let stripped = s.trim().strip_prefix("0x").unwrap_or(s.trim());
-    let bytes = hex::decode(stripped)
-        .map_err(|e| WebError::BadRequest(format!("invalid hex: {e}")))?;
+    let bytes =
+        hex::decode(stripped).map_err(|e| WebError::BadRequest(format!("invalid hex: {e}")))?;
     if bytes.len() != 20 {
         return Err(WebError::BadRequest(format!(
             "address must be 20 bytes, got {}",
@@ -256,10 +255,7 @@ pub async fn project_rename(
     Ok(cell.into_response())
 }
 
-async fn build_project_cell(
-    state: &AppState,
-    slug: &str,
-) -> Result<ProjectCell, WebError> {
+async fn build_project_cell(state: &AppState, slug: &str) -> Result<ProjectCell, WebError> {
     let header = queries::project_header(state.store.pool(), slug).await?;
     let display_name = header
         .and_then(|h| h.project_name)

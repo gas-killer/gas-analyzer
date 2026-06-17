@@ -219,7 +219,10 @@ impl Analyzer for EvmSketchAnalyzer {
 
         // 6. Estimate. Try measured first; on failure, fall back to heuristic.
         let estimate_result: Result<u64, String> = if state_updates.is_empty() {
-            Ok(estimate_gas_from_state_updates(&state_updates, call_gas_total))
+            Ok(estimate_gas_from_state_updates(
+                &state_updates,
+                call_gas_total,
+            ))
         } else {
             let gk = GasKillerEvmSketchDefault::builder(self.rpc_url.clone())
                 .at_block(BlockNumberOrTag::Number(block_number))
@@ -267,7 +270,10 @@ impl Analyzer for EvmSketchAnalyzer {
             is_heuristic,
             failure_reason,
             state_update_count: state_updates.len() as u32,
-            skipped_opcodes: skipped_opcodes.into_iter().map(|o| format!("{o:?}")).collect(),
+            skipped_opcodes: skipped_opcodes
+                .into_iter()
+                .map(|o| format!("{o:?}"))
+                .collect(),
         })
     }
 }

@@ -48,16 +48,18 @@ impl LlmClient {
     /// Single-turn chat completion. `system` is the role/style frame,
     /// `user` is the data bundle + question. Returns the model's content
     /// and the token counts.
-    pub async fn complete(
-        &self,
-        system: &str,
-        user: &str,
-    ) -> Result<LlmResponse, LlmError> {
+    pub async fn complete(&self, system: &str, user: &str) -> Result<LlmResponse, LlmError> {
         let body = ChatRequest {
             model: &self.model,
             messages: vec![
-                Message { role: "system", content: system },
-                Message { role: "user", content: user },
+                Message {
+                    role: "system",
+                    content: system,
+                },
+                Message {
+                    role: "user",
+                    content: user,
+                },
             ],
             temperature: 0.2,
             max_tokens: 600,
