@@ -48,7 +48,10 @@ pub async fn run(common: CommonConfig, cfg: HeadTrackerConfig) -> Result<()> {
         // last-head value even when we're throttled by backpressure.
         let head = {
             let _p = limiter.acquire(weights::HEAD_POLL).await;
-            provider.get_block_number().await.context("get_block_number")?
+            provider
+                .get_block_number()
+                .await
+                .context("get_block_number")?
         };
         if let Err(e) = queue.publish_last_head(head).await {
             tracing::warn!(error = %e, "publish_last_head failed");
@@ -70,8 +73,7 @@ pub async fn run(common: CommonConfig, cfg: HeadTrackerConfig) -> Result<()> {
         // Catch up one block at a time. The worker pool — not the head-tracker
         // — handles per-tx throughput.
         let block_n = next_block;
-        if let Err(e) = enqueue_block(&provider, &limiter, &queue, common.chain_id, block_n).await
-        {
+        if let Err(e) = enqueue_block(&provider, &limiter, &queue, common.chain_id, block_n).await {
             // Transient failure: log and retry the same block on next iteration.
             tracing::warn!(block_n, error = %e, "enqueue_block failed, will retry");
             sleep(Duration::from_millis(2000)).await;

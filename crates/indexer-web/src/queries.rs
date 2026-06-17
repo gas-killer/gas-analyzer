@@ -74,30 +74,34 @@ pub async fn overview_totals(
 ) -> Result<OverviewTotals, WebError> {
     let floor_day = floor("day");
     let row = match window.interval_clause() {
-        None => sqlx::query_as::<_, OverviewTotals>(&format!(
-            r#"SELECT
+        None => {
+            sqlx::query_as::<_, OverviewTotals>(&format!(
+                r#"SELECT
                  COALESCE(SUM(usd_saved_total), 0)::numeric  AS usd_saved,
                  COALESCE(SUM(wei_saved_total), 0)::numeric  AS wei_saved,
                  COALESCE(SUM(tx_count), 0)::bigint          AS tx_count,
                  COUNT(DISTINCT project_slug)::bigint        AS project_count
                FROM project_daily
                WHERE chain_id = $1{floor_day}"#
-        ))
-        .bind(chain_id)
-        .fetch_one(pool)
-        .await?,
-        Some(interval) => sqlx::query_as::<_, OverviewTotals>(&format!(
-            r#"SELECT
+            ))
+            .bind(chain_id)
+            .fetch_one(pool)
+            .await?
+        }
+        Some(interval) => {
+            sqlx::query_as::<_, OverviewTotals>(&format!(
+                r#"SELECT
                  COALESCE(SUM(usd_saved_total), 0)::numeric  AS usd_saved,
                  COALESCE(SUM(wei_saved_total), 0)::numeric  AS wei_saved,
                  COALESCE(SUM(tx_count), 0)::bigint          AS tx_count,
                  COUNT(DISTINCT project_slug)::bigint        AS project_count
                FROM project_daily
                WHERE chain_id = $1 AND day >= (now() - interval '{interval}')::date{floor_day}"#
-        ))
-        .bind(chain_id)
-        .fetch_one(pool)
-        .await?,
+            ))
+            .bind(chain_id)
+            .fetch_one(pool)
+            .await?
+        }
     };
     Ok(row)
 }
@@ -572,11 +576,17 @@ impl TxFilters {
     fn where_clause(&self, next_idx: &mut usize) -> String {
         let mut s = String::new();
         if self.from.is_some() {
-            s.push_str(&format!(" AND block_timestamp >= ${}::timestamptz", next_idx));
+            s.push_str(&format!(
+                " AND block_timestamp >= ${}::timestamptz",
+                next_idx
+            ));
             *next_idx += 1;
         }
         if self.to.is_some() {
-            s.push_str(&format!(" AND block_timestamp <  ${}::timestamptz", next_idx));
+            s.push_str(&format!(
+                " AND block_timestamp <  ${}::timestamptz",
+                next_idx
+            ));
             *next_idx += 1;
         }
         if self.min_gas_saved.is_some() {
@@ -1057,10 +1067,7 @@ pub struct BlacklistRow {
     pub created_at: DateTime<Utc>,
 }
 
-pub async fn blacklist_list(
-    pool: &PgPool,
-    chain_id: i64,
-) -> Result<Vec<BlacklistRow>, WebError> {
+pub async fn blacklist_list(pool: &PgPool, chain_id: i64) -> Result<Vec<BlacklistRow>, WebError> {
     let rows = sqlx::query_as::<_, BlacklistRow>(
         r#"SELECT chain_id, address, selector, reason, created_by, created_at
            FROM analysis_exclusion
@@ -1124,10 +1131,7 @@ pub struct UnknownRow {
     pub last_seen: Option<DateTime<Utc>>,
 }
 
-pub async fn top_unknowns(
-    pool: &PgPool,
-    chain_id: i64,
-) -> Result<Vec<UnknownRow>, WebError> {
+pub async fn top_unknowns(pool: &PgPool, chain_id: i64) -> Result<Vec<UnknownRow>, WebError> {
     let floor_ts = floor("block_timestamp");
     let rows = sqlx::query_as::<_, UnknownRow>(&format!(
         r#"SELECT
@@ -1243,10 +1247,7 @@ pub async fn resolved_label(
 
 /// Heuristic-fallback share over the last 24h. Returns `None` when there
 /// are no analyses in the window (don't render anything).
-pub async fn heuristic_rate_24h(
-    pool: &PgPool,
-    chain_id: i64,
-) -> Result<Option<f64>, WebError> {
+pub async fn heuristic_rate_24h(pool: &PgPool, chain_id: i64) -> Result<Option<f64>, WebError> {
     let row: (Option<i64>, Option<i64>) = sqlx::query_as(
         r#"SELECT
              count(*) FILTER (WHERE is_heuristic)::bigint AS heuristic_count,

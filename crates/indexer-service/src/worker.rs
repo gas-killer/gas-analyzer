@@ -77,10 +77,12 @@ async fn handle(
         analyzer.analyze_tx(hash),
     )
     .await
-    .unwrap_or_else(|_| Err(AnalyzerError::Rpc(format!(
-        "analyze_tx timed out after {}s",
-        cfg.analyze_timeout_secs
-    ))));
+    .unwrap_or_else(|_| {
+        Err(AnalyzerError::Rpc(format!(
+            "analyze_tx timed out after {}s",
+            cfg.analyze_timeout_secs
+        )))
+    });
 
     match analyze {
         Ok(report) => {

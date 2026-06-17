@@ -64,8 +64,8 @@ pub struct RateLimiterConfig {
 impl Default for RateLimiterConfig {
     fn default() -> Self {
         Self {
-            rps_budget: 240,    // ~80% of a 300 rps plan
-            burst: 60,          // small headroom for short spikes
+            rps_budget: 240, // ~80% of a 300 rps plan
+            burst: 60,       // small headroom for short spikes
             max_concurrency: 16,
         }
     }
@@ -269,9 +269,7 @@ mod tests {
             |_| true,
             || {
                 let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                async move {
-                    if n < 3 { Err("fail") } else { Ok(n) }
-                }
+                async move { if n < 3 { Err("fail") } else { Ok(n) } }
             },
         )
         .await;

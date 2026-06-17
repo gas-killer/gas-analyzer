@@ -26,8 +26,7 @@ use crate::config::{CommonConfig, RefresherConfig};
 /// empty agent), while a browser-like string passes — same reason a plain
 /// `curl` succeeds from the same host. Without this the price refresh and
 /// historical backfill both fail with 403.
-const COINGECKO_USER_AGENT: &str =
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+const COINGECKO_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
 /// Counts returned by `refresh_resolver_now` so callers (loop, admin button)
 /// can report what changed.
@@ -111,7 +110,13 @@ pub async fn run(common: CommonConfig, cfg: RefresherConfig) -> Result<()> {
         crate::fourbyte_resolver::run(common_e, cfg_e, store_e).await;
     });
 
-    let _ = tokio::try_join!(resolver_loop, price_loop, rollup_loop, labeler_loop, fourbyte_loop);
+    let _ = tokio::try_join!(
+        resolver_loop,
+        price_loop,
+        rollup_loop,
+        labeler_loop,
+        fourbyte_loop
+    );
     Ok(())
 }
 
@@ -323,8 +328,7 @@ pub async fn backfill_eth_prices_now(
 
     // Bucket by day, taking the first sample we see (coingecko returns them
     // in ascending order; daily buckets will only have one anyway).
-    let mut by_day: std::collections::BTreeMap<NaiveDate, f64> =
-        std::collections::BTreeMap::new();
+    let mut by_day: std::collections::BTreeMap<NaiveDate, f64> = std::collections::BTreeMap::new();
     for [ts_ms, price] in resp.prices {
         let secs = (ts_ms / 1000.0) as i64;
         let dt: DateTime<Utc> = match Utc.timestamp_opt(secs, 0).single() {
@@ -350,8 +354,8 @@ pub async fn backfill_eth_prices_now(
             skipped += 1;
             continue;
         }
-        let bd = BigDecimal::from_str(&format!("{:.8}", price))
-            .unwrap_or_else(|_| BigDecimal::from(0));
+        let bd =
+            BigDecimal::from_str(&format!("{:.8}", price)).unwrap_or_else(|_| BigDecimal::from(0));
         store.upsert_eth_price(day, bd).await?;
         inserted += 1;
         min_day = Some(min_day.map_or(day, |d| d.min(day)));

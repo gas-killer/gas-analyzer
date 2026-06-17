@@ -37,7 +37,11 @@ pub struct CommonConfig {
     pub min_gas_used: u64,
 
     /// Path to the curated address-overlay YAML.
-    #[arg(long, env = "OVERLAY_PATH", default_value = "/etc/indexer/overlay.yaml")]
+    #[arg(
+        long,
+        env = "OVERLAY_PATH",
+        default_value = "/etc/indexer/overlay.yaml"
+    )]
     pub overlay_path: PathBuf,
 
     /// DefiLlama protocols endpoint. Empty string disables.
