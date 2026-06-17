@@ -52,6 +52,9 @@ pub enum SkipReason {
     BelowGasThreshold,
     Reverted,
     EmptyTrace,
+    /// Trace parsed but yielded no extractable state updates — nothing to
+    /// model, so skip rather than estimate over an empty set (#158).
+    NoStateUpdates,
 }
 
 impl std::fmt::Display for SkipReason {
@@ -62,6 +65,7 @@ impl std::fmt::Display for SkipReason {
             SkipReason::BelowGasThreshold => write!(f, "below gas threshold"),
             SkipReason::Reverted => write!(f, "tx reverted on-chain"),
             SkipReason::EmptyTrace => write!(f, "empty debug trace"),
+            SkipReason::NoStateUpdates => write!(f, "no extracted state updates"),
         }
     }
 }
@@ -192,20 +196,21 @@ impl Analyzer for EvmSketchAnalyzer {
         .unwrap_or([0u8; 4]);
 
         // 4. Compute state updates from the actual historical trace.
-        // Retry transient transport errors before falling back to heuristic.
-        let trace_result = with_retry(&retry_cfg, is_transient_rpc_error, || async {
-            compute_state_updates_from_tx(provider, tx_hash).await
-        })
-        .await;
-        let (state_updates, skipped_opcodes, call_gas_total) = match trace_result {
-            Ok(t) => t,
-            Err(e) => {
-                // Tx succeeded on-chain (we checked above) but trace
-                // extraction failed — mirror the CLI's heuristic fallback.
-                tracing::warn!(error = %e, "trace extraction failed; using heuristic");
-                (Vec::new(), std::collections::HashSet::new(), 0u64)
-            }
-        };
+        // A trace failure is a real error (worker retries / dead-letters), not
+        // an empty state-update list — coercing it to empty produced the bogus
+        // flat ~271k estimate (#158).
+        let (state_updates, skipped_opcodes, call_gas_total) =
+            with_retry(&retry_cfg, is_transient_rpc_error, || async {
+                compute_state_updates_from_tx(provider, tx_hash).await
+            })
+            .await
+            .map_err(|e| AnalyzerError::Trace(format!("trace extraction failed: {e}")))?;
+
+        // Nothing to model with no state updates. The heuristic is only
+        // meaningful with a non-empty set (as in the CLI), so skip instead.
+        if state_updates.is_empty() {
+            return Err(AnalyzerError::Skipped(SkipReason::NoStateUpdates));
+        }
 
         // 5. Mid-block state — fetch preceding transactions.
         let preceding_txs = match get_preceding_transactions(provider, block_number, tx_index).await
@@ -217,34 +222,24 @@ impl Analyzer for EvmSketchAnalyzer {
             }
         };
 
-        // 6. Estimate. Try measured first; on failure, fall back to heuristic.
-        let estimate_result: Result<u64, String> = if state_updates.is_empty() {
-            Ok(estimate_gas_from_state_updates(
-                &state_updates,
-                call_gas_total,
-            ))
-        } else {
-            let gk = GasKillerEvmSketchDefault::builder(self.rpc_url.clone())
-                .at_block(BlockNumberOrTag::Number(block_number))
-                .build()
-                .await
-                .map_err(|e| AnalyzerError::Estimation(format!("builder.build: {e}")))?;
+        // 6. Estimate: measured first, heuristic fallback (non-empty set).
+        let gk = GasKillerEvmSketchDefault::builder(self.rpc_url.clone())
+            .at_block(BlockNumberOrTag::Number(block_number))
+            .build()
+            .await
+            .map_err(|e| AnalyzerError::Estimation(format!("builder.build: {e}")))?;
 
-            match gk.estimate_state_changes_gas_with_preceding(
+        let (gaskiller_gas_estimate, is_heuristic, failure_reason) = match gk
+            .estimate_state_changes_gas_with_preceding(
                 to,
                 tx_sender,
                 &state_updates,
                 &preceding_txs,
             ) {
-                Ok(g) => Ok(g),
-                Err(e) => Err(format!("{e}")),
-            }
-        };
-
-        let (gaskiller_gas_estimate, is_heuristic, failure_reason) = match estimate_result {
             Ok(g) => (g + TURETZKY_UPPER_GAS_LIMIT, false, None),
-            Err(reason) => {
+            Err(e) => {
                 let heuristic = estimate_gas_from_state_updates(&state_updates, call_gas_total);
+                let reason = format!("{e}");
                 let truncated = reason.lines().next().unwrap_or("unknown").to_string();
                 (heuristic + TURETZKY_UPPER_GAS_LIMIT, true, Some(truncated))
             }
@@ -285,6 +280,10 @@ mod tests {
     #[test]
     fn skip_reason_display() {
         assert_eq!(SkipReason::Reverted.to_string(), "tx reverted on-chain");
+        assert_eq!(
+            SkipReason::NoStateUpdates.to_string(),
+            "no extracted state updates"
+        );
     }
 
     #[test]
