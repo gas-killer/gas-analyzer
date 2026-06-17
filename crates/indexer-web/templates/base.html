@@ -10,7 +10,7 @@
 </head>
 <body>
 <header class="nav">
-    <div class="nav-brand"><a href="/">Gas Killer</a> <span class="muted">/ chain {{ chain_id }}</span></div>
+    <div class="nav-brand"><a href="/">Gas Killer</a> <span class="muted">/ {% if chain_id == 1 %}Ethereum{% else if chain_id == 11155111 %}Sepolia{% else %}chain {{ chain_id }}{% endif %}</span></div>
     <nav>
         <a href="/">Overview</a>
         <a href="/unknowns">Triage</a>
