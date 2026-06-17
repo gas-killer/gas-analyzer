@@ -213,7 +213,35 @@ docker compose up -d
 # Open the dashboard: http://<host>:3000 — sign in with the user you added.
 ```
 
-**Multi-chain**: stand up a second compose stack with a different `CHAIN_ID`, separate Postgres database, and a different RPC endpoint. The service does not multiplex chains in one process by design.
+**Multi-chain**: stand up a second compose stack with a different `CHAIN_ID`, separate Postgres database, and a different RPC endpoint. The service does not multiplex chains in one process by design — every layer is chain-partitioned (`analysis.chain_id` in the PK, MVs grouped by `chain_id`, every web query filters `WHERE chain_id = $1`), so a new chain is a deployment, not a code change.
+
+### Running a second chain (Sepolia)
+
+`docker-compose.sepolia.yml` is a ready-made second stack for Ethereum Sepolia (chain `11155111`) — its own Postgres, Redis, networks and volumes, isolated from the mainnet project, with the dashboard on `127.0.0.1:3001`.
+
+```bash
+# Add the Sepolia RPC to .env (must support debug_traceTransaction).
+echo 'SEPOLIA_RPC_URL=https://your-sepolia-rpc' >> .env
+
+# Build the shared image (skip if the mainnet stack already built it).
+docker compose -f docker-compose.sepolia.yml build indexer-build
+
+# Start the Sepolia stack. Schema auto-migrates on first boot
+# (worker/refresher call store.migrate()).
+docker compose -f docker-compose.sepolia.yml up -d
+
+# Dashboard on :3001 — reverse-proxy sepolia.<your-domain> at it.
+# Logs / psql / teardown:
+docker compose -f docker-compose.sepolia.yml logs -f head-tracker worker
+docker compose -f docker-compose.sepolia.yml exec postgres psql -U indexer indexer
+docker compose -f docker-compose.sepolia.yml down            # add -v to wipe data
+```
+
+It reuses `POSTGRES_PASSWORD` / `SESSION_SECRET` / `ETHERSCAN_API_KEY` / `OPENROUTER_*` / `users.yaml` from the mainnet `.env`. What differs on Sepolia, and why:
+
+- **USD is priced at the mainnet ETH rate.** Testnet ETH has no market; the CoinGecko endpoint fetches `ethereum` regardless of chain, so "$ saved" reads as *would-save-on-mainnet* — useful for BD framing.
+- **DefiLlama is disabled** (`DEFILLAMA_URL=""`). Its `/protocols` list is mainnet-only (chain_id 1) and can never match a Sepolia tx. Labeling falls back to Etherscan (the V2 API resolves Sepolia via `chainid=11155111` with the same key) plus `overlay.yaml` manual mappings — add entries with `chain_id: 11155111`.
+- **Gas estimation uses the mainnet hardfork spec** (`EthSpec::mainnet()`). Per-opcode gas costs are identical to Sepolia at the current fork, so estimates are valid. The only caveat is the brief windows where Sepolia activates a fork ahead of mainnet — re-validate around network upgrades.
 
 ## Labeling unknown contracts
 

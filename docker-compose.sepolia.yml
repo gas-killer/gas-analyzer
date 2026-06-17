@@ -1,0 +1,195 @@
+# =============================================================================
+# Sepolia stack — a second, fully-isolated indexer deployment for chain
+# 11155111 (Ethereum Sepolia testnet).
+#
+# The schema, rollups and every web query are already chain-partitioned
+# (`analysis.chain_id`, MVs grouped by chain_id, `WHERE chain_id = $1`), so a
+# second chain needs no code changes — only a second service stack pointed at
+# a Sepolia RPC with `CHAIN_ID=11155111`.
+#
+# This file is a standalone Compose *project* (`name:` below) with its own
+# Postgres, Redis, networks and volumes — physically isolated from the mainnet
+# stack in docker-compose.yml. Both can run side by side on one host.
+#
+#   # build the shared image once (either stack's indexer-build does it)
+#   docker compose -f docker-compose.sepolia.yml build indexer-build
+#   # bring up the Sepolia stack
+#   docker compose -f docker-compose.sepolia.yml up -d
+#
+# Schema is auto-applied on first boot (worker/refresher call store.migrate()).
+# Dashboard listens on 127.0.0.1:3001 — point sepolia.<your-domain> at it.
+#
+# Required env (see .env / .env.example):
+#   SEPOLIA_RPC_URL   Sepolia JSON-RPC with debug_traceTransaction support
+#   POSTGRES_PASSWORD shared with the mainnet stack's .env
+#   SESSION_SECRET    shared
+#   ETHERSCAN_API_KEY optional; the V2 API resolves Sepolia via chainid=11155111
+# =============================================================================
+
+name: gas-killer-sepolia
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: indexer
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: indexer
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      # Loopback-only, distinct host port so it never collides with the
+      # mainnet stack's 5432. `psql -h 127.0.0.1 -p 5433 -U indexer indexer`.
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "indexer", "-d", "indexer"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  indexer-build:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gas-killer/indexer-service:local
+    entrypoint: ["true"]
+    profiles: ["build"]
+
+  head-tracker:
+    image: gas-killer/indexer-service:local
+    command: ["/usr/local/bin/indexer-service", "head-tracker"]
+    mem_limit: 512m
+    environment:
+      RPC_URL: ${SEPOLIA_RPC_URL:?set SEPOLIA_RPC_URL}
+      CHAIN_ID: 11155111
+      DATABASE_URL: postgres://indexer:${POSTGRES_PASSWORD}@postgres:5432/indexer
+      REDIS_URL: redis://redis:6379
+      RPC_RPS_BUDGET: ${SEPOLIA_RPC_RPS_BUDGET:-100}
+      RPC_BURST: ${SEPOLIA_RPC_BURST:-25}
+      RPC_MAX_CONCURRENCY: ${SEPOLIA_RPC_MAX_CONCURRENCY:-8}
+      MIN_GAS_USED: ${MIN_GAS_USED:-50000}
+      MAX_QUEUE_DEPTH: ${MAX_QUEUE_DEPTH:-1000}
+      HEAD_POLL_MS: ${HEAD_POLL_MS:-4000}
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    image: gas-killer/indexer-service:local
+    command: ["/usr/local/bin/indexer-service", "worker"]
+    mem_limit: 1g
+    # Sepolia volume is low — one worker is plenty. Bump replicas if the
+    # pending queue grows.
+    deploy:
+      replicas: 1
+    environment:
+      RPC_URL: ${SEPOLIA_RPC_URL:?set SEPOLIA_RPC_URL}
+      CHAIN_ID: 11155111
+      DATABASE_URL: postgres://indexer:${POSTGRES_PASSWORD}@postgres:5432/indexer
+      REDIS_URL: redis://redis:6379
+      RPC_RPS_BUDGET: ${SEPOLIA_RPC_RPS_BUDGET:-100}
+      RPC_BURST: ${SEPOLIA_RPC_BURST:-25}
+      RPC_MAX_CONCURRENCY: ${SEPOLIA_RPC_MAX_CONCURRENCY:-8}
+      MIN_GAS_USED: ${MIN_GAS_USED:-50000}
+      WORKER_MAX_RETRIES: ${WORKER_MAX_RETRIES:-3}
+      OVERLAY_PATH: /etc/indexer/overlay.yaml
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  refresher:
+    image: gas-killer/indexer-service:local
+    command: ["/usr/local/bin/indexer-service", "refresher"]
+    mem_limit: 768m
+    environment:
+      RPC_URL: ${SEPOLIA_RPC_URL:?set SEPOLIA_RPC_URL}
+      CHAIN_ID: 11155111
+      DATABASE_URL: postgres://indexer:${POSTGRES_PASSWORD}@postgres:5432/indexer
+      REDIS_URL: redis://redis:6379
+      OVERLAY_PATH: /etc/indexer/overlay.yaml
+      # DefiLlama's /protocols list is Ethereum-mainnet only (chain_id 1), so it
+      # can never match a Sepolia (11155111) tx. Disable the bulk harvest;
+      # overlay.yaml manual mappings (keyed by chain_id) still load.
+      DEFILLAMA_URL: ""
+      # USD is priced at the mainnet ETH rate (testnet ETH has no market) — the
+      # CoinGecko endpoint fetches `ethereum` regardless of chain, so this is the
+      # same URL the mainnet stack uses. "$ saved" reads as would-save-on-mainnet.
+      PRICE_URL: ${PRICE_URL:-https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd}
+      RESOLVER_REFRESH_SECS: ${RESOLVER_REFRESH_SECS:-86400}
+      PRICE_REFRESH_SECS: ${PRICE_REFRESH_SECS:-3600}
+      ROLLUP_REFRESH_SECS: ${ROLLUP_REFRESH_SECS:-3600}
+      # Etherscan V2 resolves Sepolia via chainid=11155111 with the same key.
+      ETHERSCAN_API_KEY: ${ETHERSCAN_API_KEY:-}
+      LABELER_PRODUCER_INTERVAL_SECS: ${LABELER_PRODUCER_INTERVAL_SECS:-3600}
+      LABELER_BATCH_SIZE: ${LABELER_BATCH_SIZE:-200}
+      LABELER_RETRY_DAYS: ${LABELER_RETRY_DAYS:-7}
+      LABELER_MIN_DELAY_MS: ${LABELER_MIN_DELAY_MS:-250}
+      KNOWN_NAMES_PATH: /etc/indexer/known_names.yaml
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  indexer-web:
+    image: gas-killer/indexer-service:local
+    command: ["/usr/local/bin/indexer-web"]
+    mem_limit: 512m
+    environment:
+      OPENROUTER_KEY: ${OPENROUTER_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-anthropic/claude-sonnet-4-6}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      DATABASE_URL: postgres://indexer:${POSTGRES_PASSWORD}@postgres:5432/indexer
+      REDIS_URL: redis://redis:6379
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET}
+      AUTH_ALLOWLIST_PATH: /etc/indexer/users.yaml
+      BIND_ADDR: 0.0.0.0:3000
+      CHAIN_ID: 11155111
+      EXPLORER_TX_URL: ${SEPOLIA_EXPLORER_TX_URL:-https://sepolia.etherscan.io/tx/}
+      EXPLORER_ADDRESS_URL: ${SEPOLIA_EXPLORER_ADDRESS_URL:-https://sepolia.etherscan.io/address/}
+      STATIC_DIR: /opt/indexer-web/static
+      # Mirror the refresh-source vars so the manual refresh buttons hit the
+      # same upstreams the refresher loop uses (DefiLlama disabled as above).
+      DEFILLAMA_URL: ""
+      PRICE_URL: ${PRICE_URL:-https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd}
+      LABELER_BATCH_SIZE: ${LABELER_BATCH_SIZE:-200}
+      LABELER_RETRY_DAYS: ${LABELER_RETRY_DAYS:-7}
+      ETHERSCAN_API_KEY: ${ETHERSCAN_API_KEY:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      # Distinct host port from the mainnet dashboard (3000). Reverse-proxy
+      # sepolia.<your-domain> here.
+      - "127.0.0.1:3001:3000"
+    volumes:
+      - ./users.yaml:/etc/indexer/users.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
