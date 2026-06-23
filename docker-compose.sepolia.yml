@@ -58,6 +58,26 @@ services:
       timeout: 3s
       retries: 12
 
+  # Egress rate-limiter for the Sepolia RPC — see docker-compose.yml's rpc-proxy
+  # for the full rationale. Separate instance with its own upstream + rate so it
+  # can't bypass the limit via EvmSketch's internal provider. Config-only.
+  rpc-proxy:
+    image: nginx:1.27-alpine
+    mem_limit: 128m
+    environment:
+      UPSTREAM_RPC_URL: ${SEPOLIA_RPC_URL:?set SEPOLIA_RPC_URL}
+      RPC_PROXY_RATE: ${SEPOLIA_RPC_PROXY_RATE:-40}
+      NGINX_ENVSUBST_FILTER: "UPSTREAM_|RPC_PROXY_"
+    volumes:
+      - ./docker/rpc-proxy/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./docker/rpc-proxy/05-parse-rpc-url.envsh:/docker-entrypoint.d/05-parse-rpc-url.envsh:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8545/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   indexer-build:
     build:
       context: .
@@ -71,12 +91,15 @@ services:
     command: ["/usr/local/bin/indexer-service", "head-tracker"]
     mem_limit: 512m
     environment:
-      RPC_URL: ${SEPOLIA_RPC_URL:?set SEPOLIA_RPC_URL}
+      # Routed through the egress rate-limiter, not the upstream directly.
+      RPC_URL: http://rpc-proxy:8545
       CHAIN_ID: 11155111
       DATABASE_URL: postgres://indexer:${POSTGRES_PASSWORD}@postgres:5432/indexer
       REDIS_URL: redis://redis:6379
       RPC_RPS_BUDGET: ${SEPOLIA_RPC_RPS_BUDGET:-100}
-      RPC_BURST: ${SEPOLIA_RPC_BURST:-25}
+      # >= weights::ANALYZE_TX (250) so the in-process limiter stops clamping;
+      # the rpc-proxy is now the authoritative rate limit.
+      RPC_BURST: ${SEPOLIA_RPC_BURST:-250}
       RPC_MAX_CONCURRENCY: ${SEPOLIA_RPC_MAX_CONCURRENCY:-8}
       MIN_GAS_USED: ${MIN_GAS_USED:-50000}
       MAX_QUEUE_DEPTH: ${MAX_QUEUE_DEPTH:-1000}
@@ -86,6 +109,8 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      rpc-proxy:
         condition: service_healthy
     restart: unless-stopped
 
@@ -98,12 +123,15 @@ services:
     deploy:
       replicas: 1
     environment:
-      RPC_URL: ${SEPOLIA_RPC_URL:?set SEPOLIA_RPC_URL}
+      # Routed through the egress rate-limiter, not the upstream directly.
+      RPC_URL: http://rpc-proxy:8545
       CHAIN_ID: 11155111
       DATABASE_URL: postgres://indexer:${POSTGRES_PASSWORD}@postgres:5432/indexer
       REDIS_URL: redis://redis:6379
       RPC_RPS_BUDGET: ${SEPOLIA_RPC_RPS_BUDGET:-100}
-      RPC_BURST: ${SEPOLIA_RPC_BURST:-25}
+      # >= weights::ANALYZE_TX (250) so the in-process limiter stops clamping;
+      # the rpc-proxy is now the authoritative rate limit.
+      RPC_BURST: ${SEPOLIA_RPC_BURST:-250}
       RPC_MAX_CONCURRENCY: ${SEPOLIA_RPC_MAX_CONCURRENCY:-8}
       MIN_GAS_USED: ${MIN_GAS_USED:-50000}
       WORKER_MAX_RETRIES: ${WORKER_MAX_RETRIES:-3}
@@ -113,6 +141,8 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      rpc-proxy:
         condition: service_healthy
     restart: unless-stopped
 
