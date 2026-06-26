@@ -111,11 +111,14 @@ pub mod simple_rpc_db;
 use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 
 use gas_analyzer_core::{
-    Opcode, StateUpdate, compute_state_updates, encode_state_updates_to_abi,
+    Opcode, PrestateEligibility, StateUpdate, build_state_updates_from_prestate,
+    classify_prestate_eligibility, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_operations, extract_operation_counts_from_trace,
 };
 use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
-use gas_analyzer_rpc::get_trace_from_call;
+use gas_analyzer_rpc::{
+    get_call_frame_from_call, get_prestate_diff_from_call, get_trace_from_call,
+};
 
 // ============================================================================
 // Executor Types
@@ -800,15 +803,13 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 
     let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
 
-    // Run debug_traceCall and executor cache lookup concurrently — they are
-    // fully independent. On a cache miss this hides the entire executor build
-    // behind the trace fetch.
-    let (trace, executor) = tokio::try_join!(
-        get_trace_from_call(&provider, tx_request, block_id),
+    // Extract the state updates (hybrid prestate/struct-log path) and build the executor
+    // concurrently — they are independent, so on a cache miss this hides the executor build behind
+    // the trace fetch.
+    let ((state_updates, skipped_opcodes), executor) = tokio::try_join!(
+        extract_state_updates_hybrid(&provider, tx_request, block_id, contract_address),
         cache.get_or_build(rpc_url, block_number),
     )?;
-
-    let (state_updates, skipped_opcodes, _call_gas_total) = compute_state_updates(trace)?;
     tracing::Span::current().record("state_update_count", state_updates.len());
 
     let storage_updates = encode_state_updates_to_abi(&state_updates);
@@ -831,6 +832,52 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
         .await?;
 
     Ok((storage_updates, gas_estimate, false, skipped_opcodes))
+}
+
+/// Extract `(state_updates, skipped_opcodes)` for a simulated call, preferring the cheap prestate fast
+/// path and falling back to the struct-log path when it can't be used.
+///
+/// The fast path (`prestateTracer` diff + `callTracer` logs, `O(changed slots)`) is what lets
+/// heavy-compute tracked functions — whose struct-log trace times out the node — be extracted at all.
+/// It is taken only when [`classify_prestate_eligibility`] proves it sound (no cross-contract storage,
+/// no regular CALL / CREATE / SELFDESTRUCT); otherwise, and on any tracer error (e.g. a node that does
+/// not support these tracers), we fall back to `get_trace_from_call` + `compute_state_updates`, which is
+/// the previous behaviour. The fallback owns `tx_request`, so the fast path only borrows it.
+async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
+    provider: &P,
+    tx_request: TransactionRequest,
+    block: BlockId,
+    consumer: Address,
+) -> Result<(Vec<StateUpdate>, HashSet<Opcode>)> {
+    if let Ok(Some(updates)) = try_prestate_fast_path(provider, &tx_request, block, consumer).await
+    {
+        return Ok((updates, HashSet::new()));
+    }
+    let trace = get_trace_from_call(provider, tx_request, block).await?;
+    let (state_updates, skipped_opcodes, _call_gas_total) = compute_state_updates(trace)?;
+    Ok((state_updates, skipped_opcodes))
+}
+
+/// Try the prestate fast path: `Ok(Some(updates))` when eligible, `Ok(None)` when the call needs the
+/// struct-log fallback, `Err` when the prestate/call tracers are unavailable or fail (also a fallback
+/// signal). Never returns an unsound diff.
+async fn try_prestate_fast_path<P: Provider + DebugApi>(
+    provider: &P,
+    tx_request: &TransactionRequest,
+    block: BlockId,
+    consumer: Address,
+) -> Result<Option<Vec<StateUpdate>>> {
+    let diff = get_prestate_diff_from_call(provider, tx_request.clone(), block).await?;
+    let frame = get_call_frame_from_call(provider, tx_request.clone(), block).await?;
+    match classify_prestate_eligibility(&frame, &diff, consumer) {
+        PrestateEligibility::Eligible => Ok(Some(build_state_updates_from_prestate(
+            consumer, &diff, &frame,
+        ))),
+        PrestateEligibility::Fallback(reason) => {
+            tracing::debug!(reason = %reason, "prestate fast path not eligible; using struct-log path");
+            Ok(None)
+        }
+    }
 }
 
 // ============================================================================

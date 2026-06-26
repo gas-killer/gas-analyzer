@@ -8,8 +8,8 @@ use std::collections::HashSet;
 
 use alloy::primitives::FixedBytes;
 use alloy::rpc::types::trace::geth::{
-    DefaultFrame, GethDebugTracingCallOptions, GethDebugTracingOptions, GethDefaultTracingOptions,
-    GethTrace,
+    CallConfig, CallFrame, DefaultFrame, DiffMode, GethDebugTracingCallOptions,
+    GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace, PreStateConfig, PreStateFrame,
 };
 use alloy_eips::BlockId;
 use alloy_provider::Provider;
@@ -86,6 +86,68 @@ where
     };
 
     Ok(trace)
+}
+
+/// Simulate a call and return the `prestateTracer` diff (`diffMode`): per-account pre/post storage.
+///
+/// Cost is `O(changed slots)` rather than `O(execution steps)`, so this succeeds on heavy-compute
+/// tracked functions whose struct-log trace would time out the node. Used together with
+/// [`get_call_frame_from_call`] by the prestate fast path (see `gas_analyzer_core::prestate`).
+pub async fn get_prestate_diff_from_call<P, Req>(
+    provider: &P,
+    tx_request: Req,
+    block: BlockId,
+) -> Result<DiffMode>
+where
+    P: Provider + DebugApi,
+    Req: Into<alloy::rpc::types::eth::TransactionRequest>,
+{
+    let options = GethDebugTracingCallOptions {
+        tracing_options: GethDebugTracingOptions::prestate_tracer(PreStateConfig {
+            diff_mode: Some(true),
+            disable_code: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    match provider
+        .debug_trace_call(tx_request.into(), block, options)
+        .await
+        .map_err(|e| anyhow!("prestate debug_trace_call failed: {}", e))?
+    {
+        GethTrace::PreStateTracer(PreStateFrame::Diff(diff)) => Ok(diff),
+        other => Err(anyhow!("expected prestate diff frame, got {other:?}")),
+    }
+}
+
+/// Simulate a call and return the `callTracer` frame (with logs): the call tree + emitted events.
+///
+/// Used together with [`get_prestate_diff_from_call`] by the prestate fast path to recover events and to
+/// classify whether the cheap path is sound (no regular CALL / CREATE / cross-contract storage).
+pub async fn get_call_frame_from_call<P, Req>(
+    provider: &P,
+    tx_request: Req,
+    block: BlockId,
+) -> Result<CallFrame>
+where
+    P: Provider + DebugApi,
+    Req: Into<alloy::rpc::types::eth::TransactionRequest>,
+{
+    let options = GethDebugTracingCallOptions {
+        tracing_options: GethDebugTracingOptions::call_tracer(CallConfig {
+            with_log: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    match provider
+        .debug_trace_call(tx_request.into(), block, options)
+        .await
+        .map_err(|e| anyhow!("callTracer debug_trace_call failed: {}", e))?
+    {
+        GethTrace::CallTracer(frame) => Ok(frame),
+        other => Err(anyhow!("expected call frame, got {other:?}")),
+    }
 }
 
 /// Compute state updates from an existing transaction using its actual trace.
