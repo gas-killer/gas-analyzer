@@ -49,6 +49,10 @@ name    = "trace_parsing"
 harness = false
 
 [[bench]]
+name    = "prestate_parsing"
+harness = false
+
+[[bench]]
 name    = "gas_estimation"
 harness = false
 

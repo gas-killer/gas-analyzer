@@ -11,6 +11,7 @@ require-rpc-url:
 # Run the offline benchmarks (no RPC required).
 bench:
 	cargo bench -p gas-analyzer-evmsketch --bench trace_parsing
+	cargo bench -p gas-analyzer-evmsketch --bench prestate_parsing
 	cargo bench -p gas-analyzer-evmsketch --bench gas_estimation
 	cargo bench -p gas-analyzer-evmsketch --bench replay
 
@@ -25,6 +26,7 @@ bench-rpc: require-rpc-url
 #           make bench-save-baseline BASELINE=before-optimisation
 bench-save-baseline:
 	cargo bench -p gas-analyzer-evmsketch --bench trace_parsing -- --save-baseline $(BASELINE)
+	cargo bench -p gas-analyzer-evmsketch --bench prestate_parsing -- --save-baseline $(BASELINE)
 	cargo bench -p gas-analyzer-evmsketch --bench gas_estimation -- --save-baseline $(BASELINE)
 	cargo bench -p gas-analyzer-evmsketch --bench replay -- --save-baseline $(BASELINE)
 
