@@ -43,6 +43,7 @@ pub enum PrestateEligibility {
 ///     those from top-level writes), or
 ///   * does `CREATE`/`CREATE2`/`SELFDESTRUCT` (no `StateUpdate` variant represents them — the
 ///     struct-log path skips them too).
+///
 /// `STATICCALL` is read-only and ignored.
 pub fn classify_prestate_eligibility(
     frame: &CallFrame,
