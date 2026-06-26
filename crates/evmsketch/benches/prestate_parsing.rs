@@ -51,7 +51,11 @@ fn synthetic_trace() -> DefaultFrame {
             });
             written += 1;
         } else {
-            struct_logs.push(StructLog { op: "JUMPDEST".into(), depth: 1, ..Default::default() });
+            struct_logs.push(StructLog {
+                op: "JUMPDEST".into(),
+                depth: 1,
+                ..Default::default()
+            });
         }
     }
     // One LOG2 with empty data (offset 0, length 0) and two topics.
@@ -67,7 +71,12 @@ fn synthetic_trace() -> DefaultFrame {
         memory: Some(Vec::new()),
         ..Default::default()
     });
-    DefaultFrame { failed: false, gas: 0, return_value: Bytes::new(), struct_logs }
+    DefaultFrame {
+        failed: false,
+        gas: 0,
+        return_value: Bytes::new(),
+        struct_logs,
+    }
 }
 
 /// The equivalent prestate diff (`CHANGED_SLOTS` changed slots) + call frame (one LOG2) — the same
@@ -77,7 +86,8 @@ fn synthetic_prestate() -> (DiffMode, CallFrame) {
     let mut post = AccountState::default();
     for i in 0..CHANGED_SLOTS {
         pre.storage.insert(B256::from(slot_u256(i)), B256::ZERO);
-        post.storage.insert(B256::from(slot_u256(i)), B256::from(value_u256(i)));
+        post.storage
+            .insert(B256::from(slot_u256(i)), B256::from(value_u256(i)));
     }
     let mut diff = DiffMode::default();
     diff.pre.insert(CONSUMER, pre);
@@ -101,14 +111,19 @@ fn bench_extraction_paths(c: &mut Criterion) {
     let (diff, frame) = synthetic_prestate();
 
     // Sanity: both paths must yield the same number of state updates (CHANGED_SLOTS stores + 1 log).
-    let n_struct = compute_state_updates(trace.clone()).map(|(u, _, _)| u.len()).unwrap_or(0);
+    let n_struct = compute_state_updates(trace.clone())
+        .map(|(u, _, _)| u.len())
+        .unwrap_or(0);
     let n_pre = build_state_updates_from_prestate(CONSUMER, &diff, &frame).len();
     eprintln!(
         "prestate_parsing: struct-log path -> {n_struct} updates from {} steps; \
          prestate path -> {n_pre} updates from {CHANGED_SLOTS} changed slots",
         trace.struct_logs.len()
     );
-    assert_eq!(n_struct, n_pre, "both paths must produce the same number of updates");
+    assert_eq!(
+        n_struct, n_pre,
+        "both paths must produce the same number of updates"
+    );
 
     let mut group = c.benchmark_group("prestate_parsing");
     group.bench_function("compute_state_updates_heavy", |b| {
