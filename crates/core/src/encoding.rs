@@ -8,9 +8,55 @@ use alloy_sol_types::SolValue;
 
 use crate::types::{StateUpdate, StateUpdateType};
 
-/// The Turetzky upper gas limit - the floor gas cost for executing a GasKiller transaction.
-/// This represents the minimum overhead for the StateChangeHandler execution.
-pub const TURETZKY_UPPER_GAS_LIMIT: u64 = 250000u64;
+/// The Turetzky upper gas limit for BLS-verified attestations - the floor gas cost
+/// for executing a GasKiller transaction, i.e. the minimum StateChangeHandler
+/// execution overhead. The floor depends on the signature scheme used to verify the
+/// aggregated operator attestation on-chain, and BLS verification is the more
+/// expensive of the two schemes.
+pub const TURETZKY_UPPER_GAS_LIMIT_BLS: u64 = 250000u64;
+
+/// The Turetzky upper gas limit for Schnorr-verified attestations. See
+/// [`TURETZKY_UPPER_GAS_LIMIT_BLS`]; Schnorr verification is cheaper on-chain and so
+/// yields a lower floor.
+pub const TURETZKY_UPPER_GAS_LIMIT_SCHNORR: u64 = 27000u64;
+
+/// Signature scheme used to verify the aggregated operator attestation on-chain.
+///
+/// Each scheme has a different on-chain verification cost, which sets the GasKiller
+/// gas floor (the Turetzky upper gas limit). Gas figures are reported per scheme so
+/// callers can compare the trade-off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SignatureType {
+    Bls,
+    Schnorr,
+}
+
+impl SignatureType {
+    /// All signature schemes, in the order they should be reported.
+    pub const ALL: [SignatureType; 2] = [SignatureType::Bls, SignatureType::Schnorr];
+
+    /// The Turetzky upper gas limit (GasKiller gas floor) for this scheme.
+    pub fn turetzky_upper_gas_limit(self) -> u64 {
+        match self {
+            SignatureType::Bls => TURETZKY_UPPER_GAS_LIMIT_BLS,
+            SignatureType::Schnorr => TURETZKY_UPPER_GAS_LIMIT_SCHNORR,
+        }
+    }
+
+    /// Add this scheme's gas floor to a base state-change estimate to obtain the
+    /// total GasKiller gas estimate.
+    pub fn total_gas_estimate(self, base_estimate: u64) -> u64 {
+        base_estimate + self.turetzky_upper_gas_limit()
+    }
+
+    /// Human-readable label for CLI and report output.
+    pub fn label(self) -> &'static str {
+        match self {
+            SignatureType::Bls => "BLS",
+            SignatureType::Schnorr => "Schnorr",
+        }
+    }
+}
 
 /// Encode state updates to Solidity types (for contract calls).
 pub fn encode_state_updates_to_sol(
@@ -122,4 +168,46 @@ pub fn encode_state_updates_to_abi(state_updates: &[StateUpdate]) -> Bytes {
     encoded.extend_from_slice(&datas_payload);
 
     Bytes::copy_from_slice(&encoded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turetzky_upper_gas_limit_matches_scheme() {
+        assert_eq!(
+            SignatureType::Bls.turetzky_upper_gas_limit(),
+            TURETZKY_UPPER_GAS_LIMIT_BLS
+        );
+        assert_eq!(
+            SignatureType::Schnorr.turetzky_upper_gas_limit(),
+            TURETZKY_UPPER_GAS_LIMIT_SCHNORR
+        );
+        // Schnorr verification is cheaper on-chain, so its floor must be the smaller one.
+        assert!(TURETZKY_UPPER_GAS_LIMIT_SCHNORR < TURETZKY_UPPER_GAS_LIMIT_BLS);
+    }
+
+    #[test]
+    fn total_gas_estimate_adds_scheme_floor() {
+        let base = 100_000;
+        assert_eq!(
+            SignatureType::Bls.total_gas_estimate(base),
+            base + TURETZKY_UPPER_GAS_LIMIT_BLS
+        );
+        assert_eq!(
+            SignatureType::Schnorr.total_gas_estimate(base),
+            base + TURETZKY_UPPER_GAS_LIMIT_SCHNORR
+        );
+    }
+
+    #[test]
+    fn all_covers_every_scheme_with_labels() {
+        assert_eq!(
+            SignatureType::ALL,
+            [SignatureType::Bls, SignatureType::Schnorr]
+        );
+        assert_eq!(SignatureType::Bls.label(), "BLS");
+        assert_eq!(SignatureType::Schnorr.label(), "Schnorr");
+    }
 }

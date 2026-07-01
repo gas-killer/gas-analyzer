@@ -52,8 +52,8 @@ fn impl_slot() -> U256 {
 }
 
 use gas_analyzer_core::{
-    Opcode, RevertingContext, StateUpdate, TURETZKY_UPPER_GAS_LIMIT, compute_state_updates,
-    encode_state_updates_to_abi, encode_state_updates_to_sol,
+    Opcode, RevertingContext, SignatureType, StateUpdate, TURETZKY_UPPER_GAS_LIMIT_SCHNORR,
+    compute_state_updates, encode_state_updates_to_abi, encode_state_updates_to_sol,
 };
 use gas_analyzer_rpc::get_tx_trace;
 
@@ -61,7 +61,13 @@ use gas_analyzer_rpc::get_tx_trace;
 // Report Types
 // ============================================================================
 
-/// Gas analysis report for a transaction
+/// Gas analysis report for a transaction.
+///
+/// The GasKiller gas estimate is the base state-change execution cost plus the
+/// Turetzky upper gas limit, which depends on the signature scheme used to verify the
+/// aggregated operator attestation on-chain. The estimate, estimated cost, and savings
+/// are therefore reported per scheme (`_bls` / `_schnorr`) alongside the shared base
+/// estimate. Fields are flat rather than nested so the report serializes to CSV.
 #[derive(Serialize)]
 pub struct GasKillerReport {
     pub time: DateTime<Utc>,
@@ -72,10 +78,15 @@ pub struct GasKillerReport {
     pub gas_used: u64,
     pub gas_cost: u128,
     pub approx_gas_unit_price: f64,
-    pub gaskiller_gas_estimate: u64,
-    pub gaskiller_estimated_gas_cost: f64,
-    pub gas_savings: u64,
-    pub percent_savings: f64,
+    pub gaskiller_base_gas_estimate: u64,
+    pub gaskiller_gas_estimate_bls: u64,
+    pub gaskiller_gas_estimate_schnorr: u64,
+    pub gaskiller_estimated_gas_cost_bls: f64,
+    pub gaskiller_estimated_gas_cost_schnorr: f64,
+    pub gas_savings_bls: u64,
+    pub gas_savings_schnorr: u64,
+    pub percent_savings_bls: f64,
+    pub percent_savings_schnorr: f64,
     pub function_selector: FixedBytes<4>,
     pub skipped_opcodes: String,
     pub error_log: Option<String>,
@@ -109,10 +120,15 @@ impl GasKillerReport {
             gas_used: receipt.gas_used,
             gas_cost: receipt.effective_gas_price,
             approx_gas_unit_price: receipt.effective_gas_price as f64 / receipt.gas_used as f64,
-            gaskiller_gas_estimate: 0,
-            gaskiller_estimated_gas_cost: 0.0,
-            gas_savings: 0,
-            percent_savings: 0.0,
+            gaskiller_base_gas_estimate: 0,
+            gaskiller_gas_estimate_bls: 0,
+            gaskiller_gas_estimate_schnorr: 0,
+            gaskiller_estimated_gas_cost_bls: 0.0,
+            gaskiller_estimated_gas_cost_schnorr: 0.0,
+            gas_savings_bls: 0,
+            gas_savings_schnorr: 0,
+            percent_savings_bls: 0.0,
+            percent_savings_schnorr: 0.0,
             function_selector,
             skipped_opcodes: "".to_string(),
             error_log: Some(format!("{e:?}")),
@@ -141,10 +157,15 @@ impl GasKillerReport {
             gas_used: receipt.gas_used,
             gas_cost: receipt.effective_gas_price,
             approx_gas_unit_price: details.approx_gas_price_per_unit,
-            gaskiller_gas_estimate: details.gaskiller_gas_estimate,
-            gaskiller_estimated_gas_cost: details.gaskiller_estimated_gas_cost,
-            gas_savings: details.gas_savings,
-            percent_savings: details.percent_savings,
+            gaskiller_base_gas_estimate: details.gaskiller_base_gas_estimate,
+            gaskiller_gas_estimate_bls: details.bls.gas_estimate,
+            gaskiller_gas_estimate_schnorr: details.schnorr.gas_estimate,
+            gaskiller_estimated_gas_cost_bls: details.bls.estimated_gas_cost,
+            gaskiller_estimated_gas_cost_schnorr: details.schnorr.estimated_gas_cost,
+            gas_savings_bls: details.bls.gas_savings,
+            gas_savings_schnorr: details.schnorr.gas_savings,
+            percent_savings_bls: details.bls.percent_savings,
+            percent_savings_schnorr: details.schnorr.percent_savings,
             function_selector: details.function_selector,
             skipped_opcodes: details.skipped_opcodes,
             error_log: None,
@@ -152,13 +173,46 @@ impl GasKillerReport {
     }
 }
 
+/// Gas figures for a single signature scheme, derived from the base estimate.
+#[derive(Debug, Clone, Copy)]
+pub struct SignatureGasEstimate {
+    pub gas_estimate: u64,
+    pub estimated_gas_cost: f64,
+    pub gas_savings: u64,
+    pub percent_savings: f64,
+}
+
+impl SignatureGasEstimate {
+    /// Combine the base state-change estimate with a scheme's Turetzky upper gas limit
+    /// and derive the estimated cost and savings against the transaction's actual usage.
+    fn compute(
+        signature_type: SignatureType,
+        base_estimate: u64,
+        gas_used: u64,
+        approx_gas_price_per_unit: f64,
+    ) -> Self {
+        let gas_estimate = signature_type.total_gas_estimate(base_estimate);
+        let gas_savings = gas_used.saturating_sub(gas_estimate);
+        let percent_savings = if gas_used > 0 {
+            (gas_savings * 100) as f64 / gas_used as f64
+        } else {
+            0.0
+        };
+        Self {
+            gas_estimate,
+            estimated_gas_cost: approx_gas_price_per_unit * gas_estimate as f64,
+            gas_savings,
+            percent_savings,
+        }
+    }
+}
+
 /// Details for gas estimation report
 pub struct ReportDetails {
     pub approx_gas_price_per_unit: f64,
-    pub gaskiller_gas_estimate: u64,
-    pub gaskiller_estimated_gas_cost: f64,
-    pub gas_savings: u64,
-    pub percent_savings: f64,
+    pub gaskiller_base_gas_estimate: u64,
+    pub bls: SignatureGasEstimate,
+    pub schnorr: SignatureGasEstimate,
     pub function_selector: FixedBytes<4>,
     pub skipped_opcodes: String,
 }
@@ -480,9 +534,11 @@ pub async fn gas_estimate_block(
     let block_number = all_receipts[0]
         .block_number
         .expect("couldn't find block number in receipt");
+    // Compare against the smallest signature floor so we keep any transaction that
+    // could show savings under at least one scheme.
     let receipts: Vec<_> = all_receipts
         .into_iter()
-        .filter(|x| x.gas_used > TURETZKY_UPPER_GAS_LIMIT && x.to.is_some())
+        .filter(|x| x.gas_used > TURETZKY_UPPER_GAS_LIMIT_SCHNORR && x.to.is_some())
         .collect();
 
     println!("got {} receipts for block {}", receipts.len(), block_number);
@@ -514,13 +570,15 @@ pub async fn gas_estimate_tx(
         .await?
         .ok_or_else(|| anyhow!("could not get receipt for tx {}", tx_hash))?;
     let smart_contract_tx = invokes_smart_contract(&provider, &receipt).await?;
-    if receipt.gas_used <= TURETZKY_UPPER_GAS_LIMIT
+    // Compare against the smallest signature floor so we keep any transaction that could
+    // show savings under at least one scheme.
+    if receipt.gas_used <= TURETZKY_UPPER_GAS_LIMIT_SCHNORR
         || !smart_contract_tx
         || receipt.to.is_none()
         || !receipt.status()
     {
         bail!(
-            "Skipped: either 1) gas used is less than or equal to TUGL or 2) no smart contract calls are made or 3) contract creation transaction or 4) transaction failed"
+            "Skipped: either 1) gas used is less than or equal to the smallest Turetzky upper gas limit or 2) no smart contract calls are made or 3) contract creation transaction or 4) transaction failed"
         )
     }
 
@@ -578,23 +636,29 @@ pub async fn gaskiller_reporter(
         .into_iter()
         .collect::<Vec<_>>()
         .join(", ");
-    let gaskiller_gas_estimate = gk
+    let base_gas_estimate = gk
         .estimate_state_changes_gas(
             receipt.to.unwrap(), // already check if this is None in gas_estimate_tx
             &state_updates,
         )
         .await?;
-    let gaskiller_gas_estimate = gaskiller_gas_estimate + TURETZKY_UPPER_GAS_LIMIT;
     let gas_used = receipt.gas_used;
     let approx_gas_price_per_unit: f64 = receipt.effective_gas_price as f64 / gas_used as f64;
-    let gaskiller_estimated_gas_cost = approx_gas_price_per_unit * gaskiller_gas_estimate as f64;
-    let gas_savings = gas_used.saturating_sub(gaskiller_gas_estimate);
     Ok(ReportDetails {
         approx_gas_price_per_unit,
-        gaskiller_gas_estimate,
-        gaskiller_estimated_gas_cost,
-        gas_savings,
-        percent_savings: (gas_savings * 100) as f64 / gas_used as f64,
+        gaskiller_base_gas_estimate: base_gas_estimate,
+        bls: SignatureGasEstimate::compute(
+            SignatureType::Bls,
+            base_gas_estimate,
+            gas_used,
+            approx_gas_price_per_unit,
+        ),
+        schnorr: SignatureGasEstimate::compute(
+            SignatureType::Schnorr,
+            base_gas_estimate,
+            gas_used,
+            approx_gas_price_per_unit,
+        ),
         function_selector,
         skipped_opcodes,
     })
