@@ -185,7 +185,7 @@ mod tests {
             TURETZKY_UPPER_GAS_LIMIT_SCHNORR
         );
         // Schnorr verification is cheaper on-chain, so its floor must be the smaller one.
-        assert!(TURETZKY_UPPER_GAS_LIMIT_SCHNORR < TURETZKY_UPPER_GAS_LIMIT_BLS);
+        const { assert!(TURETZKY_UPPER_GAS_LIMIT_SCHNORR < TURETZKY_UPPER_GAS_LIMIT_BLS) };
     }
 
     #[test]
