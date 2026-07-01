@@ -191,13 +191,8 @@ impl SignatureGasEstimate {
         gas_used: u64,
         approx_gas_price_per_unit: f64,
     ) -> Self {
-        let gas_estimate = signature_type.total_gas_estimate(base_estimate);
-        let gas_savings = gas_used.saturating_sub(gas_estimate);
-        let percent_savings = if gas_used > 0 {
-            (gas_savings * 100) as f64 / gas_used as f64
-        } else {
-            0.0
-        };
+        let (gas_estimate, gas_savings, percent_savings) =
+            signature_type.savings(base_estimate, gas_used);
         Self {
             gas_estimate,
             estimated_gas_cost: approx_gas_price_per_unit * gas_estimate as f64,

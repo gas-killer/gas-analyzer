@@ -474,13 +474,8 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 // Report the total estimate and savings for each signature scheme, since
                 // the Turetzky upper gas limit added to the base estimate differs per scheme.
                 for signature_type in SignatureType::ALL {
-                    let gas_estimate = signature_type.total_gas_estimate(base_gas_estimate);
-                    let gas_savings = gas_used.saturating_sub(gas_estimate);
-                    let percent_savings = if gas_used > 0 {
-                        (gas_savings as f64 / gas_used as f64) * 100.0
-                    } else {
-                        0.0
-                    };
+                    let (gas_estimate, gas_savings, percent_savings) =
+                        signature_type.savings(base_gas_estimate, gas_used);
                     println!(
                         "\n{} (Turetzky upper gas limit: {})",
                         format!("[{}]", signature_type.label()).bold(),

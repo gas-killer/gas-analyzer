@@ -49,6 +49,23 @@ impl SignatureType {
         base_estimate + self.turetzky_upper_gas_limit()
     }
 
+    /// GasKiller gas figures for this scheme against a transaction's actual usage,
+    /// returned as `(total_estimate, gas_savings, percent_savings)`. `total_estimate`
+    /// is the base state-change estimate plus this scheme's floor; `gas_savings`
+    /// saturates at zero when the estimate exceeds `gas_used`; `percent_savings` is
+    /// zero when `gas_used` is zero. Both callers (CLI and report) share this so the
+    /// savings math cannot drift between them.
+    pub fn savings(self, base_estimate: u64, gas_used: u64) -> (u64, u64, f64) {
+        let total_estimate = self.total_gas_estimate(base_estimate);
+        let gas_savings = gas_used.saturating_sub(total_estimate);
+        let percent_savings = if gas_used > 0 {
+            (gas_savings as f64 / gas_used as f64) * 100.0
+        } else {
+            0.0
+        };
+        (total_estimate, gas_savings, percent_savings)
+    }
+
     /// Human-readable label for CLI and report output.
     pub fn label(self) -> &'static str {
         match self {
@@ -199,6 +216,26 @@ mod tests {
             SignatureType::Schnorr.total_gas_estimate(base),
             base + TURETZKY_UPPER_GAS_LIMIT_SCHNORR
         );
+    }
+
+    #[test]
+    fn savings_reports_estimate_savings_and_percent() {
+        // gas_used well above the floor: savings are positive.
+        let (estimate, savings, percent) = SignatureType::Bls.savings(50_000, 1_000_000);
+        assert_eq!(estimate, 50_000 + TURETZKY_UPPER_GAS_LIMIT_BLS);
+        assert_eq!(savings, 1_000_000 - estimate);
+        assert!((percent - (savings as f64 / 1_000_000.0) * 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn savings_saturates_and_guards_zero_gas() {
+        // Estimate exceeds usage: savings saturate to zero rather than underflow.
+        let (_, savings, percent) = SignatureType::Bls.savings(1_000_000, 10_000);
+        assert_eq!(savings, 0);
+        assert_eq!(percent, 0.0);
+        // Zero gas used: percentage is defined as zero, not NaN.
+        let (_, _, percent_zero) = SignatureType::Bls.savings(0, 0);
+        assert_eq!(percent_zero, 0.0);
     }
 
     #[test]
