@@ -839,8 +839,9 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 ///
 /// The fast path (`prestateTracer` diff + `callTracer` logs, `O(changed slots)`) is what lets
 /// heavy-compute tracked functions — whose struct-log trace times out the node — be extracted at all.
-/// It is taken only when [`classify_prestate_eligibility`] proves it sound (no revert anywhere at
-/// target depth, no cross-contract storage, no regular CALL / CREATE / SELFDESTRUCT); otherwise, and on any tracer error (e.g. a node that does
+/// It is taken only when [`classify_prestate_eligibility`] proves it sound (no revert of the top-level
+/// call or a transparent DELEGATECALL/CALLCODE frame — a reverted STATICCALL is read-only and stays
+/// eligible — no cross-contract storage, no regular CALL / CREATE / SELFDESTRUCT); otherwise, and on any tracer error (e.g. a node that does
 /// not support these tracers), we fall back to `get_trace_from_call` + `compute_state_updates`, which is
 /// the previous behaviour. The fallback owns `tx_request`, so the fast path only borrows it.
 async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
@@ -1415,13 +1416,17 @@ mod tests {
                 url: format!("http://127.0.0.1:{port}"),
             };
             let provider = anvil.provider();
+            let mut last_err = None;
             for _ in 0..100 {
-                if provider.get_chain_id().await.is_ok() {
-                    return anvil;
+                match provider.get_chain_id().await {
+                    Ok(_) => return anvil,
+                    // Yield to the runtime instead of blocking the executor thread.
+                    Err(e) => last_err = Some(e),
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            panic!("anvil did not become ready within 5s");
+            // stdout/stderr are suppressed, so surface the last probe error.
+            panic!("anvil did not become ready within 5s; last error: {last_err:?}");
         }
 
         fn provider(&self) -> RootProvider<Ethereum> {
