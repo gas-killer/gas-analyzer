@@ -10,9 +10,10 @@
 //! sub-`CALL` (which `compute_state_updates` represents as a CALL op whose internals re-execute on
 //! replay). So [`classify_prestate_eligibility`] reproduces that model: the consumer's frame is
 //! "target depth", `DELEGATECALL`/`CALLCODE` are transparent, and the fast path is sound only when the
-//! consumer touches no other account's storage and makes no regular `CALL`, `CREATE`, or
-//! `SELFDESTRUCT`. Callers run the cheap tracers, classify, and either [`build_state_updates_from_prestate`]
-//! (eligible) or fall back to the struct-log path (not eligible / tracers unsupported).
+//! call and every transparent frame completed without reverting, the consumer touches no other
+//! account's storage, and it makes no regular `CALL`, `CREATE`, or `SELFDESTRUCT`. Callers run the
+//! cheap tracers, classify, and either [`build_state_updates_from_prestate`] (eligible) or fall back
+//! to the struct-log path (not eligible / tracers unsupported).
 //!
 //! These are pure functions over the tracer outputs — no async, no I/O — to keep them in `core`.
 
@@ -37,19 +38,33 @@ pub enum PrestateEligibility {
 /// Decide whether the prestate fast path is sound for a call, given its `callTracer` frame and
 /// `prestateTracer` diff. Mirrors `compute_state_updates`'s replay-script model: STORE/LOG/CALL live at
 /// "target depth" (the `consumer` frame), `DELEGATECALL`/`CALLCODE` are transparent. We must fall back
-/// when the consumer:
-///   * changes a non-consumer account's storage (only CALL replay reproduces that), or
-///   * makes a regular `CALL` at target depth (its internals re-execute; a net diff can't separate
-///     those from top-level writes), or
-///   * does `CREATE`/`CREATE2`/`SELFDESTRUCT` (no `StateUpdate` variant represents them — the
-///     struct-log path skips them too).
+/// when:
+///   * the call (or a transparent frame at target depth) reverted — `compute_state_updates` is
+///     revert-unaware and extracts the rolled-back ops from the struct log, while they are absent
+///     from a net diff (and clients disagree on pruning reverted frames' logs), so the two paths
+///     would diverge, or
+///   * the consumer changes a non-consumer account's storage (only CALL replay reproduces that), or
+///   * the consumer makes a regular `CALL` at target depth (its internals re-execute; a net diff
+///     can't separate those from top-level writes), or
+///   * the consumer does `CREATE`/`CREATE2` (the struct-log path extracts a `Create`/`Create2` op
+///     that re-executes the captured initcode on replay; a net diff cannot reconstruct it) or
+///     `SELFDESTRUCT` (the struct-log path reports it via `skipped_opcodes`).
 ///
-/// `STATICCALL` is read-only and ignored.
+/// `STATICCALL` is read-only and ignored. Known caveat shared with nothing we can detect here:
+/// `TSTORE` leaves no trace in either cheap tracer, so an eligible call using transient storage
+/// loses the struct-log path's `TSTORE` skipped-opcode warning — the extracted diff itself is
+/// unaffected (transient storage never outlives the transaction).
 pub fn classify_prestate_eligibility(
     frame: &CallFrame,
     diff: &DiffMode,
     consumer: Address,
 ) -> PrestateEligibility {
+    if let Some(err) = frame.error.as_deref().or(frame.revert_reason.as_deref()) {
+        return PrestateEligibility::Fallback(format!(
+            "call reverted/failed ({err:?}); struct-log extraction of rolled-back ops can't be \
+             mirrored by a net diff"
+        ));
+    }
     let mut accounts: BTreeSet<Address> = BTreeSet::new();
     accounts.extend(diff.pre.keys().copied());
     accounts.extend(diff.post.keys().copied());
@@ -66,8 +81,9 @@ pub fn classify_prestate_eligibility(
     PrestateEligibility::Eligible
 }
 
-/// Walk the target-depth context (root + `DELEGATECALL`/`CALLCODE` descendants) for a frame type that
-/// forces the struct-log fallback. Returns the first disqualifying reason, if any.
+/// Walk the target-depth context (root + `DELEGATECALL`/`CALLCODE` descendants) for a frame type or
+/// a reverted transparent frame that forces the struct-log fallback. Returns the first disqualifying
+/// reason, if any.
 fn scan_target_depth(frame: &CallFrame) -> Option<String> {
     for c in &frame.calls {
         match c.typ.as_str() {
@@ -87,6 +103,15 @@ fn scan_target_depth(frame: &CallFrame) -> Option<String> {
                 return Some("SELFDESTRUCT at target depth (not representable)".into());
             }
             "DELEGATECALL" | "CALLCODE" => {
+                if let Some(err) = c.error.as_deref().or(c.revert_reason.as_deref()) {
+                    // The child's writes rolled back (absent from the net diff), but the
+                    // struct-log path still extracts them — only fallback keeps the paths equal.
+                    return Some(format!(
+                        "reverted {} at target depth ({err:?}); rolled-back ops need the \
+                         struct-log path",
+                        c.typ
+                    ));
+                }
                 if let Some(r) = scan_target_depth(c) {
                     return Some(r);
                 }
@@ -522,6 +547,59 @@ mod tests {
         let f = frame("CALL", vec![], vec![]);
         assert!(!is_eligible(classify_prestate_eligibility(
             &f, &diff, CONSUMER
+        )));
+    }
+
+    #[test]
+    fn fallback_on_reverted_root_frame() {
+        // A reverted call rolls everything back: the net diff is empty, but the struct-log path
+        // still extracts the pre-revert ops. Some clients (anvil/revm-inspectors) even keep the
+        // reverted root frame's logs in callTracer output — without this fallback the fast path
+        // would emit events that never happened.
+        let mut f = frame("CALL", vec![log(&[b256(1)], 1)], vec![]);
+        f.error = Some("execution reverted".into());
+        assert!(!is_eligible(classify_prestate_eligibility(
+            &f,
+            &DiffMode::default(),
+            CONSUMER
+        )));
+    }
+
+    #[test]
+    fn fallback_on_revert_reason_only_root_frame() {
+        let mut f = frame("CALL", vec![], vec![]);
+        f.revert_reason = Some("Custom()".into());
+        assert!(!is_eligible(classify_prestate_eligibility(
+            &f,
+            &DiffMode::default(),
+            CONSUMER
+        )));
+    }
+
+    #[test]
+    fn fallback_on_reverted_delegatecall_child() {
+        // Caught revert: the delegatecall's writes rolled back (absent from the net diff), but the
+        // struct-log path extracts them at target depth — the paths would diverge.
+        let mut child = frame("DELEGATECALL", vec![], vec![]);
+        child.error = Some("execution reverted".into());
+        let f = frame("CALL", vec![], vec![child]);
+        assert!(!is_eligible(classify_prestate_eligibility(
+            &f,
+            &diff_consumer_only(),
+            CONSUMER
+        )));
+    }
+
+    #[test]
+    fn reverted_staticcall_child_still_eligible() {
+        // A reverted STATICCALL cannot have changed state or emitted logs on either path.
+        let mut child = frame("STATICCALL", vec![], vec![]);
+        child.error = Some("execution reverted".into());
+        let f = frame("CALL", vec![], vec![child]);
+        assert!(is_eligible(classify_prestate_eligibility(
+            &f,
+            &diff_consumer_only(),
+            CONSUMER
         )));
     }
 
