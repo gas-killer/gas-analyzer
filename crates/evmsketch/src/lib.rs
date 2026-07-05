@@ -839,8 +839,8 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 ///
 /// The fast path (`prestateTracer` diff + `callTracer` logs, `O(changed slots)`) is what lets
 /// heavy-compute tracked functions — whose struct-log trace times out the node — be extracted at all.
-/// It is taken only when [`classify_prestate_eligibility`] proves it sound (no cross-contract storage,
-/// no regular CALL / CREATE / SELFDESTRUCT); otherwise, and on any tracer error (e.g. a node that does
+/// It is taken only when [`classify_prestate_eligibility`] proves it sound (no revert anywhere at
+/// target depth, no cross-contract storage, no regular CALL / CREATE / SELFDESTRUCT); otherwise, and on any tracer error (e.g. a node that does
 /// not support these tracers), we fall back to `get_trace_from_call` + `compute_state_updates`, which is
 /// the previous behaviour. The fallback owns `tx_request`, so the fast path only borrows it.
 async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
@@ -867,8 +867,12 @@ async fn try_prestate_fast_path<P: Provider + DebugApi>(
     block: BlockId,
     consumer: Address,
 ) -> Result<Option<Vec<StateUpdate>>> {
-    let diff = get_prestate_diff_from_call(provider, tx_request.clone(), block).await?;
-    let frame = get_call_frame_from_call(provider, tx_request.clone(), block).await?;
+    // The two tracer calls are independent — run them concurrently so the fast path costs one
+    // round-trip, not two.
+    let (diff, frame) = tokio::try_join!(
+        get_prestate_diff_from_call(provider, tx_request.clone(), block),
+        get_call_frame_from_call(provider, tx_request.clone(), block),
+    )?;
     match classify_prestate_eligibility(&frame, &diff, consumer) {
         PrestateEligibility::Eligible => Ok(Some(build_state_updates_from_prestate(
             consumer, &diff, &frame,
@@ -1370,5 +1374,462 @@ mod tests {
 
         assert_eq!(hints.get(&contract), Some(&vec![]));
         assert_eq!(hints.len(), 1);
+    }
+
+    // ========================================================================
+    // Hybrid prestate/struct-log extraction — anvil integration tests
+    //
+    // These spawn a local `anvil` (installed in CI via foundry-toolchain) and
+    // exercise the REAL tracers end-to-end: the prestate fast path and the
+    // struct-log path are run against the same deployed bytecode and their
+    // outputs compared. Contracts are hand-assembled runtime bytecode set via
+    // `anvil_setCode` — no solc/forge build step.
+    // ========================================================================
+
+    /// A local anvil instance on an OS-assigned free port, killed on drop.
+    struct LocalAnvil {
+        child: std::process::Child,
+        url: String,
+    }
+
+    impl LocalAnvil {
+        async fn spawn() -> LocalAnvil {
+            // Grab a free port, release it, and hand it to anvil. The tiny
+            // reuse window is acceptable for tests.
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("bind to pick a free port")
+                .local_addr()
+                .expect("local_addr")
+                .port();
+            let child = std::process::Command::new("anvil")
+                .args(["--port", &port.to_string(), "--silent"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect(
+                    "failed to spawn `anvil` — these tests need foundry \
+                     (https://getfoundry.sh) on PATH; CI installs it via foundry-toolchain",
+                );
+            let anvil = LocalAnvil {
+                child,
+                url: format!("http://127.0.0.1:{port}"),
+            };
+            let provider = anvil.provider();
+            for _ in 0..100 {
+                if provider.get_chain_id().await.is_ok() {
+                    return anvil;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            panic!("anvil did not become ready within 5s");
+        }
+
+        fn provider(&self) -> RootProvider<Ethereum> {
+            RootProvider::<Ethereum>::new_http(Url::parse(&self.url).expect("valid url"))
+        }
+    }
+
+    impl Drop for LocalAnvil {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    async fn set_code(provider: &RootProvider<Ethereum>, addr: Address, code: Bytes) {
+        let _: serde_json::Value = provider
+            .raw_request("anvil_setCode".into(), (addr, code))
+            .await
+            .expect("anvil_setCode");
+    }
+
+    async fn set_storage(
+        provider: &RootProvider<Ethereum>,
+        addr: Address,
+        slot: B256,
+        value: B256,
+    ) {
+        let _: serde_json::Value = provider
+            .raw_request("anvil_setStorageAt".into(), (addr, slot, value))
+            .await
+            .expect("anvil_setStorageAt");
+    }
+
+    /// A `debug_traceCall` request from anvil's first funded account.
+    fn call_request(to: Address) -> TransactionRequest {
+        TransactionRequest::default()
+            .from(address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"))
+            .to(to)
+            .gas_limit(3_000_000)
+    }
+
+    /// 32-byte topic with the given last byte, as hex for a PUSH32 immediate.
+    fn topic_hex(last: u8) -> String {
+        format!("{}{last:02x}", "00".repeat(31))
+    }
+
+    fn hex_code(spaced_hex: &str) -> Bytes {
+        Bytes::from(alloy::hex::decode(spaced_hex.replace(' ', "")).expect("valid hex"))
+    }
+
+    fn addr_hex(a: Address) -> String {
+        alloy::hex::encode(a.as_slice())
+    }
+
+    /// SSTORE(1,0x42); MSTORE(0,0xab); LOG1(mem[0..32], topic 0xaa);
+    /// SSTORE(2,5); SSTORE(2,0) — net zero; SSTORE(5,0) — zeroes a pre-seeded slot; STOP.
+    fn eligible_code() -> Bytes {
+        hex_code(&format!(
+            "6042600155 60ab600052 7f{}60206000a1 6005600255 6000600255 6000600555 00",
+            topic_hex(0xaa),
+        ))
+    }
+
+    /// LOG1(topic 0xaa); DELEGATECALL(lib); POP; LOG1(topic 0xbb); STOP.
+    /// True emission order with the lib's log is aa, cc, bb — a naive DFS
+    /// over the call tree would give aa, bb, cc.
+    fn delegate_root_code(lib: Address) -> Bytes {
+        hex_code(&format!(
+            "7f{}60006000a1 6000600060006000 73{} 5af450 7f{}60006000a1 00",
+            topic_hex(0xaa),
+            addr_hex(lib),
+            topic_hex(0xbb),
+        ))
+    }
+
+    /// LOG1(topic 0xcc); SSTORE(3,7); STOP — runs in the root's storage context.
+    fn delegate_lib_code() -> Bytes {
+        hex_code(&format!("7f{}60006000a1 6007600355 00", topic_hex(0xcc)))
+    }
+
+    /// CALL(callee, no args, no value); POP; SSTORE(4,1); STOP.
+    fn caller_code(callee: Address) -> Bytes {
+        hex_code(&format!(
+            "60006000600060006000 73{} 5af150 6001600455 00",
+            addr_hex(callee),
+        ))
+    }
+
+    /// SSTORE(1,9); STOP — the callee's own storage, reproduced only by CALL replay.
+    fn callee_code() -> Bytes {
+        hex_code("6009600155 00")
+    }
+
+    /// SSTORE(1,0x42); LOG1(topic 0xdd, no data); REVERT(0,0).
+    fn reverter_code() -> Bytes {
+        hex_code(&format!(
+            "6042600155 7f{}60006000a1 60006000fd",
+            topic_hex(0xdd)
+        ))
+    }
+
+    /// DELEGATECALL(reverter); POP — swallow the failure; SSTORE(2,0x22); STOP.
+    fn catcher_code(lib: Address) -> Bytes {
+        hex_code(&format!(
+            "6000600060006000 73{} 5af450 6022600255 00",
+            addr_hex(lib),
+        ))
+    }
+
+    fn store_up(slot: u8, value: u8) -> StateUpdate {
+        StateUpdate::Store(IStateUpdateTypes::Store {
+            slot: B256::with_last_byte(slot),
+            value: B256::with_last_byte(value),
+        })
+    }
+
+    fn log1_up(topic: u8, data: Bytes) -> StateUpdate {
+        StateUpdate::Log1(IStateUpdateTypes::Log1 {
+            data,
+            topic1: B256::with_last_byte(topic),
+        })
+    }
+
+    /// Compare update lists by their ABI encoding — the equality that matters,
+    /// since the encoded bytes are what ships to `verifyAndUpdate`.
+    fn assert_updates_eq(actual: &[StateUpdate], expected: &[StateUpdate], ctx: &str) {
+        assert_eq!(
+            encode_state_updates_to_abi(actual),
+            encode_state_updates_to_abi(expected),
+            "{ctx}:\n  actual:   {actual:?}\n  expected: {expected:?}"
+        );
+    }
+
+    /// Classify a call the way `try_prestate_fast_path` does, using the real tracers.
+    async fn classify_call(provider: &RootProvider<Ethereum>, to: Address) -> PrestateEligibility {
+        let (diff, frame) = tokio::try_join!(
+            get_prestate_diff_from_call(provider, call_request(to), BlockId::latest()),
+            get_call_frame_from_call(provider, call_request(to), BlockId::latest()),
+        )
+        .expect("prestate/callTracer debug_traceCall failed");
+        classify_prestate_eligibility(&frame, &diff, to)
+    }
+
+    /// Run BOTH extraction paths against the same deployed call.
+    /// Returns (hybrid result, struct-log-only result).
+    async fn extract_both(
+        provider: &RootProvider<Ethereum>,
+        to: Address,
+    ) -> ((Vec<StateUpdate>, HashSet<Opcode>), Vec<StateUpdate>) {
+        let hybrid =
+            extract_state_updates_hybrid(provider, call_request(to), BlockId::latest(), to)
+                .await
+                .expect("hybrid extraction failed");
+        let trace = get_trace_from_call(provider, call_request(to), BlockId::latest())
+            .await
+            .expect("struct-log debug_traceCall failed");
+        let (structlog, _, _) = compute_state_updates(trace).expect("compute_state_updates failed");
+        (hybrid, structlog)
+    }
+
+    /// Eligible call: the fast path must produce the same final storage and the
+    /// same event stream as the struct-log path — net-deduplicated (the write-
+    /// then-restore of slot 2 disappears, intermediate values collapse) with
+    /// STOREs slot-sorted ahead of logs.
+    #[tokio::test]
+    async fn test_fast_path_matches_struct_log_on_eligible_call() {
+        let anvil = LocalAnvil::spawn().await;
+        let provider = anvil.provider();
+        let consumer = address!("0x0000000000000000000000000000000000001001");
+        set_code(&provider, consumer, eligible_code()).await;
+        // Pre-seed slot 5 so the contract's SSTORE(5,0) is a real zeroing write.
+        set_storage(
+            &provider,
+            consumer,
+            B256::with_last_byte(5),
+            B256::with_last_byte(0x99),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                classify_call(&provider, consumer).await,
+                PrestateEligibility::Eligible
+            ),
+            "self-contained SSTORE+LOG call must be prestate-eligible"
+        );
+
+        let ((fast, skipped), structlog) = extract_both(&provider, consumer).await;
+        assert!(skipped.is_empty(), "fast path reports no skipped opcodes");
+
+        let word_ab = Bytes::copy_from_slice(B256::with_last_byte(0xab).as_slice());
+        assert_updates_eq(
+            &fast,
+            &[
+                store_up(1, 0x42),
+                store_up(5, 0),
+                log1_up(0xaa, word_ab.clone()),
+            ],
+            "fast path: net stores (slot-sorted, net-zero slot 2 omitted, zeroing kept), then logs",
+        );
+        assert_updates_eq(
+            &structlog,
+            &[
+                store_up(1, 0x42),
+                log1_up(0xaa, word_ab),
+                store_up(2, 5),
+                store_up(2, 0),
+                store_up(5, 0),
+            ],
+            "struct-log path: every write in execution order",
+        );
+    }
+
+    /// Logs emitted around a DELEGATECALL must come out in true emission order
+    /// (root log, lib log, root log) on BOTH paths — this is the `position`/
+    /// `index` interleaving working against a real tracer, and the delegatecall
+    /// SSTORE must land on the root's storage.
+    #[tokio::test]
+    async fn test_delegatecall_log_ordering_matches_between_paths() {
+        let anvil = LocalAnvil::spawn().await;
+        let provider = anvil.provider();
+        let root = address!("0x0000000000000000000000000000000000001002");
+        let lib = address!("0x0000000000000000000000000000000000001003");
+        set_code(&provider, root, delegate_root_code(lib)).await;
+        set_code(&provider, lib, delegate_lib_code()).await;
+
+        assert!(
+            matches!(
+                classify_call(&provider, root).await,
+                PrestateEligibility::Eligible
+            ),
+            "delegatecall-only call must be prestate-eligible"
+        );
+
+        let ((fast, _), structlog) = extract_both(&provider, root).await;
+        assert_updates_eq(
+            &fast,
+            &[
+                store_up(3, 7),
+                log1_up(0xaa, Bytes::new()),
+                log1_up(0xcc, Bytes::new()),
+                log1_up(0xbb, Bytes::new()),
+            ],
+            "fast path: delegatecall store on root, logs interleaved aa, cc, bb",
+        );
+
+        let logs_only = |updates: &[StateUpdate]| -> Vec<String> {
+            updates
+                .iter()
+                .filter(|u| matches!(u, StateUpdate::Log1(_)))
+                .map(|u| format!("{u:?}"))
+                .collect()
+        };
+        assert_eq!(
+            logs_only(&fast),
+            logs_only(&structlog),
+            "event order must match the struct-log path's true emission order"
+        );
+    }
+
+    /// A regular CALL at target depth is not representable by a net diff: the
+    /// dispatcher must fall back and return exactly what the struct-log path
+    /// returns (a replayable CALL op + the consumer's own store; the callee's
+    /// internals excluded).
+    #[tokio::test]
+    async fn test_hybrid_falls_back_on_regular_call() {
+        let anvil = LocalAnvil::spawn().await;
+        let provider = anvil.provider();
+        let caller = address!("0x0000000000000000000000000000000000001004");
+        let callee = address!("0x0000000000000000000000000000000000001005");
+        set_code(&provider, caller, caller_code(callee)).await;
+        set_code(&provider, callee, callee_code()).await;
+
+        assert!(
+            matches!(
+                classify_call(&provider, caller).await,
+                PrestateEligibility::Fallback(_)
+            ),
+            "regular CALL must force the struct-log fallback"
+        );
+
+        let ((hybrid, _), structlog) = extract_both(&provider, caller).await;
+        assert_updates_eq(
+            &hybrid,
+            &structlog,
+            "hybrid must equal the struct-log path on fallback",
+        );
+        assert_updates_eq(
+            &hybrid,
+            &[
+                StateUpdate::Call(IStateUpdateTypes::Call {
+                    target: callee,
+                    value: U256::ZERO,
+                    callargs: Bytes::new(),
+                }),
+                store_up(4, 1),
+            ],
+            "fallback output: CALL op (callee internals excluded) then own store",
+        );
+    }
+
+    /// A reverted call must fall back. Without the classifier's `error` check
+    /// the fast path would classify this Eligible and emit the LOG the tracer
+    /// still reports for the reverted root frame (anvil does not prune it) on
+    /// top of an empty storage diff — an event that never happened. Fallback
+    /// keeps the hybrid path byte-identical to the previous behaviour.
+    #[tokio::test]
+    async fn test_hybrid_falls_back_on_reverted_call() {
+        let anvil = LocalAnvil::spawn().await;
+        let provider = anvil.provider();
+        let reverter = address!("0x0000000000000000000000000000000000001006");
+        set_code(&provider, reverter, reverter_code()).await;
+
+        assert!(
+            matches!(
+                classify_call(&provider, reverter).await,
+                PrestateEligibility::Fallback(_)
+            ),
+            "reverted call must force the struct-log fallback"
+        );
+
+        let ((hybrid, _), structlog) = extract_both(&provider, reverter).await;
+        assert_updates_eq(
+            &hybrid,
+            &structlog,
+            "hybrid must equal the struct-log path for reverted calls",
+        );
+    }
+
+    /// A DELEGATECALL child that reverts while its parent succeeds: the child's
+    /// ops rolled back (absent from the net diff) but the struct-log path still
+    /// extracts them at target depth. Only fallback keeps the two paths equal.
+    #[tokio::test]
+    async fn test_hybrid_falls_back_on_caught_reverted_delegatecall() {
+        let anvil = LocalAnvil::spawn().await;
+        let provider = anvil.provider();
+        let catcher = address!("0x0000000000000000000000000000000000001007");
+        let reverter = address!("0x0000000000000000000000000000000000001006");
+        set_code(&provider, catcher, catcher_code(reverter)).await;
+        set_code(&provider, reverter, reverter_code()).await;
+
+        assert!(
+            matches!(
+                classify_call(&provider, catcher).await,
+                PrestateEligibility::Fallback(_)
+            ),
+            "caught-revert delegatecall must force the struct-log fallback"
+        );
+
+        let ((hybrid, _), structlog) = extract_both(&provider, catcher).await;
+        assert_updates_eq(
+            &hybrid,
+            &structlog,
+            "hybrid must equal the struct-log path when a transparent frame reverted",
+        );
+        assert_updates_eq(
+            &hybrid,
+            &[
+                store_up(1, 0x42),
+                log1_up(0xdd, Bytes::new()),
+                store_up(2, 0x22),
+            ],
+            "struct-log output includes the rolled-back delegatecall ops (pre-existing \
+             struct-log behaviour) plus the parent's store",
+        );
+    }
+
+    /// Shape contract of the two new rpc helpers against a real node: the
+    /// prestate diff carries the consumer's changed slots, and the call frame
+    /// carries logs with `position` populated.
+    #[tokio::test]
+    async fn test_prestate_rpc_helpers_return_diff_and_frame() {
+        let anvil = LocalAnvil::spawn().await;
+        let provider = anvil.provider();
+        let consumer = address!("0x0000000000000000000000000000000000001001");
+        set_code(&provider, consumer, eligible_code()).await;
+
+        let diff =
+            get_prestate_diff_from_call(&provider, call_request(consumer), BlockId::latest())
+                .await
+                .expect("prestate tracer");
+        let post_storage = &diff
+            .post
+            .get(&consumer)
+            .expect("consumer must appear in post state")
+            .storage;
+        assert_eq!(
+            post_storage.get(&B256::with_last_byte(1)),
+            Some(&B256::with_last_byte(0x42)),
+            "diff must carry the consumer's changed slot"
+        );
+
+        let frame = get_call_frame_from_call(&provider, call_request(consumer), BlockId::latest())
+            .await
+            .expect("call tracer");
+        assert_eq!(
+            frame.logs.len(),
+            1,
+            "callTracer must return the emitted log"
+        );
+        assert!(
+            frame.logs[0].position.is_some(),
+            "log position must be populated — ordered_target_depth_logs depends on it"
+        );
+        assert_eq!(
+            frame.logs[0].topics.as_deref(),
+            Some(&[B256::with_last_byte(0xaa)][..]),
+            "log topic must round-trip"
+        );
     }
 }
