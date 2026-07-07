@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 
 use alloy::primitives::FixedBytes;
+use alloy::rpc::types::BlockOverrides;
 use alloy::rpc::types::trace::geth::{
     CallConfig, CallFrame, DefaultFrame, DiffMode, GethDebugTracingCallOptions,
     GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace, PreStateConfig, PreStateFrame,
@@ -17,9 +18,39 @@ use alloy_provider::ext::DebugApi;
 use alloy_rpc_types::TransactionTrait;
 use anyhow::{Result, anyhow, bail};
 
+use gas_analyzer_core::SimProfile;
 use gas_analyzer_core::trace::compute_state_updates;
 use gas_analyzer_core::types::{Opcode, StateUpdate};
 use gas_analyzer_estimator::PrecedingTx;
+
+/// Apply a [`SimProfile`]'s environment overrides to a `debug_traceCall`
+/// request: the transaction-level gas limit goes on the request itself, the
+/// block-level gas limit rides in `blockOverrides`.
+///
+/// Under [`SimProfile::UnboundedV1`] the overrides are pinned protocol
+/// constants (see `gas_analyzer_core::sim_profile`), so they are applied
+/// unconditionally — a caller-supplied `gas` field reflects real-chain limits
+/// that this profile deliberately lifts. Note the node has the last word:
+/// geth/reth clamp `debug_traceCall` gas to `--rpc.gascap` and anvil to its
+/// block gas limit, so unbounded extraction requires a node started with the
+/// cap lifted (`anvil --disable-block-gas-limit`, `geth --rpc.gascap=0`).
+/// A silently-clamping node makes heavy calls OOG, which surfaces as a revert
+/// classified for fallback rather than an unsound diff.
+fn apply_sim_profile(
+    tx_request: &mut alloy::rpc::types::eth::TransactionRequest,
+    options: &mut GethDebugTracingCallOptions,
+    profile: SimProfile,
+) {
+    if let Some(tx_gas) = profile.tx_gas_limit_override() {
+        tx_request.gas = Some(tx_gas);
+    }
+    if let Some(block_gas) = profile.block_gas_limit_override() {
+        options
+            .block_overrides
+            .get_or_insert_with(BlockOverrides::default)
+            .gas_limit = Some(block_gas);
+    }
+}
 
 /// Get transaction trace from a provider using debug_traceTransaction.
 ///
@@ -64,8 +95,24 @@ where
     P: Provider + DebugApi,
     Req: Into<alloy::rpc::types::eth::TransactionRequest>,
 {
-    let tx_request = tx_request.into();
-    let options = GethDebugTracingCallOptions {
+    get_trace_from_call_with_profile(provider, tx_request, block, SimProfile::Chain).await
+}
+
+/// [`get_trace_from_call`] with an explicit [`SimProfile`] controlling the
+/// simulated environment (gas limits). `SimProfile::Chain` is identical to
+/// the plain function.
+pub async fn get_trace_from_call_with_profile<P, Req>(
+    provider: &P,
+    tx_request: Req,
+    block: BlockId,
+    profile: SimProfile,
+) -> Result<DefaultFrame>
+where
+    P: Provider + DebugApi,
+    Req: Into<alloy::rpc::types::eth::TransactionRequest>,
+{
+    let mut tx_request = tx_request.into();
+    let mut options = GethDebugTracingCallOptions {
         tracing_options: GethDebugTracingOptions {
             config: GethDefaultTracingOptions {
                 enable_memory: Some(true),
@@ -76,6 +123,7 @@ where
         },
         ..Default::default()
     };
+    apply_sim_profile(&mut tx_request, &mut options, profile);
 
     let GethTrace::Default(trace) = provider
         .debug_trace_call(tx_request, block, options)
@@ -102,7 +150,24 @@ where
     P: Provider + DebugApi,
     Req: Into<alloy::rpc::types::eth::TransactionRequest>,
 {
-    let options = GethDebugTracingCallOptions {
+    get_prestate_diff_from_call_with_profile(provider, tx_request, block, SimProfile::Chain).await
+}
+
+/// [`get_prestate_diff_from_call`] with an explicit [`SimProfile`] controlling
+/// the simulated environment (gas limits). `SimProfile::Chain` is identical to
+/// the plain function.
+pub async fn get_prestate_diff_from_call_with_profile<P, Req>(
+    provider: &P,
+    tx_request: Req,
+    block: BlockId,
+    profile: SimProfile,
+) -> Result<DiffMode>
+where
+    P: Provider + DebugApi,
+    Req: Into<alloy::rpc::types::eth::TransactionRequest>,
+{
+    let mut tx_request = tx_request.into();
+    let mut options = GethDebugTracingCallOptions {
         tracing_options: GethDebugTracingOptions::prestate_tracer(PreStateConfig {
             diff_mode: Some(true),
             disable_code: Some(true),
@@ -110,8 +175,9 @@ where
         }),
         ..Default::default()
     };
+    apply_sim_profile(&mut tx_request, &mut options, profile);
     match provider
-        .debug_trace_call(tx_request.into(), block, options)
+        .debug_trace_call(tx_request, block, options)
         .await
         .map_err(|e| anyhow!("prestate debug_trace_call failed: {}", e))?
     {
@@ -133,15 +199,33 @@ where
     P: Provider + DebugApi,
     Req: Into<alloy::rpc::types::eth::TransactionRequest>,
 {
-    let options = GethDebugTracingCallOptions {
+    get_call_frame_from_call_with_profile(provider, tx_request, block, SimProfile::Chain).await
+}
+
+/// [`get_call_frame_from_call`] with an explicit [`SimProfile`] controlling
+/// the simulated environment (gas limits). `SimProfile::Chain` is identical to
+/// the plain function.
+pub async fn get_call_frame_from_call_with_profile<P, Req>(
+    provider: &P,
+    tx_request: Req,
+    block: BlockId,
+    profile: SimProfile,
+) -> Result<CallFrame>
+where
+    P: Provider + DebugApi,
+    Req: Into<alloy::rpc::types::eth::TransactionRequest>,
+{
+    let mut tx_request = tx_request.into();
+    let mut options = GethDebugTracingCallOptions {
         tracing_options: GethDebugTracingOptions::call_tracer(CallConfig {
             with_log: Some(true),
             ..Default::default()
         }),
         ..Default::default()
     };
+    apply_sim_profile(&mut tx_request, &mut options, profile);
     match provider
-        .debug_trace_call(tx_request.into(), block, options)
+        .debug_trace_call(tx_request, block, options)
         .await
         .map_err(|e| anyhow!("callTracer debug_trace_call failed: {}", e))?
     {
