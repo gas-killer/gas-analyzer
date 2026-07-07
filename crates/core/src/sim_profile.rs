@@ -39,6 +39,17 @@
 //! land in a real transaction. Only the *signed payload* must fit on-chain.
 
 use crate::types::StateUpdate;
+use alloy_primitives::{B256, b256};
+
+/// The Gas Killer SDK's `StateTracker` transition-counter slot
+/// (`keccak256("gasKiller.stateTracker") - 1`, see solidity-sdk
+/// `StateTracker.sol`). Every `trackState` function bumps it, so every
+/// extracted diff carries a Store to this slot; `verifyAndUpdate`'s own
+/// modifier writes the same value on-chain, making the payload copy
+/// idempotent. It is a fixed protocol slot — one per consumer regardless of
+/// state size — and is therefore exempt from the single-slot shape count.
+pub const STATE_TRACKER_SLOT: B256 =
+    b256!("0xdebfdfd5a50ad117c10898d68b5ccf0893c6b40d4f443f902e2e7646601bdeaf");
 
 /// Block gas limit for the `UnboundedV1` profile: 2^40 ≈ 1.1 Tgas,
 /// ~24,000× a 45M-gas mainnet block.
@@ -98,8 +109,10 @@ impl SimProfile {
 /// Summary of a payload that passed [`validate_unbounded_shape`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnboundedShape {
-    /// Number of `Store` ops (0 or 1).
+    /// Number of `Store` ops other than the [`STATE_TRACKER_SLOT`] (0 or 1).
     pub stores: usize,
+    /// Number of `Store` ops to the fixed [`STATE_TRACKER_SLOT`] (0 or 1).
+    pub tracker_stores: usize,
     /// Number of `Call` ops. These re-execute **on-chain at real gas prices**
     /// when the payload is applied — unbounded compute inside a `Call` is NOT
     /// killed. Forwarded multi-call sub-payloads (`applyForwardedUpdates`)
@@ -152,7 +165,8 @@ impl core::fmt::Display for UnboundedShapeViolation {
 impl std::error::Error for UnboundedShapeViolation {}
 
 /// Enforce the `UnboundedV1` payload-shape invariant on extracted updates:
-/// at most one `Store`, no `CREATE`/`CREATE2`; `Call` and `Log*` ops pass.
+/// at most one `Store` beyond the fixed [`STATE_TRACKER_SLOT`] (which every
+/// `trackState` diff carries), no `CREATE`/`CREATE2`; `Call`/`Log*` ops pass.
 ///
 /// This is what makes "play fast and loose with the gas limit" sound: the
 /// simulation may burn a terabyte of gas, but the thing that lands on-chain
@@ -164,11 +178,15 @@ pub fn validate_unbounded_shape(
 ) -> Result<UnboundedShape, UnboundedShapeViolation> {
     let mut shape = UnboundedShape {
         stores: 0,
+        tracker_stores: 0,
         calls: 0,
         logs: 0,
     };
     for (index, update) in updates.iter().enumerate() {
         match update {
+            StateUpdate::Store(store) if store.slot == STATE_TRACKER_SLOT => {
+                shape.tracker_stores += 1
+            }
             StateUpdate::Store(_) => shape.stores += 1,
             StateUpdate::Call(_) => shape.calls += 1,
             StateUpdate::Log0(_)
@@ -193,7 +211,7 @@ pub fn validate_unbounded_shape(
 mod tests {
     use super::*;
     use crate::types::IStateUpdateTypes;
-    use alloy_primitives::{Address, B256, Bytes, U256};
+    use alloy_primitives::{Address, Bytes, U256};
 
     fn store() -> StateUpdate {
         StateUpdate::Store(IStateUpdateTypes::Store {
@@ -257,6 +275,7 @@ mod tests {
             shape,
             UnboundedShape {
                 stores: 1,
+                tracker_stores: 0,
                 calls: 2,
                 logs: 2
             }
@@ -276,10 +295,23 @@ mod tests {
             shape,
             UnboundedShape {
                 stores: 0,
+                tracker_stores: 0,
                 calls: 0,
                 logs: 0
             }
         );
+    }
+
+    #[test]
+    fn tracker_slot_store_is_exempt() {
+        // The realistic trackState diff: counter bump + one commitment write + log.
+        let tracker = StateUpdate::Store(IStateUpdateTypes::Store {
+            slot: STATE_TRACKER_SLOT,
+            value: B256::with_last_byte(1),
+        });
+        let shape = validate_unbounded_shape(&[tracker, store(), log1()]).unwrap();
+        assert_eq!(shape.stores, 1);
+        assert_eq!(shape.tracker_stores, 1);
     }
 
     #[test]
