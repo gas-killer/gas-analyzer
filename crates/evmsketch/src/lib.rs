@@ -111,13 +111,14 @@ pub mod simple_rpc_db;
 use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 
 use gas_analyzer_core::{
-    Opcode, PrestateEligibility, StateUpdate, build_state_updates_from_prestate,
+    Opcode, PrestateEligibility, SimProfile, StateUpdate, build_state_updates_from_prestate,
     classify_prestate_eligibility, compute_state_updates, encode_state_updates_to_abi,
-    estimate_gas_from_operations, extract_operation_counts_from_trace,
+    estimate_gas_from_operations, extract_operation_counts_from_trace, validate_unbounded_shape,
 };
 use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
 use gas_analyzer_rpc::{
-    get_call_frame_from_call, get_prestate_diff_from_call, get_trace_from_call,
+    get_call_frame_from_call_with_profile, get_prestate_diff_from_call_with_profile,
+    get_trace_from_call_with_profile,
 };
 
 // ============================================================================
@@ -768,12 +769,47 @@ fn hints_from_state_updates(
 ///
 /// # Returns
 /// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`
-#[tracing::instrument(name = "evmsketch.encode", skip_all, fields(block_number, state_update_count = tracing::field::Empty))]
 pub async fn call_to_encoded_state_updates_with_evmsketch(
     cache: &EvmSketchExecutorCache,
     rpc_url: impl AsRef<str>,
     tx_request: TransactionRequest,
     block_number: u64,
+) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
+    call_to_encoded_state_updates_with_evmsketch_profiled(
+        cache,
+        rpc_url,
+        tx_request,
+        block_number,
+        SimProfile::Chain,
+    )
+    .await
+}
+
+/// [`call_to_encoded_state_updates_with_evmsketch`] with an explicit
+/// [`SimProfile`] for the tracked-function simulation.
+///
+/// Under [`SimProfile::UnboundedV1`] the call is simulated with the pinned
+/// unbounded gas limits (`gas_analyzer_core::sim_profile`) so arbitrarily
+/// heavy compute can execute off-chain, and the extracted updates must pass
+/// [`validate_unbounded_shape`] (at most one `Store`, no `CREATE`) — a
+/// violation is a hard error, because a payload that writes N slots scales
+/// on-chain like a plain contract and defeats the mode's purpose.
+///
+/// Two things intentionally stay on the real chain's environment:
+/// - the **gas estimate** for applying the payload (`verifyAndUpdate` lands in
+///   a real block, so it must be priced under real limits);
+/// - any `Call` ops inside the payload (they re-execute on-chain at real gas).
+///
+/// The node serving `debug_traceCall` must have its execution cap lifted
+/// (`anvil --disable-block-gas-limit`, `geth --rpc.gascap=0`); otherwise
+/// heavy calls OOG inside the tracer and extraction fails.
+#[tracing::instrument(name = "evmsketch.encode", skip_all, fields(block_number, profile = ?profile, state_update_count = tracing::field::Empty))]
+pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
+    cache: &EvmSketchExecutorCache,
+    rpc_url: impl AsRef<str>,
+    tx_request: TransactionRequest,
+    block_number: u64,
+    profile: SimProfile,
 ) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
     let rpc_url = rpc_url.as_ref();
     let provider = cache.get_or_create_trace_provider(rpc_url)?;
@@ -807,10 +843,26 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
     // concurrently — they are independent, so on a cache miss this hides the executor build behind
     // the trace fetch.
     let ((state_updates, skipped_opcodes), executor) = tokio::try_join!(
-        extract_state_updates_hybrid(&provider, tx_request, block_id, contract_address),
+        extract_state_updates_hybrid(&provider, tx_request, block_id, contract_address, profile),
         cache.get_or_build(rpc_url, block_number),
     )?;
     tracing::Span::current().record("state_update_count", state_updates.len());
+
+    // The unbounded profile's whole bargain: compute may be unbounded, the
+    // on-chain payload may not. Enforce it before signing/estimating anything.
+    if profile.requires_unbounded_shape() {
+        let shape = validate_unbounded_shape(&state_updates).map_err(|violation| {
+            anyhow!(
+                "unbounded-profile payload shape violation for consumer {contract_address}: {violation}"
+            )
+        })?;
+        tracing::debug!(
+            stores = shape.stores,
+            calls = shape.calls,
+            logs = shape.logs,
+            "unbounded payload shape OK"
+        );
+    }
 
     let storage_updates = encode_state_updates_to_abi(&state_updates);
 
@@ -849,12 +901,14 @@ async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
     tx_request: TransactionRequest,
     block: BlockId,
     consumer: Address,
+    profile: SimProfile,
 ) -> Result<(Vec<StateUpdate>, HashSet<Opcode>)> {
-    if let Ok(Some(updates)) = try_prestate_fast_path(provider, &tx_request, block, consumer).await
+    if let Ok(Some(updates)) =
+        try_prestate_fast_path(provider, &tx_request, block, consumer, profile).await
     {
         return Ok((updates, HashSet::new()));
     }
-    let trace = get_trace_from_call(provider, tx_request, block).await?;
+    let trace = get_trace_from_call_with_profile(provider, tx_request, block, profile).await?;
     let (state_updates, skipped_opcodes, _call_gas_total) = compute_state_updates(trace)?;
     Ok((state_updates, skipped_opcodes))
 }
@@ -867,12 +921,13 @@ async fn try_prestate_fast_path<P: Provider + DebugApi>(
     tx_request: &TransactionRequest,
     block: BlockId,
     consumer: Address,
+    profile: SimProfile,
 ) -> Result<Option<Vec<StateUpdate>>> {
     // The two tracer calls are independent — run them concurrently so the fast path costs one
     // round-trip, not two.
     let (diff, frame) = tokio::try_join!(
-        get_prestate_diff_from_call(provider, tx_request.clone(), block),
-        get_call_frame_from_call(provider, tx_request.clone(), block),
+        get_prestate_diff_from_call_with_profile(provider, tx_request.clone(), block, profile),
+        get_call_frame_from_call_with_profile(provider, tx_request.clone(), block, profile),
     )?;
     match classify_prestate_eligibility(&frame, &diff, consumer) {
         PrestateEligibility::Eligible => Ok(Some(build_state_updates_from_prestate(
@@ -895,6 +950,9 @@ mod tests {
     use alloy::primitives::{address, bytes};
     use alloy::providers::ProviderBuilder;
     use gas_analyzer_core::types::IStateUpdateTypes;
+    use gas_analyzer_rpc::{
+        get_call_frame_from_call, get_prestate_diff_from_call, get_trace_from_call,
+    };
 
     /// `with_chain_id` must store the supplied value so `build` can bypass the
     /// `eth_chainId` probe.
@@ -1395,6 +1453,13 @@ mod tests {
 
     impl LocalAnvil {
         async fn spawn() -> LocalAnvil {
+            Self::spawn_with(&[]).await
+        }
+
+        /// Spawn with extra anvil flags — e.g. `--disable-block-gas-limit`,
+        /// which the unbounded-profile tests need so `debug_traceCall` honors
+        /// the lifted tx gas limit instead of clamping to the 30M default.
+        async fn spawn_with(extra_args: &[&str]) -> LocalAnvil {
             // Grab a free port, release it, and hand it to anvil. The tiny
             // reuse window is acceptable for tests.
             let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -1404,6 +1469,7 @@ mod tests {
                 .port();
             let child = std::process::Command::new("anvil")
                 .args(["--port", &port.to_string(), "--silent"])
+                .args(extra_args)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -1576,10 +1642,15 @@ mod tests {
         provider: &RootProvider<Ethereum>,
         to: Address,
     ) -> ((Vec<StateUpdate>, HashSet<Opcode>), Vec<StateUpdate>) {
-        let hybrid =
-            extract_state_updates_hybrid(provider, call_request(to), BlockId::latest(), to)
-                .await
-                .expect("hybrid extraction failed");
+        let hybrid = extract_state_updates_hybrid(
+            provider,
+            call_request(to),
+            BlockId::latest(),
+            to,
+            SimProfile::Chain,
+        )
+        .await
+        .expect("hybrid extraction failed");
         let trace = get_trace_from_call(provider, call_request(to), BlockId::latest())
             .await
             .expect("struct-log debug_traceCall failed");
@@ -1835,6 +1906,105 @@ mod tests {
             frame.logs[0].topics.as_deref(),
             Some(&[B256::with_last_byte(0xaa)][..]),
             "log topic must round-trip"
+        );
+    }
+
+    // ========================================================================
+    // Unbounded profile (SimProfile::UnboundedV1) — anvil integration tests
+    //
+    // These spawn anvil with `--disable-block-gas-limit` (the node-side
+    // requirement the profile documents) and prove the mode's two halves:
+    // compute beyond any real block extracts fine, and the extracted payload
+    // must still be single-slot shaped.
+    // ========================================================================
+
+    /// ~40M-gas busy loop (1,000,000 iterations × ~40 gas), then exactly one
+    /// SSTORE(1, 0x42) and one LOG1(topic 0xee) — the single-slot commitment
+    /// shape with compute far beyond a 30M block.
+    ///
+    /// Layout: PUSH3 1_000_000; loop{ DUP1 ISZERO PUSH1 end JUMPI; PUSH1 1
+    /// SWAP1 SUB; PUSH1 4 JUMP }; end: POP; SSTORE; LOG1; STOP.
+    fn gigagas_burner_code() -> Bytes {
+        hex_code(&format!(
+            "620f4240 5b 80 15 6011 57 6001 90 03 6004 56 5b 50 6042600155 7f{}60006000a1 00",
+            topic_hex(0xee),
+        ))
+    }
+
+    /// Same busy loop, but writing TWO slots — a consumer that is not
+    /// commitment-shaped and must be rejected by the unbounded profile.
+    fn gigagas_two_slot_code() -> Bytes {
+        hex_code("620f4240 5b 80 15 6011 57 6001 90 03 6004 56 5b 50 6042600155 6043600255 00")
+    }
+
+    /// Under `Chain` the burner OOGs (tx gas 3M < 40M needed): the #165 revert
+    /// classification forces fallback. Under `UnboundedV1` the same call — same
+    /// request, gas lifted to the pinned 2^40 override — extracts exactly
+    /// [Store(1,0x42), Log1(0xee)] via the prestate fast path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_unbounded_profile_extracts_beyond_block_gas_limit() {
+        let anvil = LocalAnvil::spawn_with(&["--disable-block-gas-limit"]).await;
+        let provider = anvil.provider();
+        let consumer = address!("0x0000000000000000000000000000000000002001");
+        set_code(&provider, consumer, gigagas_burner_code()).await;
+
+        // Chain profile: the 3M tx gas from call_request stands, the loop
+        // OOGs, and the reverted root frame must classify as Fallback.
+        let chain_classification = classify_call(&provider, consumer).await;
+        assert!(
+            matches!(
+                &chain_classification,
+                PrestateEligibility::Fallback(reason) if reason.contains("reverted/failed")
+            ),
+            "OOG under Chain profile must force the struct-log fallback, never an unsound diff; \
+             got {chain_classification:?}"
+        );
+
+        // UnboundedV1: identical request; the profile's pinned tx-gas override
+        // replaces the request's 3M and the burner completes.
+        let (updates, skipped) = extract_state_updates_hybrid(
+            &provider,
+            call_request(consumer),
+            BlockId::latest(),
+            consumer,
+            SimProfile::UnboundedV1,
+        )
+        .await
+        .expect("unbounded extraction must succeed on a >30M-gas call");
+        assert!(skipped.is_empty(), "no opcodes should be skipped");
+        assert_updates_eq(
+            &updates,
+            &[store_up(1, 0x42), log1_up(0xee, Bytes::new())],
+            "40M gas of compute must reduce to one Store and one Log",
+        );
+        validate_unbounded_shape(&updates).expect("burner payload is commitment-shaped");
+    }
+
+    /// A two-slot writer extracts fine but must fail the unbounded shape
+    /// gate — the exact check `call_to_encoded_state_updates_with_evmsketch_profiled`
+    /// applies before estimating/encoding.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_unbounded_profile_rejects_multi_slot_payload() {
+        let anvil = LocalAnvil::spawn_with(&["--disable-block-gas-limit"]).await;
+        let provider = anvil.provider();
+        let consumer = address!("0x0000000000000000000000000000000000002002");
+        set_code(&provider, consumer, gigagas_two_slot_code()).await;
+
+        let (updates, _) = extract_state_updates_hybrid(
+            &provider,
+            call_request(consumer),
+            BlockId::latest(),
+            consumer,
+            SimProfile::UnboundedV1,
+        )
+        .await
+        .expect("extraction itself succeeds; only the shape gate rejects");
+
+        let violation = validate_unbounded_shape(&updates)
+            .expect_err("two Store ops must violate the single-slot invariant");
+        assert_eq!(
+            violation,
+            gas_analyzer_core::UnboundedShapeViolation::TooManyStores { count: 2 }
         );
     }
 }
