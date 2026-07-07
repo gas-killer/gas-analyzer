@@ -111,22 +111,48 @@ boundary. Hence:
   alongside the chain-config hash so a proof under the wrong profile cannot
   satisfy the verifier.
 
-### Required guest change (before slashing ships)
+### Fork support (implemented)
 
-`sp1-cc`'s `ClientExecutor` today builds its `BlockEnv`/`TxEnv` from the
-anchored header. For tracked functions executed under `UnboundedV1`, the guest
-must override, exactly:
+The BreadchainCoop `sp1-contract-call` fork (branch
+`ron/unbounded-env-overrides`, targeting `cancun-v1`) provides the mechanism:
 
 ```rust
-// inside the guest, after building the env from EvmSketchInput:
-block_env.gas_limit = gas_analyzer_core::UNBOUNDED_V1_BLOCK_GAS_LIMIT;
-tx_env.gas_limit    = gas_analyzer_core::UNBOUNDED_V1_TX_GAS_LIMIT;
-// and do NOT apply the EIP-7825 tx cap for this profile
+use sp1_cc_client_executor::EnvOverrides;
+use gas_analyzer_core::UNBOUNDED_V1_BLOCK_GAS_LIMIT;
+
+let overrides = EnvOverrides::gas_limits(UNBOUNDED_V1_BLOCK_GAS_LIMIT);
+
+// Host: prefetch state under the SAME limits the guest will execute with —
+// a host that OOGs early produces a witness the guest cannot complete on.
+let out = sketch.call_raw_with_overrides(&input, overrides).await?;
+let sketch_input = sketch.finalize().await?;
+
+// Guest: re-execute under the identical env; the overrides are bound into
+// `chainConfigHash` (ChainConfigWithEnvOverrides), so a proof under
+// different limits cannot satisfy the verifier.
+let executor = ClientExecutor::eth(&sketch_input)?;
+executor.execute_and_commit_with_overrides(input, overrides);
 ```
 
-This belongs in the BreadchainCoop `sp1-contract-call` fork (branch
-`cancun-v1`) as a profile-aware executor entry point, keyed by the same
-`SimProfile` the host used.
+Setting `tx_gas_limit` also lifts revm's EIP-7825 cap (2^24, Osaka+) to the
+same value, so execution is identical on both sides of the hardfork boundary.
+Regression tests in the fork pin the two invariants: a ~40M-gas call OOGs at
+exactly the header limit without overrides, and succeeds (burning more than
+any real block) under `gas_limits(1 << 40)`.
+
+> **Latent bug fixed along the way:** upstream sp1-cc assigned the gas limit
+> via `modify_tx_chained` on the context, but `Evm::transact` replaces the tx
+> env with the converted `ContractInput` — whose `TxEnv::default()` carries
+> revm's 2^24 builder default. Every sketch/guest execution was silently
+> capped at **16,777,216 gas** regardless of the header. Any tracked function
+> above ~16.7M gas would have OOG'd in host prefetch and guest re-execution
+> even in "bounded" mode.
+
+Remaining before slashing ships: merge the fork branch into `cancun-v1`, and
+have the slashing guest program (per `SP1_REVM_IMPLEMENTATION_SPEC.md`) pass
+`EnvOverrides::gas_limits(UNBOUNDED_V1_BLOCK_GAS_LIMIT)` — importing the
+constant from `gas-analyzer-core`, never restating it — and commit the profile
+version in its public values.
 
 ## What this mode does *not* change
 
