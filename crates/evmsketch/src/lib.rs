@@ -110,8 +110,12 @@ fn gnosis_hardforks() -> EthereumChainHardforks {
 pub mod simple_rpc_db;
 use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 
+// Re-exported so downstream consumers (e.g. the Gas Killer service) can name
+// the profile without a direct gas-analyzer-core dependency.
+pub use gas_analyzer_core::SimProfile;
+
 use gas_analyzer_core::{
-    Opcode, PrestateEligibility, SimProfile, StateUpdate, build_state_updates_from_prestate,
+    Opcode, PrestateEligibility, StateUpdate, build_state_updates_from_prestate,
     classify_prestate_eligibility, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_operations, extract_operation_counts_from_trace, validate_unbounded_shape,
 };
