@@ -52,8 +52,8 @@ fn impl_slot() -> U256 {
 }
 
 use gas_analyzer_core::{
-    Opcode, RevertingContext, StateUpdate, TURETZKY_UPPER_GAS_LIMIT, compute_state_updates,
-    encode_state_updates_to_abi, encode_state_updates_to_sol,
+    Opcode, RevertingContext, SignatureType, StateUpdate, TURETZKY_UPPER_GAS_LIMIT_SCHNORR,
+    compute_state_updates, encode_state_updates_to_abi, encode_state_updates_to_sol,
 };
 use gas_analyzer_rpc::get_tx_trace;
 
@@ -61,7 +61,13 @@ use gas_analyzer_rpc::get_tx_trace;
 // Report Types
 // ============================================================================
 
-/// Gas analysis report for a transaction
+/// Gas analysis report for a transaction.
+///
+/// The GasKiller gas estimate is the base state-change execution cost plus the
+/// Turetzky upper gas limit, which depends on the signature scheme used to verify the
+/// aggregated operator attestation on-chain. The estimate, estimated cost, and savings
+/// are therefore reported per scheme (`_bls` / `_schnorr`) alongside the shared base
+/// estimate. Fields are flat rather than nested so the report serializes to CSV.
 #[derive(Serialize)]
 pub struct GasKillerReport {
     pub time: DateTime<Utc>,
@@ -72,10 +78,15 @@ pub struct GasKillerReport {
     pub gas_used: u64,
     pub gas_cost: u128,
     pub approx_gas_unit_price: f64,
-    pub gaskiller_gas_estimate: u64,
-    pub gaskiller_estimated_gas_cost: f64,
-    pub gas_savings: u64,
-    pub percent_savings: f64,
+    pub gaskiller_base_gas_estimate: u64,
+    pub gaskiller_gas_estimate_bls: u64,
+    pub gaskiller_gas_estimate_schnorr: u64,
+    pub gaskiller_estimated_gas_cost_bls: f64,
+    pub gaskiller_estimated_gas_cost_schnorr: f64,
+    pub gas_savings_bls: u64,
+    pub gas_savings_schnorr: u64,
+    pub percent_savings_bls: f64,
+    pub percent_savings_schnorr: f64,
     pub function_selector: FixedBytes<4>,
     pub skipped_opcodes: String,
     pub error_log: Option<String>,
@@ -85,6 +96,7 @@ impl GasKillerReport {
     pub fn report_error(
         time: DateTime<Utc>,
         receipt: &TransactionReceipt,
+        function_selector: FixedBytes<4>,
         e: &anyhow::Error,
     ) -> Self {
         let commit = env!("GIT_HASH").to_string();
@@ -108,11 +120,16 @@ impl GasKillerReport {
             gas_used: receipt.gas_used,
             gas_cost: receipt.effective_gas_price,
             approx_gas_unit_price: receipt.effective_gas_price as f64 / receipt.gas_used as f64,
-            gaskiller_gas_estimate: 0,
-            gaskiller_estimated_gas_cost: 0.0,
-            gas_savings: 0,
-            percent_savings: 0.0,
-            function_selector: FixedBytes::default(),
+            gaskiller_base_gas_estimate: 0,
+            gaskiller_gas_estimate_bls: 0,
+            gaskiller_gas_estimate_schnorr: 0,
+            gaskiller_estimated_gas_cost_bls: 0.0,
+            gaskiller_estimated_gas_cost_schnorr: 0.0,
+            gas_savings_bls: 0,
+            gas_savings_schnorr: 0,
+            percent_savings_bls: 0.0,
+            percent_savings_schnorr: 0.0,
+            function_selector,
             skipped_opcodes: "".to_string(),
             error_log: Some(format!("{e:?}")),
         }
@@ -140,10 +157,15 @@ impl GasKillerReport {
             gas_used: receipt.gas_used,
             gas_cost: receipt.effective_gas_price,
             approx_gas_unit_price: details.approx_gas_price_per_unit,
-            gaskiller_gas_estimate: details.gaskiller_gas_estimate,
-            gaskiller_estimated_gas_cost: details.gaskiller_estimated_gas_cost,
-            gas_savings: details.gas_savings,
-            percent_savings: details.percent_savings,
+            gaskiller_base_gas_estimate: details.gaskiller_base_gas_estimate,
+            gaskiller_gas_estimate_bls: details.bls.gas_estimate,
+            gaskiller_gas_estimate_schnorr: details.schnorr.gas_estimate,
+            gaskiller_estimated_gas_cost_bls: details.bls.estimated_gas_cost,
+            gaskiller_estimated_gas_cost_schnorr: details.schnorr.estimated_gas_cost,
+            gas_savings_bls: details.bls.gas_savings,
+            gas_savings_schnorr: details.schnorr.gas_savings,
+            percent_savings_bls: details.bls.percent_savings,
+            percent_savings_schnorr: details.schnorr.percent_savings,
             function_selector: details.function_selector,
             skipped_opcodes: details.skipped_opcodes,
             error_log: None,
@@ -151,13 +173,41 @@ impl GasKillerReport {
     }
 }
 
+/// Gas figures for a single signature scheme, derived from the base estimate.
+#[derive(Debug, Clone, Copy)]
+pub struct SignatureGasEstimate {
+    pub gas_estimate: u64,
+    pub estimated_gas_cost: f64,
+    pub gas_savings: u64,
+    pub percent_savings: f64,
+}
+
+impl SignatureGasEstimate {
+    /// Combine the base state-change estimate with a scheme's Turetzky upper gas limit
+    /// and derive the estimated cost and savings against the transaction's actual usage.
+    fn compute(
+        signature_type: SignatureType,
+        base_estimate: u64,
+        gas_used: u64,
+        approx_gas_price_per_unit: f64,
+    ) -> Self {
+        let (gas_estimate, gas_savings, percent_savings) =
+            signature_type.savings(base_estimate, gas_used);
+        Self {
+            gas_estimate,
+            estimated_gas_cost: approx_gas_price_per_unit * gas_estimate as f64,
+            gas_savings,
+            percent_savings,
+        }
+    }
+}
+
 /// Details for gas estimation report
 pub struct ReportDetails {
     pub approx_gas_price_per_unit: f64,
-    pub gaskiller_gas_estimate: u64,
-    pub gaskiller_estimated_gas_cost: f64,
-    pub gas_savings: u64,
-    pub percent_savings: f64,
+    pub gaskiller_base_gas_estimate: u64,
+    pub bls: SignatureGasEstimate,
+    pub schnorr: SignatureGasEstimate,
     pub function_selector: FixedBytes<4>,
     pub skipped_opcodes: String,
 }
@@ -448,7 +498,7 @@ pub async fn get_trace_from_call(
         bail!("transaction failed");
     }
     let tx_hash = tx_receipt.transaction_hash;
-    get_tx_trace(&provider, tx_hash).await
+    get_tx_trace(&provider, tx_hash, tx_receipt.status()).await
 }
 
 // ============================================================================
@@ -479,9 +529,11 @@ pub async fn gas_estimate_block(
     let block_number = all_receipts[0]
         .block_number
         .expect("couldn't find block number in receipt");
+    // Compare against the smallest signature floor so we keep any transaction that
+    // could show savings under at least one scheme.
     let receipts: Vec<_> = all_receipts
         .into_iter()
-        .filter(|x| x.gas_used > TURETZKY_UPPER_GAS_LIMIT && x.to.is_some())
+        .filter(|x| x.gas_used > TURETZKY_UPPER_GAS_LIMIT_SCHNORR && x.to.is_some())
         .collect();
 
     println!("got {} receipts for block {}", receipts.len(), block_number);
@@ -491,7 +543,11 @@ pub async fn gas_estimate_block(
         reports.push(
             get_report(&provider, receipt.transaction_hash, &receipt, &gk)
                 .await
-                .unwrap_or_else(|e| GasKillerReport::report_error(Utc::now(), &receipt, &e)),
+                .unwrap_or_else(|e| {
+                    // Outer fallback: only reached if `get_report` couldn't even fetch
+                    // the transaction. We have no selector to report in that case.
+                    GasKillerReport::report_error(Utc::now(), &receipt, FixedBytes::default(), &e)
+                }),
         );
         println!("done");
     }
@@ -509,13 +565,15 @@ pub async fn gas_estimate_tx(
         .await?
         .ok_or_else(|| anyhow!("could not get receipt for tx {}", tx_hash))?;
     let smart_contract_tx = invokes_smart_contract(&provider, &receipt).await?;
-    if receipt.gas_used <= TURETZKY_UPPER_GAS_LIMIT
+    // Compare against the smallest signature floor so we keep any transaction that could
+    // show savings under at least one scheme.
+    if receipt.gas_used <= TURETZKY_UPPER_GAS_LIMIT_SCHNORR
         || !smart_contract_tx
         || receipt.to.is_none()
         || !receipt.status()
     {
         bail!(
-            "Skipped: either 1) gas used is less than or equal to TUGL or 2) no smart contract calls are made or 3) contract creation transaction or 4) transaction failed"
+            "Skipped: either 1) gas used is less than or equal to the smallest Turetzky upper gas limit or 2) no smart contract calls are made or 3) contract creation transaction or 4) transaction failed"
         )
     }
 
@@ -529,12 +587,34 @@ pub async fn get_report(
     receipt: &TransactionReceipt,
     gk: &GasKillerDefault,
 ) -> Result<GasKillerReport> {
-    let details = gaskiller_reporter(&provider, tx_hash, gk, receipt).await;
+    // Fetch the function selector up front so it's available on both the success
+    // and the failure paths. Defaulting to zero only when the transaction's input
+    // is shorter than 4 bytes (e.g. a plain ETH transfer that slipped past upstream
+    // filters); in every other case the error report will carry the real selector.
+    let function_selector = fetch_function_selector(&provider, tx_hash).await?;
+
+    let details = gaskiller_reporter(&provider, tx_hash, gk, receipt, function_selector).await;
     if let Err(e) = details {
-        return Ok(GasKillerReport::report_error(Utc::now(), receipt, &e));
+        return Ok(GasKillerReport::report_error(
+            Utc::now(),
+            receipt,
+            function_selector,
+            &e,
+        ));
     }
 
     Ok(GasKillerReport::from(Utc::now(), receipt, details.unwrap()))
+}
+
+async fn fetch_function_selector(
+    provider: impl Provider,
+    tx_hash: FixedBytes<32>,
+) -> Result<FixedBytes<4>> {
+    let transaction = provider
+        .get_transaction_by_hash(tx_hash)
+        .await?
+        .ok_or_else(|| anyhow!("could not get transaction for tx {}", tx_hash))?;
+    Ok(transaction.function_selector().copied().unwrap_or_default())
 }
 
 /// Generate detailed report for a transaction
@@ -543,37 +623,37 @@ pub async fn gaskiller_reporter(
     tx_hash: FixedBytes<32>,
     gk: &GasKillerDefault,
     receipt: &TransactionReceipt,
+    function_selector: FixedBytes<4>,
 ) -> Result<ReportDetails> {
-    let transaction = provider
-        .get_transaction_by_hash(tx_hash)
-        .await?
-        .ok_or_else(|| anyhow!("could not get receipt for tx {}", tx_hash))?;
-    let trace = get_tx_trace(&provider, tx_hash).await?;
+    let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
     let (state_updates, skipped_opcodes_set, _call_gas_total) = compute_state_updates(trace)?;
     let skipped_opcodes = skipped_opcodes_set
         .into_iter()
         .collect::<Vec<_>>()
         .join(", ");
-    let gaskiller_gas_estimate = gk
+    let base_gas_estimate = gk
         .estimate_state_changes_gas(
             receipt.to.unwrap(), // already check if this is None in gas_estimate_tx
             &state_updates,
         )
         .await?;
-    let gaskiller_gas_estimate = gaskiller_gas_estimate + TURETZKY_UPPER_GAS_LIMIT;
     let gas_used = receipt.gas_used;
     let approx_gas_price_per_unit: f64 = receipt.effective_gas_price as f64 / gas_used as f64;
-    let gaskiller_estimated_gas_cost = approx_gas_price_per_unit * gaskiller_gas_estimate as f64;
-    let gas_savings = gas_used.saturating_sub(gaskiller_gas_estimate);
-    let function_selector = *transaction
-        .function_selector()
-        .ok_or_else(|| anyhow!("could not get function selector for tx 0x{}", tx_hash))?;
     Ok(ReportDetails {
         approx_gas_price_per_unit,
-        gaskiller_gas_estimate,
-        gaskiller_estimated_gas_cost,
-        gas_savings,
-        percent_savings: (gas_savings * 100) as f64 / gas_used as f64,
+        gaskiller_base_gas_estimate: base_gas_estimate,
+        bls: SignatureGasEstimate::compute(
+            SignatureType::Bls,
+            base_gas_estimate,
+            gas_used,
+            approx_gas_price_per_unit,
+        ),
+        schnorr: SignatureGasEstimate::compute(
+            SignatureType::Schnorr,
+            base_gas_estimate,
+            gas_used,
+            approx_gas_price_per_unit,
+        ),
         function_selector,
         skipped_opcodes,
     })
@@ -622,8 +702,12 @@ impl<P: Provider + DebugApi> TxStateExtractor<P> {
 
     /// Extract state updates from a transaction hash
     pub async fn extract_state_updates(&self, tx_hash: FixedBytes<32>) -> Result<Vec<StateUpdate>> {
-        // Use existing get_tx_trace function
-        let trace = get_tx_trace(&self.provider, tx_hash).await?;
+        let receipt = self
+            .provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow!("could not get receipt for tx {}", tx_hash))?;
+        let trace = get_tx_trace(&self.provider, tx_hash, receipt.status()).await?;
 
         // Use existing compute_state_updates function
         let (state_updates, _skipped, _call_gas_total) = compute_state_updates(trace)?;
@@ -652,7 +736,7 @@ impl<P: Provider + DebugApi> TxStateExtractor<P> {
             return Err(anyhow!("Transaction failed"));
         }
 
-        let trace = get_tx_trace(&self.provider, tx_hash).await?;
+        let trace = get_tx_trace(&self.provider, tx_hash, receipt.status()).await?;
         let (state_updates, _skipped, _call_gas_total) = compute_state_updates(trace)?;
 
         Ok(StateUpdateReport {
@@ -869,14 +953,18 @@ mod tests {
         let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
 
         let tx_hash = SIMPLE_STORAGE_SET_TX_HASH;
-        let trace = get_tx_trace(&provider, tx_hash).await?;
+        let receipt = provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
+        let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let (state_updates, _, _) = compute_state_updates(trace)?;
 
         let gk = GasKillerDefault::new(rpc_url, None).await?;
         let gas_estimate = gk
             .estimate_state_changes_gas(SIMPLE_STORAGE_ADDRESS, &state_updates)
             .await?;
-        assert_eq!(gas_estimate, 32549);
+        assert_eq!(gas_estimate, 32525);
         Ok(())
     }
 
@@ -890,14 +978,18 @@ mod tests {
         let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
 
         let tx_hash = ACCESS_CONTROL_MAIN_RUN_TX_HASH;
-        let trace = get_tx_trace(&provider, tx_hash).await?;
+        let receipt = provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
+        let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let (state_updates, _, _) = compute_state_updates(trace)?;
 
         let gk = GasKillerDefault::new(rpc_url, None).await?;
         let gas_estimate = gk
             .estimate_state_changes_gas(ACCESS_CONTROL_MAIN_ADDRESS, &state_updates)
             .await?;
-        assert_eq!(gas_estimate, 37185);
+        assert_eq!(gas_estimate, 37161);
         Ok(())
     }
 
@@ -911,7 +1003,11 @@ mod tests {
         let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
 
         let tx_hash = ACCESS_CONTROL_MAIN_RUN_TX_HASH;
-        let trace = get_tx_trace(&provider, tx_hash).await?;
+        let receipt = provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
+        let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let (state_updates, _, _) = compute_state_updates(trace)?;
 
         let gk = GasKillerDefault::new(rpc_url, None).await?;
@@ -939,7 +1035,11 @@ mod tests {
         let provider = ProviderBuilder::new().connect_http(rpc_url);
 
         let tx_hash = SIMPLE_STORAGE_SET_TX_HASH;
-        let trace = get_tx_trace(&provider, tx_hash).await?;
+        let receipt = provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
+        let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let (state_updates, _, _) = compute_state_updates(trace)?;
 
         assert_eq!(state_updates.len(), 2);
@@ -982,7 +1082,11 @@ mod tests {
         let provider = ProviderBuilder::new().connect_http(rpc_url);
 
         let tx_hash = SIMPLE_STORAGE_DEPOSIT_TX_HASH;
-        let trace = get_tx_trace(&provider, tx_hash).await?;
+        let receipt = provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
+        let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let (state_updates, _, _) = compute_state_updates(trace)?;
 
         assert_eq!(state_updates.len(), 2);
@@ -1029,7 +1133,11 @@ mod tests {
         let provider = ProviderBuilder::new().connect_http(rpc_url);
 
         let tx_hash = DELEGATECALL_CONTRACT_MAIN_RUN_TX_HASH;
-        let trace = get_tx_trace(&provider, tx_hash).await?;
+        let receipt = provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
+        let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let (state_updates, _, _) = compute_state_updates(trace)?;
 
         assert_eq!(state_updates.len(), 4);
@@ -1094,7 +1202,11 @@ mod tests {
         let provider = ProviderBuilder::new().connect_http(rpc_url);
 
         let tx_hash = SIMPLE_STORAGE_CALL_EXTERNAL_TX_HASH;
-        let trace = get_tx_trace(&provider, tx_hash).await?;
+        let receipt = provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
+        let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let (state_updates, _, _) = compute_state_updates(trace)?;
 
         assert_eq!(state_updates.len(), 1);

@@ -1,12 +1,12 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/anvil",
+    "crates/cli",
     "crates/core",
+    "crates/evmsketch",
     "crates/gas-estimator",
     "crates/rpc",
-    "crates/anvil",
-    "crates/evmsketch",
-    "crates/cli",
     "crates/wasm",
     "crates/indexer-api",
     "crates/indexer-rpc",
@@ -28,3 +28,6 @@ default-members = [
     "crates/indexer-service",
     "crates/indexer-web",
 ]
+
+[profile.bench]
+debug = 1

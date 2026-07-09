@@ -8,9 +8,72 @@ use alloy_sol_types::SolValue;
 
 use crate::types::{StateUpdate, StateUpdateType};
 
-/// The Turetzky upper gas limit - the floor gas cost for executing a GasKiller transaction.
-/// This represents the minimum overhead for the StateChangeHandler execution.
-pub const TURETZKY_UPPER_GAS_LIMIT: u64 = 250000u64;
+/// The Turetzky upper gas limit for BLS-verified attestations - the floor gas cost
+/// for executing a GasKiller transaction, i.e. the minimum StateChangeHandler
+/// execution overhead. The floor depends on the signature scheme used to verify the
+/// aggregated operator attestation on-chain, and BLS verification is the more
+/// expensive of the two schemes.
+pub const TURETZKY_UPPER_GAS_LIMIT_BLS: u64 = 250000u64;
+
+/// The Turetzky upper gas limit for Schnorr-verified attestations. See
+/// [`TURETZKY_UPPER_GAS_LIMIT_BLS`]; Schnorr verification is cheaper on-chain and so
+/// yields a lower floor.
+pub const TURETZKY_UPPER_GAS_LIMIT_SCHNORR: u64 = 27000u64;
+
+/// Signature scheme used to verify the aggregated operator attestation on-chain.
+///
+/// Each scheme has a different on-chain verification cost, which sets the GasKiller
+/// gas floor (the Turetzky upper gas limit). Gas figures are reported per scheme so
+/// callers can compare the trade-off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SignatureType {
+    Bls,
+    Schnorr,
+}
+
+impl SignatureType {
+    /// All signature schemes, in the order they should be reported.
+    pub const ALL: [SignatureType; 2] = [SignatureType::Bls, SignatureType::Schnorr];
+
+    /// The Turetzky upper gas limit (GasKiller gas floor) for this scheme.
+    pub fn turetzky_upper_gas_limit(self) -> u64 {
+        match self {
+            SignatureType::Bls => TURETZKY_UPPER_GAS_LIMIT_BLS,
+            SignatureType::Schnorr => TURETZKY_UPPER_GAS_LIMIT_SCHNORR,
+        }
+    }
+
+    /// Add this scheme's gas floor to a base state-change estimate to obtain the
+    /// total GasKiller gas estimate.
+    pub fn total_gas_estimate(self, base_estimate: u64) -> u64 {
+        base_estimate + self.turetzky_upper_gas_limit()
+    }
+
+    /// GasKiller gas figures for this scheme against a transaction's actual usage,
+    /// returned as `(total_estimate, gas_savings, percent_savings)`. `total_estimate`
+    /// is the base state-change estimate plus this scheme's floor; `gas_savings`
+    /// saturates at zero when the estimate exceeds `gas_used`; `percent_savings` is
+    /// zero when `gas_used` is zero. Both callers (CLI and report) share this so the
+    /// savings math cannot drift between them.
+    pub fn savings(self, base_estimate: u64, gas_used: u64) -> (u64, u64, f64) {
+        let total_estimate = self.total_gas_estimate(base_estimate);
+        let gas_savings = gas_used.saturating_sub(total_estimate);
+        let percent_savings = if gas_used > 0 {
+            (gas_savings as f64 / gas_used as f64) * 100.0
+        } else {
+            0.0
+        };
+        (total_estimate, gas_savings, percent_savings)
+    }
+
+    /// Human-readable label for CLI and report output.
+    pub fn label(self) -> &'static str {
+        match self {
+            SignatureType::Bls => "BLS",
+            SignatureType::Schnorr => "Schnorr",
+        }
+    }
+}
 
 /// Encode state updates to Solidity types (for contract calls).
 pub fn encode_state_updates_to_sol(
@@ -26,6 +89,8 @@ pub fn encode_state_updates_to_sol(
             StateUpdate::Log2(_) => StateUpdateType::LOG2,
             StateUpdate::Log3(_) => StateUpdateType::LOG3,
             StateUpdate::Log4(_) => StateUpdateType::LOG4,
+            StateUpdate::Create(_) => StateUpdateType::CREATE,
+            StateUpdate::Create2(_) => StateUpdateType::CREATE2,
         })
         .collect::<Vec<_>>();
 
@@ -41,6 +106,8 @@ pub fn encode_state_updates_to_sol(
                 StateUpdate::Log2(x) => x.abi_encode_sequence(),
                 StateUpdate::Log3(x) => x.abi_encode_sequence(),
                 StateUpdate::Log4(x) => x.abi_encode_sequence(),
+                StateUpdate::Create(x) => x.abi_encode_sequence(),
+                StateUpdate::Create2(x) => x.abi_encode_sequence(),
             })
         })
         .collect::<Vec<_>>();
@@ -118,4 +185,66 @@ pub fn encode_state_updates_to_abi(state_updates: &[StateUpdate]) -> Bytes {
     encoded.extend_from_slice(&datas_payload);
 
     Bytes::copy_from_slice(&encoded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turetzky_upper_gas_limit_matches_scheme() {
+        assert_eq!(
+            SignatureType::Bls.turetzky_upper_gas_limit(),
+            TURETZKY_UPPER_GAS_LIMIT_BLS
+        );
+        assert_eq!(
+            SignatureType::Schnorr.turetzky_upper_gas_limit(),
+            TURETZKY_UPPER_GAS_LIMIT_SCHNORR
+        );
+        // Schnorr verification is cheaper on-chain, so its floor must be the smaller one.
+        const { assert!(TURETZKY_UPPER_GAS_LIMIT_SCHNORR < TURETZKY_UPPER_GAS_LIMIT_BLS) };
+    }
+
+    #[test]
+    fn total_gas_estimate_adds_scheme_floor() {
+        let base = 100_000;
+        assert_eq!(
+            SignatureType::Bls.total_gas_estimate(base),
+            base + TURETZKY_UPPER_GAS_LIMIT_BLS
+        );
+        assert_eq!(
+            SignatureType::Schnorr.total_gas_estimate(base),
+            base + TURETZKY_UPPER_GAS_LIMIT_SCHNORR
+        );
+    }
+
+    #[test]
+    fn savings_reports_estimate_savings_and_percent() {
+        // gas_used well above the floor: savings are positive.
+        let (estimate, savings, percent) = SignatureType::Bls.savings(50_000, 1_000_000);
+        assert_eq!(estimate, 50_000 + TURETZKY_UPPER_GAS_LIMIT_BLS);
+        assert_eq!(savings, 1_000_000 - estimate);
+        assert!((percent - (savings as f64 / 1_000_000.0) * 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn savings_saturates_and_guards_zero_gas() {
+        // Estimate exceeds usage: savings saturate to zero rather than underflow.
+        let (_, savings, percent) = SignatureType::Bls.savings(1_000_000, 10_000);
+        assert_eq!(savings, 0);
+        assert_eq!(percent, 0.0);
+        // Zero gas used: percentage is defined as zero, not NaN.
+        let (_, _, percent_zero) = SignatureType::Bls.savings(0, 0);
+        assert_eq!(percent_zero, 0.0);
+    }
+
+    #[test]
+    fn all_covers_every_scheme_with_labels() {
+        assert_eq!(
+            SignatureType::ALL,
+            [SignatureType::Bls, SignatureType::Schnorr]
+        );
+        assert_eq!(SignatureType::Bls.label(), "BLS");
+        assert_eq!(SignatureType::Schnorr.label(), "Schnorr");
+    }
 }

@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use alloy::primitives::{Address, FixedBytes};
+use alloy::primitives::{Address, FixedBytes, U256};
 use alloy::providers::{ProviderBuilder, RootProvider};
 use alloy_eips::BlockNumberOrTag;
 use alloy_provider::Provider;
@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use gas_analyzer_core::{TURETZKY_UPPER_GAS_LIMIT, estimate_gas_from_state_updates};
+use gas_analyzer_core::{TURETZKY_UPPER_GAS_LIMIT_BLS, estimate_gas_from_state_updates};
 use gas_analyzer_evmsketch::GasKillerEvmSketchDefault;
 use gas_analyzer_rpc::{compute_state_updates_from_tx, get_preceding_transactions};
 use indexer_rpc::{RetryConfig, is_transient_rpc_error, with_retry};
@@ -182,18 +182,25 @@ impl Analyzer for EvmSketchAnalyzer {
         .ok_or_else(|| AnalyzerError::Rpc(format!("block {block_number} not found")))?;
         let block_timestamp = block.header.timestamp;
 
-        // 3. Function selector via `eth_getTransactionByHash`.
-        let function_selector = with_retry(&retry_cfg, is_transient_rpc_error, || async {
+        // 3. Function selector + msg.value via `eth_getTransactionByHash`.
+        let tx = with_retry(&retry_cfg, is_transient_rpc_error, || async {
             provider.get_transaction_by_hash(tx_hash).await
         })
         .await
-        .map_err(|e| AnalyzerError::Rpc(format!("get_transaction_by_hash: {e}")))?
-        .and_then(|tx| tx.function_selector().copied())
-        .map(|fs| {
-            let bytes: [u8; 4] = fs.into();
-            bytes
-        })
-        .unwrap_or([0u8; 4]);
+        .map_err(|e| AnalyzerError::Rpc(format!("get_transaction_by_hash: {e}")))?;
+
+        let function_selector = tx
+            .as_ref()
+            .and_then(|tx| tx.function_selector().copied())
+            .map(|fs| {
+                let bytes: [u8; 4] = fs.into();
+                bytes
+            })
+            .unwrap_or([0u8; 4]);
+
+        // The original msg.value must be forwarded into the simulation — a
+        // value-dependent contract path otherwise diverges from the real tx.
+        let tx_value = tx.as_ref().map(|tx| tx.value()).unwrap_or(U256::ZERO);
 
         // 4. Compute state updates from the actual historical trace.
         // A trace failure is a real error (worker retries / dead-letters), not
@@ -201,7 +208,7 @@ impl Analyzer for EvmSketchAnalyzer {
         // flat ~271k estimate (#158).
         let (state_updates, skipped_opcodes, call_gas_total) =
             with_retry(&retry_cfg, is_transient_rpc_error, || async {
-                compute_state_updates_from_tx(provider, tx_hash).await
+                compute_state_updates_from_tx(provider, tx_hash, receipt.status()).await
             })
             .await
             .map_err(|e| AnalyzerError::Trace(format!("trace extraction failed: {e}")))?;
@@ -229,19 +236,27 @@ impl Analyzer for EvmSketchAnalyzer {
             .await
             .map_err(|e| AnalyzerError::Estimation(format!("builder.build: {e}")))?;
 
+        // Single-estimate schema: report the conservative BLS floor (250k).
+        // Surfacing the lower Schnorr floor (27k) alongside it needs a schema
+        // change — `gaskiller_gas_estimate` is one column.
         let (gaskiller_gas_estimate, is_heuristic, failure_reason) = match gk
             .estimate_state_changes_gas_with_preceding(
                 to,
                 tx_sender,
                 &state_updates,
                 &preceding_txs,
+                tx_value,
             ) {
-            Ok(g) => (g + TURETZKY_UPPER_GAS_LIMIT, false, None),
+            Ok(g) => (g + TURETZKY_UPPER_GAS_LIMIT_BLS, false, None),
             Err(e) => {
                 let heuristic = estimate_gas_from_state_updates(&state_updates, call_gas_total);
                 let reason = format!("{e}");
                 let truncated = reason.lines().next().unwrap_or("unknown").to_string();
-                (heuristic + TURETZKY_UPPER_GAS_LIMIT, true, Some(truncated))
+                (
+                    heuristic + TURETZKY_UPPER_GAS_LIMIT_BLS,
+                    true,
+                    Some(truncated),
+                )
             }
         };
 

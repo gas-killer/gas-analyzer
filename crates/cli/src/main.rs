@@ -1,3 +1,4 @@
+use alloy::consensus::Transaction as _;
 use alloy::sol_types::SolError;
 use alloy::{hex, providers::ProviderBuilder};
 use alloy_provider::Provider;
@@ -85,6 +86,16 @@ async fn main() {
     dotenv::dotenv().ok();
     let cli_args = parse_args();
 
+    let log_level = if cli_args.debug { "debug" } else { "info" };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
+        )
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+        .with_target(false)
+        .init();
+
     let debug = cli_args.debug;
     let result = execute_command(cli_args).await;
     if let Err(e) = result {
@@ -123,6 +134,21 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             let original_status = receipt.status();
             let tx_sender = receipt.from;
 
+            // Fetch the original tx so we can mirror its `msg.value` during
+            // simulation. Pass-through contracts (deposit-then-forward, intent
+            // settlers, swap routers) lose ETH otherwise and value-bearing
+            // CALL state updates halt with OutOfFunds.
+            let tx = provider
+                .get_transaction_by_hash(bytes.into())
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "tx 0x{} present in receipt but missing from eth_getTransactionByHash",
+                        hex::encode(bytes)
+                    )
+                })?;
+            let tx_value = tx.value();
+
             #[cfg(feature = "anvil")]
             if cli_args.use_anvil {
                 println!("Using Anvil-based implementation...");
@@ -137,7 +163,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     .expect("Failed to initialize GasKiller");
 
                 // Get trace and compute state updates
-                let trace = get_tx_trace(&provider, bytes.into()).await?;
+                let trace = get_tx_trace(&provider, bytes.into(), original_status).await?;
                 let (state_updates, skipped_opcodes, _call_gas_total) =
                     compute_state_updates(trace)?;
 
@@ -159,6 +185,8 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 let report = gas_estimate_tx(provider, bytes.into(), &gk).await?;
 
                 // Print gas analysis
+                use gas_analyzer_core::SignatureType;
+
                 println!("\n{}", "=== Gas Analysis ===".blue().bold());
                 println!("Transaction: 0x{}", hex::encode(bytes));
                 println!(
@@ -168,14 +196,34 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 );
                 println!("Gas used: {}", gas_used);
                 println!(
-                    "GasKiller gas estimate: {} {}",
-                    report.gaskiller_gas_estimate,
+                    "GasKiller base estimate (before signature floor): {} {}",
+                    report.gaskiller_base_gas_estimate,
                     "(measured via Anvil)".cyan()
                 );
-                println!(
-                    "Gas savings: {} ({:.2}%)",
-                    report.gas_savings, report.percent_savings
-                );
+                // Report the total estimate and savings for each signature scheme, since
+                // the Turetzky upper gas limit added to the base estimate differs per scheme.
+                for (signature_type, gas_estimate, gas_savings, percent_savings) in [
+                    (
+                        SignatureType::Bls,
+                        report.gaskiller_gas_estimate_bls,
+                        report.gas_savings_bls,
+                        report.percent_savings_bls,
+                    ),
+                    (
+                        SignatureType::Schnorr,
+                        report.gaskiller_gas_estimate_schnorr,
+                        report.gas_savings_schnorr,
+                        report.percent_savings_schnorr,
+                    ),
+                ] {
+                    println!(
+                        "\n{} (Turetzky upper gas limit: {})",
+                        format!("[{}]", signature_type.label()).bold(),
+                        signature_type.turetzky_upper_gas_limit()
+                    );
+                    println!("  GasKiller gas estimate: {}", gas_estimate);
+                    println!("  Gas savings: {} ({:.2}%)", gas_savings, percent_savings);
+                }
                 if let Some(error) = &report.error_log {
                     if cli_args.debug {
                         println!("{}: {}", "Error".red(), error);
@@ -209,7 +257,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 use gas_analyzer_rpc::compute_state_updates_from_tx;
 
                 let state_updates_result =
-                    compute_state_updates_from_tx(&provider, bytes.into()).await;
+                    compute_state_updates_from_tx(&provider, bytes.into(), original_status).await;
 
                 let (state_updates, skipped_opcodes, call_gas_total, use_fallback) =
                     match state_updates_result {
@@ -251,12 +299,15 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
 
                 // Get gas estimate using the state updates extracted from the actual trace
                 use gas_analyzer_core::{
-                    TURETZKY_UPPER_GAS_LIMIT, encode_state_updates_to_abi,
-                    estimate_gas_from_state_updates,
+                    SignatureType, encode_state_updates_to_abi, estimate_gas_from_state_updates,
                 };
                 use gas_analyzer_evmsketch::GasKillerEvmSketchDefault;
 
-                let (gas_estimate, is_heuristic) = if use_fallback || state_updates.is_empty() {
+                // Base estimate is the state-change execution cost only; the Turetzky
+                // upper gas limit (which depends on the signature scheme) is added per
+                // scheme when the estimate is reported.
+                let (base_gas_estimate, is_heuristic) = if use_fallback || state_updates.is_empty()
+                {
                     // Use heuristic estimation when trace extraction failed or no state updates
                     let gk = GasKillerEvmSketchDefault::builder(rpc_url.clone())
                         .at_block(BlockNumberOrTag::Number(block_number))
@@ -265,7 +316,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
 
                     // Try trace-based heuristic estimation
                     let fallback_estimate = match gk
-                        .estimate_gas_from_trace(&provider, bytes.into())
+                        .estimate_gas_from_trace(&provider, bytes.into(), original_status)
                         .await
                     {
                         Ok(estimate) => {
@@ -285,7 +336,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                             return Err(anyhow::Error::msg(msg));
                         }
                     };
-                    (fallback_estimate + TURETZKY_UPPER_GAS_LIMIT, true)
+                    (fallback_estimate, true)
                 } else {
                     // Normal path: try measured gas estimation using extracted state updates
                     // Get the contract address from the receipt
@@ -329,8 +380,9 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                         tx_sender,
                         &state_updates,
                         &preceding_txs,
+                        tx_value,
                     ) {
-                        Ok(gas) => (gas + TURETZKY_UPPER_GAS_LIMIT, false),
+                        Ok(gas) => (gas, false),
                         Err(e) => {
                             // Fall back to heuristic estimation
                             println!(
@@ -374,7 +426,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                             }
                             let heuristic =
                                 estimate_gas_from_state_updates(&state_updates, call_gas_total);
-                            (heuristic + TURETZKY_UPPER_GAS_LIMIT, true)
+                            (heuristic, true)
                         }
                     }
                 };
@@ -399,13 +451,6 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 }
 
                 // Print gas analysis
-                let gas_savings = gas_used.saturating_sub(gas_estimate);
-                let percent_savings = if gas_used > 0 {
-                    (gas_savings as f64 / gas_used as f64) * 100.0
-                } else {
-                    0.0
-                };
-
                 println!("\n{}", "=== Gas Analysis ===".blue().bold());
                 println!("Transaction: 0x{}", hex::encode(bytes));
                 println!(
@@ -422,8 +467,23 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 } else {
                     "(measured via StateChangeHandler)".cyan()
                 };
-                println!("GasKiller gas estimate: {} {}", gas_estimate, estimate_type);
-                println!("Gas savings: {} ({:.2}%)", gas_savings, percent_savings);
+                println!(
+                    "GasKiller base estimate (before signature floor): {} {}",
+                    base_gas_estimate, estimate_type
+                );
+                // Report the total estimate and savings for each signature scheme, since
+                // the Turetzky upper gas limit added to the base estimate differs per scheme.
+                for signature_type in SignatureType::ALL {
+                    let (gas_estimate, gas_savings, percent_savings) =
+                        signature_type.savings(base_gas_estimate, gas_used);
+                    println!(
+                        "\n{} (Turetzky upper gas limit: {})",
+                        format!("[{}]", signature_type.label()).bold(),
+                        signature_type.turetzky_upper_gas_limit()
+                    );
+                    println!("  GasKiller gas estimate: {}", gas_estimate);
+                    println!("  Gas savings: {} ({:.2}%)", gas_savings, percent_savings);
+                }
             }
 
             #[cfg(not(feature = "evmsketch"))]

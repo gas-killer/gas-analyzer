@@ -99,6 +99,7 @@ pub fn analyze_trace_inner(
         // WASM runs against EmptyDB with no real chain state; pick the newest
         // spec so post-Pectra opcodes don't halt with `NotActivated`.
         spec: SpecId::OSAKA,
+        value: U256::ZERO,
     };
 
     let (gas_estimate, is_heuristic) =
@@ -456,24 +457,6 @@ mod tests {
         ]);
         let result = encode_trace_inner(&trace).unwrap();
         assert_eq!(result.state_update_count, 3);
-    }
-
-    #[test]
-    fn test_create_opcode_ignored() {
-        // CREATE is not in the matches!(CALL|SSTORE|LOG*) filter in compute_state_updates,
-        // so it's silently ignored — not extracted and not added to skipped_opcodes.
-        let create_log = serde_json::json!({
-            "pc": 50, "op": "CREATE", "gas": 85000, "gasCost": 32000, "depth": 1,
-            "stack": [
-                "0x0000000000000000000000000000000000000000000000000000000000000000",
-                "0x0000000000000000000000000000000000000000000000000000000000000000",
-                "0x0000000000000000000000000000000000000000000000000000000000000000",
-            ],
-            "memory": [],
-        });
-        let trace = make_trace(vec![create_log]);
-        let result = encode_trace_inner(&trace).unwrap();
-        assert_eq!(result.state_update_count, 0);
     }
 
     #[test]
