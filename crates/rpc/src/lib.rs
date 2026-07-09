@@ -18,9 +18,10 @@ use alloy_provider::ext::DebugApi;
 use alloy_rpc_types::TransactionTrait;
 use anyhow::{Result, anyhow, bail};
 
-use gas_analyzer_core::SimProfile;
+use alloy::rpc::types::state::{AccountOverride, StateOverridesBuilder};
 use gas_analyzer_core::trace::compute_state_updates;
 use gas_analyzer_core::types::{Opcode, StateUpdate};
+use gas_analyzer_core::{OverlayEnv, SimProfile};
 use gas_analyzer_estimator::PrecedingTx;
 
 /// Apply a [`SimProfile`]'s environment overrides to a `debug_traceCall`
@@ -49,6 +50,27 @@ fn apply_sim_profile(
             .block_overrides
             .get_or_insert_with(BlockOverrides::default)
             .gas_limit = Some(block_gas);
+    }
+}
+
+/// Mount a pinned [`OverlayEnv`]'s code bindings as `debug_traceCall` state
+/// overrides. To the simulated EVM an overlaid chunk is indistinguishable
+/// from a deployed data contract; to consensus the overlay is part of the
+/// versioned env (see `gas_analyzer_core::overlay::env_commitment`), so it is
+/// applied unconditionally, like the gas overrides. Callers must have
+/// verified the env against the pinned manifest (`OverlayEnv::verify`).
+fn apply_overlay_env(options: &mut GethDebugTracingCallOptions, env: &OverlayEnv) {
+    let mut builder = StateOverridesBuilder::default();
+    for overlay in &env.overlays {
+        builder = builder.append(
+            overlay.address,
+            AccountOverride::default().with_code(overlay.code.clone()),
+        );
+    }
+    let overrides = builder.build();
+    match &mut options.state_overrides {
+        Some(existing) => existing.extend(overrides),
+        none => *none = Some(overrides),
     }
 }
 
@@ -111,6 +133,24 @@ where
     P: Provider + DebugApi,
     Req: Into<alloy::rpc::types::eth::TransactionRequest>,
 {
+    get_trace_from_call_with_env(provider, tx_request, block, profile, None).await
+}
+
+/// [`get_trace_from_call_with_profile`] additionally mounting a pinned [`OverlayEnv`]'s
+/// code bindings as state overrides (`None` is identical to the plain
+/// profile function). The env must already be verified against the pinned
+/// manifest.
+pub async fn get_trace_from_call_with_env<P, Req>(
+    provider: &P,
+    tx_request: Req,
+    block: BlockId,
+    profile: SimProfile,
+    overlay: Option<&OverlayEnv>,
+) -> Result<DefaultFrame>
+where
+    P: Provider + DebugApi,
+    Req: Into<alloy::rpc::types::eth::TransactionRequest>,
+{
     let mut tx_request = tx_request.into();
     let mut options = GethDebugTracingCallOptions {
         tracing_options: GethDebugTracingOptions {
@@ -124,6 +164,9 @@ where
         ..Default::default()
     };
     apply_sim_profile(&mut tx_request, &mut options, profile);
+    if let Some(env) = overlay {
+        apply_overlay_env(&mut options, env);
+    }
 
     let GethTrace::Default(trace) = provider
         .debug_trace_call(tx_request, block, options)
@@ -166,6 +209,24 @@ where
     P: Provider + DebugApi,
     Req: Into<alloy::rpc::types::eth::TransactionRequest>,
 {
+    get_prestate_diff_from_call_with_env(provider, tx_request, block, profile, None).await
+}
+
+/// [`get_prestate_diff_from_call_with_profile`] additionally mounting a pinned [`OverlayEnv`]'s
+/// code bindings as state overrides (`None` is identical to the plain
+/// profile function). The env must already be verified against the pinned
+/// manifest.
+pub async fn get_prestate_diff_from_call_with_env<P, Req>(
+    provider: &P,
+    tx_request: Req,
+    block: BlockId,
+    profile: SimProfile,
+    overlay: Option<&OverlayEnv>,
+) -> Result<DiffMode>
+where
+    P: Provider + DebugApi,
+    Req: Into<alloy::rpc::types::eth::TransactionRequest>,
+{
     let mut tx_request = tx_request.into();
     let mut options = GethDebugTracingCallOptions {
         tracing_options: GethDebugTracingOptions::prestate_tracer(PreStateConfig {
@@ -176,6 +237,9 @@ where
         ..Default::default()
     };
     apply_sim_profile(&mut tx_request, &mut options, profile);
+    if let Some(env) = overlay {
+        apply_overlay_env(&mut options, env);
+    }
     match provider
         .debug_trace_call(tx_request, block, options)
         .await
@@ -215,6 +279,24 @@ where
     P: Provider + DebugApi,
     Req: Into<alloy::rpc::types::eth::TransactionRequest>,
 {
+    get_call_frame_from_call_with_env(provider, tx_request, block, profile, None).await
+}
+
+/// [`get_call_frame_from_call_with_profile`] additionally mounting a pinned [`OverlayEnv`]'s
+/// code bindings as state overrides (`None` is identical to the plain
+/// profile function). The env must already be verified against the pinned
+/// manifest.
+pub async fn get_call_frame_from_call_with_env<P, Req>(
+    provider: &P,
+    tx_request: Req,
+    block: BlockId,
+    profile: SimProfile,
+    overlay: Option<&OverlayEnv>,
+) -> Result<CallFrame>
+where
+    P: Provider + DebugApi,
+    Req: Into<alloy::rpc::types::eth::TransactionRequest>,
+{
     let mut tx_request = tx_request.into();
     let mut options = GethDebugTracingCallOptions {
         tracing_options: GethDebugTracingOptions::call_tracer(CallConfig {
@@ -224,6 +306,9 @@ where
         ..Default::default()
     };
     apply_sim_profile(&mut tx_request, &mut options, profile);
+    if let Some(env) = overlay {
+        apply_overlay_env(&mut options, env);
+    }
     match provider
         .debug_trace_call(tx_request, block, options)
         .await

@@ -7,6 +7,7 @@
 pub mod constants;
 pub mod encoding;
 pub mod heuristic;
+pub mod overlay;
 pub mod prestate;
 pub mod sim_profile;
 pub mod trace;
@@ -20,6 +21,11 @@ pub use heuristic::{
     BASE_TX_COST, LOG_BASE_COST, LOG_DATA_COST_PER_BYTE, LOG_TOPIC_COST, TraceOperations,
     WARM_SSTORE_COST, estimate_gas_from_operations, estimate_gas_from_state_updates,
     extract_operation_counts_from_trace,
+};
+pub use overlay::{
+    CodeOverlay, ENV_COMMITMENT_DOMAIN_V1, ENV_COMMITMENT_DOMAIN_V2, OVERLAY_CHUNK_PAYLOAD,
+    OVERLAY_DOMAIN_V1, OverlayEnv, OverlayError, env_commitment, overlay_chunk_address,
+    overlay_manifest_hash,
 };
 pub use prestate::{
     PrestateEligibility, build_state_updates_from_prestate, classify_prestate_eligibility,
