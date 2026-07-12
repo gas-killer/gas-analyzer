@@ -107,8 +107,10 @@ fn gnosis_hardforks() -> EthereumChainHardforks {
     ])
 }
 
+pub mod local_exec;
 pub mod overlay_mount;
 pub mod simple_rpc_db;
+pub use local_exec::LocalBlockEnv;
 pub use overlay_mount::{OverlayMount, OverlayStateDb};
 use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 
