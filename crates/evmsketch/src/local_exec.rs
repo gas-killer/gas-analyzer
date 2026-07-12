@@ -196,7 +196,12 @@ impl LocalTxRequest {
 /// concurrent traces of that block; LRU eviction drops the backend — and its
 /// fetch thread — once the round moves on) and one verified [`OverlayMount`]
 /// per manifest.
-pub(crate) struct LocalStateCache {
+///
+/// This is the local path's counterpart to [`crate::EvmSketchExecutorCache`]:
+/// pass one persistent instance (e.g. `Arc<LocalStateCache>`) across calls so
+/// concurrent traces of the same block share both the remote-state backend
+/// and the executor cache backing the gas estimate.
+pub struct LocalStateCache {
     backends: Mutex<LruCache<(String, u64), SharedBackend>>,
     overlay_mounts: Mutex<LruCache<B256, Arc<OverlayMount>>>,
 }

@@ -110,7 +110,7 @@ fn gnosis_hardforks() -> EthereumChainHardforks {
 pub mod local_exec;
 pub mod overlay_mount;
 pub mod simple_rpc_db;
-pub use local_exec::LocalBlockEnv;
+pub use local_exec::{LocalBlockEnv, LocalStateCache};
 pub use overlay_mount::{OverlayMount, OverlayStateDb};
 use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 
@@ -913,6 +913,181 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_env(
     // Merge access-list hints with slots derived from state_updates.
     // Store slots all land at contract_address (one eth_getProof call for all of them).
     // Call targets get account-info-only prefetch (empty key list).
+    let mut all_hints = hints_from_state_updates(contract_address, &state_updates);
+    for (addr, slots) in storage_hints {
+        all_hints.entry(addr).or_default().extend(slots);
+    }
+
+    let gas_estimate = executor
+        .estimate_state_changes_gas_with_hints(
+            contract_address,
+            caller_address,
+            &state_updates,
+            &all_hints,
+        )
+        .await?;
+
+    Ok((storage_updates, gas_estimate, false, skipped_opcodes))
+}
+
+// ============================================================================
+// call_to_encoded_state_updates_local (gas-analyzer#169)
+// ============================================================================
+
+/// Which engine executes the tracked call: the historical `debug_traceCall`
+/// path, or the in-process local path (issue #169).
+///
+/// Mirrors [`SimProfile`]'s role as a versioned, string-nameable selector so
+/// callers like gas-killer/service can flip executors per-deployment (e.g.
+/// `GK_SIM_EXECUTOR=rpc|local`) without a direct dependency on this crate's
+/// internal types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SimExecutor {
+    /// `debug_traceCall` against the configured RPC — the historical path.
+    /// Required for overlay-mode consumers served through a shared anvil
+    /// fork (`stateOverrides`), and the only path available on RPCs without
+    /// in-process access to blob artifacts.
+    #[default]
+    Rpc,
+    /// In-process revm execution (this module): the RPC becomes a pure state
+    /// backend, and overlays mount natively from RAM or mmapped files with
+    /// zero request-body serialization.
+    Local,
+}
+
+impl SimExecutor {
+    /// Parse the profile-style string form (`"rpc"` / `"local"`, ASCII
+    /// case-insensitive). Unknown values are an error rather than a silent
+    /// default — a typo'd `GK_SIM_EXECUTOR` should fail loudly, not silently
+    /// fall back to the slower/centralized path.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "rpc" => Ok(SimExecutor::Rpc),
+            "local" => Ok(SimExecutor::Local),
+            other => Err(anyhow!(
+                "unknown executor {other:?}: expected \"rpc\" or \"local\""
+            )),
+        }
+    }
+
+    /// The canonical string form, inverse of [`SimExecutor::parse`].
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SimExecutor::Rpc => "rpc",
+            SimExecutor::Local => "local",
+        }
+    }
+}
+
+impl std::str::FromStr for SimExecutor {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        Self::parse(s)
+    }
+}
+
+impl std::fmt::Display for SimExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// True local execution (issue #169): the tracked call is re-executed
+/// **in-process** with [`local_exec`] instead of delegating to
+/// `debug_traceCall`. The RPC at `rpc_url` is used only as a lazy state
+/// backend (accounts/storage/code fetched on first touch through a
+/// block-scoped [`foundry_fork_db::SharedBackend`], shared via `state_cache`
+/// across concurrent traces of the same block) — never as the executor.
+///
+/// Mirrors [`call_to_encoded_state_updates_with_evmsketch_env`]'s signature
+/// and return type exactly, so callers can select between the two paths
+/// (e.g. via [`SimExecutor`]) without touching downstream code:
+/// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`.
+///
+/// `overlay` mounts natively (in-RAM [`OverlayEnv`] or an mmapped
+/// [`OverlayMount`] built via [`OverlayMount::from_files`] for
+/// multi-gigabyte artifacts) — no `stateOverrides` JSON is ever produced,
+/// which is what makes 35 GB models servable at all (see module docs on
+/// `local_exec` and `overlay_mount`).
+///
+/// The gas estimate for applying the resulting payload still executes
+/// against the real chain env via the shared [`EvmSketchExecutorCache`] —
+/// unbounded compute stays off-chain, the payload's on-chain cost stays
+/// priced under real limits, exactly like the RPC path.
+#[tracing::instrument(
+    name = "evmsketch.encode_local",
+    skip_all,
+    fields(block_number, profile = ?profile, overlay = overlay.is_some(), state_update_count = tracing::field::Empty)
+)]
+pub async fn call_to_encoded_state_updates_local(
+    executor_cache: &EvmSketchExecutorCache,
+    state_cache: &LocalStateCache,
+    rpc_url: impl AsRef<str>,
+    tx_request: TransactionRequest,
+    block_number: u64,
+    profile: SimProfile,
+    overlay: Option<&OverlayEnv>,
+) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
+    let rpc_url = rpc_url.as_ref();
+
+    let contract_address = tx_request
+        .to
+        .and_then(|t| match t {
+            TxKind::Call(addr) => Some(addr),
+            TxKind::Create => None,
+        })
+        .ok_or_else(|| anyhow!("Transaction must have a 'to' address"))?;
+    let caller_address = tx_request.from.unwrap_or_default();
+
+    let mut storage_hints: HashMap<Address, Vec<B256>> = HashMap::new();
+    if let Some(al) = &tx_request.access_list {
+        for item in al.iter() {
+            storage_hints
+                .entry(item.address)
+                .or_default()
+                .extend(item.storage_keys.iter().copied());
+        }
+    }
+
+    let local_tx = local_exec::LocalTxRequest::from_request(&tx_request)?;
+
+    // The executor (built against the same rpc_url/block) supplies both the
+    // pinned block env for the trace and the RootProvider<AnyNetwork> the
+    // remote-state backend fetches through, plus the gas estimate afterward.
+    let executor = executor_cache.get_or_build(rpc_url, block_number).await?;
+    let block_env = LocalBlockEnv::from_executor(&executor);
+    let backend = state_cache.backend_for(rpc_url, block_number, executor.sketch.provider.clone());
+    let overlay_mount = overlay
+        .map(|env| state_cache.overlay_mount_for(env))
+        .transpose()?;
+
+    let (state_updates, skipped_opcodes) = local_exec::extract_state_updates_local(
+        backend,
+        overlay_mount,
+        block_env,
+        local_tx,
+        profile,
+        contract_address,
+    )
+    .await?;
+    tracing::Span::current().record("state_update_count", state_updates.len());
+
+    if profile.requires_unbounded_shape() {
+        let shape = validate_unbounded_shape(&state_updates).map_err(|violation| {
+            anyhow!(
+                "unbounded-profile payload shape violation for consumer {contract_address}: {violation}"
+            )
+        })?;
+        tracing::debug!(
+            stores = shape.stores,
+            calls = shape.calls,
+            logs = shape.logs,
+            "unbounded payload shape OK (local executor)"
+        );
+    }
+
+    let storage_updates = encode_state_updates_to_abi(&state_updates);
+
     let mut all_hints = hints_from_state_updates(contract_address, &state_updates);
     for (addr, slots) in storage_hints {
         all_hints.entry(addr).or_default().extend(slots);
