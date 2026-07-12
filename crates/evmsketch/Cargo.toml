@@ -50,7 +50,9 @@ alloy-rpc-types = "1.0.37"
 alloy-transport = "1"
 criterion   = { version = "0.5", features = ["html_reports", "async_tokio"] }
 dhat        = "0.3"
+libc        = "0.2"
 pprof       = { version = "0.15", features = ["flamegraph", "criterion", "frame-pointer", "prost-codec"] }
+rand        = "0.9"
 revm        = { version = "31.0.1", features = ["serde"] }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
