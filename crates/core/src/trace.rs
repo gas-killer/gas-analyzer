@@ -193,12 +193,21 @@ pub fn append_state_update_from_struct_log(
 /// This extracts SSTORE, CALL, and LOG operations from an existing transaction's trace,
 /// handling DELEGATECALL and CALLCODE depth tracking correctly.
 ///
-/// Returns: (state_updates, skipped_opcodes, call_gas_total)
+/// Returns: (state_updates, skipped_opcodes, call_gas_total, refund_counter)
 /// - `call_gas_total` is the total gas cost of all CALL operations in state_updates
+/// - `refund_counter` is the final (pre-cap) EIP-3529 refund counter of the
+///   traced execution, for netting refunds out of heuristic estimates
 #[tracing::instrument(name = "gas.trace_parse", skip_all, fields(state_update_count = tracing::field::Empty))]
 pub fn compute_state_updates(
     trace: DefaultFrame,
-) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64)> {
+) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64, u64)> {
+    // Transaction-global cumulative counter; the final step holds the tx
+    // total. Geth omits the field when it is zero.
+    let refund_counter = trace
+        .struct_logs
+        .last()
+        .and_then(|log| log.refund_counter)
+        .unwrap_or(0);
     let mut state_updates: Vec<StateUpdate> = Vec::with_capacity(trace.struct_logs.len() / 4);
     let mut target_depth = 1u64;
     let mut skipped_opcodes = HashSet::new();
@@ -297,7 +306,12 @@ pub fn compute_state_updates(
     }
 
     tracing::Span::current().record("state_update_count", state_updates.len());
-    Ok((state_updates, skipped_opcodes, total_call_gas))
+    Ok((
+        state_updates,
+        skipped_opcodes,
+        total_call_gas,
+        refund_counter,
+    ))
 }
 
 #[cfg(test)]
@@ -384,6 +398,38 @@ mod tests {
         assert_eq!(&c.initcode[..], &[0x60, 0x80, 0x60, 0x40, 0x52]);
         assert_eq!(c.value, U256::from(1_000u64), "endowment value extracted");
         assert_eq!(c.salt, alloy_primitives::B256::from(salt_val));
+    }
+
+    #[test]
+    fn compute_state_updates_surfaces_final_refund_counter() {
+        // The counter is cumulative; only the final step's value matters.
+        let mut mid = make_struct_log("PUSH1", vec![], vec![]);
+        mid.refund_counter = Some(4_800);
+        let mut last = make_struct_log("STOP", vec![], vec![]);
+        last.refund_counter = Some(40_000);
+
+        let trace = DefaultFrame {
+            gas: 0,
+            failed: false,
+            return_value: Default::default(),
+            struct_logs: vec![mid, last],
+        };
+        let (updates, _, _, refund) = compute_state_updates(trace).unwrap();
+        assert!(updates.is_empty());
+        assert_eq!(refund, 40_000);
+    }
+
+    #[test]
+    fn missing_refund_counter_reads_as_zero() {
+        // Geth omits the field when the counter is zero.
+        let trace = DefaultFrame {
+            gas: 0,
+            failed: false,
+            return_value: Default::default(),
+            struct_logs: vec![make_struct_log("STOP", vec![], vec![])],
+        };
+        let (_, _, _, refund) = compute_state_updates(trace).unwrap();
+        assert_eq!(refund, 0);
     }
 
     #[test]

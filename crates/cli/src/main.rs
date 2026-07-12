@@ -164,7 +164,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
 
                 // Get trace and compute state updates
                 let trace = get_tx_trace(&provider, bytes.into(), original_status).await?;
-                let (state_updates, skipped_opcodes, _call_gas_total) =
+                let (state_updates, skipped_opcodes, _call_gas_total, _refund) =
                     compute_state_updates(trace)?;
 
                 // Print state updates
@@ -259,9 +259,9 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 let state_updates_result =
                     compute_state_updates_from_tx(&provider, bytes.into(), original_status).await;
 
-                let (state_updates, skipped_opcodes, call_gas_total, use_fallback) =
+                let (state_updates, skipped_opcodes, call_gas_total, refund_counter, use_fallback) =
                     match state_updates_result {
-                        Ok(result) => (result.0, result.1, result.2, false),
+                        Ok(result) => (result.0, result.1, result.2, result.3, false),
                         Err(e) => {
                             if original_status {
                                 // Transaction succeeded originally but trace extraction failed
@@ -284,7 +284,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                                 }
 
                                 // Return empty state updates and use fallback heuristic
-                                (Vec::new(), std::collections::HashSet::new(), 0, true)
+                                (Vec::new(), std::collections::HashSet::new(), 0, 0, true)
                             } else {
                                 // Transaction originally failed, so this is expected
                                 let msg = format!(
@@ -424,8 +424,11 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                                     }
                                 }
                             }
-                            let heuristic =
-                                estimate_gas_from_state_updates(&state_updates, call_gas_total);
+                            let heuristic = estimate_gas_from_state_updates(
+                                &state_updates,
+                                call_gas_total,
+                                refund_counter,
+                            );
                             (heuristic, true)
                         }
                     }

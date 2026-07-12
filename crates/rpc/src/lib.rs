@@ -93,12 +93,12 @@ where
 /// `status` must be `receipt.status()` for `tx_hash`. Pass the already-fetched
 /// receipt's status to avoid an extra `eth_getTransactionReceipt` round-trip.
 ///
-/// Returns: (state_updates, skipped_opcodes, call_gas_total)
+/// Returns: (state_updates, skipped_opcodes, call_gas_total, refund_counter)
 pub async fn compute_state_updates_from_tx<P: Provider + DebugApi>(
     provider: &P,
     tx_hash: FixedBytes<32>,
     status: bool,
-) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64)> {
+) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64, u64)> {
     // Primary path: use the historical trace via debug_traceTransaction.
     let trace = get_tx_trace(provider, tx_hash, status).await?;
     let struct_logs_len = trace.struct_logs.len();

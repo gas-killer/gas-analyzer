@@ -213,7 +213,7 @@ impl Analyzer for EvmSketchAnalyzer {
         // A trace failure is a real error (worker retries / dead-letters), not
         // an empty state-update list — coercing it to empty produced the bogus
         // flat ~271k estimate (#158).
-        let (state_updates, skipped_opcodes, call_gas_total) =
+        let (state_updates, skipped_opcodes, call_gas_total, refund_counter) =
             with_retry(&retry_cfg, is_transient_rpc_error, || async {
                 compute_state_updates_from_tx(provider, tx_hash, receipt.status()).await
             })
@@ -230,7 +230,8 @@ impl Analyzer for EvmSketchAnalyzer {
         // (preceding-tx replay, EvmSketch fork build) is where ~all of the
         // per-analysis RPC volume lives (#119, #162).
         let (gaskiller_gas_estimate, is_heuristic, failure_reason) = if self.config.heuristic_only {
-            let heuristic = estimate_gas_from_state_updates(&state_updates, call_gas_total);
+            let heuristic =
+                estimate_gas_from_state_updates(&state_updates, call_gas_total, refund_counter);
             // Not a failure: the measured path was never attempted.
             (heuristic + TURETZKY_UPPER_GAS_LIMIT_BLS, true, None)
         } else {
@@ -263,7 +264,11 @@ impl Analyzer for EvmSketchAnalyzer {
             ) {
                 Ok(g) => (g + TURETZKY_UPPER_GAS_LIMIT_BLS, false, None),
                 Err(e) => {
-                    let heuristic = estimate_gas_from_state_updates(&state_updates, call_gas_total);
+                    let heuristic = estimate_gas_from_state_updates(
+                        &state_updates,
+                        call_gas_total,
+                        refund_counter,
+                    );
                     let reason = format!("{e}");
                     let truncated = reason.lines().next().unwrap_or("unknown").to_string();
                     (
