@@ -31,7 +31,8 @@ pub use prestate::{
     PrestateEligibility, build_state_updates_from_prestate, classify_prestate_eligibility,
 };
 pub use sim_profile::{
-    SimProfile, UNBOUNDED_V1_BLOCK_GAS_LIMIT, UNBOUNDED_V1_TX_GAS_LIMIT, UnboundedShape,
+    SimProfile, UNBOUNDED_V1_BLOCK_GAS_LIMIT, UNBOUNDED_V1_TX_GAS_LIMIT,
+    UNBOUNDED_V1_XL_BLOCK_GAS_LIMIT, UNBOUNDED_V1_XL_TX_GAS_LIMIT, UnboundedShape,
     UnboundedShapeViolation, validate_unbounded_shape,
 };
 pub use trace::{compute_state_updates, copy_memory, parse_trace_memory};

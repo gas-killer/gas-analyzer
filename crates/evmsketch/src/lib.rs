@@ -2024,6 +2024,36 @@ mod tests {
         validate_unbounded_shape(&updates).expect("burner payload is commitment-shaped");
     }
 
+    /// The XL gas tier (`SimProfile::UnboundedV1Xl`, pinned 2^43 override)
+    /// must extract the identical payload the V1 tier does on the same call:
+    /// the tier only moves the OOG ceiling, never the extraction semantics or
+    /// the shape gate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_unbounded_xl_profile_extracts_beyond_block_gas_limit() {
+        let anvil = LocalAnvil::spawn_with(&["--disable-block-gas-limit"]).await;
+        let provider = anvil.provider();
+        let consumer = address!("0x0000000000000000000000000000000000002003");
+        set_code(&provider, consumer, gigagas_burner_code()).await;
+
+        let (updates, skipped) = extract_state_updates_hybrid(
+            &provider,
+            call_request(consumer),
+            BlockId::latest(),
+            consumer,
+            SimProfile::UnboundedV1Xl,
+            None,
+        )
+        .await
+        .expect("XL extraction must succeed on a >30M-gas call");
+        assert!(skipped.is_empty(), "no opcodes should be skipped");
+        assert_updates_eq(
+            &updates,
+            &[store_up(1, 0x42), log1_up(0xee, Bytes::new())],
+            "the XL tier must extract the same single-slot payload as V1",
+        );
+        validate_unbounded_shape(&updates).expect("burner payload is commitment-shaped");
+    }
+
     /// A two-slot writer extracts fine but must fail the unbounded shape
     /// gate — the exact check `call_to_encoded_state_updates_with_evmsketch_profiled`
     /// applies before estimating/encoding.

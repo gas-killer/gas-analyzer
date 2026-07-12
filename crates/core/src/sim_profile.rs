@@ -29,7 +29,10 @@
 //! operators. Conversely, per-operator ad-hoc limits would make quorum
 //! signatures diverge on the boundary. Hence the versioned `V1` constants:
 //! any future change to these values is a new profile version, signalled
-//! out-of-band, never a silent edit.
+//! out-of-band, never a silent edit. `UnboundedV1Xl` is exactly such a
+//! version: the same V1 rules with an 8× gas ceiling (2^43) for multi-Tgas
+//! tasks. (Note: "`UNBOUNDED_V2`" names the orthogonal *code-overlay env*
+//! axis in [`crate::overlay`], not a gas tier.)
 //!
 //! Calldata note: neither revm nor the EVM protocol caps calldata *size*;
 //! calldata is bounded only through intrinsic gas (EIP-7623 floor pricing).
@@ -68,6 +71,23 @@ pub const UNBOUNDED_V1_BLOCK_GAS_LIMIT: u64 = 1 << 40;
 /// a Gas Killer payload.
 pub const UNBOUNDED_V1_TX_GAS_LIMIT: u64 = UNBOUNDED_V1_BLOCK_GAS_LIMIT;
 
+/// Block gas limit for the `UnboundedV1Xl` profile: 2^43 ≈ 8.8 Tgas, 8× the
+/// `UnboundedV1` ceiling.
+///
+/// Raised gas tier of the same V1 profile family, introduced for tasks that
+/// blow through the 2^40 cap — the motivating consumer is Qwen3.5-35B-A3B
+/// on-chain inference at ~3.6 Tgas per call, which 2^43 admits with ~2.4×
+/// headroom. Still chosen instead of `u64::MAX` for the same reason as V1:
+/// intrinsic-gas / refund / floor-cost arithmetic (all `u64` in revm and in
+/// geth's tracer path) must not overflow. The EIP-7623 calldata bound scales
+/// with it (~220 GB of floor-priced calldata — irrelevant in practice).
+pub const UNBOUNDED_V1_XL_BLOCK_GAS_LIMIT: u64 = 1 << 43;
+
+/// Transaction gas limit for the `UnboundedV1Xl` profile. Equal to the block
+/// limit, exactly like [`UNBOUNDED_V1_TX_GAS_LIMIT`] (EIP-7825 deliberately
+/// not applied).
+pub const UNBOUNDED_V1_XL_TX_GAS_LIMIT: u64 = UNBOUNDED_V1_XL_BLOCK_GAS_LIMIT;
+
 /// The EVM environment profile a tracked function is simulated under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SimProfile {
@@ -81,6 +101,25 @@ pub enum SimProfile {
     /// [`UNBOUNDED_V1_BLOCK_GAS_LIMIT`] / [`UNBOUNDED_V1_TX_GAS_LIMIT`] and
     /// enforce the single-slot payload shape on the extracted updates.
     UnboundedV1,
+    /// Gas Killer unbounded execution, raised gas tier of the V1 family:
+    /// identical to [`SimProfile::UnboundedV1`] in every way — same shape
+    /// gate, same env-commitment scheme — except the pinned gas limits are
+    /// [`UNBOUNDED_V1_XL_BLOCK_GAS_LIMIT`] / [`UNBOUNDED_V1_XL_TX_GAS_LIMIT`]
+    /// (2^43 instead of 2^40), admitting multi-Tgas tasks such as
+    /// Qwen3.5-35B-A3B inference (~3.6 Tgas/call).
+    ///
+    /// It is a distinct versioned profile, not a tunable: operators, the
+    /// analyzer, and the SP1 slashing guest must all select the same tier for
+    /// a given consumer or their update sets diverge on the OOG boundary.
+    /// The overlay env commitment (`overlay::env_commitment`) binds the gas
+    /// limits by value, so V1 and V1-XL environments commit differently with
+    /// no new domain tag.
+    ///
+    /// Naming note: this is a *gas tier* within the V1 profile family.
+    /// "`UNBOUNDED_V2`" is already taken by an orthogonal axis — the pinned
+    /// code-overlay environment (`overlay::ENV_COMMITMENT_DOMAIN_V2`), which
+    /// composes freely with either gas tier.
+    UnboundedV1Xl,
 }
 
 impl SimProfile {
@@ -89,6 +128,7 @@ impl SimProfile {
         match self {
             SimProfile::Chain => None,
             SimProfile::UnboundedV1 => Some(UNBOUNDED_V1_TX_GAS_LIMIT),
+            SimProfile::UnboundedV1Xl => Some(UNBOUNDED_V1_XL_TX_GAS_LIMIT),
         }
     }
 
@@ -97,12 +137,13 @@ impl SimProfile {
         match self {
             SimProfile::Chain => None,
             SimProfile::UnboundedV1 => Some(UNBOUNDED_V1_BLOCK_GAS_LIMIT),
+            SimProfile::UnboundedV1Xl => Some(UNBOUNDED_V1_XL_BLOCK_GAS_LIMIT),
         }
     }
 
     /// Whether extracted updates must satisfy [`validate_unbounded_shape`].
     pub fn requires_unbounded_shape(&self) -> bool {
-        matches!(self, SimProfile::UnboundedV1)
+        matches!(self, SimProfile::UnboundedV1 | SimProfile::UnboundedV1Xl)
     }
 }
 
@@ -265,6 +306,26 @@ mod tests {
         // break with the SP1 slashing guest and must ship as a new version.
         assert_eq!(UNBOUNDED_V1_BLOCK_GAS_LIMIT, 1 << 40);
         assert_eq!(UNBOUNDED_V1_TX_GAS_LIMIT, 1 << 40);
+    }
+
+    #[test]
+    fn unbounded_xl_profile_pins_v1_xl_constants() {
+        assert_eq!(
+            SimProfile::UnboundedV1Xl.tx_gas_limit_override(),
+            Some(UNBOUNDED_V1_XL_TX_GAS_LIMIT)
+        );
+        assert_eq!(
+            SimProfile::UnboundedV1Xl.block_gas_limit_override(),
+            Some(UNBOUNDED_V1_XL_BLOCK_GAS_LIMIT)
+        );
+        // Same shape gate as V1: the tier lifts compute, never payload shape.
+        assert!(SimProfile::UnboundedV1Xl.requires_unbounded_shape());
+        // Protocol-pinned like V1: 2^43 sized for ~3.6-Tgas tasks
+        // (Qwen3.5-35B-A3B inference); a change here is a new version.
+        assert_eq!(UNBOUNDED_V1_XL_BLOCK_GAS_LIMIT, 1 << 43);
+        assert_eq!(UNBOUNDED_V1_XL_TX_GAS_LIMIT, 1 << 43);
+        // The tiers must never silently coincide.
+        assert_ne!(UNBOUNDED_V1_XL_BLOCK_GAS_LIMIT, UNBOUNDED_V1_BLOCK_GAS_LIMIT);
     }
 
     #[test]

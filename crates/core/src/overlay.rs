@@ -196,7 +196,10 @@ pub fn env_commitment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim_profile::{UNBOUNDED_V1_BLOCK_GAS_LIMIT, UNBOUNDED_V1_TX_GAS_LIMIT};
+    use crate::sim_profile::{
+        UNBOUNDED_V1_BLOCK_GAS_LIMIT, UNBOUNDED_V1_TX_GAS_LIMIT, UNBOUNDED_V1_XL_BLOCK_GAS_LIMIT,
+        UNBOUNDED_V1_XL_TX_GAS_LIMIT,
+    };
     use alloy_primitives::{address, b256};
 
     /// Cross-ecosystem pin: these vectors are reproduced by
@@ -280,5 +283,14 @@ mod tests {
             Some(&other),
         );
         assert_ne!(v2, v2b, "different bytes must change the commitment");
+
+        // Gas tiers commit differently through the bound limit values alone —
+        // no new domain tag needed for `SimProfile::UnboundedV1Xl`.
+        let v1_xl = env_commitment(
+            UNBOUNDED_V1_XL_BLOCK_GAS_LIMIT,
+            UNBOUNDED_V1_XL_TX_GAS_LIMIT,
+            None,
+        );
+        assert_ne!(v1, v1_xl, "the XL gas tier must change the commitment");
     }
 }
