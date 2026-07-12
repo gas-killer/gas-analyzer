@@ -571,11 +571,20 @@ mod tests {
 
     // ===== Heuristic gas estimation tests =====
 
+    /// Calldata cost of the ABI-encoded state updates the replay would ship —
+    /// part of every heuristic estimate since the calldata term landed.
+    fn trace_calldata_gas(trace: &str) -> u64 {
+        let encoded = encode_trace_inner(trace).unwrap().encoded_updates;
+        let bytes = hex::decode(encoded.trim_start_matches("0x")).unwrap();
+        gas_analyzer_core::calldata_gas(&bytes)
+    }
+
     #[test]
     fn test_heuristic_empty_trace() {
         let trace = make_trace(vec![]);
         let result = estimate_gas_heuristic_inner(&trace).unwrap();
-        assert_eq!(result.gas_estimate, 21_000);
+        // BASE_TX_COST + calldata framing of the empty update set
+        assert_eq!(result.gas_estimate, 21_000 + trace_calldata_gas(&trace));
         assert!(result.is_heuristic);
     }
 
@@ -583,8 +592,12 @@ mod tests {
     fn test_heuristic_single_sstore() {
         let trace = make_trace(vec![make_sstore_log("1", "ff", 90000)]);
         let result = estimate_gas_heuristic_inner(&trace).unwrap();
-        // BASE_TX_COST(21000) + WARM_SSTORE_COST(5000) = 26000
-        assert_eq!(result.gas_estimate, 26_000);
+        // BASE_TX_COST(21000) + actual SSTORE gasCost from the struct log
+        // (5000 in make_sstore_log) + calldata for the encoded update
+        assert_eq!(
+            result.gas_estimate,
+            21_000 + 5_000 + trace_calldata_gas(&trace)
+        );
     }
 
     #[test]
@@ -593,8 +606,9 @@ mod tests {
         let topic = "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
         let trace = make_trace(vec![make_log1_log(data_hex, topic, 80000)]);
         let result = estimate_gas_heuristic_inner(&trace).unwrap();
-        // BASE_TX_COST(21000) + LOG_BASE_COST(375) + LOG_TOPIC_COST(375) + 32*LOG_DATA_COST_PER_BYTE(8) = 22006
-        assert_eq!(result.gas_estimate, 22_006);
+        // BASE_TX_COST(21000) + LOG_BASE_COST(375) + LOG_TOPIC_COST(375)
+        // + 32*LOG_DATA_COST_PER_BYTE(8) + calldata for the encoded update
+        assert_eq!(result.gas_estimate, 22_006 + trace_calldata_gas(&trace));
     }
 
     #[test]
@@ -749,8 +763,9 @@ mod tests {
         });
         let trace = make_trace(vec![log0]);
         let result = estimate_gas_heuristic_inner(&trace).unwrap();
-        // BASE_TX_COST(21000) + LOG_BASE_COST(375) + 4*LOG_DATA_COST_PER_BYTE(8) = 21407
-        assert_eq!(result.gas_estimate, 21_407);
+        // BASE_TX_COST(21000) + LOG_BASE_COST(375) + 4*LOG_DATA_COST_PER_BYTE(8)
+        // + calldata for the encoded update
+        assert_eq!(result.gas_estimate, 21_407 + trace_calldata_gas(&trace));
     }
 
     // ===== Isolation test =====

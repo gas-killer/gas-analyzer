@@ -200,6 +200,9 @@ pub struct TraceExtract {
     pub skipped_opcodes: HashSet<Opcode>,
     /// Total gas consumed by the extracted depth-1 CALLs (gross, pre-refund).
     pub call_gas_total: u64,
+    /// Total gas actually charged for the extracted SSTOREs (from struct-log
+    /// `gasCost`), reflecting cold/warm/dirty pricing per write.
+    pub sstore_gas_total: u64,
     /// Final (pre-cap) EIP-3529 refund counter of the traced execution, for
     /// netting refunds out of heuristic estimates.
     pub refund_counter: u64,
@@ -226,6 +229,7 @@ pub fn compute_state_updates(trace: DefaultFrame) -> Result<TraceExtract> {
     // Track gas for each CALL we extract: map from call_index to gas_after_call_opcode
     let mut call_gas_tracking: HashMap<usize, u64> = HashMap::new();
     let mut total_call_gas = 0u64;
+    let mut sstore_gas_total = 0u64;
 
     for struct_log in trace.struct_logs {
         let depth = struct_log.depth;
@@ -281,12 +285,19 @@ pub fn compute_state_updates(trace: DefaultFrame) -> Result<TraceExtract> {
                 // Now add the state update (if not filtered)
                 // Read gas before moving struct_log
                 let gas_after_opcode = struct_log.gas;
+                let gas_cost = struct_log.gas_cost;
+                let update_count_before = state_updates.len();
                 if let Some(skipped) =
                     append_state_update_from_struct_log(&mut state_updates, struct_log)?
                 {
                     skipped_opcodes.insert(skipped);
-                } else {
+                } else if state_updates.len() > update_count_before {
                     // We added a state update.
+                    if op == "SSTORE" {
+                        // struct-log gasCost is the actual charge for this
+                        // write (cold/warm/dirty per EIP-2929/2200).
+                        sstore_gas_total += gas_cost;
+                    }
                     if op == "CALL" {
                         let call_index_1based = state_updates.len();
                         call_stack.push((depth, call_index_1based));
@@ -317,6 +328,7 @@ pub fn compute_state_updates(trace: DefaultFrame) -> Result<TraceExtract> {
         state_updates,
         skipped_opcodes,
         call_gas_total: total_call_gas,
+        sstore_gas_total,
         refund_counter,
     })
 }
@@ -424,6 +436,25 @@ mod tests {
         let extract = compute_state_updates(trace).unwrap();
         assert!(extract.state_updates.is_empty());
         assert_eq!(extract.refund_counter, 40_000);
+    }
+
+    #[test]
+    fn sstore_gas_total_sums_actual_charges() {
+        // Stack bottom→top is [value, slot]; append reverses it.
+        let mut cold = make_struct_log("SSTORE", vec![U256::from(0xff), U256::from(1)], vec![]);
+        cold.gas_cost = 22_100;
+        let mut warm = make_struct_log("SSTORE", vec![U256::from(0xee), U256::from(2)], vec![]);
+        warm.gas_cost = 100;
+
+        let trace = DefaultFrame {
+            gas: 0,
+            failed: false,
+            return_value: Default::default(),
+            struct_logs: vec![cold, warm],
+        };
+        let extract = compute_state_updates(trace).unwrap();
+        assert_eq!(extract.state_updates.len(), 2);
+        assert_eq!(extract.sstore_gas_total, 22_200);
     }
 
     #[test]
