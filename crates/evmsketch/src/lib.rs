@@ -1028,8 +1028,91 @@ pub async fn call_to_encoded_state_updates_local(
     profile: SimProfile,
     overlay: Option<&OverlayEnv>,
 ) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
-    let rpc_url = rpc_url.as_ref();
+    let overlay_mount = overlay
+        .map(|env| state_cache.overlay_mount_for(env))
+        .transpose()?;
+    call_to_encoded_state_updates_local_with_mount(
+        executor_cache,
+        state_cache,
+        rpc_url.as_ref(),
+        tx_request,
+        block_number,
+        profile,
+        overlay_mount,
+    )
+    .await
+}
 
+/// [`call_to_encoded_state_updates_local`]'s file-backed twin: the overlay
+/// mounts from a **memory-mapped** [`OverlayMount::from_files`] instead of an
+/// in-RAM [`OverlayEnv`], so multi-gigabyte artifacts (e.g. the 35 GB
+/// Qwen3.5-A3B weights) never need to be resident in the analyzer process —
+/// only touched chunks are materialized, through the same bounded LRU memo
+/// [`OverlayStateDb`] consults on the in-RAM path.
+///
+/// `weights_path`/`tokenizer_path` name the two artifact blobs
+/// (`overlay_manifest_hash`'s committed layout — weights chunks first, then
+/// tokenizer chunks); `manifest` is the pinned on-chain commitment.
+/// [`OverlayMount::from_files`] recomputes the manifest with a streaming
+/// keccak pass over both files and **hard-fails on any mismatch** before a
+/// single byte is served — the same verification guarantee
+/// [`call_to_encoded_state_updates_local`] gets from `OverlayEnv::verify`.
+/// The mount is memoized on `state_cache` by `manifest`
+/// ([`LocalStateCache::overlay_mount_from_files`]), so a model is mounted
+/// (hashed + indexed) once per process, not once per call.
+///
+/// Otherwise identical to [`call_to_encoded_state_updates_local`]: same env
+/// construction, same extraction dispatch, same gas-estimate step, same
+/// return shape.
+#[tracing::instrument(
+    name = "evmsketch.encode_local_files",
+    skip_all,
+    fields(block_number, profile = ?profile, manifest = %manifest, state_update_count = tracing::field::Empty)
+)]
+#[allow(clippy::too_many_arguments)]
+pub async fn call_to_encoded_state_updates_local_files(
+    executor_cache: &EvmSketchExecutorCache,
+    state_cache: &LocalStateCache,
+    rpc_url: impl AsRef<str>,
+    tx_request: TransactionRequest,
+    block_number: u64,
+    profile: SimProfile,
+    weights_path: impl AsRef<std::path::Path>,
+    tokenizer_path: impl AsRef<std::path::Path>,
+    manifest: B256,
+) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
+    let overlay_mount =
+        state_cache.overlay_mount_from_files(weights_path, tokenizer_path, manifest)?;
+    call_to_encoded_state_updates_local_with_mount(
+        executor_cache,
+        state_cache,
+        rpc_url.as_ref(),
+        tx_request,
+        block_number,
+        profile,
+        Some(overlay_mount),
+    )
+    .await
+}
+
+/// Shared body of [`call_to_encoded_state_updates_local`] and
+/// [`call_to_encoded_state_updates_local_files`]: everything downstream of
+/// "the overlay mount is resolved" — env construction, extraction dispatch,
+/// unbounded-shape validation, ABI encoding and the gas estimate. The two
+/// public entry points differ only in *how* `overlay_mount` gets built
+/// (in-RAM [`OverlayEnv`] vs mmapped [`OverlayMount::from_files`]); this
+/// keeps that the only difference in the code paths, so the consensus
+/// contract (byte-identical extraction) is structurally guaranteed rather
+/// than merely tested.
+async fn call_to_encoded_state_updates_local_with_mount(
+    executor_cache: &EvmSketchExecutorCache,
+    state_cache: &LocalStateCache,
+    rpc_url: &str,
+    tx_request: TransactionRequest,
+    block_number: u64,
+    profile: SimProfile,
+    overlay_mount: Option<Arc<OverlayMount>>,
+) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
     let contract_address = tx_request
         .to
         .and_then(|t| match t {
@@ -1057,9 +1140,6 @@ pub async fn call_to_encoded_state_updates_local(
     let executor = executor_cache.get_or_build(rpc_url, block_number).await?;
     let block_env = LocalBlockEnv::from_executor(&executor);
     let backend = state_cache.backend_for(rpc_url, block_number, executor.sketch.provider.clone());
-    let overlay_mount = overlay
-        .map(|env| state_cache.overlay_mount_for(env))
-        .transpose()?;
 
     let (state_updates, skipped_opcodes) = local_exec::extract_state_updates_local(
         backend,
@@ -2570,6 +2650,108 @@ mod tests {
                 }),
             ],
             "overlay-mode shape: chunk bytes readable identically via stateOverrides and native mount",
+        );
+    }
+
+    /// Case 7 (gas-analyzer#172): the mmap-backed overlay entry point
+    /// (`call_to_encoded_state_updates_local_files` / `OverlayMount::from_files`)
+    /// must extract byte-identically to the in-RAM entry point
+    /// (`call_to_encoded_state_updates_local` / `OverlayMount::from_env`) for
+    /// the same blobs — the acceptance bar for exposing the file-backed
+    /// source through the local executor's public API. Same blobs, written
+    /// to temp files for the mmap leg; both legs run through
+    /// `LocalStateCache` (`overlay_mount_for` / `overlay_mount_from_files`)
+    /// exactly as the two public entry points do internally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn differential_overlay_ram_vs_mmap_files() {
+        use gas_analyzer_core::OVERLAY_CHUNK_PAYLOAD;
+
+        let anvil = LocalAnvil::spawn().await;
+        let provider = anvil.provider();
+
+        // Non-repeating, multi-chunk payload so an offset/chunk-boundary bug
+        // in either source cannot cancel out.
+        let payload: Vec<u8> = (0..(OVERLAY_CHUNK_PAYLOAD * 2 + 137) as u32)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let tokenizer: Vec<u8> = (0..613u32).map(|i| (i % 241) as u8).collect();
+        let overlay_env = OverlayEnv::from_blobs(&payload, &tokenizer).expect("overlay env");
+        let manifest = overlay_env.manifest;
+        let chunk = overlay_env.overlays[0].address;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let weights_path = dir.path().join("weights.bin");
+        let tokenizer_path = dir.path().join("tokenizer.bin");
+        std::fs::write(&weights_path, &payload).expect("write weights blob");
+        std::fs::write(&tokenizer_path, &tokenizer).expect("write tokenizer blob");
+
+        let consumer = address!("0x0000000000000000000000000000000000003009");
+        // EXTCODECOPY(chunk, dest 0, offset 1, size 32); SSTORE(1, MLOAD(0));
+        // LOG1(mem[0..32], topic 0xee); STOP.
+        set_code(
+            &provider,
+            consumer,
+            hex_code(&format!(
+                "6020 6001 6000 73{} 3c 600051600155 7f{}60206000a1 00",
+                addr_hex(chunk),
+                topic_hex(0xee),
+            )),
+        )
+        .await;
+
+        // In-RAM leg: same cache method call_to_encoded_state_updates_local
+        // makes internally.
+        let ram_cache = LocalStateCache::default();
+        let ram_mount = ram_cache
+            .overlay_mount_for(&overlay_env)
+            .expect("in-RAM overlay mount");
+        let (ram_updates, ram_skipped) = extract_local_via_anvil(
+            &anvil,
+            consumer,
+            SimProfile::Chain,
+            Some(ram_mount),
+        )
+        .await;
+
+        // Mmap leg: same cache method call_to_encoded_state_updates_local_files
+        // makes internally — manifest verification happens inside this call.
+        let files_cache = LocalStateCache::default();
+        let files_mount = files_cache
+            .overlay_mount_from_files(&weights_path, &tokenizer_path, manifest)
+            .expect("mmap overlay mount");
+        let (files_updates, files_skipped) = extract_local_via_anvil(
+            &anvil,
+            consumer,
+            SimProfile::Chain,
+            Some(files_mount),
+        )
+        .await;
+
+        assert_eq!(
+            encode_state_updates_to_abi(&ram_updates),
+            encode_state_updates_to_abi(&files_updates),
+            "in-RAM and mmap-files overlay sources must yield byte-identical encoded payloads\n  \
+             ram:   {ram_updates:?}\n  files: {files_updates:?}"
+        );
+        assert_eq!(
+            ram_skipped, files_skipped,
+            "skipped_opcodes must match between in-RAM and mmap-files overlay sources"
+        );
+
+        let expected_word = B256::from_slice(&payload[0..32]);
+        assert_updates_eq(
+            &ram_updates,
+            &[
+                StateUpdate::Store(IStateUpdateTypes::Store {
+                    slot: B256::with_last_byte(1),
+                    value: expected_word,
+                }),
+                StateUpdate::Log1(IStateUpdateTypes::Log1 {
+                    data: Bytes::copy_from_slice(expected_word.as_slice()),
+                    topic1: B256::with_last_byte(0xee),
+                }),
+            ],
+            "mmap-files overlay-mode shape: chunk bytes readable identically to the in-RAM source",
         );
     }
 
