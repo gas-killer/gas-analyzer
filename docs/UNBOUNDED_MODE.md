@@ -18,6 +18,24 @@ under pinned, protocol-versioned limits ~24,000× a mainnet block:
 |---|---|---|
 | `UNBOUNDED_V1_BLOCK_GAS_LIMIT` | `1 << 40` (~1.1 Tgas) | block env gas limit during simulation |
 | `UNBOUNDED_V1_TX_GAS_LIMIT` | `1 << 40` | tx gas limit during simulation (EIP-7825 cap deliberately not applied) |
+| `UNBOUNDED_V1_XL_BLOCK_GAS_LIMIT` | `1 << 43` (~8.8 Tgas) | block env gas limit under the `UnboundedV1Xl` tier |
+| `UNBOUNDED_V1_XL_TX_GAS_LIMIT` | `1 << 43` | tx gas limit under the `UnboundedV1Xl` tier |
+
+### The XL gas tier (`SimProfile::UnboundedV1Xl`)
+
+`UnboundedV1Xl` is a **raised gas tier of the same V1 profile family**:
+identical semantics and shape gate, only the pinned ceiling differs (2^43
+instead of 2^40). It exists for multi-Tgas tasks that blow through the V1 cap
+— the motivating consumer is Qwen3.5-35B-A3B on-chain inference at ~3.6 Tgas
+per call, which 2^43 admits with ~2.4× headroom. The tier is a versioned
+protocol constant selected per consumer, with the same determinism bargain as
+V1: operators, this analyzer, and the SP1 slashing guest must agree on it or
+their update sets diverge on the OOG boundary. Naming note: this is *not*
+"`UNBOUNDED_V2`" — that name belongs to the orthogonal pinned code-*overlay*
+env axis ([UNBOUNDED_OVERLAYS.md](./UNBOUNDED_OVERLAYS.md)). Either gas tier
+composes with overlays, and `env_commitment` already distinguishes tiers
+through the gas-limit values it binds, so no new commitment domain exists for
+XL.
 
 In exchange, the extracted payload must pass the **single-slot shape gate**
 (`validate_unbounded_shape`):
@@ -105,11 +123,12 @@ boundary. Hence:
 - The limits are `pub const` in `gas_analyzer_core::sim_profile` — the guest
   crate must import them from there (the crate is pure/WASM-safe and compiles
   in a zkVM guest).
-- Any change to the values is a **new profile version** (`UnboundedV2`, …),
-  coordinated across operators and the committed guest ELF — never a silent
-  edit. The guest's public values should commit to the profile version
-  alongside the chain-config hash so a proof under the wrong profile cannot
-  satisfy the verifier.
+- Any change to the values is a **new profile version** (`UnboundedV1Xl` is
+  the first such tier; note `UNBOUNDED_V2` names the overlay env axis, not a
+  gas tier), coordinated across operators and the committed guest ELF — never
+  a silent edit. The guest's public values should commit to the profile
+  version alongside the chain-config hash so a proof under the wrong profile
+  cannot satisfy the verifier.
 
 ### Fork support (implemented)
 
@@ -175,8 +194,9 @@ version in its public values.
 - `gas_analyzer_core::sim_profile` unit tests: profile overrides, shape gate
   (single store / multi store / CREATE rejection / empty payload).
 - `gas-analyzer-evmsketch` anvil-backed integration tests
-  (`test_unbounded_profile_*`): a ~40M-gas busy-loop consumer OOGs under
-  `Chain` (classified `Fallback`, per #165's revert soundness rule) and
-  extracts exactly `[Store, Log1]` under `UnboundedV1` against a real anvil
+  (`test_unbounded_profile_*`, `test_unbounded_xl_profile_*`): a ~40M-gas
+  busy-loop consumer OOGs under `Chain` (classified `Fallback`, per #165's
+  revert soundness rule) and extracts exactly `[Store, Log1]` under
+  `UnboundedV1` — and identically under `UnboundedV1Xl` — against a real anvil
   with `--disable-block-gas-limit`; a two-slot writer extracts but fails the
   shape gate with `TooManyStores { count: 2 }`.
