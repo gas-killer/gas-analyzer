@@ -7,6 +7,7 @@
 pub mod constants;
 pub mod encoding;
 pub mod heuristic;
+pub mod overlay;
 pub mod prestate;
 pub mod sim_profile;
 pub mod trace;
@@ -21,11 +22,17 @@ pub use heuristic::{
     WARM_SSTORE_COST, estimate_gas_from_operations, estimate_gas_from_state_updates,
     extract_operation_counts_from_trace,
 };
+pub use overlay::{
+    CodeOverlay, ENV_COMMITMENT_DOMAIN_V1, ENV_COMMITMENT_DOMAIN_V2, OVERLAY_CHUNK_PAYLOAD,
+    OVERLAY_DOMAIN_V1, OverlayEnv, OverlayError, env_commitment, overlay_chunk_address,
+    overlay_manifest_hash,
+};
 pub use prestate::{
     PrestateEligibility, build_state_updates_from_prestate, classify_prestate_eligibility,
 };
 pub use sim_profile::{
-    SimProfile, UNBOUNDED_V1_BLOCK_GAS_LIMIT, UNBOUNDED_V1_TX_GAS_LIMIT, UnboundedShape,
+    SimProfile, UNBOUNDED_V1_BLOCK_GAS_LIMIT, UNBOUNDED_V1_TX_GAS_LIMIT,
+    UNBOUNDED_V1_XL_BLOCK_GAS_LIMIT, UNBOUNDED_V1_XL_TX_GAS_LIMIT, UnboundedShape,
     UnboundedShapeViolation, validate_unbounded_shape,
 };
 pub use trace::{compute_state_updates, copy_memory, parse_trace_memory};

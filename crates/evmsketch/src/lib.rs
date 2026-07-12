@@ -112,7 +112,7 @@ use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 
 // Re-exported so downstream consumers (e.g. the Gas Killer service) can name
 // the profile without a direct gas-analyzer-core dependency.
-pub use gas_analyzer_core::SimProfile;
+pub use gas_analyzer_core::{OverlayEnv, SimProfile};
 
 use gas_analyzer_core::{
     Opcode, PrestateEligibility, StateUpdate, build_state_updates_from_prestate,
@@ -121,8 +121,8 @@ use gas_analyzer_core::{
 };
 use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
 use gas_analyzer_rpc::{
-    get_call_frame_from_call_with_profile, get_prestate_diff_from_call_with_profile,
-    get_trace_from_call_with_profile,
+    get_call_frame_from_call_with_env, get_prestate_diff_from_call_with_env,
+    get_trace_from_call_with_env,
 };
 
 // ============================================================================
@@ -815,6 +815,35 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
     block_number: u64,
     profile: SimProfile,
 ) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
+    call_to_encoded_state_updates_with_evmsketch_env(
+        cache,
+        rpc_url,
+        tx_request,
+        block_number,
+        profile,
+        None,
+    )
+    .await
+}
+
+/// [`call_to_encoded_state_updates_with_evmsketch_profiled`] additionally
+/// mounting a pinned [`OverlayEnv`] (verified against the consumer's
+/// manifest) as code state-overrides for the tracked-function simulation —
+/// the `UNBOUNDED_V2` overlay mode (`docs/UNBOUNDED_OVERLAYS.md`). `None` is
+/// identical to the profiled function.
+///
+/// The overlay participates in simulation only; the payload gas estimate
+/// stays on the real chain env, and overlaid chunks are STOP-prefixed pure
+/// data, so they can never appear as payload `Store`/`Create` targets.
+#[tracing::instrument(name = "evmsketch.encode_env", skip_all, fields(block_number, profile = ?profile, overlay = overlay.is_some(), state_update_count = tracing::field::Empty))]
+pub async fn call_to_encoded_state_updates_with_evmsketch_env(
+    cache: &EvmSketchExecutorCache,
+    rpc_url: impl AsRef<str>,
+    tx_request: TransactionRequest,
+    block_number: u64,
+    profile: SimProfile,
+    overlay: Option<&OverlayEnv>,
+) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
     let rpc_url = rpc_url.as_ref();
     let provider = cache.get_or_create_trace_provider(rpc_url)?;
 
@@ -847,7 +876,14 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
     // concurrently — they are independent, so on a cache miss this hides the executor build behind
     // the trace fetch.
     let ((state_updates, skipped_opcodes), executor) = tokio::try_join!(
-        extract_state_updates_hybrid(&provider, tx_request, block_id, contract_address, profile),
+        extract_state_updates_hybrid(
+            &provider,
+            tx_request,
+            block_id,
+            contract_address,
+            profile,
+            overlay
+        ),
         cache.get_or_build(rpc_url, block_number),
     )?;
     tracing::Span::current().record("state_update_count", state_updates.len());
@@ -906,13 +942,14 @@ async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
     block: BlockId,
     consumer: Address,
     profile: SimProfile,
+    overlay: Option<&OverlayEnv>,
 ) -> Result<(Vec<StateUpdate>, HashSet<Opcode>)> {
     if let Ok(Some(updates)) =
-        try_prestate_fast_path(provider, &tx_request, block, consumer, profile).await
+        try_prestate_fast_path(provider, &tx_request, block, consumer, profile, overlay).await
     {
         return Ok((updates, HashSet::new()));
     }
-    let trace = get_trace_from_call_with_profile(provider, tx_request, block, profile).await?;
+    let trace = get_trace_from_call_with_env(provider, tx_request, block, profile, overlay).await?;
     let (state_updates, skipped_opcodes, _call_gas_total) = compute_state_updates(trace)?;
     Ok((state_updates, skipped_opcodes))
 }
@@ -926,12 +963,13 @@ async fn try_prestate_fast_path<P: Provider + DebugApi>(
     block: BlockId,
     consumer: Address,
     profile: SimProfile,
+    overlay: Option<&OverlayEnv>,
 ) -> Result<Option<Vec<StateUpdate>>> {
     // The two tracer calls are independent — run them concurrently so the fast path costs one
     // round-trip, not two.
     let (diff, frame) = tokio::try_join!(
-        get_prestate_diff_from_call_with_profile(provider, tx_request.clone(), block, profile),
-        get_call_frame_from_call_with_profile(provider, tx_request.clone(), block, profile),
+        get_prestate_diff_from_call_with_env(provider, tx_request.clone(), block, profile, overlay),
+        get_call_frame_from_call_with_env(provider, tx_request.clone(), block, profile, overlay),
     )?;
     match classify_prestate_eligibility(&frame, &diff, consumer) {
         PrestateEligibility::Eligible => Ok(Some(build_state_updates_from_prestate(
@@ -1652,6 +1690,7 @@ mod tests {
             BlockId::latest(),
             to,
             SimProfile::Chain,
+            None,
         )
         .await
         .expect("hybrid extraction failed");
@@ -1972,6 +2011,7 @@ mod tests {
             BlockId::latest(),
             consumer,
             SimProfile::UnboundedV1,
+            None,
         )
         .await
         .expect("unbounded extraction must succeed on a >30M-gas call");
@@ -1980,6 +2020,36 @@ mod tests {
             &updates,
             &[store_up(1, 0x42), log1_up(0xee, Bytes::new())],
             "40M gas of compute must reduce to one Store and one Log",
+        );
+        validate_unbounded_shape(&updates).expect("burner payload is commitment-shaped");
+    }
+
+    /// The XL gas tier (`SimProfile::UnboundedV1Xl`, pinned 2^43 override)
+    /// must extract the identical payload the V1 tier does on the same call:
+    /// the tier only moves the OOG ceiling, never the extraction semantics or
+    /// the shape gate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_unbounded_xl_profile_extracts_beyond_block_gas_limit() {
+        let anvil = LocalAnvil::spawn_with(&["--disable-block-gas-limit"]).await;
+        let provider = anvil.provider();
+        let consumer = address!("0x0000000000000000000000000000000000002003");
+        set_code(&provider, consumer, gigagas_burner_code()).await;
+
+        let (updates, skipped) = extract_state_updates_hybrid(
+            &provider,
+            call_request(consumer),
+            BlockId::latest(),
+            consumer,
+            SimProfile::UnboundedV1Xl,
+            None,
+        )
+        .await
+        .expect("XL extraction must succeed on a >30M-gas call");
+        assert!(skipped.is_empty(), "no opcodes should be skipped");
+        assert_updates_eq(
+            &updates,
+            &[store_up(1, 0x42), log1_up(0xee, Bytes::new())],
+            "the XL tier must extract the same single-slot payload as V1",
         );
         validate_unbounded_shape(&updates).expect("burner payload is commitment-shaped");
     }
@@ -2000,6 +2070,7 @@ mod tests {
             BlockId::latest(),
             consumer,
             SimProfile::UnboundedV1,
+            None,
         )
         .await
         .expect("extraction itself succeeds; only the shape gate rejects");
