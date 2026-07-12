@@ -134,6 +134,9 @@ services:
       RPC_BURST: ${SEPOLIA_RPC_BURST:-250}
       RPC_MAX_CONCURRENCY: ${SEPOLIA_RPC_MAX_CONCURRENCY:-8}
       MIN_GAS_USED: ${MIN_GAS_USED:-50000}
+      # Namespaced like the rate knobs so mainnet and Sepolia toggle
+      # independently from the shared .env.
+      HEURISTIC_ONLY: ${SEPOLIA_HEURISTIC_ONLY:-false}
       WORKER_MAX_RETRIES: ${WORKER_MAX_RETRIES:-3}
       OVERLAY_PATH: /etc/indexer/overlay.yaml
       RUST_LOG: ${RUST_LOG:-info}

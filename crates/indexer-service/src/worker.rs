@@ -25,6 +25,7 @@ pub async fn run(common: CommonConfig, cfg: WorkerConfig) -> Result<()> {
         AnalyzerConfig {
             chain_id: common.chain_id,
             min_gas_used: common.min_gas_used,
+            heuristic_only: common.heuristic_only,
         },
     ));
 

@@ -109,6 +109,7 @@ services:
       RPC_BURST: ${RPC_BURST:-250}
       RPC_MAX_CONCURRENCY: ${RPC_MAX_CONCURRENCY:-8}
       MIN_GAS_USED: ${MIN_GAS_USED:-50000}
+      HEURISTIC_ONLY: ${HEURISTIC_ONLY:-false}
       WORKER_MAX_RETRIES: ${WORKER_MAX_RETRIES:-3}
       OVERLAY_PATH: /etc/indexer/overlay.yaml
       RUST_LOG: ${RUST_LOG:-info}

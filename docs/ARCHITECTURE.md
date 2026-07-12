@@ -520,6 +520,7 @@ All via env. `*` = required. Empty string disables the noted loops.
 | `REDIS_URL` | `redis://127.0.0.1:6379` | service, web | Redis |
 | `RPC_RPS_BUDGET` / `RPC_BURST` / `RPC_MAX_CONCURRENCY` | `100` / `25` / `8` | service | Rate limiter |
 | `MIN_GAS_USED` | `50000` | service | Skip txs below this gas |
+| `HEURISTIC_ONLY` | `false` | worker | Heuristic-only estimation: skip preceding-tx replay + EvmSketch fork (~300× fewer RPC calls, cruder estimates) |
 | `MAX_QUEUE_DEPTH` | `1000` | head-tracker | Backpressure threshold |
 | `HEAD_POLL_MS` | `4000` | head-tracker | Head poll interval |
 | `WORKER_MAX_RETRIES` | `3` | worker | Retries before dead-letter |
