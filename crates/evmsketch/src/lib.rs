@@ -2572,4 +2572,96 @@ mod tests {
             "overlay-mode shape: chunk bytes readable identically via stateOverrides and native mount",
         );
     }
+
+    // ========================================================================
+    // Local vs RPC throughput benchmark (#169)
+    //
+    // Not a criterion bench: the RPC leg alone can take several seconds and
+    // criterion's default sampling would run it dozens of times. This is a
+    // manual-timing #[ignore]d test — run with:
+    //   cargo test -p gas-analyzer-evmsketch --lib bench_local_vs_rpc_throughput \
+    //     -- --ignored --nocapture
+    // ========================================================================
+
+    /// ~50,000,000-iteration busy loop (~40 gas/iter ≈ 2 Ggas), one SSTORE and
+    /// one LOG1 at the end — the same single-slot commitment shape as
+    /// `gigagas_burner_code`, scaled to billions of gas with `PUSH4` so the
+    /// iteration count (up to ~4.29B) doesn't overflow a `PUSH3` immediate.
+    ///
+    /// Layout: PUSH4 iters; loop(JUMPDEST): DUP1 ISZERO PUSH1 end JUMPI;
+    /// PUSH1 1 SWAP1 SUB PUSH1 loop JUMP; end(JUMPDEST): POP; SSTORE; LOG1; STOP.
+    fn compute_heavy_loop_code(iters: u32) -> Bytes {
+        hex_code(&format!(
+            "63{iters:08x} 5b 80 15 6012 57 6001 90 03 6005 56 5b 50 6042600155 7f{}60006000a1 00",
+            topic_hex(0xee),
+        ))
+    }
+
+    /// Times the compute-heavy loop through both paths against the same
+    /// anvil instance and prints gas/s for each — the deliverable #169 asks
+    /// for ("time local vs RPC path on a compute-heavy loop, report gas/s").
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "manual benchmark — run with --ignored --nocapture"]
+    async fn bench_local_vs_rpc_throughput() {
+        const ITERS: u32 = 50_000_000;
+        const GAS_PER_ITER: u64 = 40;
+        let approx_gas = ITERS as u64 * GAS_PER_ITER;
+
+        let anvil = LocalAnvil::spawn_with(&["--disable-block-gas-limit"]).await;
+        let provider = anvil.provider();
+        let consumer = address!("0x0000000000000000000000000000000000009001");
+        set_code(&provider, consumer, compute_heavy_loop_code(ITERS)).await;
+
+        eprintln!(
+            "bench_local_vs_rpc_throughput: ~{approx_gas} gas ({:.2} Ggas) busy loop, {ITERS} iterations",
+            approx_gas as f64 / 1e9
+        );
+
+        // RPC path: extract_state_updates_hybrid under UnboundedV1 (pinned
+        // gas overrides lift the tx/block caps past the loop's cost) against
+        // the real debug_traceCall tracers.
+        let rpc_start = std::time::Instant::now();
+        let (rpc_updates, _) = extract_state_updates_hybrid(
+            &provider,
+            call_request(consumer),
+            BlockId::latest(),
+            consumer,
+            SimProfile::UnboundedV1,
+            None,
+        )
+        .await
+        .expect("RPC-path extraction failed");
+        let rpc_elapsed = rpc_start.elapsed();
+
+        // Local path: in-process revm over a SharedBackend pinned to the same
+        // anvil block.
+        let local_start = std::time::Instant::now();
+        let (local_updates, _) =
+            extract_local_via_anvil(&anvil, consumer, SimProfile::UnboundedV1, None).await;
+        let local_elapsed = local_start.elapsed();
+
+        assert_eq!(
+            encode_state_updates_to_abi(&rpc_updates),
+            encode_state_updates_to_abi(&local_updates),
+            "throughput bench sanity check: both paths must still agree on the payload"
+        );
+
+        let rpc_gas_per_s = approx_gas as f64 / rpc_elapsed.as_secs_f64();
+        let local_gas_per_s = approx_gas as f64 / local_elapsed.as_secs_f64();
+
+        eprintln!(
+            "RPC path:   {:>8.3}s  ({:.3} Ggas/s)",
+            rpc_elapsed.as_secs_f64(),
+            rpc_gas_per_s / 1e9
+        );
+        eprintln!(
+            "Local path: {:>8.3}s  ({:.3} Ggas/s)",
+            local_elapsed.as_secs_f64(),
+            local_gas_per_s / 1e9
+        );
+        eprintln!(
+            "Speedup (local vs RPC): {:.2}x",
+            rpc_elapsed.as_secs_f64() / local_elapsed.as_secs_f64().max(f64::EPSILON)
+        );
+    }
 }
