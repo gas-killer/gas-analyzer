@@ -261,6 +261,51 @@ impl LocalStateCache {
         cache.put(env.manifest, mount.clone());
         Ok(mount)
     }
+
+    /// The mmap-backed [`OverlayMount`] for the artifact blobs at
+    /// `weights_path`/`tokenizer_path`, memoized by `manifest` on the same
+    /// LRU as [`Self::overlay_mount_for`] — a multi-gigabyte model is mounted
+    /// (streaming-hashed and index-built) once per process, not once per
+    /// call.
+    ///
+    /// [`OverlayMount::from_files`] recomputes the manifest from the blobs
+    /// via a streaming keccak pass and hard-fails on any mismatch against
+    /// `manifest` ([`OverlayError::ManifestMismatch`] surfaced through the
+    /// returned `anyhow::Error`) — the same verification contract as
+    /// [`Self::overlay_mount_for`]/`OverlayEnv::verify`. Callers must not
+    /// mutate the blob files while the returned mount is in use (the `mmap`
+    /// contract `OverlayMount::from_files` documents).
+    pub fn overlay_mount_from_files(
+        &self,
+        weights_path: impl AsRef<std::path::Path>,
+        tokenizer_path: impl AsRef<std::path::Path>,
+        manifest: B256,
+    ) -> Result<Arc<OverlayMount>> {
+        let mut cache = self
+            .overlay_mounts
+            .lock()
+            .expect("overlay mount cache mutex poisoned");
+        if let Some(mount) = cache.get(&manifest) {
+            return Ok(mount.clone());
+        }
+        // Don't hold the mutex across the mount build: `from_files` streams a
+        // full pass over multi-gigabyte blobs to verify the manifest. Two
+        // concurrent callers that both miss may each mount; the later `put`
+        // overwrites the earlier entry. Both mounts are equivalent (same
+        // verified manifest, same index), so this only wastes one mount in
+        // the rare cold-start race — the same trade-off
+        // `EvmSketchExecutorCache::get_or_build` documents.
+        drop(cache);
+
+        let mount = Arc::new(OverlayMount::from_files(weights_path, tokenizer_path, manifest)?);
+
+        let mut cache = self
+            .overlay_mounts
+            .lock()
+            .expect("overlay mount cache mutex poisoned");
+        cache.put(manifest, mount.clone());
+        Ok(mount)
+    }
 }
 
 // ============================================================================
