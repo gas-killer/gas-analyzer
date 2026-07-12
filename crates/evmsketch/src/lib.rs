@@ -2261,4 +2261,315 @@ mod tests {
             gas_analyzer_core::UnboundedShapeViolation::TooManyStores { count: 2 }
         );
     }
+
+    // ========================================================================
+    // RPC path vs local path — byte-identical differential tests (#169)
+    //
+    // Same deployed bytecode, same anvil block: extract via the RPC path
+    // (extract_state_updates_hybrid, real debug_traceCall tracers) and via
+    // the local path (local_exec::extract_state_updates_local, in-process
+    // revm over a SharedBackend pinned to anvil) and assert the ABI-encoded
+    // payload bytes are identical. `EvmSketchExecutorCache`/`EvmSketch` only
+    // support mainnet/sepolia/gnosis genesis (chain_id_to_genesis_and_spec),
+    // so these tests drive extraction directly rather than through the full
+    // call_to_encoded_state_updates_* entry points — the gas-estimate half
+    // downstream of extraction is identical code shared by both paths.
+    // ========================================================================
+
+    use foundry_fork_db::{BlockchainDb, SharedBackend, cache::BlockchainDbMeta};
+    use local_exec::LocalTxRequest;
+
+    /// anvil's default hardfork (Prague) and chain id (31337), used to build
+    /// a [`LocalBlockEnv`] without going through `EvmSketchExecutorBuilder`
+    /// (which rejects non-mainnet/sepolia/gnosis chain ids).
+    const ANVIL_CHAIN_ID: u64 = 31_337;
+
+    fn any_provider(anvil: &LocalAnvil) -> RootProvider<AnyNetwork> {
+        RootProvider::<AnyNetwork>::new_http(Url::parse(&anvil.url).expect("valid url"))
+    }
+
+    /// Fetch anvil's current header and build the matching [`LocalBlockEnv`]
+    /// — the same fields `LocalBlockEnv::from_executor` would pull from an
+    /// anchored `EvmSketchExecutor`, sourced directly via `eth_getBlockByNumber`
+    /// since anvil's chain id can't build one.
+    async fn anvil_local_block_env(provider: &RootProvider<AnyNetwork>) -> LocalBlockEnv {
+        let block = provider
+            .get_block_by_number(BlockNumberOrTag::Latest)
+            .await
+            .expect("eth_getBlockByNumber failed")
+            .expect("latest block must exist");
+        LocalBlockEnv {
+            chain_id: ANVIL_CHAIN_ID,
+            spec: SpecId::PRAGUE,
+            number: block.header.number,
+            timestamp: block.header.timestamp,
+            gas_limit: block.header.gas_limit,
+            coinbase: block.header.beneficiary,
+            prevrandao: block.header.mix_hash.unwrap_or_default(),
+            basefee: block.header.base_fee_per_gas.unwrap_or(0),
+            difficulty: block.header.difficulty,
+        }
+    }
+
+    /// A `SharedBackend` pinned to anvil's current block — the local path's
+    /// remote-state DB for these tests.
+    fn anvil_shared_backend(provider: RootProvider<AnyNetwork>, block_number: u64) -> SharedBackend {
+        let db = BlockchainDb::new(BlockchainDbMeta::default(), None);
+        SharedBackend::spawn_backend_thread(provider, db, Some(BlockId::number(block_number)))
+    }
+
+    /// Extract via the local path against a live anvil instance: same
+    /// dispatch rules as [`extract_state_updates_hybrid`], but executed
+    /// in-process against a `SharedBackend`.
+    async fn extract_local_via_anvil(
+        anvil: &LocalAnvil,
+        to: Address,
+        profile: SimProfile,
+        overlay: Option<Arc<OverlayMount>>,
+    ) -> (Vec<StateUpdate>, HashSet<Opcode>) {
+        let provider = any_provider(anvil);
+        let env = anvil_local_block_env(&provider).await;
+        let backend = anvil_shared_backend(provider, env.number);
+        let tx = LocalTxRequest::from_request(&call_request(to)).expect("valid tx request");
+        local_exec::extract_state_updates_local(backend, overlay, env, tx, profile, to)
+            .await
+            .expect("local extraction failed")
+    }
+
+    /// Run both paths against the same deployed call and assert their
+    /// ABI-encoded payloads are byte-identical — the acceptance bar issue
+    /// #169 sets for the local executor.
+    async fn assert_rpc_and_local_identical(
+        anvil: &LocalAnvil,
+        to: Address,
+        profile: SimProfile,
+        overlay_env: Option<&OverlayEnv>,
+        overlay_mount: Option<Arc<OverlayMount>>,
+        ctx: &str,
+    ) -> (Vec<StateUpdate>, Vec<StateUpdate>) {
+        let provider = anvil.provider();
+        let (rpc_updates, rpc_skipped) = extract_state_updates_hybrid(
+            &provider,
+            call_request(to),
+            BlockId::latest(),
+            to,
+            profile,
+            overlay_env,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{ctx}: RPC-path extraction failed: {e:?}"));
+
+        let (local_updates, local_skipped) =
+            extract_local_via_anvil(anvil, to, profile, overlay_mount).await;
+
+        assert_eq!(
+            encode_state_updates_to_abi(&rpc_updates),
+            encode_state_updates_to_abi(&local_updates),
+            "{ctx}: RPC-path and local-path encoded payloads diverged\n  rpc:   {rpc_updates:?}\n  local: {local_updates:?}"
+        );
+        assert_eq!(
+            rpc_skipped, local_skipped,
+            "{ctx}: skipped_opcodes must match between paths"
+        );
+        (rpc_updates, local_updates)
+    }
+
+    /// Case 1: simple single-slot store (no logs, no calls) — the baseline
+    /// prestate-fast-path shape.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn differential_simple_store() {
+        let anvil = LocalAnvil::spawn().await;
+        let consumer = address!("0x0000000000000000000000000000000000003001");
+        set_code(&anvil.provider(), consumer, hex_code("6042600155 00")).await;
+
+        let (rpc, _) = assert_rpc_and_local_identical(
+            &anvil,
+            consumer,
+            SimProfile::Chain,
+            None,
+            None,
+            "simple_store",
+        )
+        .await;
+        assert_updates_eq(&rpc, &[store_up(1, 0x42)], "simple_store shape");
+    }
+
+    /// Case 2: multi-slot store — net-diff dedup (write-then-restore
+    /// disappears) and slot-sorted ordering must agree between paths.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn differential_multi_slot() {
+        let anvil = LocalAnvil::spawn().await;
+        let provider = anvil.provider();
+        let consumer = address!("0x0000000000000000000000000000000000003002");
+        set_code(&provider, consumer, eligible_code()).await;
+        set_storage(
+            &provider,
+            consumer,
+            B256::with_last_byte(5),
+            B256::with_last_byte(0x99),
+        )
+        .await;
+
+        let (rpc, _) = assert_rpc_and_local_identical(
+            &anvil,
+            consumer,
+            SimProfile::Chain,
+            None,
+            None,
+            "multi_slot",
+        )
+        .await;
+        let word_ab = Bytes::copy_from_slice(B256::with_last_byte(0xab).as_slice());
+        assert_updates_eq(
+            &rpc,
+            &[store_up(1, 0x42), store_up(5, 0), log1_up(0xaa, word_ab)],
+            "multi_slot shape (also covers logs — see eligible_code)",
+        );
+    }
+
+    /// Case 3: logs, specifically DELEGATECALL log interleaving — true
+    /// emission order (aa, cc, bb) must agree between paths.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn differential_logs_delegatecall_interleaving() {
+        let anvil = LocalAnvil::spawn().await;
+        let provider = anvil.provider();
+        let root = address!("0x0000000000000000000000000000000000003003");
+        let lib = address!("0x0000000000000000000000000000000000003004");
+        set_code(&provider, root, delegate_root_code(lib)).await;
+        set_code(&provider, lib, delegate_lib_code()).await;
+
+        let (rpc, _) = assert_rpc_and_local_identical(
+            &anvil,
+            root,
+            SimProfile::Chain,
+            None,
+            None,
+            "logs_delegatecall_interleaving",
+        )
+        .await;
+        assert_updates_eq(
+            &rpc,
+            &[
+                store_up(3, 7),
+                log1_up(0xaa, Bytes::new()),
+                log1_up(0xcc, Bytes::new()),
+                log1_up(0xbb, Bytes::new()),
+            ],
+            "delegatecall interleaving shape",
+        );
+    }
+
+    /// Case 4: nested regular CALL — forces the struct-log/replay-script
+    /// fallback on both paths; the replayable CALL op (callee internals
+    /// excluded) plus the caller's own store must agree.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn differential_nested_call() {
+        let anvil = LocalAnvil::spawn().await;
+        let provider = anvil.provider();
+        let caller = address!("0x0000000000000000000000000000000000003005");
+        let callee = address!("0x0000000000000000000000000000000000003006");
+        set_code(&provider, caller, caller_code(callee)).await;
+        set_code(&provider, callee, callee_code()).await;
+
+        let (rpc, _) = assert_rpc_and_local_identical(
+            &anvil,
+            caller,
+            SimProfile::Chain,
+            None,
+            None,
+            "nested_call",
+        )
+        .await;
+        assert_updates_eq(
+            &rpc,
+            &[
+                StateUpdate::Call(IStateUpdateTypes::Call {
+                    target: callee,
+                    value: U256::ZERO,
+                    callargs: Bytes::new(),
+                }),
+                store_up(4, 1),
+            ],
+            "nested CALL shape",
+        );
+    }
+
+    /// Case 5: revert — pre-revert ops must still be extracted identically
+    /// (revert-unaware struct-log semantics) on both paths.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn differential_revert() {
+        let anvil = LocalAnvil::spawn().await;
+        let reverter = address!("0x0000000000000000000000000000000000003007");
+        set_code(&anvil.provider(), reverter, reverter_code()).await;
+
+        let (rpc, _) =
+            assert_rpc_and_local_identical(&anvil, reverter, SimProfile::Chain, None, None, "revert")
+                .await;
+        assert_updates_eq(
+            &rpc,
+            &[store_up(1, 0x42), log1_up(0xdd, Bytes::new())],
+            "reverted call shape: pre-revert ops captured",
+        );
+    }
+
+    /// Case 6: overlay mode — RPC path mounts the overlay via
+    /// `anvil_setCode` (`stateOverrides`-equivalent for a real node), local
+    /// path mounts the same bytes natively via `OverlayMount::from_env`.
+    /// A consumer that `EXTCODECOPY`s a chunk and commits one word of it
+    /// must produce byte-identical payloads under both mounting strategies.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn differential_overlay_mode() {
+        let anvil = LocalAnvil::spawn().await;
+        let provider = anvil.provider();
+
+        let payload: Vec<u8> = (0..100u32).map(|i| (i % 256) as u8).collect();
+        let overlay_env = OverlayEnv::from_blobs(&payload, b"tok").expect("overlay env");
+        let chunk = overlay_env.overlays[0].address;
+        let overlay_mount =
+            Arc::new(OverlayMount::from_env(&overlay_env, overlay_env.manifest).expect("mount"));
+
+        let consumer = address!("0x0000000000000000000000000000000000003008");
+        // EXTCODECOPY(chunk, dest 0, offset 1, size 32); SSTORE(1, MLOAD(0));
+        // LOG1(mem[0..32], topic 0xee); STOP.
+        set_code(
+            &provider,
+            consumer,
+            hex_code(&format!(
+                "6020 6001 6000 73{} 3c 600051600155 7f{}60206000a1 00",
+                addr_hex(chunk),
+                topic_hex(0xee),
+            )),
+        )
+        .await;
+
+        // RPC path: no anvil_setCode for the chunk itself — apply_overlay_env
+        // mounts it as a stateOverrides code override for the trace call, the
+        // real UNBOUNDED_V2 transport. The chunk account is never deployed on
+        // anvil, mirroring "no rootDirectory" mode on-chain.
+        let (rpc, _) = assert_rpc_and_local_identical(
+            &anvil,
+            consumer,
+            SimProfile::Chain,
+            Some(&overlay_env),
+            Some(overlay_mount),
+            "overlay_mode",
+        )
+        .await;
+
+        let expected_word = B256::from_slice(&payload[0..32]);
+        assert_updates_eq(
+            &rpc,
+            &[
+                StateUpdate::Store(IStateUpdateTypes::Store {
+                    slot: B256::with_last_byte(1),
+                    value: expected_word,
+                }),
+                StateUpdate::Log1(IStateUpdateTypes::Log1 {
+                    data: Bytes::copy_from_slice(expected_word.as_slice()),
+                    topic1: B256::with_last_byte(0xee),
+                }),
+            ],
+            "overlay-mode shape: chunk bytes readable identically via stateOverrides and native mount",
+        );
+    }
 }
