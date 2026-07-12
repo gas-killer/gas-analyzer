@@ -43,6 +43,11 @@ pub struct AnalysisReport {
     pub failure_reason: Option<String>,
     pub state_update_count: u32,
     pub skipped_opcodes: Vec<String>,
+    /// A callee called back into the target contract during execution
+    /// (Uniswap-style swap callbacks). The heuristic counts that callback gas
+    /// as unoptimizable external gas, so heuristic rows with this flag may
+    /// understate savings. Policy: flag, don't correct (#113).
+    pub reentered: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -214,7 +219,7 @@ impl Analyzer for EvmSketchAnalyzer {
         // an empty state-update list — coercing it to empty produced the bogus
         // flat ~271k estimate (#158).
         let extract = with_retry(&retry_cfg, is_transient_rpc_error, || async {
-            compute_state_updates_from_tx(provider, tx_hash, receipt.status()).await
+            compute_state_updates_from_tx(provider, tx_hash, receipt.status(), Some(to)).await
         })
         .await
         .map_err(|e| AnalyzerError::Trace(format!("trace extraction failed: {e}")))?;
@@ -294,6 +299,7 @@ impl Analyzer for EvmSketchAnalyzer {
             is_heuristic,
             failure_reason,
             state_update_count: extract.state_updates.len() as u32,
+            reentered: extract.reentered,
             skipped_opcodes: extract
                 .skipped_opcodes
                 .into_iter()

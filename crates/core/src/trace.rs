@@ -206,11 +206,22 @@ pub struct TraceExtract {
     /// Final (pre-cap) EIP-3529 refund counter of the traced execution, for
     /// netting refunds out of heuristic estimates.
     pub refund_counter: u64,
+    /// A frame at depth >= 2 issued a CALL-family opcode targeting the origin
+    /// contract — a callee called back into it (e.g. a Uniswap V3 swap
+    /// callback). The extracted depth-1 call gas then includes the origin
+    /// contract's own callback logic, so heuristic estimates over this
+    /// extraction are qualified, not corrected. Always `false` when no origin
+    /// address was supplied.
+    pub reentered: bool,
 }
 
 /// Compute state updates from a Geth DefaultFrame trace (see [`TraceExtract`]).
+///
+/// `origin` is the address of the traced transaction's target contract (the
+/// code executing at depth 1). When supplied, calls from deeper frames back
+/// into it set [`TraceExtract::reentered`]; pass `None` to skip detection.
 #[tracing::instrument(name = "gas.trace_parse", skip_all, fields(state_update_count = tracing::field::Empty))]
-pub fn compute_state_updates(trace: DefaultFrame) -> Result<TraceExtract> {
+pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Result<TraceExtract> {
     // Transaction-global cumulative counter; the final step holds the tx
     // total. Geth omits the field when it is zero.
     let refund_counter = trace
@@ -230,10 +241,26 @@ pub fn compute_state_updates(trace: DefaultFrame) -> Result<TraceExtract> {
     let mut call_gas_tracking: HashMap<usize, u64> = HashMap::new();
     let mut total_call_gas = 0u64;
     let mut sstore_gas_total = 0u64;
+    let mut reentered = false;
 
     for struct_log in trace.struct_logs {
         let depth = struct_log.depth;
         let op = struct_log.op.as_ref().to_string();
+
+        // Re-entry detection: any CALL-family opcode below depth 1 whose
+        // target (second stack item from the top) is the origin contract.
+        if !reentered
+            && depth >= 2
+            && matches!(
+                op.as_str(),
+                "CALL" | "STATICCALL" | "DELEGATECALL" | "CALLCODE"
+            )
+            && let (Some(origin), Some(stack)) = (origin, struct_log.stack.as_ref())
+            && stack.len() >= 2
+            && Address::from_word(stack[stack.len() - 2].into()) == origin
+        {
+            reentered = true;
+        }
 
         // Whenever stepping up (leaving a CALL/CALLCODE/DELEGATECALL) reset the target depth
         // and pop call stack for any CALLs we've exited.
@@ -330,6 +357,7 @@ pub fn compute_state_updates(trace: DefaultFrame) -> Result<TraceExtract> {
         call_gas_total: total_call_gas,
         sstore_gas_total,
         refund_counter,
+        reentered,
     })
 }
 
@@ -433,7 +461,7 @@ mod tests {
             return_value: Default::default(),
             struct_logs: vec![mid, last],
         };
-        let extract = compute_state_updates(trace).unwrap();
+        let extract = compute_state_updates(trace, None).unwrap();
         assert!(extract.state_updates.is_empty());
         assert_eq!(extract.refund_counter, 40_000);
     }
@@ -452,9 +480,74 @@ mod tests {
             return_value: Default::default(),
             struct_logs: vec![cold, warm],
         };
-        let extract = compute_state_updates(trace).unwrap();
+        let extract = compute_state_updates(trace, None).unwrap();
         assert_eq!(extract.state_updates.len(), 2);
         assert_eq!(extract.sstore_gas_total, 22_200);
+    }
+
+    #[test]
+    fn reentry_flagged_when_deep_frame_calls_origin() {
+        let origin = Address::repeat_byte(0xaa);
+        // STATICCALL at depth 3 back into the origin. Stack bottom→top ends
+        // with [.., address, gas]: address is second from the top.
+        let mut callback = make_struct_log(
+            "STATICCALL",
+            vec![
+                U256::ZERO,                             // retSize
+                U256::ZERO,                             // retOffset
+                U256::ZERO,                             // argsSize
+                U256::ZERO,                             // argsOffset
+                U256::from_be_slice(origin.as_slice()), // address
+                U256::from(100_000u64),                 // gas (top)
+            ],
+            vec![],
+        );
+        callback.depth = 3;
+
+        let trace = DefaultFrame {
+            gas: 0,
+            failed: false,
+            return_value: Default::default(),
+            struct_logs: vec![callback],
+        };
+        let extract = compute_state_updates(trace, Some(origin)).unwrap();
+        assert!(extract.reentered);
+    }
+
+    #[test]
+    fn reentry_not_flagged_for_other_targets_or_missing_origin() {
+        let origin = Address::repeat_byte(0xaa);
+        let other = Address::repeat_byte(0xbb);
+        let mut call = make_struct_log(
+            "STATICCALL",
+            vec![
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+                U256::from_be_slice(other.as_slice()),
+                U256::from(100_000u64),
+            ],
+            vec![],
+        );
+        call.depth = 2;
+
+        let mk = |log: StructLog| DefaultFrame {
+            gas: 0,
+            failed: false,
+            return_value: Default::default(),
+            struct_logs: vec![log],
+        };
+
+        // Different target: not re-entry.
+        let extract = compute_state_updates(mk(call.clone()), Some(origin)).unwrap();
+        assert!(!extract.reentered);
+
+        // No origin supplied: detection off even for a matching target.
+        let mut self_call = call.clone();
+        self_call.stack.as_mut().unwrap()[4] = U256::from_be_slice(origin.as_slice());
+        let extract = compute_state_updates(mk(self_call), None).unwrap();
+        assert!(!extract.reentered);
     }
 
     #[test]
@@ -466,7 +559,7 @@ mod tests {
             return_value: Default::default(),
             struct_logs: vec![make_struct_log("STOP", vec![], vec![])],
         };
-        let extract = compute_state_updates(trace).unwrap();
+        let extract = compute_state_updates(trace, None).unwrap();
         assert_eq!(extract.refund_counter, 0);
     }
 

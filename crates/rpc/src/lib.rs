@@ -4,7 +4,7 @@
 //! (alloy-provider, DebugApi). These are separated from the core crate
 //! because they are not WASM-compatible.
 
-use alloy::primitives::FixedBytes;
+use alloy::primitives::{Address, FixedBytes};
 use alloy::rpc::types::trace::geth::{
     DefaultFrame, GethDebugTracingCallOptions, GethDebugTracingOptions, GethDefaultTracingOptions,
     GethTrace,
@@ -90,16 +90,19 @@ where
 /// `status` must be `receipt.status()` for `tx_hash`. Pass the already-fetched
 /// receipt's status to avoid an extra `eth_getTransactionReceipt` round-trip.
 ///
+/// `origin` is the traced transaction's target contract, used for re-entry
+/// detection (see [`TraceExtract::reentered`]); pass `None` to skip it.
 pub async fn compute_state_updates_from_tx<P: Provider + DebugApi>(
     provider: &P,
     tx_hash: FixedBytes<32>,
     status: bool,
+    origin: Option<Address>,
 ) -> Result<TraceExtract> {
     // Primary path: use the historical trace via debug_traceTransaction.
     let trace = get_tx_trace(provider, tx_hash, status).await?;
     let struct_logs_len = trace.struct_logs.len();
     if struct_logs_len > 0 {
-        return compute_state_updates(trace);
+        return compute_state_updates(trace, origin);
     }
 
     bail!(

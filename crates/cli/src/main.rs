@@ -168,7 +168,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     state_updates,
                     skipped_opcodes,
                     ..
-                } = compute_state_updates(trace)?;
+                } = compute_state_updates(trace, receipt.to)?;
 
                 // Print state updates
                 println!("\n{}", "=== State Updates ===".green().bold());
@@ -259,8 +259,13 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 // Use shared trace function from rpc crate
                 use gas_analyzer_rpc::compute_state_updates_from_tx;
 
-                let state_updates_result =
-                    compute_state_updates_from_tx(&provider, bytes.into(), original_status).await;
+                let state_updates_result = compute_state_updates_from_tx(
+                    &provider,
+                    bytes.into(),
+                    original_status,
+                    receipt.to,
+                )
+                .await;
 
                 let (extract, use_fallback) = match state_updates_result {
                     Ok(extract) => (extract, false),
@@ -474,6 +479,15 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     "GasKiller base estimate (before signature floor): {} {}",
                     base_gas_estimate, estimate_type
                 );
+                if extract.reentered {
+                    println!(
+                        "{}",
+                        "Note: a callee re-entered the target contract during execution. \
+                         External-call gas includes the contract's own callback logic, so \
+                         heuristic estimates may overshoot."
+                            .yellow()
+                    );
+                }
                 // Report the total estimate and savings for each signature scheme, since
                 // the Turetzky upper gas limit added to the base estimate differs per scheme.
                 for signature_type in SignatureType::ALL {

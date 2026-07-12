@@ -812,7 +812,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
         state_updates,
         skipped_opcodes,
         ..
-    } = compute_state_updates(trace)?;
+    } = compute_state_updates(trace, Some(contract_address))?;
     tracing::Span::current().record("state_update_count", state_updates.len());
 
     let storage_updates = encode_state_updates_to_abi(&state_updates);

@@ -630,7 +630,7 @@ pub async fn gaskiller_reporter(
         state_updates,
         skipped_opcodes: skipped_opcodes_set,
         ..
-    } = compute_state_updates(trace)?;
+    } = compute_state_updates(trace, None)?;
     let skipped_opcodes = skipped_opcodes_set
         .into_iter()
         .collect::<Vec<_>>()
@@ -682,7 +682,7 @@ pub async fn call_to_encoded_state_updates_with_gas_estimate(
         state_updates,
         skipped_opcodes,
         ..
-    } = compute_state_updates(trace)?;
+    } = compute_state_updates(trace, None)?;
     let gas_estimate = gk
         .estimate_state_changes_gas(contract_address, &state_updates)
         .await?;
@@ -718,7 +718,7 @@ impl<P: Provider + DebugApi> TxStateExtractor<P> {
         let trace = get_tx_trace(&self.provider, tx_hash, receipt.status()).await?;
 
         // Use existing compute_state_updates function
-        let state_updates = compute_state_updates(trace)?.state_updates;
+        let state_updates = compute_state_updates(trace, None)?.state_updates;
 
         Ok(state_updates)
     }
@@ -745,7 +745,7 @@ impl<P: Provider + DebugApi> TxStateExtractor<P> {
         }
 
         let trace = get_tx_trace(&self.provider, tx_hash, receipt.status()).await?;
-        let state_updates = compute_state_updates(trace)?.state_updates;
+        let state_updates = compute_state_updates(trace, None)?.state_updates;
 
         Ok(StateUpdateReport {
             tx_hash,
@@ -966,7 +966,7 @@ mod tests {
             .await?
             .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
         let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
-        let state_updates = compute_state_updates(trace)?.state_updates;
+        let state_updates = compute_state_updates(trace, None)?.state_updates;
 
         let gk = GasKillerDefault::new(rpc_url, None).await?;
         let gas_estimate = gk
@@ -991,7 +991,7 @@ mod tests {
             .await?
             .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
         let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
-        let state_updates = compute_state_updates(trace)?.state_updates;
+        let state_updates = compute_state_updates(trace, None)?.state_updates;
 
         let gk = GasKillerDefault::new(rpc_url, None).await?;
         let gas_estimate = gk
@@ -1016,7 +1016,7 @@ mod tests {
             .await?
             .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
         let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
-        let state_updates = compute_state_updates(trace)?.state_updates;
+        let state_updates = compute_state_updates(trace, None)?.state_updates;
 
         let gk = GasKillerDefault::new(rpc_url, None).await?;
         let gas_estimate = gk
@@ -1048,7 +1048,7 @@ mod tests {
             .await?
             .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
         let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
-        let state_updates = compute_state_updates(trace)?.state_updates;
+        let state_updates = compute_state_updates(trace, None)?.state_updates;
 
         assert_eq!(state_updates.len(), 2);
         assert!(matches!(state_updates[0], StateUpdate::Store(_)));
@@ -1095,7 +1095,7 @@ mod tests {
             .await?
             .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
         let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
-        let state_updates = compute_state_updates(trace)?.state_updates;
+        let state_updates = compute_state_updates(trace, None)?.state_updates;
 
         assert_eq!(state_updates.len(), 2);
         assert!(matches!(state_updates[0], StateUpdate::Store(_)));
@@ -1146,7 +1146,7 @@ mod tests {
             .await?
             .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
         let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
-        let state_updates = compute_state_updates(trace)?.state_updates;
+        let state_updates = compute_state_updates(trace, None)?.state_updates;
 
         assert_eq!(state_updates.len(), 4);
         let StateUpdate::Store(IStateUpdateTypes::Store { slot, value }) = &state_updates[0] else {
@@ -1215,7 +1215,7 @@ mod tests {
             .await?
             .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
         let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
-        let state_updates = compute_state_updates(trace)?.state_updates;
+        let state_updates = compute_state_updates(trace, None)?.state_updates;
 
         assert_eq!(state_updates.len(), 1);
         assert!(matches!(state_updates[0], StateUpdate::Call(_)));
@@ -1248,7 +1248,7 @@ mod tests {
         let tx_request = simple_storage.set(U256::from(1)).into_transaction_request();
 
         let trace = get_trace_from_call(rpc_url, tx_request, None).await?;
-        let state_updates = compute_state_updates(trace)?.state_updates;
+        let state_updates = compute_state_updates(trace, None)?.state_updates;
 
         assert_eq!(state_updates.len(), 2);
         assert!(matches!(state_updates[0], StateUpdate::Store(_)));

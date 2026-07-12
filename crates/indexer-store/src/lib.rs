@@ -95,9 +95,10 @@ impl Store {
                 from_address, to_address, function_selector, project_slug,
                 gas_used, effective_gas_price_wei, gaskiller_gas_estimate,
                 gas_saved, wei_saved, is_heuristic, failure_reason,
-                state_update_count, skipped_opcodes
+                state_update_count, skipped_opcodes, reentered
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                $19
             )
             ON CONFLICT (chain_id, block_number, tx_index) DO NOTHING
             "#,
@@ -120,6 +121,7 @@ impl Store {
         .bind(report.failure_reason.as_deref())
         .bind(report.state_update_count as i32)
         .bind(&report.skipped_opcodes)
+        .bind(report.reentered)
         .execute(&self.pool)
         .await?;
         Ok(())
