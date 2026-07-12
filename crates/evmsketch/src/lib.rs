@@ -111,8 +111,8 @@ pub mod simple_rpc_db;
 use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 
 use gas_analyzer_core::{
-    Opcode, StateUpdate, compute_state_updates, encode_state_updates_to_abi,
-    estimate_gas_from_operations, extract_operation_counts_from_trace,
+    Opcode, StateUpdate, compute_state_updates, compute_state_updates_canonical,
+    encode_state_updates_to_abi, estimate_gas_from_operations, extract_operation_counts_from_trace,
 };
 use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
 use gas_analyzer_rpc::get_trace_from_call;
@@ -753,24 +753,66 @@ fn hints_from_state_updates(
     hints
 }
 
+/// How the target's storage mutations are laid out in the emitted update program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StateEncoding {
+    /// Legacy: raw depth-1 `SSTORE`s in trace order; nested writes are dropped and
+    /// left to replay natively inside their emitted `CALL`. No guarantee about the
+    /// storage an external (re-entrant) call observes mid-program, and reverted
+    /// `DELEGATECALL` writes can leak in.
+    #[default]
+    Legacy,
+    /// Canonical checkpointing: before every emitted external `CALL`/`CREATE` the
+    /// program brings the target's storage to the exact image native execution had
+    /// at that point, and a final slice re-asserts the canonical end state. A
+    /// re-entrant call therefore observes canonical storage, and the committed
+    /// final state is correct even if a re-entrant replay diverged. See
+    /// [`gas_analyzer_core::compute_state_updates_canonical`].
+    Canonical,
+}
+
 /// Compute encoded state updates and gas estimate for a transaction call using EvmSketch.
 ///
-/// Simulates the call via `debug_traceCall` at the given block, extracts state updates,
-/// encodes them to ABI, and estimates gas. The executor build step (~50–70 ms,
-/// 1× `eth_getBlockByNumber`; plus `eth_chainId` on the first miss per URL) is
-/// skipped on cache hits. The HTTP connection pool for
-/// `rpc_url` is managed by `cache` and shared across calls — pass a persistent
-/// `EvmSketchExecutorCache` for best performance; for one-shot use pass
-/// `&EvmSketchExecutorCache::new(1)`.
+/// Legacy-encoding convenience wrapper over
+/// [`call_to_encoded_state_updates_with_evmsketch_mode`].
 ///
 /// # Returns
 /// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`
-#[tracing::instrument(name = "evmsketch.encode", skip_all, fields(block_number, state_update_count = tracing::field::Empty))]
 pub async fn call_to_encoded_state_updates_with_evmsketch(
     cache: &EvmSketchExecutorCache,
     rpc_url: impl AsRef<str>,
     tx_request: TransactionRequest,
     block_number: u64,
+) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
+    call_to_encoded_state_updates_with_evmsketch_mode(
+        cache,
+        rpc_url,
+        tx_request,
+        block_number,
+        StateEncoding::Legacy,
+    )
+    .await
+}
+
+/// Compute encoded state updates and gas estimate for a transaction call using EvmSketch.
+///
+/// Simulates the call via `debug_traceCall` at the given block, extracts state updates
+/// under the chosen [`StateEncoding`], encodes them to ABI, and estimates gas. The
+/// executor build step (~50–70 ms, 1× `eth_getBlockByNumber`; plus `eth_chainId` on the
+/// first miss per URL) is skipped on cache hits. The HTTP connection pool for `rpc_url`
+/// is managed by `cache` and shared across calls — pass a persistent
+/// `EvmSketchExecutorCache` for best performance; for one-shot use pass
+/// `&EvmSketchExecutorCache::new(1)`.
+///
+/// # Returns
+/// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`
+#[tracing::instrument(name = "evmsketch.encode", skip_all, fields(block_number, encoding = ?encoding, state_update_count = tracing::field::Empty))]
+pub async fn call_to_encoded_state_updates_with_evmsketch_mode(
+    cache: &EvmSketchExecutorCache,
+    rpc_url: impl AsRef<str>,
+    tx_request: TransactionRequest,
+    block_number: u64,
+    encoding: StateEncoding,
 ) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
     let rpc_url = rpc_url.as_ref();
     let provider = cache.get_or_create_trace_provider(rpc_url)?;
@@ -808,7 +850,10 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
         cache.get_or_build(rpc_url, block_number),
     )?;
 
-    let (state_updates, skipped_opcodes, _call_gas_total) = compute_state_updates(trace)?;
+    let (state_updates, skipped_opcodes, _call_gas_total) = match encoding {
+        StateEncoding::Legacy => compute_state_updates(trace)?,
+        StateEncoding::Canonical => compute_state_updates_canonical(trace, contract_address)?,
+    };
     tracing::Span::current().record("state_update_count", state_updates.len());
 
     let storage_updates = encode_state_updates_to_abi(&state_updates);
