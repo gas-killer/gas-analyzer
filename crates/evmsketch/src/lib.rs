@@ -107,7 +107,9 @@ fn gnosis_hardforks() -> EthereumChainHardforks {
     ])
 }
 
+pub mod overlay_mount;
 pub mod simple_rpc_db;
+pub use overlay_mount::{OverlayMount, OverlayStateDb};
 use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 
 // Re-exported so downstream consumers (e.g. the Gas Killer service) can name
