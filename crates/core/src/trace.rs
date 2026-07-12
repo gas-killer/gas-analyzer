@@ -193,14 +193,21 @@ pub fn append_state_update_from_struct_log(
 /// This extracts SSTORE, CALL, and LOG operations from an existing transaction's trace,
 /// handling DELEGATECALL and CALLCODE depth tracking correctly.
 ///
-/// Returns: (state_updates, skipped_opcodes, call_gas_total, refund_counter)
-/// - `call_gas_total` is the total gas cost of all CALL operations in state_updates
-/// - `refund_counter` is the final (pre-cap) EIP-3529 refund counter of the
-///   traced execution, for netting refunds out of heuristic estimates
+/// Everything extracted from a struct-log trace in a single pass.
+#[derive(Debug, Default)]
+pub struct TraceExtract {
+    pub state_updates: Vec<StateUpdate>,
+    pub skipped_opcodes: HashSet<Opcode>,
+    /// Total gas consumed by the extracted depth-1 CALLs (gross, pre-refund).
+    pub call_gas_total: u64,
+    /// Final (pre-cap) EIP-3529 refund counter of the traced execution, for
+    /// netting refunds out of heuristic estimates.
+    pub refund_counter: u64,
+}
+
+/// Compute state updates from a Geth DefaultFrame trace (see [`TraceExtract`]).
 #[tracing::instrument(name = "gas.trace_parse", skip_all, fields(state_update_count = tracing::field::Empty))]
-pub fn compute_state_updates(
-    trace: DefaultFrame,
-) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64, u64)> {
+pub fn compute_state_updates(trace: DefaultFrame) -> Result<TraceExtract> {
     // Transaction-global cumulative counter; the final step holds the tx
     // total. Geth omits the field when it is zero.
     let refund_counter = trace
@@ -306,12 +313,12 @@ pub fn compute_state_updates(
     }
 
     tracing::Span::current().record("state_update_count", state_updates.len());
-    Ok((
+    Ok(TraceExtract {
         state_updates,
         skipped_opcodes,
-        total_call_gas,
+        call_gas_total: total_call_gas,
         refund_counter,
-    ))
+    })
 }
 
 #[cfg(test)]
@@ -414,9 +421,9 @@ mod tests {
             return_value: Default::default(),
             struct_logs: vec![mid, last],
         };
-        let (updates, _, _, refund) = compute_state_updates(trace).unwrap();
-        assert!(updates.is_empty());
-        assert_eq!(refund, 40_000);
+        let extract = compute_state_updates(trace).unwrap();
+        assert!(extract.state_updates.is_empty());
+        assert_eq!(extract.refund_counter, 40_000);
     }
 
     #[test]
@@ -428,8 +435,8 @@ mod tests {
             return_value: Default::default(),
             struct_logs: vec![make_struct_log("STOP", vec![], vec![])],
         };
-        let (_, _, _, refund) = compute_state_updates(trace).unwrap();
-        assert_eq!(refund, 0);
+        let extract = compute_state_updates(trace).unwrap();
+        assert_eq!(extract.refund_counter, 0);
     }
 
     #[test]

@@ -111,7 +111,7 @@ pub mod simple_rpc_db;
 use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 
 use gas_analyzer_core::{
-    Opcode, StateUpdate, compute_state_updates, encode_state_updates_to_abi,
+    Opcode, StateUpdate, TraceExtract, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_operations, extract_operation_counts_from_trace,
 };
 use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
@@ -808,7 +808,11 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
         cache.get_or_build(rpc_url, block_number),
     )?;
 
-    let (state_updates, skipped_opcodes, _call_gas_total, _refund) = compute_state_updates(trace)?;
+    let TraceExtract {
+        state_updates,
+        skipped_opcodes,
+        ..
+    } = compute_state_updates(trace)?;
     tracing::Span::current().record("state_update_count", state_updates.len());
 
     let storage_updates = encode_state_updates_to_abi(&state_updates);

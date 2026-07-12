@@ -164,8 +164,11 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
 
                 // Get trace and compute state updates
                 let trace = get_tx_trace(&provider, bytes.into(), original_status).await?;
-                let (state_updates, skipped_opcodes, _call_gas_total, _refund) =
-                    compute_state_updates(trace)?;
+                let gas_analyzer_core::TraceExtract {
+                    state_updates,
+                    skipped_opcodes,
+                    ..
+                } = compute_state_updates(trace)?;
 
                 // Print state updates
                 println!("\n{}", "=== State Updates ===".green().bold());
@@ -259,43 +262,39 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 let state_updates_result =
                     compute_state_updates_from_tx(&provider, bytes.into(), original_status).await;
 
-                let (state_updates, skipped_opcodes, call_gas_total, refund_counter, use_fallback) =
-                    match state_updates_result {
-                        Ok(result) => (result.0, result.1, result.2, result.3, false),
-                        Err(e) => {
-                            if original_status {
-                                // Transaction succeeded originally but trace extraction failed
-                                // Fall back to heuristic estimation
-                                println!(
+                let (extract, use_fallback) = match state_updates_result {
+                    Ok(extract) => (extract, false),
+                    Err(e) => {
+                        if original_status {
+                            // Transaction succeeded originally but trace extraction failed
+                            // Fall back to heuristic estimation
+                            println!(
                                     "{}",
                                     "Warning: Trace extraction failed, using fallback heuristic estimation"
                                         .yellow()
                                 );
-                                if cli_args.debug {
-                                    println!("   Reason: {e:?}");
-                                } else {
-                                    println!(
-                                        "   Reason: {}",
-                                        format!("{e}")
-                                            .split('\n')
-                                            .next()
-                                            .unwrap_or("Unknown error")
-                                    );
-                                }
-
-                                // Return empty state updates and use fallback heuristic
-                                (Vec::new(), std::collections::HashSet::new(), 0, 0, true)
+                            if cli_args.debug {
+                                println!("   Reason: {e:?}");
                             } else {
-                                // Transaction originally failed, so this is expected
-                                let msg = format!(
-                                    "Cannot analyze failed transaction. Original transaction reverted.\n\
-                                    Error: {}",
-                                    e
+                                println!(
+                                    "   Reason: {}",
+                                    format!("{e}").split('\n').next().unwrap_or("Unknown error")
                                 );
-                                return Err(anyhow::Error::msg(msg));
                             }
+
+                            // Return an empty extraction and use fallback heuristic
+                            (gas_analyzer_core::TraceExtract::default(), true)
+                        } else {
+                            // Transaction originally failed, so this is expected
+                            let msg = format!(
+                                "Cannot analyze failed transaction. Original transaction reverted.\n\
+                                    Error: {}",
+                                e
+                            );
+                            return Err(anyhow::Error::msg(msg));
                         }
-                    };
+                    }
+                };
 
                 // Get gas estimate using the state updates extracted from the actual trace
                 use gas_analyzer_core::{
@@ -306,7 +305,8 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 // Base estimate is the state-change execution cost only; the Turetzky
                 // upper gas limit (which depends on the signature scheme) is added per
                 // scheme when the estimate is reported.
-                let (base_gas_estimate, is_heuristic) = if use_fallback || state_updates.is_empty()
+                let (base_gas_estimate, is_heuristic) = if use_fallback
+                    || extract.state_updates.is_empty()
                 {
                     // Use heuristic estimation when trace extraction failed or no state updates
                     let gk = GasKillerEvmSketchDefault::builder(rpc_url.clone())
@@ -378,7 +378,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     match gk.estimate_state_changes_gas_with_preceding(
                         contract_address,
                         tx_sender,
-                        &state_updates,
+                        &extract.state_updates,
                         &preceding_txs,
                         tx_value,
                     ) {
@@ -424,31 +424,31 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                                     }
                                 }
                             }
-                            let heuristic = estimate_gas_from_state_updates(
-                                &state_updates,
-                                call_gas_total,
-                                refund_counter,
-                            );
+                            let heuristic = estimate_gas_from_state_updates(&extract);
                             (heuristic, true)
                         }
                     }
                 };
 
                 // Encode the state updates
-                let _encoded = encode_state_updates_to_abi(&state_updates);
+                let _encoded = encode_state_updates_to_abi(&extract.state_updates);
 
                 // Print state updates (debug only)
                 if cli_args.debug {
                     println!("\n{}", "=== State Updates ===".green().bold());
-                    println!("Total state updates: {}", state_updates.len());
-                    for (i, update) in state_updates.iter().enumerate() {
+                    println!("Total state updates: {}", extract.state_updates.len());
+                    for (i, update) in extract.state_updates.iter().enumerate() {
                         println!("  {}: {:?}", i + 1, update);
                     }
-                    if !skipped_opcodes.is_empty() {
+                    if !extract.skipped_opcodes.is_empty() {
                         println!(
                             "\n{}: {}",
                             "Skipped opcodes".yellow(),
-                            skipped_opcodes.into_iter().collect::<Vec<_>>().join(", ")
+                            extract
+                                .skipped_opcodes
+                                .into_iter()
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         );
                     }
                 }

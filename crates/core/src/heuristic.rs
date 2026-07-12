@@ -33,6 +33,7 @@
 
 use std::collections::HashMap;
 
+use crate::trace::TraceExtract;
 use crate::types::StateUpdate;
 
 /// Heuristic gas costs for different operations
@@ -70,29 +71,21 @@ fn apply_refund(gross: u64, refund_counter: u64) -> u64 {
     gross - refund_counter.min(gross / MAX_REFUND_QUOTIENT)
 }
 
-/// Estimate gas from state updates using heuristic costs.
+/// Estimate gas from a trace extraction using heuristic costs.
 ///
-/// This provides a rough estimate based on known gas costs for each operation type.
-///
-/// # Arguments
-/// * `state_updates` - The state updates to estimate gas for
-/// * `external_call_gas` - Actual gas used by external calls (cannot be optimized)
-/// * `refund_counter` - Final EIP-3529 refund counter from the trace (pre-cap);
-///   pass 0 when unavailable to reproduce the old (overshooting) behavior
+/// This provides a rough estimate based on known gas costs for each operation
+/// type, using the trace-measured aggregates carried by [`TraceExtract`]
+/// (external call gas, refund counter).
 ///
 /// # Returns
 /// Estimated gas cost
-pub fn estimate_gas_from_state_updates(
-    state_updates: &[StateUpdate],
-    external_call_gas: u64,
-    refund_counter: u64,
-) -> u64 {
+pub fn estimate_gas_from_state_updates(extract: &TraceExtract) -> u64 {
     let mut gas = BASE_TX_COST;
 
     // Add actual gas used by external calls (cannot be optimized)
-    gas += external_call_gas;
+    gas += extract.call_gas_total;
 
-    for update in state_updates {
+    for update in &extract.state_updates {
         gas += match update {
             StateUpdate::Store(_) => WARM_SSTORE_COST,
             // CALL gas is already included in external_call_gas from the trace
@@ -123,7 +116,7 @@ pub fn estimate_gas_from_state_updates(
         };
     }
 
-    apply_refund(gas, refund_counter)
+    apply_refund(gas, extract.refund_counter)
 }
 
 /// Estimate gas from trace operations using heuristic costs.
@@ -306,11 +299,19 @@ pub fn extract_operation_counts_from_trace(
 mod refund_tests {
     use super::*;
 
+    fn extract(call_gas_total: u64, refund_counter: u64) -> TraceExtract {
+        TraceExtract {
+            call_gas_total,
+            refund_counter,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn refund_below_cap_subtracts_fully() {
         // gross = 21_000 base + 100_000 call gas = 121_000; cap = 24_200
         assert_eq!(
-            estimate_gas_from_state_updates(&[], 100_000, 10_000),
+            estimate_gas_from_state_updates(&extract(100_000, 10_000)),
             111_000
         );
     }
@@ -319,14 +320,17 @@ mod refund_tests {
     fn refund_capped_at_fifth_of_gross() {
         // gross = 121_000; refund 1M clamps to 121_000 / 5 = 24_200
         assert_eq!(
-            estimate_gas_from_state_updates(&[], 100_000, 1_000_000),
+            estimate_gas_from_state_updates(&extract(100_000, 1_000_000)),
             96_800
         );
     }
 
     #[test]
     fn zero_refund_preserves_old_behavior() {
-        assert_eq!(estimate_gas_from_state_updates(&[], 100_000, 0), 121_000);
+        assert_eq!(
+            estimate_gas_from_state_updates(&extract(100_000, 0)),
+            121_000
+        );
     }
 
     #[test]

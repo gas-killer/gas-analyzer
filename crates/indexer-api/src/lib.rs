@@ -213,16 +213,15 @@ impl Analyzer for EvmSketchAnalyzer {
         // A trace failure is a real error (worker retries / dead-letters), not
         // an empty state-update list — coercing it to empty produced the bogus
         // flat ~271k estimate (#158).
-        let (state_updates, skipped_opcodes, call_gas_total, refund_counter) =
-            with_retry(&retry_cfg, is_transient_rpc_error, || async {
-                compute_state_updates_from_tx(provider, tx_hash, receipt.status()).await
-            })
-            .await
-            .map_err(|e| AnalyzerError::Trace(format!("trace extraction failed: {e}")))?;
+        let extract = with_retry(&retry_cfg, is_transient_rpc_error, || async {
+            compute_state_updates_from_tx(provider, tx_hash, receipt.status()).await
+        })
+        .await
+        .map_err(|e| AnalyzerError::Trace(format!("trace extraction failed: {e}")))?;
 
         // Nothing to model with no state updates. The heuristic is only
         // meaningful with a non-empty set (as in the CLI), so skip instead.
-        if state_updates.is_empty() {
+        if extract.state_updates.is_empty() {
             return Err(AnalyzerError::Skipped(SkipReason::NoStateUpdates));
         }
 
@@ -230,8 +229,7 @@ impl Analyzer for EvmSketchAnalyzer {
         // (preceding-tx replay, EvmSketch fork build) is where ~all of the
         // per-analysis RPC volume lives (#119, #162).
         let (gaskiller_gas_estimate, is_heuristic, failure_reason) = if self.config.heuristic_only {
-            let heuristic =
-                estimate_gas_from_state_updates(&state_updates, call_gas_total, refund_counter);
+            let heuristic = estimate_gas_from_state_updates(&extract);
             // Not a failure: the measured path was never attempted.
             (heuristic + TURETZKY_UPPER_GAS_LIMIT_BLS, true, None)
         } else {
@@ -258,17 +256,13 @@ impl Analyzer for EvmSketchAnalyzer {
             match gk.estimate_state_changes_gas_with_preceding(
                 to,
                 tx_sender,
-                &state_updates,
+                &extract.state_updates,
                 &preceding_txs,
                 tx_value,
             ) {
                 Ok(g) => (g + TURETZKY_UPPER_GAS_LIMIT_BLS, false, None),
                 Err(e) => {
-                    let heuristic = estimate_gas_from_state_updates(
-                        &state_updates,
-                        call_gas_total,
-                        refund_counter,
-                    );
+                    let heuristic = estimate_gas_from_state_updates(&extract);
                     let reason = format!("{e}");
                     let truncated = reason.lines().next().unwrap_or("unknown").to_string();
                     (
@@ -299,8 +293,9 @@ impl Analyzer for EvmSketchAnalyzer {
             wei_saved,
             is_heuristic,
             failure_reason,
-            state_update_count: state_updates.len() as u32,
-            skipped_opcodes: skipped_opcodes
+            state_update_count: extract.state_updates.len() as u32,
+            skipped_opcodes: extract
+                .skipped_opcodes
                 .into_iter()
                 .map(|o| format!("{o:?}"))
                 .collect(),

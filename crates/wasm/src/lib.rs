@@ -1,14 +1,13 @@
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types::trace::geth::DefaultFrame;
 use gas_analyzer_core::{
-    StateUpdate, compute_state_updates, encode_state_updates_to_abi,
+    TraceExtract, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_state_updates,
 };
 use gas_analyzer_estimator::{SimEnvOpts, estimate_state_changes_gas};
 use revm::database::{CacheDB, EmptyDB};
 use revm::primitives::hardfork::SpecId;
 use serde::Serialize;
-use std::collections::HashSet;
 use wasm_bindgen::prelude::*;
 
 /// Initialize panic hook for better error messages in browser console.
@@ -49,19 +48,10 @@ pub struct EstimateGasResult {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-fn parse_and_compute(
-    trace_json: &str,
-) -> Result<(Vec<StateUpdate>, HashSet<String>, u64, u64), String> {
+fn parse_and_compute(trace_json: &str) -> Result<TraceExtract, String> {
     let trace: DefaultFrame =
         serde_json::from_str(trace_json).map_err(|e| format!("Failed to parse trace: {}", e))?;
-    let (updates, skipped, call_gas, refund_counter) = compute_state_updates(trace)
-        .map_err(|e| format!("Failed to compute state updates: {}", e))?;
-    Ok((
-        updates,
-        skipped.into_iter().collect(),
-        call_gas,
-        refund_counter,
-    ))
+    compute_state_updates(trace).map_err(|e| format!("Failed to compute state updates: {}", e))
 }
 
 fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsError> {
@@ -81,10 +71,10 @@ pub fn analyze_trace_inner(
     caller_address: &str,
     estimate_state_changes_block_number: Option<u64>,
 ) -> Result<AnalyzeTraceResult, String> {
-    let (state_updates, skipped_opcodes, call_gas_total, refund_counter) =
-        parse_and_compute(trace_json)?;
+    let extract = parse_and_compute(trace_json)?;
+    let state_updates = &extract.state_updates;
 
-    let encoded = encode_state_updates_to_abi(&state_updates);
+    let encoded = encode_state_updates_to_abi(state_updates);
 
     let addr: Address = estimator_address
         .parse()
@@ -111,15 +101,12 @@ pub fn analyze_trace_inner(
     };
 
     let (gas_estimate, is_heuristic) =
-        match estimate_state_changes_gas(&mut cache_db, addr, caller, &state_updates, &sim_env) {
+        match estimate_state_changes_gas(&mut cache_db, addr, caller, state_updates, &sim_env) {
             Ok(gas) => (gas, false),
-            Err(_) => (
-                estimate_gas_from_state_updates(&state_updates, call_gas_total, refund_counter),
-                true,
-            ),
+            Err(_) => (estimate_gas_from_state_updates(&extract), true),
         };
 
-    let mut skipped = skipped_opcodes.into_iter().collect::<Vec<_>>();
+    let mut skipped = extract.skipped_opcodes.iter().cloned().collect::<Vec<_>>();
     skipped.sort();
 
     Ok(AnalyzeTraceResult {
@@ -132,24 +119,27 @@ pub fn analyze_trace_inner(
 }
 
 pub fn estimate_gas_heuristic_inner(trace_json: &str) -> Result<EstimateGasResult, String> {
-    let (state_updates, skipped_opcodes, call_gas_total, refund_counter) =
-        parse_and_compute(trace_json)?;
+    let extract = parse_and_compute(trace_json)?;
 
-    let gas = estimate_gas_from_state_updates(&state_updates, call_gas_total, refund_counter);
+    let gas = estimate_gas_from_state_updates(&extract);
 
-    let mut skipped = skipped_opcodes.into_iter().collect::<Vec<_>>();
+    let mut skipped = extract.skipped_opcodes.into_iter().collect::<Vec<_>>();
     skipped.sort();
 
     Ok(EstimateGasResult {
         gas_estimate: gas,
         is_heuristic: true,
-        state_update_count: state_updates.len(),
+        state_update_count: extract.state_updates.len(),
         skipped_opcodes: skipped,
     })
 }
 
 pub fn encode_trace_inner(trace_json: &str) -> Result<EncodeTraceResult, String> {
-    let (state_updates, skipped_opcodes, _, _) = parse_and_compute(trace_json)?;
+    let TraceExtract {
+        state_updates,
+        skipped_opcodes,
+        ..
+    } = parse_and_compute(trace_json)?;
 
     let encoded = encode_state_updates_to_abi(&state_updates);
     let mut skipped = skipped_opcodes.into_iter().collect::<Vec<_>>();
