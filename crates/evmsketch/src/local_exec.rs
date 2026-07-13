@@ -63,7 +63,9 @@ use alloy_eips::BlockId;
 use alloy_provider::RootProvider;
 use alloy_provider::network::AnyNetwork;
 use anyhow::{Result, anyhow};
-use foundry_fork_db::{BlockchainDb, SharedBackend, backend::BlockingMode, cache::BlockchainDbMeta};
+use foundry_fork_db::{
+    BlockchainDb, SharedBackend, backend::BlockingMode, cache::BlockchainDbMeta,
+};
 use lru::LruCache;
 use revm::bytecode::opcode;
 use revm::context::result::ExecutionResult;
@@ -85,7 +87,7 @@ use gas_analyzer_core::types::IStateUpdateTypes;
 use gas_analyzer_core::{Opcode, OverlayEnv, PrestateEligibility, SimProfile, StateUpdate};
 
 use crate::DefaultEvmSketchExecutor;
-use crate::overlay_mount::{OverlayMount, OverlayStateDb};
+use crate::overlay_mount::{OverlayMount, OverlayMountSet, OverlayStateDb};
 
 // ============================================================================
 // Block environment
@@ -213,7 +215,12 @@ impl Default for LocalStateCache {
             // blocks. Eviction after the round bounds the remote-state cache
             // exactly as issue #169's memory notes require.
             backends: Mutex::new(LruCache::new(NonZeroUsize::new(4).expect("non-zero"))),
-            overlay_mounts: Mutex::new(LruCache::new(NonZeroUsize::new(2).expect("non-zero"))),
+            // Sized above the number of concurrently served models: two
+            // pinned models mounted simultaneously (multi-overlay) plus
+            // headroom, so a third transient mount can never evict a resident
+            // model — re-mounting a file-backed model costs a full streaming
+            // keccak pass over the blobs (minutes for 35 GB artifacts).
+            overlay_mounts: Mutex::new(LruCache::new(NonZeroUsize::new(4).expect("non-zero"))),
         }
     }
 }
@@ -233,11 +240,8 @@ impl LocalStateCache {
             return backend.clone();
         }
         let db = BlockchainDb::new(BlockchainDbMeta::default(), None);
-        let backend = SharedBackend::spawn_backend_thread(
-            provider,
-            db,
-            Some(BlockId::number(block_number)),
-        );
+        let backend =
+            SharedBackend::spawn_backend_thread(provider, db, Some(BlockId::number(block_number)));
         cache.put(key, backend.clone());
         backend
     }
@@ -297,7 +301,11 @@ impl LocalStateCache {
         // `EvmSketchExecutorCache::get_or_build` documents.
         drop(cache);
 
-        let mount = Arc::new(OverlayMount::from_files(weights_path, tokenizer_path, manifest)?);
+        let mount = Arc::new(OverlayMount::from_files(
+            weights_path,
+            tokenizer_path,
+            manifest,
+        )?);
 
         let mut cache = self
             .overlay_mounts
@@ -305,6 +313,42 @@ impl LocalStateCache {
             .expect("overlay mount cache mutex poisoned");
         cache.put(manifest, mount.clone());
         Ok(mount)
+    }
+
+    /// The composite [`OverlayMountSet`] for several file-backed models at
+    /// once — the multi-overlay construction path. Each `(weights_path,
+    /// tokenizer_path, manifest)` spec resolves through
+    /// [`Self::overlay_mount_from_files`]: same mandatory streaming-keccak
+    /// verification against the pinned manifest, same manifest-keyed
+    /// memoization, so N models are hashed + indexed once per process, not
+    /// once per call.
+    ///
+    /// Chunk addresses are derived per-manifest, so distinct manifests yield
+    /// disjoint address sets and the composite lookup is sound (see
+    /// [`OverlayMountSet`]). Duplicate manifests in `specs` are refused
+    /// outright: two specs naming the same commitment is caller
+    /// misconfiguration (the later one's paths would be silently ignored via
+    /// the cache), and this failure mode should be loud.
+    pub fn overlay_mount_set_from_files<W, T>(
+        &self,
+        specs: &[(W, T, B256)],
+    ) -> Result<OverlayMountSet>
+    where
+        W: AsRef<std::path::Path>,
+        T: AsRef<std::path::Path>,
+    {
+        let mut seen = std::collections::HashSet::with_capacity(specs.len());
+        let mut mounts = Vec::with_capacity(specs.len());
+        for (weights_path, tokenizer_path, manifest) in specs {
+            if !seen.insert(*manifest) {
+                return Err(anyhow!(
+                    "duplicate overlay manifest {manifest} in multi-mount spec: \
+                     each mounted model must have a distinct pinned manifest"
+                ));
+            }
+            mounts.push(self.overlay_mount_from_files(weights_path, tokenizer_path, *manifest)?);
+        }
+        Ok(OverlayMountSet::new(mounts))
     }
 }
 
@@ -614,10 +658,11 @@ impl<CTX> Inspector<CTX, EthInterpreter> for ReplayScriptInspector {
                 let (Ok(slot), Ok(value)) = (interp.stack.peek(0), interp.stack.peek(1)) else {
                     return;
                 };
-                self.updates.push(StateUpdate::Store(IStateUpdateTypes::Store {
-                    slot: slot.into(),
-                    value: value.into(),
-                }));
+                self.updates
+                    .push(StateUpdate::Store(IStateUpdateTypes::Store {
+                        slot: slot.into(),
+                        value: value.into(),
+                    }));
             }
             opcode::LOG0..=opcode::LOG4 => {
                 let topic_count = (op - opcode::LOG0) as usize;
@@ -668,11 +713,12 @@ impl<CTX> Inspector<CTX, EthInterpreter> for ReplayScriptInspector {
                     return;
                 };
                 let callargs: Bytes = copy_frame_memory(interp, args_offset, args_len).into();
-                self.updates.push(StateUpdate::Call(IStateUpdateTypes::Call {
-                    target: Address::from_word(address.into()),
-                    value,
-                    callargs,
-                }));
+                self.updates
+                    .push(StateUpdate::Call(IStateUpdateTypes::Call {
+                        target: Address::from_word(address.into()),
+                        value,
+                        callargs,
+                    }));
             }
             opcode::CREATE => {
                 // Stack (top-first): value, offset, size.
@@ -758,7 +804,7 @@ impl<CTX> Inspector<CTX, EthInterpreter> for ReplayScriptInspector {
 /// the inspector for post-processing. Nothing is committed anywhere.
 fn run_pass<DB, INSP>(
     db: DB,
-    overlay: Option<Arc<OverlayMount>>,
+    overlay: OverlayMountSet,
     env: &LocalBlockEnv,
     tx: &LocalTxRequest,
     profile: SimProfile,
@@ -779,7 +825,7 @@ where
 {
     let (block_gas_limit, tx_gas_limit) = resolve_gas_limits(env, tx, profile);
 
-    let cache_db = CacheDB::new(OverlayStateDb::new(db, overlay));
+    let cache_db = CacheDB::new(OverlayStateDb::new_multi(db, overlay));
     let ctx = Context::mainnet()
         .with_db(cache_db)
         .modify_cfg_chained(|cfg| {
@@ -829,7 +875,7 @@ where
 /// [`extract_state_updates_local`]).
 pub(crate) fn extract_state_updates_local_blocking<DB>(
     db: DB,
-    overlay: Option<Arc<OverlayMount>>,
+    overlay: OverlayMountSet,
     env: &LocalBlockEnv,
     tx: &LocalTxRequest,
     profile: SimProfile,
@@ -879,7 +925,7 @@ where
 /// blocking pool with the backend switched to plain-blocking mode.
 pub(crate) async fn extract_state_updates_local(
     backend: SharedBackend,
-    overlay: Option<Arc<OverlayMount>>,
+    overlay: OverlayMountSet,
     env: LocalBlockEnv,
     tx: LocalTxRequest,
     profile: SimProfile,
@@ -970,7 +1016,7 @@ mod tests {
     ) -> (Vec<StateUpdate>, HashSet<Opcode>) {
         extract_state_updates_local_blocking(
             db.clone(),
-            None,
+            OverlayMountSet::default(),
             &test_env(),
             &test_tx(consumer),
             profile,
@@ -1314,7 +1360,7 @@ mod tests {
 
         let (updates, _) = extract_state_updates_local_blocking(
             db,
-            Some(mount),
+            mount.into(),
             &test_env(),
             &test_tx(consumer),
             SimProfile::Chain,
@@ -1338,5 +1384,130 @@ mod tests {
             ],
             "overlay bytes must be readable through EXTCODECOPY and commit correctly",
         );
+    }
+
+    /// TWO models mounted simultaneously (multi-overlay): a consumer that
+    /// EXTCODECOPYs one chunk from each model and commits both words must see
+    /// each model's own bytes — the composite lookup resolves both manifests'
+    /// disjoint address sets in a single execution, with no chunk account
+    /// existing in the underlying DB for either model.
+    #[test]
+    fn two_model_mount_set_serves_both_models_in_one_call() {
+        let payload_a: Vec<u8> = (0..100u32).map(|i| (i % 256) as u8).collect();
+        let payload_b: Vec<u8> = (0..100u32).map(|i| ((i * 7 + 3) % 253) as u8).collect();
+        let env_a = OverlayEnv::from_blobs(&payload_a, b"tok-a").expect("overlay env a");
+        let env_b = OverlayEnv::from_blobs(&payload_b, b"tok-b").expect("overlay env b");
+        assert_ne!(env_a.manifest, env_b.manifest);
+        let chunk_a = env_a.overlays[0].address;
+        let chunk_b = env_b.overlays[0].address;
+
+        let mounts: OverlayMountSet = [
+            Arc::new(OverlayMount::from_env(&env_a, env_a.manifest).expect("mount a")),
+            Arc::new(OverlayMount::from_env(&env_b, env_b.manifest).expect("mount b")),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut db = seed_db();
+        let consumer = address!("0x000000000000000000000000000000000000200b");
+        // EXTCODECOPY(chunkA, dest 0, offset 1, size 32); SSTORE(1, MLOAD(0));
+        // EXTCODECOPY(chunkB, dest 0, offset 1, size 32); SSTORE(2, MLOAD(0));
+        // LOG1(mem[0..32], topic 0xee); STOP.
+        set_code(
+            &mut db,
+            consumer,
+            hex_code(&format!(
+                "6020 6001 6000 73{} 3c 600051600155 6020 6001 6000 73{} 3c 600051600255 7f{}60206000a1 00",
+                addr_hex(chunk_a),
+                addr_hex(chunk_b),
+                topic_hex(0xee),
+            )),
+        );
+
+        let (updates, _) = extract_state_updates_local_blocking(
+            db,
+            mounts,
+            &test_env(),
+            &test_tx(consumer),
+            SimProfile::Chain,
+            consumer,
+        )
+        .expect("local extraction with two-model overlay set");
+
+        let word_a = B256::from_slice(&payload_a[0..32]);
+        let word_b = B256::from_slice(&payload_b[0..32]);
+        assert_ne!(
+            word_a, word_b,
+            "distinct payloads required for the test to bite"
+        );
+        assert_updates_eq(
+            &updates,
+            &[
+                StateUpdate::Store(IStateUpdateTypes::Store {
+                    slot: B256::with_last_byte(1),
+                    value: word_a,
+                }),
+                StateUpdate::Store(IStateUpdateTypes::Store {
+                    slot: B256::with_last_byte(2),
+                    value: word_b,
+                }),
+                StateUpdate::Log1(IStateUpdateTypes::Log1 {
+                    data: Bytes::copy_from_slice(word_b.as_slice()),
+                    topic1: B256::with_last_byte(0xee),
+                }),
+            ],
+            "each model's chunk must resolve to its own bytes through the composite mount set",
+        );
+    }
+
+    /// `overlay_mount_set_from_files` builds each model once (manifest-keyed
+    /// memoization) and refuses duplicate manifests in one spec list.
+    #[test]
+    fn mount_set_from_files_memoizes_and_rejects_duplicates() {
+        use std::io::Write as _;
+
+        let payload_a: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+        let payload_b: Vec<u8> = (0..300u32).map(|i| ((i * 7 + 3) % 253) as u8).collect();
+        let env_a = OverlayEnv::from_blobs(&payload_a, b"tok-a").expect("env a");
+        let env_b = OverlayEnv::from_blobs(&payload_b, b"tok-b").expect("env b");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            let mut f = std::fs::File::create(&path).expect("create blob");
+            f.write_all(bytes).expect("write blob");
+            path
+        };
+        let wa = write("wa.bin", &payload_a);
+        let ta = write("ta.bin", b"tok-a");
+        let wb = write("wb.bin", &payload_b);
+        let tb = write("tb.bin", b"tok-b");
+
+        let cache = LocalStateCache::default();
+        let specs = vec![
+            (wa.clone(), ta.clone(), env_a.manifest),
+            (wb.clone(), tb.clone(), env_b.manifest),
+        ];
+        let set = cache
+            .overlay_mount_set_from_files(&specs)
+            .expect("two-model set");
+        assert_eq!(set.len(), 2);
+        assert_eq!(set.manifests(), vec![env_a.manifest, env_b.manifest]);
+
+        // Second build returns the memoized mounts (same Arcs).
+        let again = cache
+            .overlay_mount_set_from_files(&specs)
+            .expect("memoized set");
+        assert_eq!(again.manifests(), set.manifests());
+
+        // Duplicate manifest in one spec list is refused loudly.
+        let dup = vec![
+            (wa.clone(), ta.clone(), env_a.manifest),
+            (wa, ta, env_a.manifest),
+        ];
+        let err = cache
+            .overlay_mount_set_from_files(&dup)
+            .expect_err("duplicate manifest must be refused");
+        assert!(err.to_string().contains("duplicate overlay manifest"));
     }
 }

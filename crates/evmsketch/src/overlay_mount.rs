@@ -195,7 +195,10 @@ impl OverlayMount {
             }
         }
 
-        Ok(Self::new(manifest, OverlaySourceInner::Files { maps, index }))
+        Ok(Self::new(
+            manifest,
+            OverlaySourceInner::Files { maps, index },
+        ))
     }
 
     fn new(manifest: B256, source: OverlaySourceInner) -> Self {
@@ -277,25 +280,109 @@ impl OverlayMount {
     }
 }
 
+/// An ordered collection of verified [`OverlayMount`]s consulted as ONE
+/// composite lookup — the multi-model mounting primitive.
+///
+/// Chunk addresses are derived per-manifest
+/// (`keccak256("gaskiller.llm.overlay.v1" || manifest || u64be(i))[12..]`,
+/// see `gas_analyzer_core::overlay::overlay_chunk_address`), so the address
+/// sets of mounts with **distinct manifests are disjoint** (a cross-manifest
+/// collision is a ~2^-160 event). Trying each mount in turn is therefore a
+/// sound composite: at most one mount can resolve any address, and mount
+/// order cannot affect what execution observes. An empty set is a transparent
+/// passthrough, equivalent to running with no overlay at all.
+///
+/// Cheap to clone: the set is a `Vec` of [`Arc`](std::sync::Arc)s, and each
+/// mount's chunk memo is shared across clones.
+#[derive(Debug, Clone, Default)]
+pub struct OverlayMountSet {
+    mounts: Vec<std::sync::Arc<OverlayMount>>,
+}
+
+impl OverlayMountSet {
+    /// A composite over `mounts`. Callers are expected to pass mounts with
+    /// distinct manifests (see the type docs for why that makes the composite
+    /// sound); [`crate::LocalStateCache::overlay_mount_set_from_files`]
+    /// enforces this for the file-backed construction path.
+    pub fn new(mounts: Vec<std::sync::Arc<OverlayMount>>) -> Self {
+        Self { mounts }
+    }
+
+    /// `true` when the set holds no mounts (transparent passthrough).
+    pub fn is_empty(&self) -> bool {
+        self.mounts.is_empty()
+    }
+
+    /// Number of mounted models.
+    pub fn len(&self) -> usize {
+        self.mounts.len()
+    }
+
+    /// The verified manifests of the mounted models, in mount order.
+    pub fn manifests(&self) -> Vec<B256> {
+        self.mounts.iter().map(|m| m.manifest()).collect()
+    }
+
+    /// O(mounts) membership check that never materializes chunk bytes.
+    pub fn contains(&self, address: &Address) -> bool {
+        self.mounts.iter().any(|m| m.contains(address))
+    }
+
+    /// The `(code_hash, bytecode)` mounted at `address` across all models,
+    /// materializing (and memoizing, per mount) it if needed. `None` when the
+    /// address is not a chunk of any mounted model. Disjointness (see type
+    /// docs) guarantees at most one mount resolves.
+    pub fn account_code(&self, address: &Address) -> Option<(B256, Bytecode)> {
+        self.mounts.iter().find_map(|m| m.account_code(address))
+    }
+}
+
+impl From<std::sync::Arc<OverlayMount>> for OverlayMountSet {
+    fn from(mount: std::sync::Arc<OverlayMount>) -> Self {
+        Self::new(vec![mount])
+    }
+}
+
+impl From<Option<std::sync::Arc<OverlayMount>>> for OverlayMountSet {
+    fn from(mount: Option<std::sync::Arc<OverlayMount>>) -> Self {
+        Self::new(mount.into_iter().collect())
+    }
+}
+
+impl FromIterator<std::sync::Arc<OverlayMount>> for OverlayMountSet {
+    fn from_iter<I: IntoIterator<Item = std::sync::Arc<OverlayMount>>>(iter: I) -> Self {
+        Self::new(iter.into_iter().collect())
+    }
+}
+
 /// A [`DatabaseRef`] layer that serves overlay chunk accounts locally and
 /// delegates everything else to `inner` (the lazy remote-state backend).
 ///
-/// With `overlay: None` it is a transparent passthrough, so the local
-/// executor uses one database type for both plain and overlay-mode traces.
+/// With an empty [`OverlayMountSet`] it is a transparent passthrough, so the
+/// local executor uses one database type for plain, single-overlay and
+/// multi-overlay traces alike.
 #[derive(Debug)]
 pub struct OverlayStateDb<DB> {
     inner: DB,
-    overlay: Option<std::sync::Arc<OverlayMount>>,
+    mounts: OverlayMountSet,
 }
 
 impl<DB> OverlayStateDb<DB> {
-    /// Wrap `inner`, consulting `overlay` (if any) before it.
+    /// Wrap `inner`, consulting `overlay` (if any) before it — the
+    /// single-model convenience form of [`OverlayStateDb::new_multi`].
     pub fn new(inner: DB, overlay: Option<std::sync::Arc<OverlayMount>>) -> Self {
-        Self { inner, overlay }
+        Self::new_multi(inner, overlay.into())
+    }
+
+    /// Wrap `inner`, consulting every mount in `mounts` before it. The
+    /// mounts' address sets are disjoint (per-manifest derived addresses —
+    /// see [`OverlayMountSet`]), so this composite is order-independent.
+    pub fn new_multi(inner: DB, mounts: OverlayMountSet) -> Self {
+        Self { inner, mounts }
     }
 
     fn overlay_hit(&self, address: &Address) -> Option<(B256, Bytecode)> {
-        self.overlay.as_ref()?.account_code(address)
+        self.mounts.account_code(address)
     }
 }
 
@@ -323,9 +410,7 @@ impl<DB: DatabaseRef> DatabaseRef for OverlayStateDb<DB> {
     }
 
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        if let Some(overlay) = &self.overlay
-            && overlay.contains(&address)
-        {
+        if self.mounts.contains(&address) {
             // Never-deployed derived address: empty storage, no remote fetch.
             return Ok(U256::ZERO);
         }
@@ -445,8 +530,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wpath = write_temp(&dir, "w.bin", &weights);
         let tpath = write_temp(&dir, "t.bin", &tokenizer);
-        let err = OverlayMount::from_files(&wpath, &tpath, B256::ZERO)
-            .expect_err("wrong pin for files");
+        let err =
+            OverlayMount::from_files(&wpath, &tpath, B256::ZERO).expect_err("wrong pin for files");
         assert!(err.to_string().contains("refusing to mount"));
 
         // Tampered blob against the honest pin is refused too.
@@ -519,5 +604,130 @@ mod tests {
         let db_plain: OverlayStateDb<CacheDB<EmptyDB>> =
             OverlayStateDb::new(CacheDB::new(EmptyDB::default()), None);
         assert!(db_plain.basic_ref(chunk_addr).expect("ok").is_none());
+    }
+
+    /// A second synthetic model with content distinct from [`synthetic_blobs`]
+    /// so cross-model mixups can never produce matching bytes.
+    fn synthetic_blobs_b() -> (Vec<u8>, Vec<u8>) {
+        let weights: Vec<u8> = (0..OVERLAY_CHUNK_PAYLOAD + 311)
+            .map(|i| ((i * 7 + 3) % 253) as u8)
+            .collect();
+        let tokenizer: Vec<u8> = (0..419).map(|i| ((i * 11 + 5) % 239) as u8).collect();
+        (weights, tokenizer)
+    }
+
+    /// The multi-model composite: two models' manifests derive disjoint
+    /// address sets, every chunk of each model resolves through the set to
+    /// exactly its own mount's bytes, a stranger address resolves on none,
+    /// and an empty set never resolves anything.
+    #[test]
+    fn mount_set_serves_two_disjoint_models() {
+        let (wa, ta) = synthetic_blobs();
+        let (wb, tb) = synthetic_blobs_b();
+        let env_a = OverlayEnv::from_blobs(&wa, &ta).expect("env a");
+        let env_b = OverlayEnv::from_blobs(&wb, &tb).expect("env b");
+        assert_ne!(env_a.manifest, env_b.manifest, "distinct models required");
+
+        let mount_a = Arc::new(OverlayMount::from_env(&env_a, env_a.manifest).expect("mount a"));
+        let mount_b = Arc::new(OverlayMount::from_env(&env_b, env_b.manifest).expect("mount b"));
+
+        // Disjointness: no address of one model's chunk set appears in the
+        // other's (the KEY FACT that makes the composite lookup safe).
+        for o in &env_a.overlays {
+            assert!(
+                !mount_b.contains(&o.address),
+                "model A chunk {} collided into model B's address set",
+                o.address
+            );
+        }
+        for o in &env_b.overlays {
+            assert!(
+                !mount_a.contains(&o.address),
+                "model B chunk {} collided into model A's address set",
+                o.address
+            );
+        }
+
+        let set = OverlayMountSet::new(vec![mount_a, mount_b]);
+        assert_eq!(set.len(), 2);
+        assert!(!set.is_empty());
+        assert_eq!(set.manifests(), vec![env_a.manifest, env_b.manifest]);
+
+        for (env, tag) in [(&env_a, "A"), (&env_b, "B")] {
+            for overlay in &env.overlays {
+                assert!(set.contains(&overlay.address));
+                let (hash, code) = set.account_code(&overlay.address).unwrap_or_else(|| {
+                    panic!("model {tag} chunk {} must resolve", overlay.address)
+                });
+                assert_eq!(
+                    code.original_bytes(),
+                    overlay.code,
+                    "model {tag} chunk {} bytes diverged through the set",
+                    overlay.address
+                );
+                assert_eq!(hash, keccak256(&overlay.code));
+            }
+        }
+
+        let stranger = Address::repeat_byte(0x42);
+        assert!(!set.contains(&stranger));
+        assert!(set.account_code(&stranger).is_none());
+
+        let empty = OverlayMountSet::default();
+        assert!(empty.is_empty());
+        assert!(empty.account_code(&env_a.overlays[0].address).is_none());
+    }
+
+    /// The DatabaseRef layer over a two-model set: both models' chunks come
+    /// back as fresh code-only accounts, chunk storage is zero without
+    /// touching the inner DB, and non-chunk accounts pass through.
+    #[test]
+    fn overlay_state_db_multi_serves_both_models_and_delegates_rest() {
+        let (wa, ta) = synthetic_blobs();
+        let (wb, tb) = synthetic_blobs_b();
+        let env_a = OverlayEnv::from_blobs(&wa, &ta).expect("env a");
+        let env_b = OverlayEnv::from_blobs(&wb, &tb).expect("env b");
+        let set = OverlayMountSet::new(vec![
+            Arc::new(OverlayMount::from_env(&env_a, env_a.manifest).expect("mount a")),
+            Arc::new(OverlayMount::from_env(&env_b, env_b.manifest).expect("mount b")),
+        ]);
+
+        let mut inner = CacheDB::new(EmptyDB::default());
+        let plain = Address::repeat_byte(0x77);
+        inner.insert_account_info(
+            plain,
+            AccountInfo {
+                balance: U256::from(123u64),
+                nonce: 9,
+                code_hash: revm::primitives::KECCAK_EMPTY,
+                code: None,
+            },
+        );
+        let db = OverlayStateDb::new_multi(inner, set);
+
+        for env in [&env_a, &env_b] {
+            let chunk_addr = env.overlays[0].address;
+            let info = db
+                .basic_ref(chunk_addr)
+                .expect("basic_ref ok")
+                .expect("chunk account exists");
+            assert_eq!(info.balance, U256::ZERO);
+            assert_eq!(info.nonce, 0);
+            assert_eq!(
+                info.code.as_ref().expect("code inlined").original_bytes(),
+                env.overlays[0].code
+            );
+            assert_eq!(
+                db.storage_ref(chunk_addr, U256::from(5u64)).expect("ok"),
+                U256::ZERO,
+            );
+        }
+
+        let passthrough = db
+            .basic_ref(plain)
+            .expect("basic_ref ok")
+            .expect("plain account exists");
+        assert_eq!(passthrough.balance, U256::from(123u64));
+        assert_eq!(passthrough.nonce, 9);
     }
 }
