@@ -73,6 +73,7 @@ use revm::context::{Context, TxEnv};
 use revm::context_interface::transaction::{AccessList, SignedAuthorization};
 use revm::database::CacheDB;
 use revm::database_interface::DatabaseRef;
+use revm::inspector::NoOpInspector;
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_types::{Jumps, MemoryTr};
 use revm::interpreter::{
@@ -940,6 +941,68 @@ pub(crate) async fn extract_state_updates_local(
 }
 
 // ============================================================================
+// View-call execution (returns raw output, not a state-update payload)
+// ============================================================================
+
+/// Executes a read-only call entirely in-process and returns its raw return
+/// data — the local, overlay-aware twin of plain `eth_call`, for callers that
+/// need a huge view function's OUTPUT rather than a tracked function's state
+/// diff (e.g. gas-killer/service's sharded-inference segment executor running
+/// `Qwen35SegEngine.forwardRange` against a 34 GB mmap overlay that no RPC
+/// node hosts).
+///
+/// Same environment as [`extract_state_updates_local_blocking`] (`run_pass`:
+/// eth_call fee/nonce semantics, profile gas overrides, overlay-aware state),
+/// but a single pass with a no-op inspector and no extraction. Reverts and
+/// halts are errors, not outputs: a segment call's witness checks
+/// (`expectXIn` mismatches) revert, and a committee member must surface that
+/// loudly rather than hash-commit an empty result.
+///
+/// Blocking: `db` misses hit the network synchronously; call from
+/// `spawn_blocking` (see [`call_view_local`]).
+pub(crate) fn call_view_local_blocking<DB>(
+    db: DB,
+    overlay: OverlayMountSet,
+    env: &LocalBlockEnv,
+    tx: &LocalTxRequest,
+    profile: SimProfile,
+) -> Result<Bytes>
+where
+    DB: DatabaseRef,
+    DB::Error: core::fmt::Debug,
+{
+    let (result, _state, _inspector) = run_pass(db, overlay, env, tx, profile, NoOpInspector)?;
+    match result {
+        ExecutionResult::Success { output, .. } => Ok(output.into_data()),
+        ExecutionResult::Revert { output, gas_used } => Err(anyhow!(
+            "view call reverted (gas_used {gas_used}): {output}"
+        )),
+        ExecutionResult::Halt { reason, gas_used } => Err(anyhow!(
+            "view call halted: {reason:?} (gas_used {gas_used})"
+        )),
+    }
+}
+
+/// Async wrapper: runs [`call_view_local_blocking`] on the blocking pool with
+/// the backend switched to plain-blocking mode — the same pattern as
+/// [`extract_state_updates_local`], because a heavy view call (an LLM segment
+/// is minutes of pure compute) must never occupy an async worker thread.
+pub(crate) async fn call_view_local(
+    backend: SharedBackend,
+    overlay: OverlayMountSet,
+    env: LocalBlockEnv,
+    tx: LocalTxRequest,
+    profile: SimProfile,
+) -> Result<Bytes> {
+    let backend = backend.with_blocking_mode(BlockingMode::Block);
+    tokio::task::spawn_blocking(move || {
+        call_view_local_blocking(backend, overlay, &env, &tx, profile)
+    })
+    .await
+    .map_err(|e| anyhow!("local view-call task panicked: {e}"))?
+}
+
+// ============================================================================
 // Tests (pure revm — no anvil, no network)
 // ============================================================================
 
@@ -1509,5 +1572,69 @@ mod tests {
             .overlay_mount_set_from_files(&dup)
             .expect_err("duplicate manifest must be refused");
         assert!(err.to_string().contains("duplicate overlay manifest"));
+    }
+
+    #[test]
+    fn view_call_returns_output_bytes() {
+        let mut db = seed_db();
+        let consumer = address!("0x000000000000000000000000000000000000300a");
+        // MSTORE(0, 0x..2a); RETURN(0, 32).
+        set_code(&mut db, consumer, hex_code("602a 600052 60206000 f3"));
+        let out = call_view_local_blocking(
+            db,
+            OverlayMountSet::default(),
+            &test_env(),
+            &test_tx(consumer),
+            SimProfile::Chain,
+        )
+        .expect("view call");
+        assert_eq!(out, Bytes::from(B256::with_last_byte(0x2a).to_vec()));
+    }
+
+    #[test]
+    fn view_call_reads_overlay_chunk() {
+        let payload: Vec<u8> = (0..100u32).map(|i| (i % 256) as u8).collect();
+        let env = OverlayEnv::from_blobs(&payload, b"tok").expect("overlay env");
+        let mount = Arc::new(OverlayMount::from_env(&env, env.manifest).expect("mount"));
+        let chunk = env.overlays[0].address;
+
+        let mut db = seed_db();
+        let consumer = address!("0x000000000000000000000000000000000000300b");
+        // EXTCODECOPY(chunk, dest 0, offset 1, size 32); RETURN(0, 32).
+        set_code(
+            &mut db,
+            consumer,
+            hex_code(&format!(
+                "6020 6001 6000 73{} 3c 60206000 f3",
+                addr_hex(chunk)
+            )),
+        );
+        let out = call_view_local_blocking(
+            db,
+            mount.into(),
+            &test_env(),
+            &test_tx(consumer),
+            SimProfile::Chain,
+        )
+        .expect("view call with overlay");
+        // Chunk code is 0x00 || payload, so offset 1..33 is payload[0..32].
+        assert_eq!(out, Bytes::copy_from_slice(&payload[0..32]));
+    }
+
+    #[test]
+    fn view_call_revert_is_an_error() {
+        let mut db = seed_db();
+        let consumer = address!("0x000000000000000000000000000000000000300c");
+        // REVERT(0, 0).
+        set_code(&mut db, consumer, hex_code("6000 6000 fd"));
+        let err = call_view_local_blocking(
+            db,
+            OverlayMountSet::default(),
+            &test_env(),
+            &test_tx(consumer),
+            SimProfile::Chain,
+        )
+        .expect_err("revert must be an error, not empty output");
+        assert!(err.to_string().contains("reverted"), "got: {err}");
     }
 }

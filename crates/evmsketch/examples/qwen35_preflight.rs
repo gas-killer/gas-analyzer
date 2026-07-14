@@ -37,8 +37,7 @@ use rand::rngs::StdRng;
 
 /// Pinned on-chain manifest for the Qwen3.5-35B-A3B artifact set (from the
 /// deploy brief / `artifacts/manifest.json`).
-const PINNED_MANIFEST: &str =
-    "0x7bdf4876a6861287521dadab3d3870f74dfa557507ed200d49f75bcb09f01fa9";
+const PINNED_MANIFEST: &str = "0x7bdf4876a6861287521dadab3d3870f74dfa557507ed200d49f75bcb09f01fa9";
 
 /// Number of randomly sampled chunk addresses to touch — enough to exercise
 /// the mmap path across the whole 34.7 GB file (not just the front, which
@@ -106,7 +105,11 @@ fn memory_bytes() -> u64 {
         let ret = libc::getrusage(libc::RUSAGE_SELF, &mut usage);
         assert_eq!(ret, 0, "getrusage failed");
         let raw = usage.ru_maxrss as u64;
-        if cfg!(target_os = "linux") { raw * 1024 } else { raw }
+        if cfg!(target_os = "linux") {
+            raw * 1024
+        } else {
+            raw
+        }
     }
 }
 
@@ -125,9 +128,7 @@ fn artifacts_dir() -> PathBuf {
     std::env::var("QWEN35_ARTIFACTS_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            PathBuf::from(
-                "/Users/wk/conductor/workspaces/solidity-sdk/monterrey-v3/artifacts",
-            )
+            PathBuf::from("/Users/wk/conductor/workspaces/solidity-sdk/monterrey-v3/artifacts")
         })
 }
 
@@ -136,7 +137,10 @@ fn main() {
     let weights_path = dir.join("weights.bin");
     let tokenizer_path = dir.join("tokenizer.bin");
 
-    for (label, path) in [("weights.bin", &weights_path), ("tokenizer.bin", &tokenizer_path)] {
+    for (label, path) in [
+        ("weights.bin", &weights_path),
+        ("tokenizer.bin", &tokenizer_path),
+    ] {
         assert!(
             path.is_file(),
             "expected {label} at {} — set QWEN35_ARTIFACTS_DIR to override",
@@ -173,7 +177,10 @@ fn main() {
     println!("pinned manifest: {pinned_manifest}");
 
     let footprint_before = memory_bytes();
-    println!("physical footprint before mount: {}", human_bytes(footprint_before));
+    println!(
+        "physical footprint before mount: {}",
+        human_bytes(footprint_before)
+    );
 
     // ------------------------------------------------------------------
     // 1. Mount: streaming keccak verify + address index build. This is the
@@ -184,11 +191,10 @@ fn main() {
     //    sampling, below.
     // ------------------------------------------------------------------
     let mount_start = Instant::now();
-    let mount = OverlayMount::from_files(&weights_path, &tokenizer_path, pinned_manifest)
-        .expect(
-            "OverlayMount::from_files failed — manifest verification or file I/O error; \
+    let mount = OverlayMount::from_files(&weights_path, &tokenizer_path, pinned_manifest).expect(
+        "OverlayMount::from_files failed — manifest verification or file I/O error; \
              see the printed cause above",
-        );
+    );
     let mount_elapsed = mount_start.elapsed();
 
     let footprint_after_mount = memory_bytes();
@@ -257,13 +263,16 @@ fn main() {
             mount.contains(&expected_addr),
             "chunk {idx}: derived address {expected_addr} not found in the mounted index"
         );
-        let (code_hash, bytecode) = mount
-            .account_code(&expected_addr)
-            .unwrap_or_else(|| panic!("chunk {idx}: account_code returned None for {expected_addr}"));
+        let (code_hash, bytecode) = mount.account_code(&expected_addr).unwrap_or_else(|| {
+            panic!("chunk {idx}: account_code returned None for {expected_addr}")
+        });
         let code = bytecode.original_bytes();
 
         assert!(!code.is_empty(), "chunk {idx}: code must not be empty");
-        assert_eq!(code[0], 0x00, "chunk {idx}: code must be STOP-prefixed (0x00 || payload)");
+        assert_eq!(
+            code[0], 0x00,
+            "chunk {idx}: code must be STOP-prefixed (0x00 || payload)"
+        );
         let payload_len = code.len() - 1;
         let is_last_weight_chunk = idx == expected_weight_chunks as u64 - 1;
         let is_last_chunk = idx == expected_total as u64 - 1;
@@ -328,7 +337,10 @@ fn main() {
         "mount (verify+index) time: {:.2}s",
         mount_elapsed.as_secs_f64()
     );
-    println!("sample touch+verify time : {:.2}s", sample_elapsed.as_secs_f64());
+    println!(
+        "sample touch+verify time : {:.2}s",
+        sample_elapsed.as_secs_f64()
+    );
     println!(
         "total wall time          : {:.2}s",
         mount_start.elapsed().as_secs_f64()
@@ -348,7 +360,11 @@ fn main() {
     println!(
         "memory budget (steady-state)    : {} ({})",
         human_bytes(MEMORY_BUDGET_BYTES),
-        if footprint_final < MEMORY_BUDGET_BYTES { "PASS" } else { "FAIL" }
+        if footprint_final < MEMORY_BUDGET_BYTES {
+            "PASS"
+        } else {
+            "FAIL"
+        }
     );
     println!(
         "manifest verification    : PASS (OverlayMount::from_files recomputed and matched {pinned_manifest})"
