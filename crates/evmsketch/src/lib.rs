@@ -1168,6 +1168,13 @@ where
 /// executing the same segment against equally-prepared environments return
 /// byte-identical outputs. Reverts and halts are errors (see
 /// `local_exec::call_view_local_blocking`).
+///
+/// `state_cache` is taken as an `Arc` (unlike the tracked-path siblings)
+/// because the ENTIRE blocking half — including the mount resolution, whose
+/// cold-cache cost is a full streaming-keccak pass over the artifact files
+/// (minutes for 35 GB models) — runs on the blocking pool. Awaiting this
+/// future never occupies an async worker thread for longer than the cheap
+/// env construction, even on the first call after process start.
 #[tracing::instrument(
     name = "evmsketch.view_local_multi",
     skip_all,
@@ -1175,7 +1182,7 @@ where
 )]
 pub async fn call_view_local_multi<W, T>(
     executor_cache: &EvmSketchExecutorCache,
-    state_cache: &LocalStateCache,
+    state_cache: std::sync::Arc<LocalStateCache>,
     rpc_url: impl AsRef<str>,
     tx_request: TransactionRequest,
     block_number: u64,
@@ -1186,7 +1193,10 @@ where
     W: AsRef<std::path::Path>,
     T: AsRef<std::path::Path>,
 {
-    let mounts = state_cache.overlay_mount_set_from_files(mounts_spec)?;
+    let specs: Vec<(std::path::PathBuf, std::path::PathBuf, B256)> = mounts_spec
+        .iter()
+        .map(|(w, t, m)| (w.as_ref().to_path_buf(), t.as_ref().to_path_buf(), *m))
+        .collect();
     let local_tx = local_exec::LocalTxRequest::from_request(&tx_request)?;
     let executor = executor_cache
         .get_or_build(rpc_url.as_ref(), block_number)
@@ -1197,7 +1207,18 @@ where
         block_number,
         executor.sketch.provider.clone(),
     );
-    local_exec::call_view_local(backend, mounts, block_env, local_tx, profile).await
+    tokio::task::spawn_blocking(move || {
+        local_exec::call_view_local_files_blocking(
+            backend,
+            &state_cache,
+            &specs,
+            &block_env,
+            &local_tx,
+            profile,
+        )
+    })
+    .await
+    .map_err(|e| anyhow!("local view-call task panicked: {e}"))?
 }
 
 /// Shared body of [`call_to_encoded_state_updates_local`],
