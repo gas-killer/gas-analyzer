@@ -959,7 +959,7 @@ pub(crate) async fn extract_state_updates_local(
 /// loudly rather than hash-commit an empty result.
 ///
 /// Blocking: `db` misses hit the network synchronously; call from
-/// `spawn_blocking` (see [`call_view_local`]).
+/// `spawn_blocking` (see [`call_view_local_files_blocking`]).
 pub(crate) fn call_view_local_blocking<DB>(
     db: DB,
     overlay: OverlayMountSet,
@@ -983,23 +983,23 @@ where
     }
 }
 
-/// Async wrapper: runs [`call_view_local_blocking`] on the blocking pool with
-/// the backend switched to plain-blocking mode — the same pattern as
-/// [`extract_state_updates_local`], because a heavy view call (an LLM segment
-/// is minutes of pure compute) must never occupy an async worker thread.
-pub(crate) async fn call_view_local(
+/// The whole blocking half of a file-mounted view call: backend switched to
+/// plain-blocking mode, overlay mounts resolved (on a COLD cache this is the
+/// full streaming-keccak manifest verification over the artifact files —
+/// minutes for 35 GB models, which is exactly why it must run here and not on
+/// the async caller's thread), then the single-pass execution. Run the whole
+/// thing from `spawn_blocking` — see `call_view_local_multi` in lib.rs.
+pub(crate) fn call_view_local_files_blocking(
     backend: SharedBackend,
-    overlay: OverlayMountSet,
-    env: LocalBlockEnv,
-    tx: LocalTxRequest,
+    state_cache: &LocalStateCache,
+    specs: &[(std::path::PathBuf, std::path::PathBuf, B256)],
+    env: &LocalBlockEnv,
+    tx: &LocalTxRequest,
     profile: SimProfile,
 ) -> Result<Bytes> {
     let backend = backend.with_blocking_mode(BlockingMode::Block);
-    tokio::task::spawn_blocking(move || {
-        call_view_local_blocking(backend, overlay, &env, &tx, profile)
-    })
-    .await
-    .map_err(|e| anyhow!("local view-call task panicked: {e}"))?
+    let mounts = state_cache.overlay_mount_set_from_files(specs)?;
+    call_view_local_blocking(backend, mounts, env, tx, profile)
 }
 
 // ============================================================================
@@ -1636,5 +1636,47 @@ mod tests {
         )
         .expect_err("revert must be an error, not empty output");
         assert!(err.to_string().contains("reverted"), "got: {err}");
+    }
+
+    #[test]
+    fn view_call_profile_gas_override_decides_halt_vs_output() {
+        // The same 1M-iteration countdown burner as
+        // unbounded_profiles_lift_gas_beyond_chain_limits, but ending in
+        // MSTORE+RETURN instead of SSTORE+LOG (jump targets 0x04/0x11 sit in
+        // the unchanged prefix). Under Chain the request's 3M gas stands ->
+        // OOG halt, and the halt arm must be a loud error; under the
+        // unbounded tiers the pinned profile override replaces the request's
+        // gas and the call completes with its return data — proving the view
+        // path rides resolve_gas_limits exactly like the tracked path (a
+        // production segment cannot finish under chain limits).
+        let mut db = seed_db();
+        let consumer = address!("0x000000000000000000000000000000000000300d");
+        set_code(
+            &mut db,
+            consumer,
+            hex_code("620f4240 5b 80 15 6011 57 6001 90 03 6004 56 5b 50 602a 600052 60206000 f3"),
+        );
+
+        let err = call_view_local_blocking(
+            db.clone(),
+            OverlayMountSet::default(),
+            &test_env(),
+            &test_tx(consumer),
+            SimProfile::Chain,
+        )
+        .expect_err("OOG under Chain must be a loud halt error");
+        assert!(err.to_string().contains("halted"), "got: {err}");
+
+        for profile in [SimProfile::UnboundedV1, SimProfile::UnboundedV1Xl] {
+            let out = call_view_local_blocking(
+                db.clone(),
+                OverlayMountSet::default(),
+                &test_env(),
+                &test_tx(consumer),
+                profile,
+            )
+            .expect("unbounded profile must lift the gas and complete");
+            assert_eq!(out, Bytes::from(B256::with_last_byte(0x2a).to_vec()));
+        }
     }
 }
