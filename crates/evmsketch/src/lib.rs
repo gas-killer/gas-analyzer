@@ -1152,6 +1152,54 @@ where
     .await
 }
 
+/// The view-call sibling of [`call_to_encoded_state_updates_local_multi`]:
+/// executes a read-only call in-process with the same multi-model overlay
+/// mounts and pinned profile, returning the call's **raw return data**
+/// instead of extracting a state-update payload.
+///
+/// This is the entry point for gas-killer/service's sharded-inference
+/// segment executor (`Qwen35SegEngine.forwardRange` / `argmaxRange`): a
+/// segment call is a pure view over pinned overlay code — there is no
+/// storage diff to extract, no unbounded payload shape to validate, and no
+/// settlement gas to estimate, so those stages are skipped entirely.
+/// Everything else — executor pinning at `(rpc_url, block_number)`, the lazy
+/// remote-state backend, manifest verification + memoized mmap mounts — is
+/// identical to the tracked-function path, so two committee members
+/// executing the same segment against equally-prepared environments return
+/// byte-identical outputs. Reverts and halts are errors (see
+/// `local_exec::call_view_local_blocking`).
+#[tracing::instrument(
+    name = "evmsketch.view_local_multi",
+    skip_all,
+    fields(block_number, profile = ?profile, mounts = mounts_spec.len())
+)]
+pub async fn call_view_local_multi<W, T>(
+    executor_cache: &EvmSketchExecutorCache,
+    state_cache: &LocalStateCache,
+    rpc_url: impl AsRef<str>,
+    tx_request: TransactionRequest,
+    block_number: u64,
+    profile: SimProfile,
+    mounts_spec: &[(W, T, B256)],
+) -> Result<Bytes>
+where
+    W: AsRef<std::path::Path>,
+    T: AsRef<std::path::Path>,
+{
+    let mounts = state_cache.overlay_mount_set_from_files(mounts_spec)?;
+    let local_tx = local_exec::LocalTxRequest::from_request(&tx_request)?;
+    let executor = executor_cache
+        .get_or_build(rpc_url.as_ref(), block_number)
+        .await?;
+    let block_env = LocalBlockEnv::from_executor(&executor);
+    let backend = state_cache.backend_for(
+        rpc_url.as_ref(),
+        block_number,
+        executor.sketch.provider.clone(),
+    );
+    local_exec::call_view_local(backend, mounts, block_env, local_tx, profile).await
+}
+
 /// Shared body of [`call_to_encoded_state_updates_local`],
 /// [`call_to_encoded_state_updates_local_files`] and
 /// [`call_to_encoded_state_updates_local_multi`]: everything downstream of
