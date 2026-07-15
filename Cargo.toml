@@ -16,6 +16,11 @@ default-members = [
     "crates/evmsketch",
     "crates/cli",
 ]
+# revmc-harness is the standalone revmc (EVM AOT/JIT) differential-equality
+# spike. It pulls revm 41.x + the LLVM toolchain and is kept OUT of the
+# workspace so it can never perturb the consensus-critical Cargo.lock the
+# interpreted local-exec path resolves against. It has its own Cargo.lock.
+exclude = ["revmc-harness"]
 
 [profile.bench]
 debug = 1
