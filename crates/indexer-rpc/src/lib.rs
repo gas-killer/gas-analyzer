@@ -81,9 +81,9 @@ type Bucket = governor::RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 pub struct RateLimiter {
     bucket: Arc<Bucket>,
     semaphore: Arc<Semaphore>,
-    /// The configured burst capacity. We clamp single-acquire weights to this
-    /// because `governor::RateLimiter::until_n_ready(N)` errors immediately
-    /// when N > burst (it can never be satisfied).
+    /// The configured burst capacity — the chunk size for heavy acquires,
+    /// since `governor::RateLimiter::until_n_ready(N)` errors immediately
+    /// when N > burst (the bucket can never hold that many tokens).
     burst: u32,
 }
 
@@ -99,25 +99,24 @@ impl RateLimiter {
         }
     }
 
-    /// Acquire up to `weight` tokens AND a concurrency slot. The weight is
-    /// clamped to the configured burst — requesting more would error
-    /// immediately because the bucket can never hold that many tokens.
-    /// Callers that genuinely need a heavy charge should reach this in
-    /// multiple smaller acquires.
+    /// Acquire `weight` tokens AND a concurrency slot. Weights above the
+    /// configured burst are charged in burst-sized chunks — the bucket can
+    /// never hold more than `burst` tokens at once, so a single
+    /// `until_n_ready(weight)` would error immediately. Chunking charges the
+    /// full weight (no silent under-charge) while pacing at the sustained
+    /// `rps_budget`.
     pub async fn acquire(&self, weight: u32) -> Permit {
-        let requested = weight.max(1);
-        if requested > self.burst {
-            tracing::warn!(
-                requested,
-                burst = self.burst,
-                "weight exceeds burst; clamping (raise RPC_BURST to charge accurately)"
-            );
-        }
-        let clamped = requested.min(self.burst);
-        let n = NonZeroU32::new(clamped).expect("clamped weight >= 1");
-        if let Err(e) = self.bucket.until_n_ready(n).await {
-            // Should not happen now that we clamp to burst, but log just in case.
-            tracing::error!(?e, "rate limiter bucket error");
+        let mut remaining = weight.max(1);
+        while remaining > 0 {
+            let chunk = remaining.min(self.burst);
+            let n = NonZeroU32::new(chunk).expect("chunk >= 1");
+            if let Err(e) = self.bucket.until_n_ready(n).await {
+                // Unreachable: chunk <= burst by construction. Log and stop
+                // charging rather than spinning on a broken bucket.
+                tracing::error!(?e, "rate limiter bucket error");
+                break;
+            }
+            remaining -= chunk;
         }
         let semaphore_permit = self
             .semaphore
@@ -203,10 +202,10 @@ where
 /// (yet); the rendered string is the most reliable signal across providers.
 pub fn is_transient_rpc_error<E: std::fmt::Display>(e: &E) -> bool {
     let s = e.to_string().to_lowercase();
-    s.contains("503")
-        || s.contains("502")
-        || s.contains("504")
-        || s.contains("429")
+    contains_status_code(&s, "503")
+        || contains_status_code(&s, "502")
+        || contains_status_code(&s, "504")
+        || contains_status_code(&s, "429")
         || s.contains("error sending request")
         || s.contains("connection reset")
         || s.contains("connection closed")
@@ -215,6 +214,29 @@ pub fn is_transient_rpc_error<E: std::fmt::Display>(e: &E) -> bool {
         || s.contains("timeout")
         || s.contains("temporarily unavailable")
         || s.contains("unexpected eof")
+}
+
+/// True when `code` appears in `s` as a standalone numeric token — not
+/// embedded in a longer number or hex string. A bare substring check would
+/// classify "block 15029" or a hash containing `...a429f...` as a transient
+/// HTTP status. Boundaries are non-hex-digit so decimal values, addresses,
+/// and tx hashes never match.
+fn contains_status_code(s: &str, code: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = s[from..].find(code) {
+        let start = from + pos;
+        let end = start + code.len();
+        let hex_prefixed = start >= 2 && &bytes[start - 2..start] == b"0x";
+        let boundary_before =
+            !hex_prefixed && (start == 0 || !bytes[start - 1].is_ascii_hexdigit());
+        let boundary_after = end == bytes.len() || !bytes[end].is_ascii_hexdigit();
+        if boundary_before && boundary_after {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
 }
 
 fn backoff_with_jitter(config: &RetryConfig, attempt: u32) -> Duration {
@@ -255,6 +277,38 @@ mod tests {
             elapsed >= Duration::from_millis(80),
             "expected ~100ms wait, got {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn heavy_weight_charges_fully_in_chunks() {
+        // burst 5, 100 rps — a 25-token acquire must wait for refills:
+        // 5 immediate + 20 refilled at 100/s ≈ 200ms minimum.
+        let limiter = RateLimiter::new(RateLimiterConfig {
+            rps_budget: 100,
+            burst: 5,
+            max_concurrency: 4,
+        });
+        let start = std::time::Instant::now();
+        let _p = limiter.acquire(25).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "expected ~200ms of refill pacing, got {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn transient_matches_status_tokens_not_embedded_digits() {
+        assert!(is_transient_rpc_error(&"HTTP error 429 Too Many Requests"));
+        assert!(is_transient_rpc_error(&"server error: status 502"));
+        assert!(is_transient_rpc_error(&"(code: 503, message: unavailable)"));
+        // Digits embedded in larger numbers / hex must not classify as status codes.
+        assert!(!is_transient_rpc_error(&"block 15029 not found"));
+        assert!(!is_transient_rpc_error(&"gas required exceeds 4290000"));
+        assert!(!is_transient_rpc_error(
+            &"execution reverted at 0xab4292f1c40e9d8b5029aa7c503b6f429d000000"
+        ));
+        assert!(!is_transient_rpc_error(&"invalid opcode at pc 0x429"));
     }
 
     #[tokio::test]
