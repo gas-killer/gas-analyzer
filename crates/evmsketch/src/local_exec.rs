@@ -1679,4 +1679,314 @@ mod tests {
             assert_eq!(out, Bytes::from(B256::with_last_byte(0x2a).to_vec()));
         }
     }
+
+    // ========================================================================
+    // Phase-4 consensus-gate golden generator
+    //
+    // The revm-41 + revmc fast executor (`crates/gk-fast-view`) lives in a
+    // separate crate on a separate revm major, so the two interpreters cannot
+    // be linked into one test binary. This test is the ground-truth side of the
+    // cross-version differential: it runs a set of overlay-mounted view calls
+    // through the REAL revm-31 interpreter path (`call_view_local_blocking`) and
+    // emits self-describing `.fixture` files (the `gk_fast_view::job` text
+    // format) into `crates/gk-fast-view/tests/golden/`. The gk-fast-view
+    // consensus test then replays the exact same scenario through revm-41+revmc
+    // and asserts byte-identical returndata against the committed `expected`.
+    //
+    // It always runs in the default `cargo test` as a REGRESSION LOCK: it
+    // recomputes each returndata and asserts it still equals the committed
+    // fixture's `expected` line (catching any revm-31 drift). Set
+    // `GK_GEN_GOLDEN=1` to (re)write the fixture files.
+    // ========================================================================
+
+    /// Minimal two-pass EVM assembler with labels (ported from revmc-harness),
+    /// so jump destinations are never hand-counted.
+    #[derive(Default)]
+    struct Asm {
+        code: Vec<u8>,
+        labels: std::collections::HashMap<&'static str, usize>,
+        fixups: Vec<(usize, &'static str)>,
+    }
+    impl Asm {
+        fn op(&mut self, b: u8) -> &mut Self {
+            self.code.push(b);
+            self
+        }
+        fn push0(&mut self) -> &mut Self {
+            self.op(0x5f)
+        }
+        fn push1(&mut self, x: u8) -> &mut Self {
+            self.op(0x60);
+            self.code.push(x);
+            self
+        }
+        fn push_bytes(&mut self, bytes: &[u8]) -> &mut Self {
+            assert!(!bytes.is_empty() && bytes.len() <= 32);
+            self.op(0x5f + bytes.len() as u8);
+            self.code.extend_from_slice(bytes);
+            self
+        }
+        fn label(&mut self, name: &'static str) -> &mut Self {
+            self.op(0x5b);
+            self.labels.insert(name, self.code.len() - 1);
+            self
+        }
+        fn push_label(&mut self, name: &'static str) -> &mut Self {
+            self.op(0x61);
+            let pos = self.code.len();
+            self.code.extend_from_slice(&[0, 0]);
+            self.fixups.push((pos, name));
+            self
+        }
+        fn jump_to(&mut self, name: &'static str) -> &mut Self {
+            self.push_label(name).op(0x56)
+        }
+        fn jumpi_to(&mut self, name: &'static str) -> &mut Self {
+            self.push_label(name).op(0x57)
+        }
+        fn finish(mut self) -> Vec<u8> {
+            for (pos, name) in &self.fixups {
+                let addr = *self.labels.get(name).expect("undefined label") as u16;
+                let be = addr.to_be_bytes();
+                self.code[*pos] = be[0];
+                self.code[*pos + 1] = be[1];
+            }
+            self.code
+        }
+    }
+
+    const CALLDATALOAD: u8 = 0x35;
+    const MLOAD: u8 = 0x51;
+    const MSTORE: u8 = 0x52;
+    const ADD: u8 = 0x01;
+    const MUL: u8 = 0x02;
+    const SUB: u8 = 0x03;
+    const AND: u8 = 0x16;
+    const ISZERO: u8 = 0x15;
+    const DUP1: u8 = 0x80;
+    const SWAP1: u8 = 0x90;
+    const POP: u8 = 0x50;
+    const RETURN: u8 = 0xf3;
+    const EXTCODECOPY: u8 = 0x3c;
+    const SHA3: u8 = 0x20;
+
+    /// Packed-int arith loop: `acc=((acc*3+7)^2)&0xffffffff` for `iters`, → 32B.
+    fn asm_matmul(iters: u64) -> (Vec<u8>, Vec<u8>) {
+        let mut a = Asm::default();
+        a.push0().op(CALLDATALOAD);
+        a.label("loop");
+        a.op(DUP1).op(ISZERO);
+        a.jumpi_to("end");
+        a.push0().op(MLOAD);
+        a.push1(3).op(MUL);
+        a.push1(7).op(ADD);
+        a.op(DUP1).op(MUL);
+        a.push_bytes(&[0xff, 0xff, 0xff, 0xff]).op(AND);
+        a.push0().op(MSTORE);
+        a.push1(1).op(SWAP1).op(SUB);
+        a.jump_to("loop");
+        a.label("end");
+        a.op(POP);
+        a.push1(0x20).push0().op(RETURN);
+        let mut cd = vec![0u8; 32];
+        cd[24..32].copy_from_slice(&iters.to_be_bytes());
+        (a.finish(), cd)
+    }
+
+    /// EXTCODECOPY the whole overlay chunk into memory, KECCAK256 it, return the
+    /// 32-byte digest — the "read weight bytes from an overlay-mounted chunk"
+    /// shape. `chunk` is the derived phantom address, `code_len` its code size.
+    fn asm_extcodecopy_overlay(chunk: Address, code_len: u16) -> (Vec<u8>, Vec<u8>) {
+        let mut a = Asm::default();
+        a.push_bytes(&code_len.to_be_bytes()); // size
+        a.push0(); // offset
+        a.push0(); // destOffset
+        a.push_bytes(chunk.as_slice()); // addr (PUSH20)
+        a.op(EXTCODECOPY);
+        a.push_bytes(&code_len.to_be_bytes()); // length
+        a.push0(); // offset
+        a.op(SHA3);
+        a.push0().op(MSTORE);
+        a.push1(0x20).push0().op(RETURN);
+        (a.finish(), Vec::new())
+    }
+
+    /// `iters`×{EXTCODECOPY overlay chunk to mem[0], acc=(acc+mem[0])&0xffffffff},
+    /// return acc — the seg-engine "copy weight chunk + integer fold" inner loop
+    /// over an OVERLAY-mounted chunk (closest to the real `forwardRange`).
+    fn asm_forward_range(chunk: Address, code_len: u16, iters: u64) -> (Vec<u8>, Vec<u8>) {
+        const ACC: u16 = 0x8000;
+        let mut a = Asm::default();
+        a.push0().op(CALLDATALOAD);
+        a.label("loop");
+        a.op(DUP1).op(ISZERO);
+        a.jumpi_to("end");
+        a.push_bytes(&code_len.to_be_bytes());
+        a.push0();
+        a.push0();
+        a.push_bytes(chunk.as_slice());
+        a.op(EXTCODECOPY);
+        a.push_bytes(&ACC.to_be_bytes()).op(MLOAD);
+        a.push0().op(MLOAD).op(ADD);
+        a.push_bytes(&[0xff, 0xff, 0xff, 0xff]).op(AND);
+        a.push_bytes(&ACC.to_be_bytes()).op(MSTORE);
+        a.push1(1).op(SWAP1).op(SUB);
+        a.jump_to("loop");
+        a.label("end");
+        a.op(POP);
+        a.push_bytes(&ACC.to_be_bytes()).op(MLOAD).push0().op(MSTORE);
+        a.push1(0x20).push0().op(RETURN);
+        let mut cd = vec![0u8; 32];
+        cd[24..32].copy_from_slice(&iters.to_be_bytes());
+        (a.finish(), cd)
+    }
+
+    /// CANCUN env matching the gk-fast-view fixture defaults exactly (all
+    /// header fields the fixtures don't read are pinned identical on both
+    /// sides; CANCUN is the revmc-proven spec).
+    fn gen_env() -> LocalBlockEnv {
+        LocalBlockEnv {
+            chain_id: 1,
+            spec: SpecId::CANCUN,
+            number: 0,
+            timestamp: 0,
+            gas_limit: 30_000_000,
+            coinbase: Address::ZERO,
+            prevrandao: B256::ZERO,
+            basefee: 0,
+            difficulty: U256::ZERO,
+        }
+    }
+
+    #[test]
+    fn phase4_emit_consensus_golden_fixtures() {
+        use std::fmt::Write as _;
+
+        let golden_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../gk-fast-view/tests/golden");
+        std::fs::create_dir_all(&golden_dir).expect("create golden dir");
+        let regen = std::env::var("GK_GEN_GOLDEN").is_ok();
+
+        let caller = CALLER;
+        let engine = address!("0x0000000000000000000000000000000000004321");
+
+        // Deterministic overlay blobs (single chunk each; non-repeating so an
+        // offset bug cannot cancel out). Emitted verbatim into the fixture, so
+        // gk-fast-view replays these exact chunk bytes.
+        let weights: Vec<u8> = (0..200u32)
+            .map(|i| (i.wrapping_mul(37).wrapping_add(11) % 251) as u8)
+            .collect();
+        let tokenizer: Vec<u8> = (0..40u32)
+            .map(|i| (i.wrapping_mul(13).wrapping_add(7) % 241) as u8)
+            .collect();
+        let env_ov = OverlayEnv::from_blobs(&weights, &tokenizer).expect("overlay env");
+        let chunk0 = env_ov.overlays[0].address;
+        let chunk0_len = env_ov.overlays[0].code.len() as u16;
+
+        let (mm_code, mm_cd) = asm_matmul(1_000);
+        let (ec_code, ec_cd) = asm_extcodecopy_overlay(chunk0, chunk0_len);
+        let (fr_code, fr_cd) = asm_forward_range(chunk0, chunk0_len, 64);
+
+        let scenarios: Vec<(&str, Vec<u8>, Vec<u8>, bool)> = vec![
+            ("matmul", mm_code, mm_cd, false),
+            ("extcodecopy_overlay", ec_code, ec_cd, true),
+            ("forward_range", fr_code, fr_cd, true),
+        ];
+
+        for (name, code, calldata, use_overlay) in scenarios {
+            let mut db = seed_db();
+            set_code(&mut db, engine, Bytes::from(code.clone()));
+            let mounts = if use_overlay {
+                OverlayMountSet::new(vec![Arc::new(
+                    OverlayMount::from_env(&env_ov, env_ov.manifest).expect("mount"),
+                )])
+            } else {
+                OverlayMountSet::default()
+            };
+            let tx = LocalTxRequest {
+                from: caller,
+                to: engine,
+                input: Bytes::from(calldata.clone()),
+                value: U256::ZERO,
+                gas: Some(5_000_000),
+                gas_price: 0,
+                nonce: None,
+                access_list: Default::default(),
+                authorization_list: Default::default(),
+            };
+            let out = call_view_local_blocking(db, mounts, &gen_env(), &tx, SimProfile::UnboundedV1)
+                .expect("revm-31 view call");
+
+            let mut text = String::new();
+            let _ = writeln!(
+                text,
+                "# GENERATED by evmsketch phase4_emit_consensus_golden_fixtures (revm-31 interpreter)."
+            );
+            let _ = writeln!(
+                text,
+                "# Ground-truth golden for the gk-fast-view (revm-41 + revmc) consensus gate."
+            );
+            let _ = writeln!(text, "spec CANCUN");
+            let _ = writeln!(text, "profile UnboundedV1");
+            let _ = writeln!(text, "from {}", addr_hex(caller));
+            let _ = writeln!(text, "to {}", addr_hex(engine));
+            let _ = writeln!(text, "input {}", alloy::hex::encode(&calldata));
+            let _ = writeln!(text, "gas 5000000");
+            let _ = writeln!(
+                text,
+                "account {} {}",
+                addr_hex(engine),
+                alloy::hex::encode(&code)
+            );
+            if use_overlay {
+                let _ = writeln!(
+                    text,
+                    "mount_pairs {}",
+                    alloy::hex::encode(env_ov.manifest.as_slice())
+                );
+                for o in &env_ov.overlays {
+                    let _ = writeln!(
+                        text,
+                        "pair {} {}",
+                        addr_hex(o.address),
+                        alloy::hex::encode(&o.code)
+                    );
+                }
+            }
+            let _ = writeln!(text, "expected {}", alloy::hex::encode(&out));
+
+            let path = golden_dir.join(format!("{name}.fixture"));
+            if regen || !path.exists() {
+                std::fs::write(&path, &text).expect("write golden fixture");
+                eprintln!("[golden] wrote {}", path.display());
+            }
+
+            // Regression lock: the committed fixture's expected returndata must
+            // still equal what the revm-31 interpreter produces today.
+            let committed = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+                panic!(
+                    "golden fixture {} missing; run `GK_GEN_GOLDEN=1 cargo test -p gas-analyzer \
+                     phase4_emit_consensus_golden_fixtures` to generate it",
+                    path.display()
+                )
+            });
+            let committed_expected = committed
+                .lines()
+                .find_map(|l| l.strip_prefix("expected "))
+                .unwrap_or("")
+                .trim();
+            assert_eq!(
+                committed_expected,
+                alloy::hex::encode(&out),
+                "revm-31 golden drift for `{name}`: committed fixture no longer matches the \
+                 interpreter output; regenerate with GK_GEN_GOLDEN=1 and re-run the gk-fast-view \
+                 consensus test"
+            );
+            eprintln!(
+                "[golden] {name}: {} bytes returndata OK ({}overlay)",
+                out.len(),
+                if use_overlay { "" } else { "no " }
+            );
+        }
+    }
 }

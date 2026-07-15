@@ -20,7 +20,14 @@ default-members = [
 # spike. It pulls revm 41.x + the LLVM toolchain and is kept OUT of the
 # workspace so it can never perturb the consensus-critical Cargo.lock the
 # interpreted local-exec path resolves against. It has its own Cargo.lock.
-exclude = ["revmc-harness"]
+#
+# crates/gk-fast-view is the productionized Phase-4 fast executor built ON the
+# proven harness: it ports OverlayMount/OverlayStateDb + the view-call execution
+# to revm 41 and dispatches through revmc (AOT/JIT). It is EXCLUDED for the exact
+# same reason as the harness — revm 41 + revmc + LLVM must never touch the
+# revm-31 consensus-critical Cargo.lock. It has its own Cargo.lock and is
+# built/tested standalone (LLVM_SYS_221_PREFIX=/opt/homebrew/opt/llvm@22).
+exclude = ["revmc-harness", "crates/gk-fast-view"]
 
 [profile.bench]
 debug = 1
