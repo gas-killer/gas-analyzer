@@ -1,0 +1,65 @@
+# gk-fast-view — the Phase-4 revmc AOT/JIT fast executor for overlay-mounted
+# EVM view calls. Built directly on the proven `revmc-harness` spike: it ports
+# OverlayMount / OverlayMountSet / OverlayStateDb and the view-call execution
+# to revm 41, then dispatches execution through revmc (compile the fixed engine
+# bytecode ONCE, run many view calls on the compiled artifact).
+#
+# DELIBERATELY EXCLUDED from the analyzer workspace (see the root Cargo.toml
+# `[workspace] exclude`) so that pulling in revm 41.x + revmc + the LLVM
+# toolchain deps CANNOT perturb the shared, consensus-critical Cargo.lock the
+# interpreted revm-31 local-exec path resolves against. Own Cargo.lock, built
+# and tested standalone.
+#
+# Build/run requires LLVM 22 for the JIT backend (identical to the harness):
+#   export LLVM_SYS_221_PREFIX=/opt/homebrew/opt/llvm@22
+#   export PATH="/opt/homebrew/opt/llvm@22/bin:$PATH"
+#   export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/opt/llvm@22/lib
+#   cargo test -- --nocapture
+[package]
+name = "gk-fast-view"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "gk-fast-view"
+path = "src/bin/gk_fast_view.rs"
+
+[dependencies]
+# revmc, pinned to the exact commit vetted in the harness spike.
+revmc = { git = "https://github.com/paradigmxyz/revmc", rev = "520462a463523a3bcd0a47226ddbc3200d62232e", features = ["llvm-prefer-dynamic"] }
+revmc-context = { git = "https://github.com/paradigmxyz/revmc", rev = "520462a463523a3bcd0a47226ddbc3200d62232e", default-features = false, features = ["evm"] }
+# Force-links the builtin symbols the JIT-compiled bytecode calls into
+# (EXTCODECOPY, KECCAK256, ...).
+revmc-builtins = { git = "https://github.com/paradigmxyz/revmc", rev = "520462a463523a3bcd0a47226ddbc3200d62232e", default-features = false }
+
+# revm 41.x subcrates — the exact set revmc pins, so the EVM types unify with
+# revmc's JitEvm wrapper (mirrors revmc-harness/Cargo.toml).
+revm-bytecode = "41"
+# The optional_* features expose the disable_balance_check / disable_base_fee /
+# disable_fee_charge / disable_block_gas_limit cfg flags the revm-31 reference
+# `run_pass` sets to reproduce eth_call/debug_traceCall semantics. Enabling them
+# here turns them on for every consumer of revm-context in this crate's graph
+# (revmc-context included) — additive, so it cannot change compiled behaviour.
+revm-context = { version = "41", features = [
+    "optional_balance_check",
+    "optional_block_gas_limit",
+    "optional_no_base_fee",
+    "optional_fee_charge",
+] }
+revm-context-interface = "41"
+revm-database = "41"
+revm-database-interface = "41"
+revm-handler = "41"
+revm-primitives = "41"
+revm-state = "41"
+
+anyhow = "1"
+lru = "0.12"
+memmap2 = "0.9"
+
+[dev-dependencies]
+hex = "0.4"
