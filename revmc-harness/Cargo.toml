@@ -1,0 +1,39 @@
+# Standalone differential-equality harness for the revmc (EVM AOT/JIT compiler)
+# integration spike. This crate is DELIBERATELY EXCLUDED from the analyzer
+# workspace (see the root Cargo.toml `[workspace] exclude`) so that pulling in
+# revm 41.x + revmc + the LLVM toolchain deps CANNOT perturb the shared,
+# consensus-critical Cargo.lock that the interpreted local-exec path resolves
+# against. It has its own Cargo.lock and is built/tested on its own.
+#
+# Build/run requires LLVM 22 for the JIT backend:
+#   export LLVM_SYS_221_PREFIX=/opt/homebrew/opt/llvm@22
+#   export PATH="/opt/homebrew/opt/llvm@22/bin:$PATH"
+#   # runtime dylib lookup for the dynamically-linked LLVM:
+#   export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/opt/llvm@22/lib
+#   cargo test -- --nocapture
+[package]
+name = "revmc-harness"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# revmc, pinned to the exact commit vetted in the feasibility spike.
+revmc = { git = "https://github.com/paradigmxyz/revmc", rev = "520462a463523a3bcd0a47226ddbc3200d62232e", features = ["llvm-prefer-dynamic"] }
+revmc-context = { git = "https://github.com/paradigmxyz/revmc", rev = "520462a463523a3bcd0a47226ddbc3200d62232e", default-features = false, features = ["evm"] }
+# Needed to link the builtin symbols the JIT-compiled bytecode calls into.
+revmc-builtins = { git = "https://github.com/paradigmxyz/revmc", rev = "520462a463523a3bcd0a47226ddbc3200d62232e", default-features = false }
+
+# revm 41.x subcrates — the exact set revmc pins, so the EVM types unify with
+# revmc's JitEvm wrapper.
+revm-bytecode = "41"
+revm-context = "41"
+revm-context-interface = "41"
+revm-database = "41"
+revm-database-interface = "41"
+revm-handler = "41"
+revm-primitives = "41"
+revm-state = "41"
