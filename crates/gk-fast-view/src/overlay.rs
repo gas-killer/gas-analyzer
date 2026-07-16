@@ -405,3 +405,133 @@ impl<DB: DatabaseRef> DatabaseRef for OverlayStateDb<DB> {
         self.inner.block_hash_ref(number)
     }
 }
+
+// ============================================================================
+// WarmStateDb — a persistent, process-lifetime read-through cache over an
+// IMMUTABLE `DatabaseRef` (the fast path's analog of the interpreter's
+// process-wide `LocalStateCache`).
+// ============================================================================
+
+/// A [`DatabaseRef`] that memoizes every account / storage slot / code blob it
+/// resolves from `inner`, so a second view call against the SAME immutable state
+/// serves those reads from RAM instead of re-touching the slow, memory-pressured
+/// overlay source.
+///
+/// This is the fast path's counterpart to the revm-31 interpreter's process-wide
+/// `LocalStateCache` warm-up: `inner` is an immutable [`OverlayStateDb`] over
+/// fixed base state, so caching its reads is **byte-safe** — every lookup returns
+/// exactly the bytes `inner` would, only without re-materializing the overlay
+/// chunk (`0x00 || payload` copy + keccak of ~24 KB) on the 2nd..Nth job.
+///
+/// Read-only by construction: a `DatabaseRef` is never mutated by EVM execution.
+/// Execution writes go to revm's in-memory journal, and committing them requires
+/// the separate `DatabaseCommit` trait — which this type deliberately does NOT
+/// implement. So a view call (which returns/reverts without committing) cannot
+/// corrupt the shared cache for a later call. The only interior mutation is the
+/// read-through memo, guarded per-map by a `Mutex`.
+pub struct WarmStateDb<DB> {
+    inner: DB,
+    accounts: Mutex<HashMap<Address, Option<AccountInfo>>>,
+    storage: Mutex<HashMap<(Address, U256), U256>>,
+    code: Mutex<HashMap<B256, Bytecode>>,
+}
+
+impl<DB> WarmStateDb<DB> {
+    /// Wrap `inner` in an empty read-through cache.
+    pub fn new(inner: DB) -> Self {
+        Self {
+            inner,
+            accounts: Mutex::new(HashMap::new()),
+            storage: Mutex::new(HashMap::new()),
+            code: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `(accounts, storage_slots, code_blobs)` currently memoized — for tests /
+    /// diagnostics only.
+    pub fn cached_counts(&self) -> (usize, usize, usize) {
+        (
+            self.accounts.lock().expect("warm accounts mutex").len(),
+            self.storage.lock().expect("warm storage mutex").len(),
+            self.code.lock().expect("warm code mutex").len(),
+        )
+    }
+}
+
+impl<DB: DatabaseRef> DatabaseRef for WarmStateDb<DB> {
+    type Error = DB::Error;
+
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        if let Some(hit) = self.accounts.lock().expect("warm accounts mutex").get(&address) {
+            return Ok(hit.clone());
+        }
+        let info = self.inner.basic_ref(address)?;
+        self.accounts
+            .lock()
+            .expect("warm accounts mutex")
+            .insert(address, info.clone());
+        Ok(info)
+    }
+
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        if let Some(hit) = self.code.lock().expect("warm code mutex").get(&code_hash) {
+            return Ok(hit.clone());
+        }
+        let code = self.inner.code_by_hash_ref(code_hash)?;
+        self.code
+            .lock()
+            .expect("warm code mutex")
+            .insert(code_hash, code.clone());
+        Ok(code)
+    }
+
+    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        if let Some(hit) = self
+            .storage
+            .lock()
+            .expect("warm storage mutex")
+            .get(&(address, index))
+        {
+            return Ok(*hit);
+        }
+        let value = self.inner.storage_ref(address, index)?;
+        self.storage
+            .lock()
+            .expect("warm storage mutex")
+            .insert((address, index), value);
+        Ok(value)
+    }
+
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        // Block hash is (a) rarely read by a view call and (b) part of the pinned
+        // block env, not overlay state; delegate uncached.
+        self.inner.block_hash_ref(number)
+    }
+}
+
+/// A cheaply-cloneable handle to a shared [`WarmStateDb`]. revm's `CacheDB`
+/// requires the underlying database **by value**, so the persistent warm cache
+/// is handed to a fresh per-call `CacheDB` through this `Arc` newtype while the
+/// memo itself stays shared across every call.
+#[derive(Clone)]
+pub struct WarmHandle<DB>(pub std::sync::Arc<WarmStateDb<DB>>);
+
+impl<DB: DatabaseRef> DatabaseRef for WarmHandle<DB> {
+    type Error = DB::Error;
+
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.0.basic_ref(address)
+    }
+
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        self.0.code_by_hash_ref(code_hash)
+    }
+
+    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        self.0.storage_ref(address, index)
+    }
+
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        self.0.block_hash_ref(number)
+    }
+}

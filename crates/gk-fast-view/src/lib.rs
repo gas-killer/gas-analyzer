@@ -31,10 +31,13 @@ pub mod overlay;
 
 use std::time::{Duration, Instant};
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use anyhow::{Result, anyhow};
 use revm_context::{BlockEnv, CfgEnv, Context, Journal, TxEnv};
 use revm_context_interface::result::ExecutionResult;
-use revm_database::CacheDB;
+use revm_database::{CacheDB, EmptyDB};
 use revm_database_interface::{DBErrorMarker, Database, DatabaseRef};
 use revm_handler::{ExecuteEvm, MainBuilder};
 use revm_primitives::{
@@ -49,8 +52,24 @@ use revmc_builtins as _;
 
 pub use overlay::{
     CodeOverlay, OVERLAY_CHUNK_PAYLOAD, OverlayEnv, OverlayMount, OverlayMountSet, OverlayStateDb,
-    overlay_chunk_address, overlay_manifest_hash,
+    WarmHandle, WarmStateDb, overlay_chunk_address, overlay_manifest_hash,
 };
+
+/// The concrete state stack the persistent warm cache wraps: the job's base
+/// contracts (`CacheDB<EmptyDB>`) viewed through the overlay mount set, memoized
+/// by a process-lifetime read-through cache. Immutable per key, so reusing it
+/// across jobs is byte-safe.
+type WarmBaseDb = WarmStateDb<OverlayStateDb<CacheDB<EmptyDB>>>;
+
+/// Cache key for the persistent warm state: the mount set's manifests (which
+/// commit to the exact overlay bytes) plus a fingerprint of the base-state db.
+/// Same key ⇒ same immutable state ⇒ safe to reuse the resolved reads; any
+/// difference (a different overlay OR different base contracts) forces a rebuild.
+#[derive(Clone, PartialEq, Eq)]
+struct WarmKey {
+    manifests: Vec<B256>,
+    base_fingerprint: B256,
+}
 
 // ============================================================================
 // Profile — byte-identical gas overrides to gas_analyzer_core::SimProfile
@@ -177,6 +196,22 @@ pub struct FastView {
     compiler: EvmCompiler<EvmLlvmBackend>,
     functions: B256Map<RawEvmCompilerFn>,
     spec: SpecId,
+    /// Verified overlay mounts, memoized by manifest so `OverlayMount::from_files`'s
+    /// streaming-keccak verify runs AT MOST ONCE per distinct overlay for this
+    /// executor's lifetime. Multi-entry: a transiently-mounted model never evicts
+    /// a resident one (mirrors the interpreter `LocalStateCache.overlay_mounts`).
+    mount_cache: HashMap<B256, Arc<OverlayMount>>,
+    /// The persistent, process-lifetime warm state cache (one live entry, keyed
+    /// by `WarmKey`). Reused whenever the next job's overlay + base match, so the
+    /// 2nd..Nth job resolves overlay chunk reads from RAM. Single-entry keeps it
+    /// simple; the *expensive* verify is already amortized by `mount_cache`, so a
+    /// key change only re-resolves (cheap) reads, never re-verifies.
+    warm: Option<(WarmKey, Arc<WarmBaseDb>)>,
+    /// Count of overlay mounts actually built (cache misses) — for the
+    /// amortization test's deterministic proof that the verify ran once.
+    mount_build_count: usize,
+    /// Count of warm-state caches actually built (cache misses).
+    warm_build_count: usize,
 }
 
 impl FastView {
@@ -188,12 +223,47 @@ impl FastView {
             compiler,
             functions: B256Map::default(),
             spec,
+            mount_cache: HashMap::new(),
+            warm: None,
+            mount_build_count: 0,
+            warm_build_count: 0,
         })
     }
 
     /// Number of distinct contract bytecodes compiled so far.
     pub fn compiled_count(&self) -> usize {
         self.functions.len()
+    }
+
+    /// Number of overlay mounts actually built via their `build` closure (cache
+    /// misses). For an amortized daemon serving one overlay this is 1.
+    pub fn mount_builds(&self) -> usize {
+        self.mount_build_count
+    }
+
+    /// Number of warm-state caches actually built (cache misses). For an
+    /// amortized daemon serving identical jobs this is 1.
+    pub fn warm_builds(&self) -> usize {
+        self.warm_build_count
+    }
+
+    /// Get-or-build a verified overlay mount, memoized by `manifest`. The
+    /// manifest commits to the exact overlay bytes (`keccak(keccak(weights) ||
+    /// keccak(tokenizer))`), so a cache hit is sound: identical manifest ⇒
+    /// identical immutable overlay. `build` (which for the file-backed path runs
+    /// the streaming-keccak verify over the whole weights blob) is invoked ONLY
+    /// on a miss.
+    pub fn mount_get_or_build<F>(&mut self, manifest: B256, build: F) -> Result<Arc<OverlayMount>>
+    where
+        F: FnOnce() -> Result<OverlayMount>,
+    {
+        if let Some(mount) = self.mount_cache.get(&manifest) {
+            return Ok(mount.clone());
+        }
+        let mount = Arc::new(build()?);
+        self.mount_build_count += 1;
+        self.mount_cache.insert(manifest, mount.clone());
+        Ok(mount)
     }
 
     /// Whether the bytecode with this codehash has been compiled.
@@ -242,6 +312,46 @@ impl FastView {
         DB: DatabaseRef,
         DB::Error: DBErrorMarker + core::fmt::Debug,
     {
+        self.call_view_inner(base, mounts, env, tx, profile, true)
+    }
+
+    /// Execute the view call through the **pure revm-41 interpreter** — the JIT
+    /// is never consulted (the compiled-fn map handed to `JitEvm` is empty, so
+    /// every codehash falls back to the interpreter).
+    ///
+    /// This is the consensus-gate reference twin of [`call_view`](Self::call_view):
+    /// running the SAME real engine bytecode + overlay through both this and
+    /// `call_view` isolates whether a divergence is a revmc codegen bug (the two
+    /// differ) or a cross-revm-version / env difference (both differ from the
+    /// revm-31 golden together). See `tests/real_engine.rs`.
+    pub fn call_view_interpreted<DB>(
+        &mut self,
+        base: DB,
+        mounts: OverlayMountSet,
+        env: &ViewEnv,
+        tx: &ViewTx,
+        profile: Profile,
+    ) -> Result<Bytes>
+    where
+        DB: DatabaseRef,
+        DB::Error: DBErrorMarker + core::fmt::Debug,
+    {
+        self.call_view_inner(base, mounts, env, tx, profile, false)
+    }
+
+    fn call_view_inner<DB>(
+        &mut self,
+        base: DB,
+        mounts: OverlayMountSet,
+        env: &ViewEnv,
+        tx: &ViewTx,
+        profile: Profile,
+        use_jit: bool,
+    ) -> Result<Bytes>
+    where
+        DB: DatabaseRef,
+        DB::Error: DBErrorMarker + core::fmt::Debug,
+    {
         if env.spec != self.spec {
             return Err(anyhow!(
                 "FastView compiled for spec {:?} but view env requests {:?}; \
@@ -256,19 +366,53 @@ impl FastView {
         let overlay_db = OverlayStateDb::new_multi(base, mounts);
         let target_code = fetch_code(&overlay_db, tx.to)
             .map_err(|e| anyhow!("resolve target {} code: {e:?}", tx.to))?;
-        if let Some(code) = &target_code {
-            if !code.is_empty() {
-                self.warm_code(code)?;
+        if use_jit {
+            if let Some(code) = &target_code {
+                if !code.is_empty() {
+                    self.warm_code(code)?;
+                }
             }
         }
 
         let (block_gas_limit, tx_gas_limit) = resolve_gas_limits(env, tx, profile);
         let cache_db = CacheDB::new(overlay_db);
+        self.dispatch_view(cache_db, env, block_gas_limit, tx, tx_gas_limit, profile, use_jit)
+    }
 
+    /// The consensus-critical transact + returndata extraction, factored out so
+    /// the fresh-per-call ([`call_view_inner`](Self::call_view_inner)) and the
+    /// warm-cache ([`call_view_warm`](Self::call_view_warm)) paths share ONE
+    /// implementation — they differ only in the `Database` handed in, never in
+    /// how execution is run or how the result is turned into returndata.
+    ///
+    /// Uses `transact` (NOT `transact_commit`): a view call returns/reverts
+    /// without committing, so nothing is written back to `cache_db` — the reason
+    /// a persistent read-through cache underneath is byte-safe.
+    fn dispatch_view<D>(
+        &self,
+        cache_db: D,
+        env: &ViewEnv,
+        block_gas_limit: u64,
+        tx: &ViewTx,
+        tx_gas_limit: u64,
+        profile: Profile,
+        use_jit: bool,
+    ) -> Result<Bytes>
+    where
+        D: Database,
+        D::Error: DBErrorMarker + core::fmt::Debug,
+    {
         let inner = build_ctx(cache_db, env, block_gas_limit, profile).build_mainnet();
         // `functions` is a cheap HashMap of raw fn pointers; clone per call so
-        // the compiled-fn cache stays owned by `self` across calls.
-        let mut evm = JitEvm::new(inner, self.functions.clone());
+        // the compiled-fn cache stays owned by `self` across calls. An empty map
+        // (the `!use_jit` path) makes `JitEvm` dispatch every codehash to the
+        // interpreter.
+        let functions = if use_jit {
+            self.functions.clone()
+        } else {
+            B256Map::default()
+        };
+        let mut evm = JitEvm::new(inner, functions);
         let tx_env = build_tx_env(tx, tx_gas_limit)?;
         let out = evm
             .transact(tx_env)
@@ -290,6 +434,76 @@ impl FastView {
                 gas.tx_gas_used()
             )),
         }
+    }
+
+    /// The **amortized** execution path the persistent daemon uses. Reuses a
+    /// warm, read-through overlay/base state cache keyed by (mount manifests +
+    /// `base_fingerprint`), so the 2nd..Nth identical job resolves overlay chunk
+    /// reads from RAM instead of re-materializing them. `build_base` is invoked
+    /// ONLY on a cache miss (a key change), so a warm hit rebuilds neither the
+    /// base db nor the overlay view.
+    ///
+    /// Byte-identical to [`call_view`](Self::call_view): the warm layer is a pure
+    /// memoizing passthrough over the same immutable `OverlayStateDb`, and the
+    /// per-call `CacheDB` on top is fresh exactly as in the fresh path. Different
+    /// manifest ⇒ different `WarmKey` ⇒ a rebuilt (never reused) cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn call_view_warm<F>(
+        &mut self,
+        manifests: Vec<B256>,
+        base_fingerprint: B256,
+        mounts: OverlayMountSet,
+        build_base: F,
+        env: &ViewEnv,
+        tx: &ViewTx,
+        profile: Profile,
+    ) -> Result<Bytes>
+    where
+        F: FnOnce() -> CacheDB<EmptyDB>,
+    {
+        if env.spec != self.spec {
+            return Err(anyhow!(
+                "FastView compiled for spec {:?} but view env requests {:?}; \
+                 spec is consensus-critical — build a FastView per spec",
+                self.spec,
+                env.spec
+            ));
+        }
+
+        let key = WarmKey {
+            manifests,
+            base_fingerprint,
+        };
+        let warm: Arc<WarmBaseDb> = match &self.warm {
+            Some((k, arc)) if *k == key => arc.clone(),
+            _ => {
+                // Cache miss (first job, or the overlay/base changed): build the
+                // immutable base+overlay view ONCE and wrap it in a fresh warm
+                // read-through cache. `build_base` (which populates the engine +
+                // caller accounts) runs only here.
+                let inner = OverlayStateDb::new_multi(build_base(), mounts);
+                let arc = Arc::new(WarmStateDb::new(inner));
+                self.warm_build_count += 1;
+                self.warm = Some((key, arc.clone()));
+                arc
+            }
+        };
+        let handle = WarmHandle(warm);
+
+        // Resolve + compile the target engine bytecode BEFORE moving the warm
+        // handle into the per-call CacheDB (mirrors the fresh path). Both the
+        // resolve and every execution read hit the warm memo on the 2nd+ job.
+        let target_code = fetch_code(&handle, tx.to)
+            .map_err(|e| anyhow!("resolve target {} code: {e:?}", tx.to))?;
+        if let Some(code) = &target_code {
+            if !code.is_empty() {
+                self.warm_code(code)?;
+            }
+        }
+
+        let (block_gas_limit, tx_gas_limit) = resolve_gas_limits(env, tx, profile);
+        let cache_db = CacheDB::new(handle);
+        self.dispatch_view(cache_db, env, block_gas_limit, tx, tx_gas_limit, profile, true)
     }
 
     /// Like [`call_view`](Self::call_view) but also returns the wall-clock
