@@ -107,7 +107,11 @@ fn gnosis_hardforks() -> EthereumChainHardforks {
     ])
 }
 
+pub mod local_exec;
+pub mod overlay_mount;
 pub mod simple_rpc_db;
+pub use local_exec::{LocalBlockEnv, LocalStateCache};
+pub use overlay_mount::{OverlayMount, OverlayMountSet, OverlayStateDb};
 use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 
 // Re-exported so downstream consumers (e.g. the Gas Killer service) can name
@@ -909,6 +913,388 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_env(
     // Merge access-list hints with slots derived from state_updates.
     // Store slots all land at contract_address (one eth_getProof call for all of them).
     // Call targets get account-info-only prefetch (empty key list).
+    let mut all_hints = hints_from_state_updates(contract_address, &state_updates);
+    for (addr, slots) in storage_hints {
+        all_hints.entry(addr).or_default().extend(slots);
+    }
+
+    let gas_estimate = executor
+        .estimate_state_changes_gas_with_hints(
+            contract_address,
+            caller_address,
+            &state_updates,
+            &all_hints,
+        )
+        .await?;
+
+    Ok((storage_updates, gas_estimate, false, skipped_opcodes))
+}
+
+// ============================================================================
+// call_to_encoded_state_updates_local (gas-analyzer#169)
+// ============================================================================
+
+/// Which engine executes the tracked call: the historical `debug_traceCall`
+/// path, or the in-process local path (issue #169).
+///
+/// Mirrors [`SimProfile`]'s role as a versioned, string-nameable selector so
+/// callers like gas-killer/service can flip executors per-deployment (e.g.
+/// `GK_SIM_EXECUTOR=rpc|local`) without a direct dependency on this crate's
+/// internal types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SimExecutor {
+    /// `debug_traceCall` against the configured RPC — the historical path.
+    /// Required for overlay-mode consumers served through a shared anvil
+    /// fork (`stateOverrides`), and the only path available on RPCs without
+    /// in-process access to blob artifacts.
+    #[default]
+    Rpc,
+    /// In-process revm execution (this module): the RPC becomes a pure state
+    /// backend, and overlays mount natively from RAM or mmapped files with
+    /// zero request-body serialization.
+    Local,
+}
+
+impl SimExecutor {
+    /// Parse the profile-style string form (`"rpc"` / `"local"`, ASCII
+    /// case-insensitive). Unknown values are an error rather than a silent
+    /// default — a typo'd `GK_SIM_EXECUTOR` should fail loudly, not silently
+    /// fall back to the slower/centralized path.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "rpc" => Ok(SimExecutor::Rpc),
+            "local" => Ok(SimExecutor::Local),
+            other => Err(anyhow!(
+                "unknown executor {other:?}: expected \"rpc\" or \"local\""
+            )),
+        }
+    }
+
+    /// The canonical string form, inverse of [`SimExecutor::parse`].
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SimExecutor::Rpc => "rpc",
+            SimExecutor::Local => "local",
+        }
+    }
+}
+
+impl std::str::FromStr for SimExecutor {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        Self::parse(s)
+    }
+}
+
+impl std::fmt::Display for SimExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// True local execution (issue #169): the tracked call is re-executed
+/// **in-process** with [`local_exec`] instead of delegating to
+/// `debug_traceCall`. The RPC at `rpc_url` is used only as a lazy state
+/// backend (accounts/storage/code fetched on first touch through a
+/// block-scoped [`foundry_fork_db::SharedBackend`], shared via `state_cache`
+/// across concurrent traces of the same block) — never as the executor.
+///
+/// Mirrors [`call_to_encoded_state_updates_with_evmsketch_env`]'s signature
+/// and return type exactly, so callers can select between the two paths
+/// (e.g. via [`SimExecutor`]) without touching downstream code:
+/// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`.
+///
+/// `overlay` mounts natively (in-RAM [`OverlayEnv`] or an mmapped
+/// [`OverlayMount`] built via [`OverlayMount::from_files`] for
+/// multi-gigabyte artifacts) — no `stateOverrides` JSON is ever produced,
+/// which is what makes 35 GB models servable at all (see module docs on
+/// `local_exec` and `overlay_mount`).
+///
+/// The gas estimate for applying the resulting payload still executes
+/// against the real chain env via the shared [`EvmSketchExecutorCache`] —
+/// unbounded compute stays off-chain, the payload's on-chain cost stays
+/// priced under real limits, exactly like the RPC path.
+#[tracing::instrument(
+    name = "evmsketch.encode_local",
+    skip_all,
+    fields(block_number, profile = ?profile, overlay = overlay.is_some(), state_update_count = tracing::field::Empty)
+)]
+pub async fn call_to_encoded_state_updates_local(
+    executor_cache: &EvmSketchExecutorCache,
+    state_cache: &LocalStateCache,
+    rpc_url: impl AsRef<str>,
+    tx_request: TransactionRequest,
+    block_number: u64,
+    profile: SimProfile,
+    overlay: Option<&OverlayEnv>,
+) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
+    let overlay_mount = overlay
+        .map(|env| state_cache.overlay_mount_for(env))
+        .transpose()?;
+    call_to_encoded_state_updates_local_with_mounts(
+        executor_cache,
+        state_cache,
+        rpc_url.as_ref(),
+        tx_request,
+        block_number,
+        profile,
+        overlay_mount.into(),
+    )
+    .await
+}
+
+/// [`call_to_encoded_state_updates_local`]'s file-backed twin: the overlay
+/// mounts from a **memory-mapped** [`OverlayMount::from_files`] instead of an
+/// in-RAM [`OverlayEnv`], so multi-gigabyte artifacts (e.g. the 35 GB
+/// Qwen3.5-A3B weights) never need to be resident in the analyzer process —
+/// only touched chunks are materialized, through the same bounded LRU memo
+/// [`OverlayStateDb`] consults on the in-RAM path.
+///
+/// `weights_path`/`tokenizer_path` name the two artifact blobs
+/// (`overlay_manifest_hash`'s committed layout — weights chunks first, then
+/// tokenizer chunks); `manifest` is the pinned on-chain commitment.
+/// [`OverlayMount::from_files`] recomputes the manifest with a streaming
+/// keccak pass over both files and **hard-fails on any mismatch** before a
+/// single byte is served — the same verification guarantee
+/// [`call_to_encoded_state_updates_local`] gets from `OverlayEnv::verify`.
+/// The mount is memoized on `state_cache` by `manifest`
+/// ([`LocalStateCache::overlay_mount_from_files`]), so a model is mounted
+/// (hashed + indexed) once per process, not once per call.
+///
+/// Otherwise identical to [`call_to_encoded_state_updates_local`]: same env
+/// construction, same extraction dispatch, same gas-estimate step, same
+/// return shape.
+#[tracing::instrument(
+    name = "evmsketch.encode_local_files",
+    skip_all,
+    fields(block_number, profile = ?profile, manifest = %manifest, state_update_count = tracing::field::Empty)
+)]
+#[allow(clippy::too_many_arguments)]
+pub async fn call_to_encoded_state_updates_local_files(
+    executor_cache: &EvmSketchExecutorCache,
+    state_cache: &LocalStateCache,
+    rpc_url: impl AsRef<str>,
+    tx_request: TransactionRequest,
+    block_number: u64,
+    profile: SimProfile,
+    weights_path: impl AsRef<std::path::Path>,
+    tokenizer_path: impl AsRef<std::path::Path>,
+    manifest: B256,
+) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
+    let overlay_mount =
+        state_cache.overlay_mount_from_files(weights_path, tokenizer_path, manifest)?;
+    call_to_encoded_state_updates_local_with_mounts(
+        executor_cache,
+        state_cache,
+        rpc_url.as_ref(),
+        tx_request,
+        block_number,
+        profile,
+        overlay_mount.into(),
+    )
+    .await
+}
+
+/// The multi-overlay twin of [`call_to_encoded_state_updates_local_files`]:
+/// mounts **several models' pinned overlays simultaneously**, each from its
+/// own `(weights_path, tokenizer_path, manifest)` artifact spec, and serves
+/// them through one composite lookup for the traced call.
+///
+/// Chunk addresses are derived per-manifest
+/// (`keccak256("gaskiller.llm.overlay.v1" || manifest || u64be(i))[12..]`),
+/// so distinct manifests own disjoint address sets and mounting N models at
+/// once is exactly as sound as mounting one — at most one model can resolve
+/// any address the trace touches (see [`OverlayMountSet`]). This is what lets
+/// one operator process serve multiple on-chain models (e.g. Qwen3.5-35B-A3B
+/// and Qwen3-0.6B) from local mmap files instead of hosting any model's
+/// chunks as forked chain state.
+///
+/// Every spec gets the same guarantees as the single-model entry point:
+/// mandatory streaming-keccak verification against its pinned manifest
+/// (hard-fail before a byte is served), lazy mmap chunk materialization, and
+/// manifest-keyed memoization on `state_cache`
+/// ([`LocalStateCache::overlay_mount_set_from_files`]) so each model is
+/// mounted once per process. Duplicate manifests in `mounts_spec` are
+/// refused. An empty `mounts_spec` runs the trace with no overlay, identical
+/// to [`call_to_encoded_state_updates_local`] with `overlay: None`.
+///
+/// Otherwise identical to [`call_to_encoded_state_updates_local_files`]:
+/// same env construction, same extraction dispatch, same gas-estimate step,
+/// same return shape.
+#[tracing::instrument(
+    name = "evmsketch.encode_local_multi",
+    skip_all,
+    fields(block_number, profile = ?profile, mounts = mounts_spec.len(), state_update_count = tracing::field::Empty)
+)]
+pub async fn call_to_encoded_state_updates_local_multi<W, T>(
+    executor_cache: &EvmSketchExecutorCache,
+    state_cache: &LocalStateCache,
+    rpc_url: impl AsRef<str>,
+    tx_request: TransactionRequest,
+    block_number: u64,
+    profile: SimProfile,
+    mounts_spec: &[(W, T, B256)],
+) -> Result<(Bytes, u64, bool, HashSet<Opcode>)>
+where
+    W: AsRef<std::path::Path>,
+    T: AsRef<std::path::Path>,
+{
+    let mounts = state_cache.overlay_mount_set_from_files(mounts_spec)?;
+    call_to_encoded_state_updates_local_with_mounts(
+        executor_cache,
+        state_cache,
+        rpc_url.as_ref(),
+        tx_request,
+        block_number,
+        profile,
+        mounts,
+    )
+    .await
+}
+
+/// The view-call sibling of [`call_to_encoded_state_updates_local_multi`]:
+/// executes a read-only call in-process with the same multi-model overlay
+/// mounts and pinned profile, returning the call's **raw return data**
+/// instead of extracting a state-update payload.
+///
+/// This is the entry point for gas-killer/service's sharded-inference
+/// segment executor (`Qwen35SegEngine.forwardRange` / `argmaxRange`): a
+/// segment call is a pure view over pinned overlay code — there is no
+/// storage diff to extract, no unbounded payload shape to validate, and no
+/// settlement gas to estimate, so those stages are skipped entirely.
+/// Everything else — executor pinning at `(rpc_url, block_number)`, the lazy
+/// remote-state backend, manifest verification + memoized mmap mounts — is
+/// identical to the tracked-function path, so two committee members
+/// executing the same segment against equally-prepared environments return
+/// byte-identical outputs. Reverts and halts are errors (see
+/// `local_exec::call_view_local_blocking`).
+///
+/// `state_cache` is taken as an `Arc` (unlike the tracked-path siblings)
+/// because the ENTIRE blocking half — including the mount resolution, whose
+/// cold-cache cost is a full streaming-keccak pass over the artifact files
+/// (minutes for 35 GB models) — runs on the blocking pool. Awaiting this
+/// future never occupies an async worker thread for longer than the cheap
+/// env construction, even on the first call after process start.
+#[tracing::instrument(
+    name = "evmsketch.view_local_multi",
+    skip_all,
+    fields(block_number, profile = ?profile, mounts = mounts_spec.len())
+)]
+pub async fn call_view_local_multi<W, T>(
+    executor_cache: &EvmSketchExecutorCache,
+    state_cache: std::sync::Arc<LocalStateCache>,
+    rpc_url: impl AsRef<str>,
+    tx_request: TransactionRequest,
+    block_number: u64,
+    profile: SimProfile,
+    mounts_spec: &[(W, T, B256)],
+) -> Result<Bytes>
+where
+    W: AsRef<std::path::Path>,
+    T: AsRef<std::path::Path>,
+{
+    let specs: Vec<(std::path::PathBuf, std::path::PathBuf, B256)> = mounts_spec
+        .iter()
+        .map(|(w, t, m)| (w.as_ref().to_path_buf(), t.as_ref().to_path_buf(), *m))
+        .collect();
+    let local_tx = local_exec::LocalTxRequest::from_request(&tx_request)?;
+    let executor = executor_cache
+        .get_or_build(rpc_url.as_ref(), block_number)
+        .await?;
+    let block_env = LocalBlockEnv::from_executor(&executor);
+    let backend = state_cache.backend_for(
+        rpc_url.as_ref(),
+        block_number,
+        executor.sketch.provider.clone(),
+    );
+    tokio::task::spawn_blocking(move || {
+        local_exec::call_view_local_files_blocking(
+            backend,
+            &state_cache,
+            &specs,
+            &block_env,
+            &local_tx,
+            profile,
+        )
+    })
+    .await
+    .map_err(|e| anyhow!("local view-call task panicked: {e}"))?
+}
+
+/// Shared body of [`call_to_encoded_state_updates_local`],
+/// [`call_to_encoded_state_updates_local_files`] and
+/// [`call_to_encoded_state_updates_local_multi`]: everything downstream of
+/// "the overlay mounts are resolved" — env construction, extraction dispatch,
+/// unbounded-shape validation, ABI encoding and the gas estimate. The public
+/// entry points differ only in *how* the [`OverlayMountSet`] gets built
+/// (none / in-RAM [`OverlayEnv`] / mmapped [`OverlayMount::from_files`] /
+/// several of the latter); this keeps that the only difference in the code
+/// paths, so the consensus contract (byte-identical extraction) is
+/// structurally guaranteed rather than merely tested.
+async fn call_to_encoded_state_updates_local_with_mounts(
+    executor_cache: &EvmSketchExecutorCache,
+    state_cache: &LocalStateCache,
+    rpc_url: &str,
+    tx_request: TransactionRequest,
+    block_number: u64,
+    profile: SimProfile,
+    mounts: OverlayMountSet,
+) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
+    let contract_address = tx_request
+        .to
+        .and_then(|t| match t {
+            TxKind::Call(addr) => Some(addr),
+            TxKind::Create => None,
+        })
+        .ok_or_else(|| anyhow!("Transaction must have a 'to' address"))?;
+    let caller_address = tx_request.from.unwrap_or_default();
+
+    let mut storage_hints: HashMap<Address, Vec<B256>> = HashMap::new();
+    if let Some(al) = &tx_request.access_list {
+        for item in al.iter() {
+            storage_hints
+                .entry(item.address)
+                .or_default()
+                .extend(item.storage_keys.iter().copied());
+        }
+    }
+
+    let local_tx = local_exec::LocalTxRequest::from_request(&tx_request)?;
+
+    // The executor (built against the same rpc_url/block) supplies both the
+    // pinned block env for the trace and the RootProvider<AnyNetwork> the
+    // remote-state backend fetches through, plus the gas estimate afterward.
+    let executor = executor_cache.get_or_build(rpc_url, block_number).await?;
+    let block_env = LocalBlockEnv::from_executor(&executor);
+    let backend = state_cache.backend_for(rpc_url, block_number, executor.sketch.provider.clone());
+
+    let (state_updates, skipped_opcodes) = local_exec::extract_state_updates_local(
+        backend,
+        mounts,
+        block_env,
+        local_tx,
+        profile,
+        contract_address,
+    )
+    .await?;
+    tracing::Span::current().record("state_update_count", state_updates.len());
+
+    if profile.requires_unbounded_shape() {
+        let shape = validate_unbounded_shape(&state_updates).map_err(|violation| {
+            anyhow!(
+                "unbounded-profile payload shape violation for consumer {contract_address}: {violation}"
+            )
+        })?;
+        tracing::debug!(
+            stores = shape.stores,
+            calls = shape.calls,
+            logs = shape.logs,
+            "unbounded payload shape OK (local executor)"
+        );
+    }
+
+    let storage_updates = encode_state_updates_to_abi(&state_updates);
+
     let mut all_hints = hints_from_state_updates(contract_address, &state_updates);
     for (addr, slots) in storage_hints {
         all_hints.entry(addr).or_default().extend(slots);
@@ -2080,6 +2466,660 @@ mod tests {
         assert_eq!(
             violation,
             gas_analyzer_core::UnboundedShapeViolation::TooManyStores { count: 2 }
+        );
+    }
+
+    // ========================================================================
+    // RPC path vs local path — byte-identical differential tests (#169)
+    //
+    // Same deployed bytecode, same anvil block: extract via the RPC path
+    // (extract_state_updates_hybrid, real debug_traceCall tracers) and via
+    // the local path (local_exec::extract_state_updates_local, in-process
+    // revm over a SharedBackend pinned to anvil) and assert the ABI-encoded
+    // payload bytes are identical. `EvmSketchExecutorCache`/`EvmSketch` only
+    // support mainnet/sepolia/gnosis genesis (chain_id_to_genesis_and_spec),
+    // so these tests drive extraction directly rather than through the full
+    // call_to_encoded_state_updates_* entry points — the gas-estimate half
+    // downstream of extraction is identical code shared by both paths.
+    // ========================================================================
+
+    use foundry_fork_db::{BlockchainDb, SharedBackend, cache::BlockchainDbMeta};
+    use local_exec::LocalTxRequest;
+
+    /// anvil's default hardfork (Prague) and chain id (31337), used to build
+    /// a [`LocalBlockEnv`] without going through `EvmSketchExecutorBuilder`
+    /// (which rejects non-mainnet/sepolia/gnosis chain ids).
+    const ANVIL_CHAIN_ID: u64 = 31_337;
+
+    fn any_provider(anvil: &LocalAnvil) -> RootProvider<AnyNetwork> {
+        RootProvider::<AnyNetwork>::new_http(Url::parse(&anvil.url).expect("valid url"))
+    }
+
+    /// Fetch anvil's current header and build the matching [`LocalBlockEnv`]
+    /// — the same fields `LocalBlockEnv::from_executor` would pull from an
+    /// anchored `EvmSketchExecutor`, sourced directly via `eth_getBlockByNumber`
+    /// since anvil's chain id can't build one.
+    async fn anvil_local_block_env(provider: &RootProvider<AnyNetwork>) -> LocalBlockEnv {
+        let block = provider
+            .get_block_by_number(BlockNumberOrTag::Latest)
+            .await
+            .expect("eth_getBlockByNumber failed")
+            .expect("latest block must exist");
+        LocalBlockEnv {
+            chain_id: ANVIL_CHAIN_ID,
+            spec: SpecId::PRAGUE,
+            number: block.header.number,
+            timestamp: block.header.timestamp,
+            gas_limit: block.header.gas_limit,
+            coinbase: block.header.beneficiary,
+            prevrandao: block.header.mix_hash.unwrap_or_default(),
+            basefee: block.header.base_fee_per_gas.unwrap_or(0),
+            difficulty: block.header.difficulty,
+        }
+    }
+
+    /// A `SharedBackend` pinned to anvil's current block — the local path's
+    /// remote-state DB for these tests.
+    fn anvil_shared_backend(
+        provider: RootProvider<AnyNetwork>,
+        block_number: u64,
+    ) -> SharedBackend {
+        let db = BlockchainDb::new(BlockchainDbMeta::default(), None);
+        SharedBackend::spawn_backend_thread(provider, db, Some(BlockId::number(block_number)))
+    }
+
+    /// Extract via the local path against a live anvil instance: same
+    /// dispatch rules as [`extract_state_updates_hybrid`], but executed
+    /// in-process against a `SharedBackend`.
+    async fn extract_local_via_anvil(
+        anvil: &LocalAnvil,
+        to: Address,
+        profile: SimProfile,
+        overlay: OverlayMountSet,
+    ) -> (Vec<StateUpdate>, HashSet<Opcode>) {
+        let provider = any_provider(anvil);
+        let env = anvil_local_block_env(&provider).await;
+        let backend = anvil_shared_backend(provider, env.number);
+        let tx = LocalTxRequest::from_request(&call_request(to)).expect("valid tx request");
+        local_exec::extract_state_updates_local(backend, overlay, env, tx, profile, to)
+            .await
+            .expect("local extraction failed")
+    }
+
+    /// Run both paths against the same deployed call and assert their
+    /// ABI-encoded payloads are byte-identical — the acceptance bar issue
+    /// #169 sets for the local executor.
+    async fn assert_rpc_and_local_identical(
+        anvil: &LocalAnvil,
+        to: Address,
+        profile: SimProfile,
+        overlay_env: Option<&OverlayEnv>,
+        overlay_mount: OverlayMountSet,
+        ctx: &str,
+    ) -> (Vec<StateUpdate>, Vec<StateUpdate>) {
+        let provider = anvil.provider();
+        let (rpc_updates, rpc_skipped) = extract_state_updates_hybrid(
+            &provider,
+            call_request(to),
+            BlockId::latest(),
+            to,
+            profile,
+            overlay_env,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{ctx}: RPC-path extraction failed: {e:?}"));
+
+        let (local_updates, local_skipped) =
+            extract_local_via_anvil(anvil, to, profile, overlay_mount).await;
+
+        assert_eq!(
+            encode_state_updates_to_abi(&rpc_updates),
+            encode_state_updates_to_abi(&local_updates),
+            "{ctx}: RPC-path and local-path encoded payloads diverged\n  rpc:   {rpc_updates:?}\n  local: {local_updates:?}"
+        );
+        assert_eq!(
+            rpc_skipped, local_skipped,
+            "{ctx}: skipped_opcodes must match between paths"
+        );
+        (rpc_updates, local_updates)
+    }
+
+    /// Case 1: simple single-slot store (no logs, no calls) — the baseline
+    /// prestate-fast-path shape.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn differential_simple_store() {
+        let anvil = LocalAnvil::spawn().await;
+        let consumer = address!("0x0000000000000000000000000000000000003001");
+        set_code(&anvil.provider(), consumer, hex_code("6042600155 00")).await;
+
+        let (rpc, _) = assert_rpc_and_local_identical(
+            &anvil,
+            consumer,
+            SimProfile::Chain,
+            None,
+            OverlayMountSet::default(),
+            "simple_store",
+        )
+        .await;
+        assert_updates_eq(&rpc, &[store_up(1, 0x42)], "simple_store shape");
+    }
+
+    /// Case 2: multi-slot store — net-diff dedup (write-then-restore
+    /// disappears) and slot-sorted ordering must agree between paths.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn differential_multi_slot() {
+        let anvil = LocalAnvil::spawn().await;
+        let provider = anvil.provider();
+        let consumer = address!("0x0000000000000000000000000000000000003002");
+        set_code(&provider, consumer, eligible_code()).await;
+        set_storage(
+            &provider,
+            consumer,
+            B256::with_last_byte(5),
+            B256::with_last_byte(0x99),
+        )
+        .await;
+
+        let (rpc, _) = assert_rpc_and_local_identical(
+            &anvil,
+            consumer,
+            SimProfile::Chain,
+            None,
+            OverlayMountSet::default(),
+            "multi_slot",
+        )
+        .await;
+        let word_ab = Bytes::copy_from_slice(B256::with_last_byte(0xab).as_slice());
+        assert_updates_eq(
+            &rpc,
+            &[store_up(1, 0x42), store_up(5, 0), log1_up(0xaa, word_ab)],
+            "multi_slot shape (also covers logs — see eligible_code)",
+        );
+    }
+
+    /// Case 3: logs, specifically DELEGATECALL log interleaving — true
+    /// emission order (aa, cc, bb) must agree between paths.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn differential_logs_delegatecall_interleaving() {
+        let anvil = LocalAnvil::spawn().await;
+        let provider = anvil.provider();
+        let root = address!("0x0000000000000000000000000000000000003003");
+        let lib = address!("0x0000000000000000000000000000000000003004");
+        set_code(&provider, root, delegate_root_code(lib)).await;
+        set_code(&provider, lib, delegate_lib_code()).await;
+
+        let (rpc, _) = assert_rpc_and_local_identical(
+            &anvil,
+            root,
+            SimProfile::Chain,
+            None,
+            OverlayMountSet::default(),
+            "logs_delegatecall_interleaving",
+        )
+        .await;
+        assert_updates_eq(
+            &rpc,
+            &[
+                store_up(3, 7),
+                log1_up(0xaa, Bytes::new()),
+                log1_up(0xcc, Bytes::new()),
+                log1_up(0xbb, Bytes::new()),
+            ],
+            "delegatecall interleaving shape",
+        );
+    }
+
+    /// Case 4: nested regular CALL — forces the struct-log/replay-script
+    /// fallback on both paths; the replayable CALL op (callee internals
+    /// excluded) plus the caller's own store must agree.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn differential_nested_call() {
+        let anvil = LocalAnvil::spawn().await;
+        let provider = anvil.provider();
+        let caller = address!("0x0000000000000000000000000000000000003005");
+        let callee = address!("0x0000000000000000000000000000000000003006");
+        set_code(&provider, caller, caller_code(callee)).await;
+        set_code(&provider, callee, callee_code()).await;
+
+        let (rpc, _) = assert_rpc_and_local_identical(
+            &anvil,
+            caller,
+            SimProfile::Chain,
+            None,
+            OverlayMountSet::default(),
+            "nested_call",
+        )
+        .await;
+        assert_updates_eq(
+            &rpc,
+            &[
+                StateUpdate::Call(IStateUpdateTypes::Call {
+                    target: callee,
+                    value: U256::ZERO,
+                    callargs: Bytes::new(),
+                }),
+                store_up(4, 1),
+            ],
+            "nested CALL shape",
+        );
+    }
+
+    /// Case 5: revert — pre-revert ops must still be extracted identically
+    /// (revert-unaware struct-log semantics) on both paths.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn differential_revert() {
+        let anvil = LocalAnvil::spawn().await;
+        let reverter = address!("0x0000000000000000000000000000000000003007");
+        set_code(&anvil.provider(), reverter, reverter_code()).await;
+
+        let (rpc, _) = assert_rpc_and_local_identical(
+            &anvil,
+            reverter,
+            SimProfile::Chain,
+            None,
+            OverlayMountSet::default(),
+            "revert",
+        )
+        .await;
+        assert_updates_eq(
+            &rpc,
+            &[store_up(1, 0x42), log1_up(0xdd, Bytes::new())],
+            "reverted call shape: pre-revert ops captured",
+        );
+    }
+
+    /// Case 6: overlay mode — RPC path mounts the overlay via
+    /// `anvil_setCode` (`stateOverrides`-equivalent for a real node), local
+    /// path mounts the same bytes natively via `OverlayMount::from_env`.
+    /// A consumer that `EXTCODECOPY`s a chunk and commits one word of it
+    /// must produce byte-identical payloads under both mounting strategies.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn differential_overlay_mode() {
+        let anvil = LocalAnvil::spawn().await;
+        let provider = anvil.provider();
+
+        let payload: Vec<u8> = (0..100u32).map(|i| (i % 256) as u8).collect();
+        let overlay_env = OverlayEnv::from_blobs(&payload, b"tok").expect("overlay env");
+        let chunk = overlay_env.overlays[0].address;
+        let overlay_mount =
+            Arc::new(OverlayMount::from_env(&overlay_env, overlay_env.manifest).expect("mount"));
+
+        let consumer = address!("0x0000000000000000000000000000000000003008");
+        // EXTCODECOPY(chunk, dest 0, offset 1, size 32); SSTORE(1, MLOAD(0));
+        // LOG1(mem[0..32], topic 0xee); STOP.
+        set_code(
+            &provider,
+            consumer,
+            hex_code(&format!(
+                "6020 6001 6000 73{} 3c 600051600155 7f{}60206000a1 00",
+                addr_hex(chunk),
+                topic_hex(0xee),
+            )),
+        )
+        .await;
+
+        // RPC path: no anvil_setCode for the chunk itself — apply_overlay_env
+        // mounts it as a stateOverrides code override for the trace call, the
+        // real UNBOUNDED_V2 transport. The chunk account is never deployed on
+        // anvil, mirroring "no rootDirectory" mode on-chain.
+        let (rpc, _) = assert_rpc_and_local_identical(
+            &anvil,
+            consumer,
+            SimProfile::Chain,
+            Some(&overlay_env),
+            overlay_mount.into(),
+            "overlay_mode",
+        )
+        .await;
+
+        let expected_word = B256::from_slice(&payload[0..32]);
+        assert_updates_eq(
+            &rpc,
+            &[
+                StateUpdate::Store(IStateUpdateTypes::Store {
+                    slot: B256::with_last_byte(1),
+                    value: expected_word,
+                }),
+                StateUpdate::Log1(IStateUpdateTypes::Log1 {
+                    data: Bytes::copy_from_slice(expected_word.as_slice()),
+                    topic1: B256::with_last_byte(0xee),
+                }),
+            ],
+            "overlay-mode shape: chunk bytes readable identically via stateOverrides and native mount",
+        );
+    }
+
+    /// Case 7 (gas-analyzer#172): the mmap-backed overlay entry point
+    /// (`call_to_encoded_state_updates_local_files` / `OverlayMount::from_files`)
+    /// must extract byte-identically to the in-RAM entry point
+    /// (`call_to_encoded_state_updates_local` / `OverlayMount::from_env`) for
+    /// the same blobs — the acceptance bar for exposing the file-backed
+    /// source through the local executor's public API. Same blobs, written
+    /// to temp files for the mmap leg; both legs run through
+    /// `LocalStateCache` (`overlay_mount_for` / `overlay_mount_from_files`)
+    /// exactly as the two public entry points do internally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn differential_overlay_ram_vs_mmap_files() {
+        use gas_analyzer_core::OVERLAY_CHUNK_PAYLOAD;
+
+        let anvil = LocalAnvil::spawn().await;
+        let provider = anvil.provider();
+
+        // Non-repeating, multi-chunk payload so an offset/chunk-boundary bug
+        // in either source cannot cancel out.
+        let payload: Vec<u8> = (0..(OVERLAY_CHUNK_PAYLOAD * 2 + 137) as u32)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let tokenizer: Vec<u8> = (0..613u32).map(|i| (i % 241) as u8).collect();
+        let overlay_env = OverlayEnv::from_blobs(&payload, &tokenizer).expect("overlay env");
+        let manifest = overlay_env.manifest;
+        let chunk = overlay_env.overlays[0].address;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let weights_path = dir.path().join("weights.bin");
+        let tokenizer_path = dir.path().join("tokenizer.bin");
+        std::fs::write(&weights_path, &payload).expect("write weights blob");
+        std::fs::write(&tokenizer_path, &tokenizer).expect("write tokenizer blob");
+
+        let consumer = address!("0x0000000000000000000000000000000000003009");
+        // EXTCODECOPY(chunk, dest 0, offset 1, size 32); SSTORE(1, MLOAD(0));
+        // LOG1(mem[0..32], topic 0xee); STOP.
+        set_code(
+            &provider,
+            consumer,
+            hex_code(&format!(
+                "6020 6001 6000 73{} 3c 600051600155 7f{}60206000a1 00",
+                addr_hex(chunk),
+                topic_hex(0xee),
+            )),
+        )
+        .await;
+
+        // In-RAM leg: same cache method call_to_encoded_state_updates_local
+        // makes internally.
+        let ram_cache = LocalStateCache::default();
+        let ram_mount = ram_cache
+            .overlay_mount_for(&overlay_env)
+            .expect("in-RAM overlay mount");
+        let (ram_updates, ram_skipped) =
+            extract_local_via_anvil(&anvil, consumer, SimProfile::Chain, ram_mount.into()).await;
+
+        // Mmap leg: same cache method call_to_encoded_state_updates_local_files
+        // makes internally — manifest verification happens inside this call.
+        let files_cache = LocalStateCache::default();
+        let files_mount = files_cache
+            .overlay_mount_from_files(&weights_path, &tokenizer_path, manifest)
+            .expect("mmap overlay mount");
+        let (files_updates, files_skipped) =
+            extract_local_via_anvil(&anvil, consumer, SimProfile::Chain, files_mount.into()).await;
+
+        assert_eq!(
+            encode_state_updates_to_abi(&ram_updates),
+            encode_state_updates_to_abi(&files_updates),
+            "in-RAM and mmap-files overlay sources must yield byte-identical encoded payloads\n  \
+             ram:   {ram_updates:?}\n  files: {files_updates:?}"
+        );
+        assert_eq!(
+            ram_skipped, files_skipped,
+            "skipped_opcodes must match between in-RAM and mmap-files overlay sources"
+        );
+
+        let expected_word = B256::from_slice(&payload[0..32]);
+        assert_updates_eq(
+            &ram_updates,
+            &[
+                StateUpdate::Store(IStateUpdateTypes::Store {
+                    slot: B256::with_last_byte(1),
+                    value: expected_word,
+                }),
+                StateUpdate::Log1(IStateUpdateTypes::Log1 {
+                    data: Bytes::copy_from_slice(expected_word.as_slice()),
+                    topic1: B256::with_last_byte(0xee),
+                }),
+            ],
+            "mmap-files overlay-mode shape: chunk bytes readable identically to the in-RAM source",
+        );
+    }
+
+    /// Case 8 (multi-overlay): TWO models' pinned overlays mounted
+    /// simultaneously from local artifact files
+    /// (`call_to_encoded_state_updates_local_multi` /
+    /// `LocalStateCache::overlay_mount_set_from_files`) must extract
+    /// byte-identically to the RPC path with the same chunk accounts hosted
+    /// as real chain state (`anvil_setCode`) — the fork-hosted arrangement
+    /// the composite mount replaces. A consumer reads one chunk from EACH
+    /// model in a single call: each model's chunks must resolve to its own
+    /// bytes (the manifests' derived address sets are disjoint, so the
+    /// composite lookup cannot mix them up), and non-overlay accounts (the
+    /// consumer itself) still pass through to the chain backend.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn differential_two_model_overlay_mount_set() {
+        use gas_analyzer_core::OVERLAY_CHUNK_PAYLOAD;
+
+        let anvil = LocalAnvil::spawn().await;
+        let provider = anvil.provider();
+
+        // Two models with distinct, non-repeating content so a cross-model
+        // mixup or offset bug in the composite lookup cannot cancel out.
+        let weights_a: Vec<u8> = (0..(OVERLAY_CHUNK_PAYLOAD * 2 + 137) as u32)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let tokenizer_a: Vec<u8> = (0..613u32).map(|i| (i % 241) as u8).collect();
+        let weights_b: Vec<u8> = (0..(OVERLAY_CHUNK_PAYLOAD + 311) as u32)
+            .map(|i| ((i * 7 + 3) % 253) as u8)
+            .collect();
+        let tokenizer_b: Vec<u8> = (0..419u32).map(|i| ((i * 11 + 5) % 239) as u8).collect();
+
+        let env_a = OverlayEnv::from_blobs(&weights_a, &tokenizer_a).expect("overlay env a");
+        let env_b = OverlayEnv::from_blobs(&weights_b, &tokenizer_b).expect("overlay env b");
+        assert_ne!(env_a.manifest, env_b.manifest);
+        // The KEY FACT the composite relies on: per-manifest derived address
+        // sets are disjoint.
+        for oa in &env_a.overlays {
+            assert!(
+                env_b.overlays.iter().all(|ob| ob.address != oa.address),
+                "chunk address sets of the two manifests must be disjoint"
+            );
+        }
+        let chunk_a = env_a.overlays[0].address;
+        let chunk_b = env_b.overlays[0].address;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).expect("write blob");
+            path
+        };
+        let mounts_spec = vec![
+            (
+                write("weights_a.bin", &weights_a),
+                write("tokenizer_a.bin", &tokenizer_a),
+                env_a.manifest,
+            ),
+            (
+                write("weights_b.bin", &weights_b),
+                write("tokenizer_b.bin", &tokenizer_b),
+                env_b.manifest,
+            ),
+        ];
+
+        let consumer = address!("0x000000000000000000000000000000000000300a");
+        // EXTCODECOPY(chunkA, dest 0, offset 1, size 32); SSTORE(1, MLOAD(0));
+        // EXTCODECOPY(chunkB, dest 0, offset 1, size 32); SSTORE(2, MLOAD(0));
+        // LOG1(mem[0..32], topic 0xee); STOP.
+        set_code(
+            &provider,
+            consumer,
+            hex_code(&format!(
+                "6020 6001 6000 73{} 3c 600051600155 6020 6001 6000 73{} 3c 600051600255 7f{}60206000a1 00",
+                addr_hex(chunk_a),
+                addr_hex(chunk_b),
+                topic_hex(0xee),
+            )),
+        )
+        .await;
+
+        // RPC leg: BOTH models' chunks hosted as real chain state via
+        // anvil_setCode — exactly the shared-fork arrangement production used
+        // for Qwen3-0.6B, and the reference the composite mount must be
+        // byte-identical to. No overlay rides along the trace request.
+        for env in [&env_a, &env_b] {
+            for overlay in &env.overlays {
+                set_code(&provider, overlay.address, overlay.code.clone()).await;
+            }
+        }
+        let (rpc_updates, rpc_skipped) = extract_state_updates_hybrid(
+            &provider,
+            call_request(consumer),
+            BlockId::latest(),
+            consumer,
+            SimProfile::Chain,
+            None,
+        )
+        .await
+        .expect("RPC-path extraction with fork-hosted chunks failed");
+
+        // Local leg: the same two models mounted from files as ONE composite
+        // set — the exact set construction
+        // call_to_encoded_state_updates_local_multi makes internally.
+        let state_cache = LocalStateCache::default();
+        let mounts = state_cache
+            .overlay_mount_set_from_files(&mounts_spec)
+            .expect("two-model mount set");
+        assert_eq!(mounts.len(), 2);
+        let (local_updates, local_skipped) =
+            extract_local_via_anvil(&anvil, consumer, SimProfile::Chain, mounts).await;
+
+        assert_eq!(
+            encode_state_updates_to_abi(&rpc_updates),
+            encode_state_updates_to_abi(&local_updates),
+            "fork-hosted chunks (RPC path) and the two-model composite mount (local path) \
+             must yield byte-identical encoded payloads\n  rpc:   {rpc_updates:?}\n  local: {local_updates:?}"
+        );
+        assert_eq!(
+            rpc_skipped, local_skipped,
+            "skipped_opcodes must match between paths"
+        );
+
+        // Chunk code is 0x00 || payload, so offset 1..33 is payload[0..32] —
+        // per model.
+        let word_a = B256::from_slice(&weights_a[0..32]);
+        let word_b = B256::from_slice(&weights_b[0..32]);
+        assert_ne!(word_a, word_b);
+        assert_updates_eq(
+            &local_updates,
+            &[
+                StateUpdate::Store(IStateUpdateTypes::Store {
+                    slot: B256::with_last_byte(1),
+                    value: word_a,
+                }),
+                StateUpdate::Store(IStateUpdateTypes::Store {
+                    slot: B256::with_last_byte(2),
+                    value: word_b,
+                }),
+                StateUpdate::Log1(IStateUpdateTypes::Log1 {
+                    data: Bytes::copy_from_slice(word_b.as_slice()),
+                    topic1: B256::with_last_byte(0xee),
+                }),
+            ],
+            "two-model shape: each model's chunk resolves to its own bytes in one call",
+        );
+    }
+
+    // ========================================================================
+    // Local vs RPC throughput benchmark (#169)
+    //
+    // Not a criterion bench: the RPC leg alone can take several seconds and
+    // criterion's default sampling would run it dozens of times. This is a
+    // manual-timing #[ignore]d test — run with:
+    //   cargo test -p gas-analyzer-evmsketch --lib bench_local_vs_rpc_throughput \
+    //     -- --ignored --nocapture
+    // ========================================================================
+
+    /// ~50,000,000-iteration busy loop (~40 gas/iter ≈ 2 Ggas), one SSTORE and
+    /// one LOG1 at the end — the same single-slot commitment shape as
+    /// `gigagas_burner_code`, scaled to billions of gas with `PUSH4` so the
+    /// iteration count (up to ~4.29B) doesn't overflow a `PUSH3` immediate.
+    ///
+    /// Layout: PUSH4 iters; loop(JUMPDEST): DUP1 ISZERO PUSH1 end JUMPI;
+    /// PUSH1 1 SWAP1 SUB PUSH1 loop JUMP; end(JUMPDEST): POP; SSTORE; LOG1; STOP.
+    fn compute_heavy_loop_code(iters: u32) -> Bytes {
+        hex_code(&format!(
+            "63{iters:08x} 5b 80 15 6012 57 6001 90 03 6005 56 5b 50 6042600155 7f{}60006000a1 00",
+            topic_hex(0xee),
+        ))
+    }
+
+    /// Times the compute-heavy loop through both paths against the same
+    /// anvil instance and prints gas/s for each — the deliverable #169 asks
+    /// for ("time local vs RPC path on a compute-heavy loop, report gas/s").
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "manual benchmark — run with --ignored --nocapture"]
+    async fn bench_local_vs_rpc_throughput() {
+        const ITERS: u32 = 50_000_000;
+        const GAS_PER_ITER: u64 = 40;
+        let approx_gas = ITERS as u64 * GAS_PER_ITER;
+
+        let anvil = LocalAnvil::spawn_with(&["--disable-block-gas-limit"]).await;
+        let provider = anvil.provider();
+        let consumer = address!("0x0000000000000000000000000000000000009001");
+        set_code(&provider, consumer, compute_heavy_loop_code(ITERS)).await;
+
+        eprintln!(
+            "bench_local_vs_rpc_throughput: ~{approx_gas} gas ({:.2} Ggas) busy loop, {ITERS} iterations",
+            approx_gas as f64 / 1e9
+        );
+
+        // RPC path: extract_state_updates_hybrid under UnboundedV1 (pinned
+        // gas overrides lift the tx/block caps past the loop's cost) against
+        // the real debug_traceCall tracers.
+        let rpc_start = std::time::Instant::now();
+        let (rpc_updates, _) = extract_state_updates_hybrid(
+            &provider,
+            call_request(consumer),
+            BlockId::latest(),
+            consumer,
+            SimProfile::UnboundedV1,
+            None,
+        )
+        .await
+        .expect("RPC-path extraction failed");
+        let rpc_elapsed = rpc_start.elapsed();
+
+        // Local path: in-process revm over a SharedBackend pinned to the same
+        // anvil block.
+        let local_start = std::time::Instant::now();
+        let (local_updates, _) = extract_local_via_anvil(
+            &anvil,
+            consumer,
+            SimProfile::UnboundedV1,
+            OverlayMountSet::default(),
+        )
+        .await;
+        let local_elapsed = local_start.elapsed();
+
+        assert_eq!(
+            encode_state_updates_to_abi(&rpc_updates),
+            encode_state_updates_to_abi(&local_updates),
+            "throughput bench sanity check: both paths must still agree on the payload"
+        );
+
+        let rpc_gas_per_s = approx_gas as f64 / rpc_elapsed.as_secs_f64();
+        let local_gas_per_s = approx_gas as f64 / local_elapsed.as_secs_f64();
+
+        eprintln!(
+            "RPC path:   {:>8.3}s  ({:.3} Ggas/s)",
+            rpc_elapsed.as_secs_f64(),
+            rpc_gas_per_s / 1e9
+        );
+        eprintln!(
+            "Local path: {:>8.3}s  ({:.3} Ggas/s)",
+            local_elapsed.as_secs_f64(),
+            local_gas_per_s / 1e9
+        );
+        eprintln!(
+            "Speedup (local vs RPC): {:.2}x",
+            rpc_elapsed.as_secs_f64() / local_elapsed.as_secs_f64().max(f64::EPSILON)
         );
     }
 }

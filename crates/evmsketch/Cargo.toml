@@ -18,7 +18,22 @@ gas-analyzer-core = { path = "../core" }
 gas-analyzer-estimator = { path = "../gas-estimator" }
 gas-analyzer-rpc = { path = "../rpc" }
 reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1" }
-revm = { version = "31.0.1" }
+# Exact pins: the local execution path (src/local_exec.rs) re-executes tracked
+# functions in-process and operators sign what it extracts. revm's gas
+# accounting / journal semantics and foundry-fork-db's state fetching are
+# consensus-affecting — an upgrade can move OOG boundaries, so it must ship as
+# a coordinated, versioned change (see gas_analyzer_core::sim_profile docs).
+# foundry-fork-db 0.21.0 is built against revm 33, but resolves to the same
+# revm-database-interface/revm-state crates as revm 31.0.2 in Cargo.lock, so
+# its SharedBackend implements exactly the DatabaseRef trait consumed here.
+revm = { version = "=31.0.2", features = [
+    "optional_balance_check",
+    "optional_block_gas_limit",
+    "optional_no_base_fee",
+    "optional_fee_charge",
+] }
+foundry-fork-db = "=0.21.0"
+memmap2 = "0.9"
 sp1-cc-client-executor = { git = "https://github.com/BreadchainCoop/sp1-contract-call", branch = "cancun-v1", package = "sp1-cc-client-executor" }
 sp1-cc-host-executor = { git = "https://github.com/BreadchainCoop/sp1-contract-call", branch = "cancun-v1", package = "sp1-cc-host-executor" }
 lru = "0.13"
@@ -35,13 +50,16 @@ alloy-rpc-types = "1.0.37"
 alloy-transport = "1"
 criterion   = { version = "0.5", features = ["html_reports", "async_tokio"] }
 dhat        = "0.3"
+libc        = "0.2"
 pprof       = { version = "0.15", features = ["flamegraph", "criterion", "frame-pointer", "prost-codec"] }
+rand        = "0.9"
 revm        = { version = "31.0.1", features = ["serde"] }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 sha2        = "0.10"
 stats_alloc = "0.1"
 tokio       = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+tempfile    = "3"
 tower       = "0.5"
 
 [[bench]]
