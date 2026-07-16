@@ -45,7 +45,7 @@ use std::io::{BufRead, Read, Write};
 use anyhow::{Context, Result, bail};
 use gk_fast_view::FastView;
 use gk_fast_view::job::{Job, hex_encode};
-use revm_primitives::{Bytes, hardfork::SpecId};
+use revm_primitives::{B256, Bytes, hardfork::SpecId, keccak256};
 
 fn main() {
     if let Err(e) = run() {
@@ -101,20 +101,23 @@ fn run_one_shot(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Daemon mode: serve framed jobs from stdin against a persistent per-spec
-/// [`FastView`], so the engine bytecode compiles once and is reused across every
-/// segment. Loops until stdin EOF.
+/// Daemon mode: serve framed jobs from stdin against persistent per-engine
+/// [`FastView`]s, so each engine's bytecode compiles once and is reused across
+/// every segment. Loops until stdin EOF.
 fn serve() -> Result<()> {
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     let stdout = std::io::stdout();
     let mut writer = stdout.lock();
 
-    // One FastView per SpecId seen. In practice a deployment pins a single spec,
-    // so this holds exactly one compiled engine for the daemon's lifetime; the
-    // per-spec map only guards the (unexpected) mixed-spec case without ever
-    // discarding a warm cache.
-    let mut views: Vec<(SpecId, FastView)> = Vec::new();
+    // One FastView per (SpecId, engine-codehash). revmc's JIT module FINALIZES
+    // after its first compile, so a single FastView can hold exactly one
+    // compiled engine — a second distinct engine through the same FastView
+    // fails with "cannot compile more functions after finalizing the module"
+    // (observed live when one node served both the 0.6B and 35B models). Each
+    // model therefore gets its own FastView (own JIT module + mount + warm
+    // caches, which are per-model anyway); none is ever discarded.
+    let mut views: Vec<((SpecId, B256), FastView)> = Vec::new();
 
     eprintln!(
         "gk-fast-view: --serve daemon ready (compile-once; length-prefixed frames on stdin)"
@@ -133,10 +136,11 @@ fn serve() -> Result<()> {
         match execute_job_text(&mut views, &text) {
             Ok(returndata) => {
                 eprintln!(
-                    "gk-fast-view: --serve served job, {} bytes returndata in {:?} (engines compiled: {})",
+                    "gk-fast-view: --serve served job, {} bytes returndata in {:?} (engines compiled: {} across {} views)",
                     returndata.len(),
                     started.elapsed(),
                     views.iter().map(|(_, fv)| fv.compiled_count()).sum::<usize>(),
+                    views.len(),
                 );
                 let hex = hex_encode(&returndata);
                 write_response(&mut writer, "OK", hex.as_bytes())?;
@@ -150,17 +154,28 @@ fn serve() -> Result<()> {
     }
 }
 
-/// Parse + execute one job against the persistent per-spec [`FastView`] cache,
-/// compiling the engine on first sight and reusing it forever after. Also honours
-/// a fixture `expected` line (turns a mismatch into a loud error), mirroring the
-/// one-shot path.
-fn execute_job_text(views: &mut Vec<(SpecId, FastView)>, text: &str) -> Result<Bytes> {
+/// Parse + execute one job against the persistent per-(spec, engine) [`FastView`]
+/// cache, compiling each engine on first sight and reusing it forever after. Also
+/// honours a fixture `expected` line (turns a mismatch into a loud error),
+/// mirroring the one-shot path.
+fn execute_job_text(views: &mut Vec<((SpecId, B256), FastView)>, text: &str) -> Result<Bytes> {
     let job = Job::parse(text).context("parse job")?;
 
-    let idx = match views.iter().position(|(s, _)| *s == job.spec) {
+    // The engine is the base account at the call target; its codehash picks the
+    // FastView. A job whose target resolves through the overlay (no inline code)
+    // keys on B256::ZERO — such calls never JIT-compile, so sharing is safe.
+    let engine_key = job
+        .accounts
+        .iter()
+        .find(|(addr, _)| *addr == job.to)
+        .map(|(_, code)| keccak256(code))
+        .unwrap_or(B256::ZERO);
+
+    let key = (job.spec, engine_key);
+    let idx = match views.iter().position(|(k, _)| *k == key) {
         Some(i) => i,
         None => {
-            views.push((job.spec, FastView::new(job.spec).context("new FastView")?));
+            views.push((key, FastView::new(job.spec).context("new FastView")?));
             views.len() - 1
         }
     };
