@@ -289,8 +289,26 @@ impl Job {
     }
 
     /// Execute the job through a fresh [`FastView`] and return the returndata.
+    ///
+    /// One-shot semantics: the engine is JIT-compiled from scratch for this call
+    /// (nothing is amortized). The sidecar's persistent `--serve` mode uses
+    /// [`execute_with`](Self::execute_with) instead so the compiled-fn cache
+    /// survives across jobs.
     pub fn execute(&self) -> Result<Bytes> {
         let mut fv = FastView::new(self.spec)?;
+        self.execute_with(&mut fv)
+    }
+
+    /// Execute the job against a caller-owned [`FastView`], returning the
+    /// returndata. Byte-for-byte identical to [`execute`](Self::execute) — the
+    /// compiled artifact is deterministic per `(codehash, spec)` — but the
+    /// caller's `fv` keeps the compiled-engine cache across calls, so only the
+    /// FIRST job of a given engine pays the LLVM codegen cost. This is the
+    /// compile-once-run-many amortization the persistent daemon relies on.
+    ///
+    /// `fv` MUST be pinned to this job's `spec` (`FastView::call_view` enforces
+    /// it and errors loudly on mismatch).
+    pub fn execute_with(&self, fv: &mut FastView) -> Result<Bytes> {
         fv.call_view(
             self.base_db(),
             self.mount_set()?,

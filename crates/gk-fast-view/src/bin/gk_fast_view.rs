@@ -3,23 +3,49 @@
 //! The revm-31 service/analyzer cannot link revm-41 + revmc in-process (see the
 //! Phase-4 report / crate README for the co-link blocker), so the node shells
 //! out to this binary when `GK_SHARD_FAST_EXECUTOR=1`. It reads a `.job` (the
-//! [`gk_fast_view::job`] text format) from a path argument or stdin, executes
-//! the overlay-mounted view call on the revmc-compiled path, and prints the raw
-//! returndata as hex to stdout (nothing else on stdout — diagnostics go to
-//! stderr). A revert/halt exits non-zero with the reason on stderr, so the node
-//! surfaces the failure loudly instead of hash-committing an empty result.
+//! [`gk_fast_view::job`] text format), executes the overlay-mounted view call on
+//! the revmc-compiled path, and returns the raw returndata as hex.
 //!
-//! Usage:
-//!   gk-fast-view [JOB_FILE]      # reads stdin if JOB_FILE is omitted
+//! ## Two modes
 //!
-//! On success stdout is exactly one line: the lowercase hex returndata (no
-//! `0x`). If the job carries an `expected` line (a golden fixture), the binary
-//! also asserts byte-identity and fails loudly on mismatch.
+//! * **One-shot** (`gk-fast-view [JOB_FILE]`) — reads ONE job (from a path arg,
+//!   or stdin if omitted), executes it through a fresh [`FastView`], prints the
+//!   lowercase-hex returndata as one line on stdout, and exits. A revert/halt
+//!   exits non-zero with the reason on stderr. Used by ad-hoc replays and any
+//!   caller that wants a single self-contained invocation.
+//!
+//! * **Daemon** (`gk-fast-view --serve` / `gk-fast-view serve`) — the amortized
+//!   path the service uses. Runs a loop over stdin serving MANY framed jobs
+//!   against a PERSISTENT [`FastView`], so the ~20KB seg-engine bytecode is
+//!   JIT-compiled **once** (memoized by codehash) and every subsequent segment
+//!   runs on the compiled artifact. Spawning a fresh one-shot per segment would
+//!   re-run LLVM codegen every time (~116s on the real engine) — the bug this
+//!   mode fixes.
+//!
+//! ### Daemon wire protocol (length-prefixed, binary-safe)
+//!
+//! Returndata can reach ~1.5MB, so both directions are length-prefixed rather
+//! than newline-delimited. All lengths are decimal ASCII.
+//!
+//! ```text
+//! request  (service -> daemon):  "<job_byte_len>\n" then <job_byte_len> bytes of job text
+//! response (daemon -> service):  "<STATUS> <payload_byte_len>\n" then <payload_byte_len> bytes
+//!     STATUS = OK   payload = lowercase-hex returndata (no 0x)
+//!     STATUS = ERR  payload = utf-8 error message (revert/halt/parse/compile)
+//! ```
+//!
+//! An `ERR` frame is a per-job execution failure (revert/halt/mismatch); the
+//! daemon stays healthy and ready for the next job — the caller surfaces it and
+//! falls back to the interpreter. EOF on stdin (a zero-length read of the length
+//! line) shuts the daemon down cleanly. Only frames go to stdout; every
+//! diagnostic goes to stderr.
 
-use std::io::Read;
+use std::io::{BufRead, Read, Write};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use gk_fast_view::FastView;
 use gk_fast_view::job::{Job, hex_encode};
+use revm_primitives::{Bytes, hardfork::SpecId};
 
 fn main() {
     if let Err(e) = run() {
@@ -30,7 +56,16 @@ fn main() {
 
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("--serve") | Some("serve") => serve(),
+        _ => run_one_shot(&args),
+    }
+}
 
+/// One-shot mode: read a single job (file arg or whole stdin), execute through a
+/// fresh [`FastView`], print the hex returndata. Unchanged behaviour — the path
+/// the tests/examples and ad-hoc replays rely on.
+fn run_one_shot(args: &[String]) -> Result<()> {
     let text = if let Some(path) = args.first() {
         std::fs::read_to_string(path).with_context(|| format!("read job file {path}"))?
     } else {
@@ -53,7 +88,7 @@ fn run() -> Result<()> {
 
     if let Some(expected) = &job.expected {
         if expected.as_ref() != returndata.as_ref() {
-            anyhow::bail!(
+            bail!(
                 "returndata mismatch vs expected:\n  expected 0x{}\n  got      0x{}",
                 hex_encode(expected),
                 hex_encode(&returndata)
@@ -63,5 +98,119 @@ fn run() -> Result<()> {
     }
 
     println!("{}", hex_encode(&returndata));
+    Ok(())
+}
+
+/// Daemon mode: serve framed jobs from stdin against a persistent per-spec
+/// [`FastView`], so the engine bytecode compiles once and is reused across every
+/// segment. Loops until stdin EOF.
+fn serve() -> Result<()> {
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
+
+    // One FastView per SpecId seen. In practice a deployment pins a single spec,
+    // so this holds exactly one compiled engine for the daemon's lifetime; the
+    // per-spec map only guards the (unexpected) mixed-spec case without ever
+    // discarding a warm cache.
+    let mut views: Vec<(SpecId, FastView)> = Vec::new();
+
+    eprintln!(
+        "gk-fast-view: --serve daemon ready (compile-once; length-prefixed frames on stdin)"
+    );
+
+    loop {
+        let text = match read_request(&mut reader)? {
+            Some(t) => t,
+            None => {
+                eprintln!("gk-fast-view: --serve daemon: stdin EOF, exiting");
+                return Ok(());
+            }
+        };
+
+        let started = std::time::Instant::now();
+        match execute_job_text(&mut views, &text) {
+            Ok(returndata) => {
+                eprintln!(
+                    "gk-fast-view: --serve served job, {} bytes returndata in {:?} (engines compiled: {})",
+                    returndata.len(),
+                    started.elapsed(),
+                    views.iter().map(|(_, fv)| fv.compiled_count()).sum::<usize>(),
+                );
+                let hex = hex_encode(&returndata);
+                write_response(&mut writer, "OK", hex.as_bytes())?;
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                eprintln!("gk-fast-view: --serve job error: {msg}");
+                write_response(&mut writer, "ERR", msg.as_bytes())?;
+            }
+        }
+    }
+}
+
+/// Parse + execute one job against the persistent per-spec [`FastView`] cache,
+/// compiling the engine on first sight and reusing it forever after. Also honours
+/// a fixture `expected` line (turns a mismatch into a loud error), mirroring the
+/// one-shot path.
+fn execute_job_text(views: &mut Vec<(SpecId, FastView)>, text: &str) -> Result<Bytes> {
+    let job = Job::parse(text).context("parse job")?;
+
+    let idx = match views.iter().position(|(s, _)| *s == job.spec) {
+        Some(i) => i,
+        None => {
+            views.push((job.spec, FastView::new(job.spec).context("new FastView")?));
+            views.len() - 1
+        }
+    };
+    let returndata = job
+        .execute_with(&mut views[idx].1)
+        .context("execute view call")?;
+
+    if let Some(expected) = &job.expected {
+        if expected.as_ref() != returndata.as_ref() {
+            bail!(
+                "returndata mismatch vs expected:\n  expected 0x{}\n  got      0x{}",
+                hex_encode(expected),
+                hex_encode(&returndata)
+            );
+        }
+    }
+    Ok(returndata)
+}
+
+/// Read one length-prefixed request frame: a decimal byte-length line, then that
+/// many bytes of job text. Returns `Ok(None)` on a clean EOF (no more jobs).
+fn read_request<R: BufRead>(reader: &mut R) -> Result<Option<String>> {
+    let mut len_line = String::new();
+    let n = reader
+        .read_line(&mut len_line)
+        .context("read request length line")?;
+    if n == 0 {
+        return Ok(None); // clean EOF between frames
+    }
+    let trimmed = len_line.trim();
+    if trimmed.is_empty() {
+        // Tolerate a stray blank line between frames.
+        return read_request(reader);
+    }
+    let len: usize = trimmed
+        .parse()
+        .with_context(|| format!("parse request length {trimmed:?}"))?;
+    let mut buf = vec![0u8; len];
+    reader
+        .read_exact(&mut buf)
+        .context("read request body")?;
+    let text = String::from_utf8(buf).context("request body not utf-8")?;
+    Ok(Some(text))
+}
+
+/// Write one length-prefixed response frame: `"<STATUS> <len>\n"` then `<len>`
+/// bytes of payload, then flush.
+fn write_response<W: Write>(writer: &mut W, status: &str, payload: &[u8]) -> Result<()> {
+    write!(writer, "{status} {}\n", payload.len()).context("write response header")?;
+    writer.write_all(payload).context("write response body")?;
+    writer.flush().context("flush response")?;
     Ok(())
 }
