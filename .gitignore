@@ -20,3 +20,5 @@ Thumbs.db
 
 # Ignore test files
 test.csv
+# local repro assets (large weight blobs + engine bytecode dumps)
+repro/
