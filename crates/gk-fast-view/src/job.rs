@@ -224,6 +224,11 @@ impl Job {
     }
 
     /// Build the [`OverlayMountSet`] this job specifies (verifying mmap mounts).
+    ///
+    /// One-shot: every mmap mount re-runs `OverlayMount::from_files`'s
+    /// streaming-keccak verify. The persistent daemon uses
+    /// [`mount_set_cached`](Self::mount_set_cached) instead so the verify runs
+    /// once per distinct overlay.
     pub fn mount_set(&self) -> Result<OverlayMountSet> {
         let mut mounts = Vec::with_capacity(self.mounts.len());
         for m in &self.mounts {
@@ -240,6 +245,61 @@ impl Job {
             mounts.push(std::sync::Arc::new(mount));
         }
         Ok(OverlayMountSet::new(mounts))
+    }
+
+    /// Build the [`OverlayMountSet`] reusing `fv`'s process-lifetime mount cache:
+    /// an already-verified mount for a manifest is REUSED, so only the first job
+    /// of a given overlay pays `OverlayMount::from_files`'s streaming-keccak
+    /// verify over the (multi-gigabyte) weights blob. Byte-identical to
+    /// [`mount_set`](Self::mount_set): the manifest commits to the exact overlay
+    /// bytes, so a cached mount serves the same chunk code as a freshly-built one.
+    pub fn mount_set_cached(&self, fv: &mut FastView) -> Result<OverlayMountSet> {
+        let mut mounts = Vec::with_capacity(self.mounts.len());
+        for m in &self.mounts {
+            let mount = match m {
+                MountSpec::Pairs { manifest, pairs } => {
+                    let manifest = *manifest;
+                    let pairs = pairs.clone();
+                    fv.mount_get_or_build(manifest, move || {
+                        Ok(OverlayMount::from_pairs(manifest, pairs))
+                    })?
+                }
+                MountSpec::Files {
+                    weights,
+                    tokenizer,
+                    manifest,
+                } => {
+                    let manifest = *manifest;
+                    let weights = weights.clone();
+                    let tokenizer = tokenizer.clone();
+                    fv.mount_get_or_build(manifest, move || {
+                        OverlayMount::from_files(&weights, &tokenizer, manifest)
+                    })?
+                }
+            };
+            mounts.push(mount);
+        }
+        Ok(OverlayMountSet::new(mounts))
+    }
+
+    /// A deterministic fingerprint of the base-state db this job builds
+    /// ([`base_db`](Self::base_db)), so the persistent warm cache can tell apart
+    /// jobs whose resolved base reads would differ. Two jobs with the same
+    /// contract accounts + caller build byte-identical base state and can safely
+    /// share the warm cache; any difference changes the fingerprint and forces a
+    /// rebuild. Balances/nonces are fixed constants in `base_db`, so only each
+    /// account's (address, code) and the caller address are hashed. Order-
+    /// independent (accounts are sorted first) — `base_db` is a `HashMap`.
+    pub fn base_fingerprint(&self) -> B256 {
+        let mut accts: Vec<&(Address, Bytes)> = self.accounts.iter().collect();
+        accts.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut pre = Vec::with_capacity(self.accounts.len() * 52 + 20);
+        for (addr, code) in accts {
+            pre.extend_from_slice(addr.as_slice());
+            pre.extend_from_slice(keccak256(code).as_slice());
+        }
+        pre.extend_from_slice(self.from.as_slice());
+        keccak256(pre)
     }
 
     /// The in-memory base-state db (funded engine/contract accounts).
@@ -301,17 +361,25 @@ impl Job {
 
     /// Execute the job against a caller-owned [`FastView`], returning the
     /// returndata. Byte-for-byte identical to [`execute`](Self::execute) — the
-    /// compiled artifact is deterministic per `(codehash, spec)` — but the
-    /// caller's `fv` keeps the compiled-engine cache across calls, so only the
-    /// FIRST job of a given engine pays the LLVM codegen cost. This is the
-    /// compile-once-run-many amortization the persistent daemon relies on.
+    /// compiled artifact is deterministic per `(codehash, spec)`, and the warm
+    /// state cache is a pure memoizing passthrough over immutable state — but the
+    /// caller's `fv` amortizes THREE things across jobs: the LLVM codegen (only
+    /// the first job of a given engine pays it), the overlay mount verify (only
+    /// the first job of a given overlay re-runs the streaming keccak), and the
+    /// overlay/base state resolution (the 2nd..Nth job reads from the warm
+    /// cache). This is the amortization the persistent daemon relies on.
     ///
-    /// `fv` MUST be pinned to this job's `spec` (`FastView::call_view` enforces
-    /// it and errors loudly on mismatch).
+    /// `fv` MUST be pinned to this job's `spec` (`FastView::call_view_warm`
+    /// enforces it and errors loudly on mismatch).
     pub fn execute_with(&self, fv: &mut FastView) -> Result<Bytes> {
-        fv.call_view(
-            self.base_db(),
-            self.mount_set()?,
+        let mounts = self.mount_set_cached(fv)?;
+        let manifests = mounts.manifests();
+        let base_fingerprint = self.base_fingerprint();
+        fv.call_view_warm(
+            manifests,
+            base_fingerprint,
+            mounts,
+            || self.base_db(),
             &self.view_env(),
             &self.view_tx(),
             self.profile,
