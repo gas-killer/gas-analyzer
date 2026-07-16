@@ -142,6 +142,51 @@ fn serve_matches_oneshot_and_reuses_engine() {
     );
 }
 
+/// One `--serve` daemon must serve MULTIPLE DISTINCT ENGINES. revmc's JIT module
+/// finalizes after its first compile, so a single FastView can hold exactly one
+/// compiled engine — before the per-engine pooling fix, the second engine
+/// through the same daemon failed with "cannot compile more functions after
+/// finalizing the module" (observed LIVE when one node served the 0.6B and the
+/// 35B: every 35B job errored and fell back to the slow interpreter).
+#[test]
+fn serve_compiles_a_second_engine_after_the_first() {
+    let fixture_a = include_str!("golden/forward_range.fixture");
+    let job_a = Job::parse(fixture_a).expect("parse fixture");
+    let expected_a = job_a.expected.clone().expect("fixture expected");
+
+    // Engine B: a distinct trivial engine — PUSH32 <marker>; PUSH0; MSTORE;
+    // PUSH1 0x20; PUSH0; RETURN. Returndata = the 32-byte marker.
+    let marker: [u8; 32] = keccak256(b"gk-fast-view second-engine regression").0;
+    let mut code_b = vec![0x7f];
+    code_b.extend_from_slice(&marker);
+    code_b.extend_from_slice(&[0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3]);
+    let to_b = "00000000000000000000000000000000000000ab";
+    let job_b = format!(
+        "spec CANCUN\nprofile UnboundedV1Xl\nfrom {}\nto {}\ninput \ngas {}\naccount {} {}\n",
+        "0".repeat(40),
+        to_b,
+        1u64 << 30,
+        to_b,
+        hex_encode(&code_b),
+    );
+    Job::parse(&job_b).expect("job B parses");
+
+    let mut serve = Serve::spawn();
+    // 1. Engine A compiles + serves.
+    let (rd_a1, _) = serve.call(fixture_a);
+    assert_eq!(hex_encode(&rd_a1), hex_encode(&expected_a), "engine A job 1 != golden");
+    // 2. Engine B through the SAME daemon — the pre-fix failure point.
+    let (rd_b1, _) = serve.call(&job_b);
+    assert_eq!(hex_encode(&rd_b1), hex_encode(&marker), "engine B returndata != marker");
+    // 3. Back to engine A: its FastView (and caches) must be undisturbed.
+    let (rd_a2, _) = serve.call(fixture_a);
+    assert_eq!(hex_encode(&rd_a2), hex_encode(&expected_a), "engine A job 2 != golden after B");
+    // 4. Engine B again: reuses its own compiled artifact.
+    let (rd_b2, _) = serve.call(&job_b);
+    assert_eq!(hex_encode(&rd_b2), hex_encode(&marker), "engine B job 2 != marker");
+    eprintln!("[two-engine OK] one daemon served two distinct engines, both byte-identical across reuse");
+}
+
 // ---------------------------------------------------------------------------
 // Real-engine amortization (the money metric). #[ignore]d: needs the multi-GB
 // weights overlay and ~2 min (one real LLVM codegen of the ~20KB seg engine).
