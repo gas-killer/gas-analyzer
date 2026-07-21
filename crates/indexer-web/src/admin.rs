@@ -796,7 +796,10 @@ fn render_markdown(src: &str) -> String {
 /// check since browsers strip them too when parsing a URL, so a scheme can't
 /// be split across them (e.g. `jav\tascript:`) to dodge the check.
 fn is_safe_url(url: &str) -> bool {
-    let cleaned: String = url.chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).collect();
+    let cleaned: String = url
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
     let trimmed = cleaned.trim_start();
     let Some(colon_idx) = trimmed.find(':') else {
         return true;
