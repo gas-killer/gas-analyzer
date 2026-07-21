@@ -1016,6 +1016,42 @@ mod tests {
     }
 
     #[test]
+    fn canonical_total_call_gas_matches_legacy_for_delegatecall_trace() {
+        // TARGET delegatecalls a library, which (still in TARGET's context)
+        // makes an emitted CALL to y. The delegatecall itself is never emitted
+        // and never charged in either encoder — only the CALL is — so both
+        // encoders must agree on total_call_gas despite Canonical hoisting
+        // delegatecall frames instead of emitting them.
+        let lib = Address::new([0x33; 20]);
+        let y = Address::new([0x44; 20]);
+        let logs = vec![
+            delegatecall(1, 80_000, lib, None),
+            call(2, 70_000, y),
+            resume(2, 65_000, true),
+            resume(1, 60_000, true),
+        ];
+        let canonical_trace = DefaultFrame {
+            failed: false,
+            gas: 0,
+            return_value: Default::default(),
+            struct_logs: logs.clone(),
+        };
+        let (_, _, canon_gas) =
+            compute_state_updates_canonical(canonical_trace, TARGET_ADDR).expect("canonical");
+        let legacy_trace = DefaultFrame {
+            failed: false,
+            gas: 0,
+            return_value: Default::default(),
+            struct_logs: logs,
+        };
+        let (_, _, legacy_gas) = compute_state_updates(legacy_trace).expect("legacy");
+        assert_eq!(
+            canon_gas, legacy_gas,
+            "total_call_gas must agree between encoders on a delegatecall-heavy trace"
+        );
+    }
+
+    #[test]
     fn write_by_unrelated_callee_is_not_attributed_to_target() {
         // Inside CALL(x), x writes ITS OWN storage (storage_ctx = x ≠ TARGET).
         // That must never enter TARGET's canonical image.
