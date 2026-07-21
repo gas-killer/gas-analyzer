@@ -20,7 +20,9 @@ pub use heuristic::{
     WARM_SSTORE_COST, estimate_gas_from_operations, estimate_gas_from_state_updates,
     extract_operation_counts_from_trace,
 };
-pub use trace::{compute_state_updates, copy_memory, parse_trace_memory};
+pub use trace::{
+    compute_state_updates, compute_state_updates_canonical, copy_memory, parse_trace_memory,
+};
 pub use types::{
     DummyExternal, IStateUpdateTypes, Opcode, RevertingContext, SimpleStorage, StateUpdate,
     StateUpdateType, StateUpdates,
