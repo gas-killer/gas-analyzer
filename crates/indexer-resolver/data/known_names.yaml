@@ -1,0 +1,78 @@
+# Curated mapping from Etherscan ContractName → project_slug.
+# Highest-priority resolution after the YAML overlay. Used by the auto-labeler
+# when it pulls a verified contract name from Etherscan and needs to decide
+# which DefiLlama project_slug it belongs to.
+#
+# Names are matched case-insensitively after stripping common version/role
+# suffixes (V1, V2, V3, Router, Router02, RouterV2, Token, Proxy,
+# Implementation). Add entries here when you see a recurring `ContractName`
+# in the labeler logs that doesn't auto-resolve.
+#
+# Slug should match an existing entry in DefiLlama (so category metadata
+# joins correctly) or in `overlay.yaml`.
+
+# === stablecoins / tokens ===
+- name: TetherToken
+  slug: tether
+- name: FiatTokenProxy
+  slug: usd-coin
+- name: FiatTokenV2_2
+  slug: usd-coin
+- name: WETH9
+  slug: weth
+- name: Dai
+  slug: makerdao
+- name: BNB
+  slug: binance-cex
+
+# === DEX routers ===
+- name: UniswapV2Router02
+  slug: uniswap-v2
+- name: UniswapV3Router
+  slug: uniswap-v3
+- name: SwapRouter
+  slug: uniswap-v3
+- name: SwapRouter02
+  slug: uniswap-v3
+- name: UniversalRouter
+  slug: uniswap-v3
+- name: SushiV2Router
+  slug: sushiswap
+- name: SushiSwapRouter
+  slug: sushiswap
+
+# === DEX aggregators ===
+- name: AggregationRouterV5
+  slug: 1inch-network
+- name: AggregationRouterV6
+  slug: 1inch-network
+- name: GenericRouter
+  slug: 0x
+
+# === lending / money markets ===
+- name: AAVEPool
+  slug: aave-v3
+- name: Pool
+  slug: aave-v3
+- name: AAVELending
+  slug: aave-v2
+- name: Comptroller
+  slug: compound-finance
+- name: Bulker
+  slug: compound-v3
+
+# === staking / liquid staking ===
+- name: stETH
+  slug: lido
+- name: Lido
+  slug: lido
+- name: rETH
+  slug: rocket-pool
+- name: RocketDepositPool
+  slug: rocket-pool
+
+# === MEV / infra ===
+- name: BundleExecutor
+  slug: flashbots
+- name: MEVBlocker
+  slug: mev-blocker

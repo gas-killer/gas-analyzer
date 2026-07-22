@@ -1,0 +1,289 @@
+{% extends "base.html" %}
+{% block title %}Overview — Gas Killer Indexer{% endblock %}
+{% block content %}
+
+<section class="card hero-card">
+    <h3>Total gas saved · lifetime</h3>
+    <div class="metric hero-metric">{{ totals_lifetime.usd_saved }}</div>
+    <div class="muted">{{ totals_lifetime.eth_saved }} · {{ totals_lifetime.tx_count }} txs across {{ totals_lifetime.project_count }} projects</div>
+</section>
+
+<section class="totals-grid">
+    <div class="card">
+        <h3>Last 30d</h3>
+        <div class="metric">{{ totals_30d.usd_saved }}</div>
+        <div class="muted">{{ totals_30d.eth_saved }} · {{ totals_30d.tx_count }} txs</div>
+    </div>
+    <div class="card">
+        <h3>Last 7d</h3>
+        <div class="metric">{{ totals_7d.usd_saved }}</div>
+        <div class="muted">{{ totals_7d.eth_saved }} · {{ totals_7d.tx_count }} txs</div>
+    </div>
+    <div class="card">
+        <h3>Last 24h</h3>
+        <div class="metric">{{ totals_24h.usd_saved }}</div>
+        <div class="muted">{{ totals_24h.eth_saved }} · {{ totals_24h.tx_count }} txs</div>
+    </div>
+</section>
+
+<section class="totals-grid projection-grid">
+    <div class="card projection-card">
+        <h3>Projected monthly</h3>
+        <div class="metric">{{ projection.monthly_usd }}</div>
+        <div class="muted">{{ projection.monthly_eth }} <span class="extrapolated">· extrapolated from last 30d</span></div>
+    </div>
+    <div class="card projection-card">
+        <h3>Projected yearly</h3>
+        <div class="metric">{{ projection.yearly_usd }}</div>
+        <div class="muted">{{ projection.yearly_eth }} <span class="extrapolated">· extrapolated from last 30d × 12.17</span></div>
+    </div>
+</section>
+
+<section class="charts-row">
+    <div class="card chart-card">
+        <h3>Tx count · last 30 days</h3>
+        <canvas id="dailyChart"></canvas>
+    </div>
+</section>
+
+<section class="card">
+    <div class="leaderboard-header">
+        <h3 style="margin:0;">Leaderboard · last 30 days</h3>
+        <div class="pivot-toggle" role="tablist">
+            <a href="?group=functions" class="pivot-chip{% if group == "functions" %} active{% endif %}">Functions</a>
+            <a href="?group=contracts" class="pivot-chip{% if group == "contracts" %} active{% endif %}">Contracts</a>
+            <a href="?group=projects"  class="pivot-chip{% if group == "projects"  %} active{% endif %}">Projects</a>
+            <a href="?group=orgs"      class="pivot-chip{% if group == "orgs"      %} active{% endif %}">Orgs</a>
+        </div>
+    </div>
+    <p class="muted" style="margin-top:10px;margin-bottom:14px;">
+        <strong>% of gas bill</strong> = wei_saved / wei_spent — the dollar pitch.
+        <strong>Median</strong> = robust avg over covered txs only.
+        Default sort: USD saved (highest first).
+    </p>
+
+    {% if group == "orgs" %}
+    <table class="data-table" id="leaderboard">
+        <thead>
+            <tr>
+                <th>Organization</th>
+                <th class="right sortable" data-sort="num" data-col="1" data-default="desc">Projects <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="2" data-default="desc">Contracts <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="3" data-default="desc">Txs <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="4" data-default="desc">USD saved <span class="sort-indicator">▼</span></th>
+                <th class="right sortable" data-sort="num" data-col="5" data-default="desc">Avg % <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="6" data-default="desc">% of gas bill <span class="sort-indicator"></span></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for row in orgs %}
+            <tr>
+                <td><strong>{{ row.org_name }}</strong></td>
+                <td class="right">{{ row.project_count }}</td>
+                <td class="right">{{ row.contract_count }}</td>
+                <td class="right">{{ row.tx_count }}</td>
+                <td class="right"><strong>{{ row.usd_saved }}</strong></td>
+                <td class="right">{{ row.avg_savings_pct_pct }}</td>
+                <td class="right">{{ row.savings_of_spend_pct }}</td>
+            </tr>
+        {% else %}
+            <tr><td colspan="7" class="muted">No organizations defined yet — assign projects to orgs via <a href="/admin/orgs">/admin/orgs</a>.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else if group == "functions" %}
+    <table class="data-table" id="leaderboard">
+        <thead>
+            <tr>
+                <th>Function</th>
+                <th>Contract</th>
+                <th>Project</th>
+                <th class="right sortable" data-sort="num" data-col="3" data-default="desc">Txs <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="4" data-default="desc">USD saved <span class="sort-indicator">▼</span></th>
+                <th class="right sortable" data-sort="num" data-col="5" data-default="desc">Avg % <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="6" data-default="desc">Median % <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="7" data-default="desc">% of gas bill <span class="sort-indicator"></span></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for row in functions %}
+            <tr>
+                <td>
+                    <a href="/functions/{{ row.address_hex }}/{{ row.selector_hex }}">
+                    {% if !row.function_name.is_empty() %}
+                        <strong title="{{ row.function_sig }}">{{ row.function_name }}</strong>
+                        <span class="muted" style="font-size:11px;"><code>{{ row.selector_hex }}</code></span>
+                    {% else %}
+                        <code>{{ row.selector_hex }}</code>
+                        <span class="muted" style="font-size:11px;">?</span>
+                    {% endif %}
+                    </a>
+                </td>
+                <td><a href="/contracts/{{ row.address_hex }}"><code>{{ row.address_hex }}</code></a></td>
+                <td><a href="/projects/{{ row.project_slug }}">{{ row.project_display }}</a></td>
+                <td class="right">{{ row.tx_count }}</td>
+                <td class="right"><strong>{{ row.usd_saved }}</strong></td>
+                <td class="right">{{ row.avg_savings_pct_pct }}</td>
+                <td class="right">{{ row.median_savings_pct_pct }}</td>
+                <td class="right">{{ row.savings_of_spend_pct }}</td>
+            </tr>
+        {% else %}
+            <tr><td colspan="8" class="muted">No data yet.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else if group == "contracts" %}
+    <table class="data-table" id="leaderboard">
+        <thead>
+            <tr>
+                <th>Contract</th>
+                <th>Project</th>
+                <th class="right sortable" data-sort="num" data-col="2" data-default="desc">Funcs <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="3" data-default="desc">Txs <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="4" data-default="desc">USD saved <span class="sort-indicator">▼</span></th>
+                <th class="right sortable" data-sort="num" data-col="5" data-default="desc">Avg % <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="6" data-default="desc">Median % <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="7" data-default="desc">% of gas bill <span class="sort-indicator"></span></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for row in contracts %}
+            <tr>
+                <td><a href="/contracts/{{ row.address_hex }}"><code>{{ row.address_hex }}</code></a></td>
+                <td>
+                    {% match row.unknown_address_hex %}
+                        {% when Some with (addr) %}
+                            <span class="label-cell" id="label-cell-{{ addr }}">
+                                <a href="/projects/{{ row.project_slug }}" class="label-unknown">{{ row.project_display }}</a>
+                                <a class="label-edit-icon" href="#"
+                                   hx-get="/api/labels/edit?address={{ addr }}&chain_id={{ chain_id }}"
+                                   hx-target="#label-cell-{{ addr }}"
+                                   hx-swap="outerHTML"
+                                   title="Map to project">✎</a>
+                            </span>
+                        {% when None %}
+                            <a href="/projects/{{ row.project_slug }}">{{ row.project_display }}</a>
+                    {% endmatch %}
+                </td>
+                <td class="right">{{ row.function_count }}</td>
+                <td class="right">{{ row.tx_count }}</td>
+                <td class="right"><strong>{{ row.usd_saved }}</strong></td>
+                <td class="right">{{ row.avg_savings_pct_pct }}</td>
+                <td class="right">{{ row.median_savings_pct_pct }}</td>
+                <td class="right">{{ row.savings_of_spend_pct }}</td>
+            </tr>
+        {% else %}
+            <tr><td colspan="8" class="muted">No data yet.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <table class="data-table" id="leaderboard">
+        <thead>
+            <tr>
+                <th>Project</th>
+                <th class="right sortable" data-sort="num" data-col="1" data-default="desc">Txs <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="2" data-default="desc">Avg % <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="3" data-default="desc">Median % <span class="sort-indicator"></span></th>
+                <th class="right sortable" data-sort="num" data-col="4" data-default="desc">% of gas bill <span class="sort-indicator">▼</span></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for row in leaderboard %}
+            <tr>
+                <td>
+                    {% match row.unknown_address_hex %}
+                        {% when Some with (addr) %}
+                            <span class="label-cell" id="label-cell-{{ addr }}">
+                                <a href="/projects/{{ row.project_slug }}" class="label-unknown">{{ row.display_name }}</a>
+                                <a class="label-edit-icon" href="#"
+                                   hx-get="/api/labels/edit?address={{ addr }}&chain_id={{ chain_id }}"
+                                   hx-target="#label-cell-{{ addr }}"
+                                   hx-swap="outerHTML"
+                                   title="Map to project">✎</a>
+                            </span>
+                        {% when None %}
+                            <span class="label-cell" id="project-cell-{{ row.project_slug }}">
+                                <a href="/projects/{{ row.project_slug }}">{{ row.display_name }}</a>
+                                <a class="label-edit-icon" href="#"
+                                   hx-get="/api/projects/edit?slug={{ row.project_slug }}"
+                                   hx-target="#project-cell-{{ row.project_slug }}"
+                                   hx-swap="outerHTML"
+                                   title="Rename display name">✎</a>
+                            </span>
+                    {% endmatch %}
+                </td>
+                <td class="right">{{ row.tx_count }}</td>
+                <td class="right">{{ row.avg_savings_pct_pct }}</td>
+                <td class="right">{{ row.median_savings_pct_pct }}</td>
+                <td class="right"><strong>{{ row.savings_of_spend_pct }}</strong></td>
+            </tr>
+        {% else %}
+            <tr><td colspan="5" class="muted">No data yet.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+</section>
+
+<script id="daily-data" type="application/json">{
+    "labels": [{% for p in daily_30d %}"{{ p.day }}"{% if !loop.last %},{% endif %}{% endfor %}],
+    "values": [{% for p in daily_30d %}{{ p.tx_count }}{% if !loop.last %},{% endif %}{% endfor %}]
+}</script>
+<script>
+window.addEventListener("DOMContentLoaded", () => {
+    const daily = JSON.parse(document.getElementById("daily-data").textContent);
+    new Chart(document.getElementById("dailyChart"), {
+        type: "line",
+        data: {
+            labels: daily.labels,
+            datasets: [{ label: "Tx count", data: daily.values, borderColor: "#7ec8a4", backgroundColor: "rgba(126,200,164,0.18)", tension: 0.25, fill: true }]
+        },
+        options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { ticks: { callback: v => Number(v).toLocaleString() } } } }
+    });
+
+    const table = document.getElementById("leaderboard");
+    if (!table) return;
+    const tbody = table.tBodies[0];
+    const headers = table.querySelectorAll("th.sortable");
+    const parseNum = (s) => {
+        // Cells are formatted for humans ($1.23M, $45.60K, 12.3%, 1,234), so
+        // parse the mantissa AND honour any K/M/B magnitude suffix — otherwise
+        // "$1.23M" would parse to 1.23 and sort below "$999".
+        const t = (s || "").trim();
+        const n = parseFloat(t.replace(/[^0-9.\-]/g, ""));
+        if (isNaN(n)) return -Infinity;
+        const suffix = t.replace(/[0-9.,$%\s\-]/g, "").toUpperCase();
+        const mult = suffix.includes("B") ? 1e9
+                   : suffix.includes("M") ? 1e6
+                   : suffix.includes("K") ? 1e3
+                   : 1;
+        return n * mult;
+    };
+    const sortBy = (col, dir) => {
+        const rows = Array.from(tbody.querySelectorAll("tr")).filter(r => r.children.length > 1);
+        rows.sort((a, b) => {
+            const av = parseNum(a.children[col].textContent);
+            const bv = parseNum(b.children[col].textContent);
+            return dir === "asc" ? av - bv : bv - av;
+        });
+        rows.forEach(r => tbody.appendChild(r));
+    };
+    headers.forEach(th => {
+        th.style.cursor = "pointer";
+        th.addEventListener("click", () => {
+            const col = parseInt(th.dataset.col, 10);
+            const current = th.dataset.dir;
+            const next = current === "desc" ? "asc" : "desc";
+            headers.forEach(h => {
+                h.dataset.dir = "";
+                h.querySelector(".sort-indicator").textContent = "";
+            });
+            th.dataset.dir = next;
+            th.querySelector(".sort-indicator").textContent = next === "desc" ? "▼" : "▲";
+            sortBy(col, next);
+        });
+    });
+});
+</script>
+{% endblock %}

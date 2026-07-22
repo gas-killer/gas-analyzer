@@ -1,0 +1,34 @@
+<p class="muted" style="margin-top:0;">
+    Still-unlabeled contracts whose first analyzed transaction landed within the
+    last {{ days }} days{% if min_eth > 0.0 %}, with at least {{ min_eth }} ETH saved{% endif %}.
+    Ranked by lifetime ETH saved. Blacklisted contracts and unsupported-opcode / 0%-savings rows are excluded.
+</p>
+<table class="data-table">
+    <thead>
+        <tr>
+            <th>Address</th>
+            <th>First seen</th>
+            <th>Last seen</th>
+            <th class="right">Txs</th>
+            <th class="right">ETH saved</th>
+            <th class="right">USD saved</th>
+        </tr>
+    </thead>
+    <tbody>
+    {% for c in candidates %}
+        <tr>
+            <td>
+                <a href="/contracts/{{ c.address_hex }}"><code>{{ c.address_hex }}</code></a>
+                <a href="{{ explorer_address_url }}{{ c.address_hex }}" target="_blank" rel="noopener" class="external-link" title="Open on explorer">↗</a>
+            </td>
+            <td>{{ c.first_seen }}</td>
+            <td>{{ c.last_seen }}</td>
+            <td class="right">{{ c.tx_count }}</td>
+            <td class="right">{{ c.eth_saved }}</td>
+            <td class="right">{{ c.usd_saved }}</td>
+        </tr>
+    {% else %}
+        <tr><td colspan="6" class="muted">No newly-appearing unlabeled contracts cleared the filter.</td></tr>
+    {% endfor %}
+    </tbody>
+</table>

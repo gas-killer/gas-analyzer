@@ -1,0 +1,80 @@
+{% if health.falls_behind %}
+<div class="alert-banner">
+    ⚠ Indexer is {{ health.blocks_behind.unwrap_or(0) }} blocks behind chain head
+    (warn threshold: {{ health.blocks_behind_threshold }}). Recent data may be stale.
+</div>
+{% endif %}
+
+<div class="health-grid">
+    <div class="health-cell" data-tip="The most recent block of transactions we've finished analyzing for gas savings.">
+        <div class="muted">Latest analyzed block</div>
+        <div class="metric">
+            {% match health.latest_analyzed_block %}
+                {% when Some with (b) %}{{ b }}
+                {% when None %}—
+            {% endmatch %}
+        </div>
+    </div>
+    <div class="health-cell" data-tip="The latest block currently live on the blockchain. If this stops moving, the indexer has lost its connection to the chain.">
+        <div class="muted">Latest block on chain</div>
+        <div class="metric">
+            {% match health.last_seen_block %}
+                {% when Some with (b) %}{{ b }}
+                {% when None %}<span class="muted">stale</span>
+            {% endmatch %}
+        </div>
+    </div>
+    <div class="health-cell" data-tip="How far our analysis is behind the live blockchain. Small is healthy; a large or growing number means recent transactions aren't reflected in the figures yet.">
+        <div class="muted">Blocks behind</div>
+        <div class="metric {% if health.falls_behind %}metric-bad{% endif %}">
+            {% match health.blocks_behind %}
+                {% when Some with (b) %}{{ b }}
+                {% when None %}—
+            {% endmatch %}
+        </div>
+    </div>
+    <div class="health-cell" data-tip="Transactions lined up and waiting to be analyzed. A short-lived backlog is normal; a number that stays high means analysis can't keep up with chain activity.">
+        <div class="muted">Waiting to analyze</div>
+        <div class="metric">{{ health.pending_queue }}</div>
+    </div>
+    <div class="health-cell" data-tip="Transactions we couldn't analyze even after several automatic retries — usually a temporary data-provider hiccup. These are not counted in any savings figure. A handful is normal; a steadily rising number means the figures may be missing some activity.">
+        <div class="muted">Failed to analyze</div>
+        <div class="metric">{{ health.dead_letter }}</div>
+    </div>
+    <div class="health-cell" data-tip="How long ago we last recorded a newly analyzed transaction. If this keeps climbing, analysis has stalled.">
+        <div class="muted">Last analyzed</div>
+        <div class="metric">
+            {% match health.last_insert_age_secs %}
+                {% when Some with (s) %}{{ s }}s ago
+                {% when None %}—
+            {% endmatch %}
+        </div>
+    </div>
+    <div class="health-cell" data-tip="Total transactions analyzed so far. Includes some that are later excluded from the savings figures (for example zero-savings or unsupported transactions).">
+        <div class="muted">Total analyzed</div>
+        <div class="metric">{{ health.total_rows }}</div>
+    </div>
+    <div class="health-cell" data-tip="Share of the last 24 hours' transactions where savings were estimated rather than measured exactly. A higher number means less precise figures, usually caused by data-provider limits.">
+        <div class="muted">Estimated · 24h</div>
+        <div class="metric">
+            {% match health.heuristic_rate_24h %}
+                {% when Some with (r) %}{{ "{:.1}"|format(r * 100.0) }}%
+                {% when None %}—
+            {% endmatch %}
+        </div>
+    </div>
+</div>
+
+{% if !health.error_categories.is_empty() %}
+<div class="card" style="margin-top:14px;background:var(--bg);">
+    <h3 style="margin-bottom:8px;">Errors · last 24h</h3>
+    <table class="data-table compact">
+        <thead><tr><th>Category</th><th class="right">Count</th></tr></thead>
+        <tbody>
+        {% for e in health.error_categories %}
+            <tr><td>{{ e.label }}</td><td class="right">{{ e.count }}</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}

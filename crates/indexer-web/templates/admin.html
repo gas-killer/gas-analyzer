@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}Admin — Gas Killer Indexer{% endblock %}
+{% block content %}
+
+<h2>Admin <span class="muted" style="font-size:14px;">· <a href="/admin/blacklist">Blacklist</a> · <a href="/admin/orgs">Organizations</a></span></h2>
+
+<section class="card">
+    <h3>Service health</h3>
+    <div id="health-region"
+         hx-get="/admin/health"
+         hx-trigger="every 5s"
+         hx-swap="innerHTML">
+        {% include "_health.html" %}
+    </div>
+</section>
+
+<section class="card">
+    <h3>Data start date</h3>
+    <p class="muted">Ignore everything before this date across the whole dashboard — totals, leaderboards, charts, contract pages and candidates. Use it to hide unreliable early data (savings recorded before the analysis method was finalised) so the figures you show only count trustworthy results. Leave the date empty to include all history.</p>
+    <form class="candidates-filter"
+          hx-post="/admin/data-floor"
+          hx-target="#data-floor-banner"
+          hx-swap="innerHTML">
+        <label>Start from
+            <input type="date" name="floor" value="{{ data_floor }}">
+        </label>
+        <button class="btn" type="submit">Apply</button>
+    </form>
+    <p class="muted" style="margin-top:6px;">
+        {% if data_floor.is_empty() %}
+            Currently including <strong>all history</strong>.
+        {% else %}
+            Currently ignoring everything before <strong>{{ data_floor }}</strong>.
+        {% endif %}
+    </p>
+    <div id="data-floor-banner"></div>
+</section>
+
+<section class="card">
+    <h3>High-savings candidates</h3>
+    <p class="muted">Still-unlabeled contracts that <em>first appeared recently</em> and are saving meaningful gas — fresh gas-killer candidates worth researching and labeling. Blacklisted contracts and unsupported-opcode / 0%-savings rows are excluded.</p>
+    <form class="candidates-filter"
+          hx-get="/admin/candidates"
+          hx-target="#candidates-region"
+          hx-swap="innerHTML"
+          hx-trigger="load, submit">
+        <label>New within
+            <input type="number" name="days" value="14" min="1" max="365"> days
+        </label>
+        <label>Min saved
+            <input type="number" name="min_eth" value="0" min="0" step="0.0001"> ETH
+        </label>
+        <button class="btn" type="submit">Apply</button>
+    </form>
+    <div id="candidates-region" class="muted">loading…</div>
+</section>
+
+<section class="card">
+    <h3>AI diagnostics</h3>
+    <p class="muted">Bundles current counters + recent error events and asks an LLM (via OpenRouter) to summarize what's wrong, what's healthy, and what to do next.</p>
+    <button class="btn"
+            hx-post="/admin/diagnose"
+            hx-target="#diagnose-region"
+            hx-swap="innerHTML"
+            hx-indicator="#diagnose-spinner">Diagnose now</button>
+    <span id="diagnose-spinner" class="htmx-indicator muted" style="margin-left:10px;">working…</span>
+    <div id="diagnose-region" class="diagnose-region"></div>
+</section>
+
+<section class="card">
+    <h3>Manual refresh</h3>
+    <p class="muted">Each button triggers the same job the refresher loop runs internally — useful when you want the dashboard to reflect a recent change without waiting for the next tick. None of these are destructive: they re-read upstream data and re-aggregate, but never delete or rewrite history.</p>
+    <div class="refresh-grid">
+        <div class="refresh-item">
+            <button class="btn" hx-post="/admin/refresh/rollups" hx-target="#refresh-banner" hx-swap="innerHTML">Refresh project_daily &amp; function_daily</button>
+            <p class="muted">Rebuilds the hourly rollups feeding leaderboards. Cheap — ~10s on a fresh deploy.</p>
+        </div>
+        <div class="refresh-item">
+            <button class="btn" hx-post="/admin/refresh/eth-price" hx-target="#refresh-banner" hx-swap="innerHTML">Refresh ETH price</button>
+            <p class="muted">Fetches today's ETH/USD from Coingecko and upserts. Fixes "USD missing" gaps.</p>
+        </div>
+        <div class="refresh-item">
+            <button class="btn" hx-post="/admin/refresh/eth-price-backfill" hx-target="#refresh-banner" hx-swap="innerHTML" hx-confirm="Fetch historical ETH/USD prices from Coingecko for every day in the analysis range that doesn't already have one?">Backfill historical ETH prices</button>
+            <p class="muted">One HTTP call to Coingecko's <code>market_chart/range</code> covering <code>min(block_timestamp)</code> through today, daily granularity. Existing rows are preserved. Run once after a fresh deploy, or after a long outage in the refresher's price loop.</p>
+        </div>
+        <div class="refresh-item">
+            <button class="btn" hx-post="/admin/refresh/resolver" hx-target="#refresh-banner" hx-swap="innerHTML">Refresh resolver</button>
+            <p class="muted">Re-reads the YAML overlay + DefiLlama protocol list, upserts projects, retro-relabels historical unknowns that now have mappings.</p>
+        </div>
+        <div class="refresh-item">
+            <button class="btn" hx-post="/admin/refresh/labeler" hx-target="#refresh-banner" hx-swap="innerHTML">Tick labeler producer</button>
+            <p class="muted">Pushes the next batch of top-savings unknown contracts into the Etherscan/Blockscout lookup queue.</p>
+        </div>
+        <div class="refresh-item">
+            <button class="btn" hx-post="/admin/refresh/relabel" hx-target="#refresh-banner" hx-swap="innerHTML">Relabel unknowns</button>
+            <p class="muted">Sweeps the analysis table: any row tagged <code>unknown:0x...</code> whose address has since been mapped gets its slug rewritten.</p>
+        </div>
+    </div>
+    <div id="refresh-banner"></div>
+</section>
+
+{% endblock %}

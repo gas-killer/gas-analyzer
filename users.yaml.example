@@ -1,0 +1,12 @@
+# Allowlist of users permitted to sign in to the indexer-web UI.
+# Mounted into the container at /etc/indexer/users.yaml.
+#
+# Generate a bcrypt hash with one of:
+#   htpasswd -bnBC 12 "" 'YOUR-PASSWORD' | tr -d ':\n'
+#   python3 -c "import bcrypt;print(bcrypt.hashpw(b'YOUR-PASSWORD', bcrypt.gensalt(12)).decode())"
+#
+# (Cost factor 12 is the bcrypt default — fine for this small list. Higher
+#  costs slow login by O(2^n).)
+
+- username: ramgos
+  bcrypt_hash: "$2b$12$replace.this.with.your.real.bcrypt.hash.string.................."

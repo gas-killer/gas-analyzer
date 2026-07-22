@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}Triage — Gas Killer Indexer{% endblock %}
+{% block content %}
+
+<section class="card">
+    <div class="leaderboard-header">
+        <h3 style="margin:0;">Triage · last 30 days</h3>
+        <div class="pivot-toggle" role="tablist">
+            <a href="?tab=contracts" class="pivot-chip{% if tab == "contracts" %} active{% endif %}">Unknown contracts</a>
+            <a href="?tab=selectors" class="pivot-chip{% if tab == "selectors" %} active{% endif %}">Unresolved selectors</a>
+        </div>
+    </div>
+    <p class="muted" style="margin-top:10px;">
+        {% if tab == "selectors" %}
+            Function selectors 4byte.directory has no signature for, ranked by total savings.
+            Resolve manually by clicking through to the function page and editing the row.
+        {% else %}
+            Contract addresses with no project mapping yet, ranked by total savings.
+            Click ✎ to map an address to a known project.
+        {% endif %}
+    </p>
+
+    {% if tab == "selectors" %}
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Selector</th>
+                <th>Example contract</th>
+                <th class="right">Txs</th>
+                <th class="right">USD saved</th>
+                <th class="right">ETH saved</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for r in selectors %}
+            <tr>
+                <td><a href="/functions/{{ r.example_address_hex }}/{{ r.selector_hex }}"><code>{{ r.selector_hex }}</code></a></td>
+                <td><a href="/contracts/{{ r.example_address_hex }}"><code>{{ r.example_address_hex }}</code></a></td>
+                <td class="right">{{ r.tx_count }}</td>
+                <td class="right"><strong>{{ r.usd_saved }}</strong></td>
+                <td class="right">{{ r.wei_saved }}</td>
+            </tr>
+        {% else %}
+            <tr><td colspan="5" class="muted">No unresolved selectors — 4byte has signatures for everything in the window.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Address</th>
+                <th>Display name</th>
+                <th class="right">Txs</th>
+                <th class="right">ETH saved</th>
+                <th class="right">Last seen</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for r in contracts %}
+            <tr>
+                <td>
+                    <a href="/contracts/{{ r.address_hex }}"><code>{{ r.address_hex }}</code></a>
+                    <a href="{{ explorer_address_url }}{{ r.address_hex }}" target="_blank" rel="noopener" class="external-link" title="Open on Etherscan">↗</a>
+                </td>
+                <td>
+                    <span class="label-cell" id="label-cell-{{ r.address_hex }}">
+                        <span class="label-unknown">unknown</span>
+                        <a class="label-edit-icon" href="#"
+                           hx-get="/api/labels/edit?address={{ r.address_hex }}&chain_id={{ chain_id }}"
+                           hx-target="#label-cell-{{ r.address_hex }}"
+                           hx-swap="outerHTML"
+                           title="Map to project">✎</a>
+                    </span>
+                </td>
+                <td class="right">{{ r.tx_count }}</td>
+                <td class="right">{{ r.wei_saved }}</td>
+                <td class="right">{{ r.last_seen }}</td>
+            </tr>
+        {% else %}
+            <tr><td colspan="5" class="muted">No unknown contracts in the last 30 days — every measured tx mapped to a known project.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+</section>
+
+{% endblock %}

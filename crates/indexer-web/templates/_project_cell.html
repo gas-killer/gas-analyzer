@@ -1,0 +1,9 @@
+<span class="label-cell" id="project-cell-{{ project_slug }}">
+    <a href="/projects/{{ project_slug }}">{{ display_name }}</a>
+    <a class="label-edit-icon"
+       href="#"
+       hx-get="/api/projects/edit?slug={{ project_slug }}"
+       hx-target="#project-cell-{{ project_slug }}"
+       hx-swap="outerHTML"
+       title="Rename display name">✎</a>
+</span>
