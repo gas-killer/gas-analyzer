@@ -55,11 +55,31 @@ pub async fn run(common: CommonConfig, cfg: WorkerConfig) -> Result<()> {
 
     tracing::info!("worker ready");
 
+    let ttl_secs = cfg.queue_job_ttl_secs as i64;
+    let mut expired_dropped: u64 = 0;
+
     loop {
         let job = match queue.claim(Duration::from_secs(5)).await? {
             Some(j) => j,
             None => continue,
         };
+
+        // Enqueue outpaces drain whenever analysis capacity trails chain
+        // volume, so stale jobs are dropped at claim time instead of being
+        // analyzed arbitrarily late. Checked before `acquire` so expired
+        // jobs never spend rate-limiter budget.
+        if ttl_secs > 0 {
+            let expired = job
+                .age_secs(chrono::Utc::now().timestamp())
+                .is_some_and(|age| age > ttl_secs);
+            if expired {
+                expired_dropped += 1;
+                if expired_dropped.is_multiple_of(1000) {
+                    tracing::info!(total = expired_dropped, "expired jobs dropped");
+                }
+                continue;
+            }
+        }
 
         let _permit = limiter.acquire(analyze_weight).await;
         if let Err(e) = handle(&job, &analyzer, &resolver, &store, &cfg, &queue).await {
