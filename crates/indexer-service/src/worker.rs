@@ -44,6 +44,15 @@ pub async fn run(common: CommonConfig, cfg: WorkerConfig) -> Result<()> {
 
     let queue = Queue::connect(&common.redis_url).await?;
 
+    // Heuristic-only analyses skip the replay/fork RPC volume, so charge the
+    // slimmer weight — at the full ANALYZE_TX cost the limiter would pace the
+    // cheap mode as if it were expensive, eating most of the quota win (#162).
+    let analyze_weight = if common.heuristic_only {
+        weights::HEURISTIC_ANALYZE_TX
+    } else {
+        weights::ANALYZE_TX
+    };
+
     tracing::info!("worker ready");
 
     loop {
@@ -52,7 +61,8 @@ pub async fn run(common: CommonConfig, cfg: WorkerConfig) -> Result<()> {
             None => continue,
         };
 
-        if let Err(e) = handle(&job, &analyzer, &resolver, &store, &limiter, &cfg, &queue).await {
+        let _permit = limiter.acquire(analyze_weight).await;
+        if let Err(e) = handle(&job, &analyzer, &resolver, &store, &cfg, &queue).await {
             tracing::error!(?job, error = %e, "job handling failed");
         }
     }
@@ -63,11 +73,9 @@ async fn handle(
     analyzer: &Arc<EvmSketchAnalyzer>,
     resolver: &Arc<Resolver>,
     store: &Store,
-    limiter: &RateLimiter,
     cfg: &WorkerConfig,
     queue: &Queue,
 ) -> Result<()> {
-    let _permit = limiter.acquire(weights::ANALYZE_TX).await;
     let hash = FixedBytes::<32>::from(job.tx_hash);
 
     // Backstop: an individual analysis must complete in a bounded time.
