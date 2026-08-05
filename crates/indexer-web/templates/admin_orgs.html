@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}Organizations — Gas Killer Indexer{% endblock %}
+{% block content %}
+
+<h2>Organizations</h2>
+<p class="muted">An organization is a parent brand (e.g. "Uniswap") that groups several projects together, so the leaderboard can show one combined "X ETH saved across N contracts" line per brand. Create a brand below, then assign projects to it.</p>
+
+<section class="card">
+    <h3>Add an organization</h3>
+    <form method="post" action="/admin/orgs/create" class="blacklist-form">
+        <label>Organization name <input type="text" name="org_name" required placeholder="Uniswap"></label>
+        <button type="submit" class="btn">Add</button>
+    </form>
+    <p class="muted">Just the brand name — an internal id is generated for you automatically.</p>
+</section>
+
+<section class="card">
+    <h3>Your organizations</h3>
+    <p class="muted">Edit a name to rename a brand; its assignments are kept.</p>
+    <table class="data-table">
+        <thead><tr><th>Organization</th><th></th></tr></thead>
+        <tbody>
+        {% for o in orgs %}
+            <tr>
+                <td colspan="2">
+                    <form method="post" action="/admin/orgs/create" style="display:flex;gap:6px;align-items:center;">
+                        <input type="hidden" name="org_slug" value="{{ o.org_slug }}">
+                        <input type="text" name="org_name" value="{{ o.org_name }}" required style="flex:1;max-width:320px;">
+                        <button type="submit" class="btn">Rename</button>
+                    </form>
+                </td>
+            </tr>
+        {% else %}
+            <tr><td colspan="2" class="muted">No organizations yet — add one above.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<section class="card">
+    <h3>Assign projects</h3>
+    <p class="muted">Pick the brand each project belongs to. "— none —" leaves it ungrouped.</p>
+    <table class="data-table">
+        <thead><tr><th>Project</th><th>Organization</th></tr></thead>
+        <tbody>
+        {% for p in projects %}
+            <tr>
+                <td><a href="/projects/{{ p.project_slug }}">{{ p.project_name }}</a></td>
+                <td>
+                    <form method="post" action="/admin/orgs/assign" style="display:flex;gap:6px;align-items:center;">
+                        <input type="hidden" name="project_slug" value="{{ p.project_slug }}">
+                        <select name="org_slug">
+                            <option value=""{% if p.org_slug.is_empty() %} selected{% endif %}>— none —</option>
+                            {% for o in orgs %}
+                                <option value="{{ o.org_slug }}"{% if p.org_slug == o.org_slug %} selected{% endif %}>{{ o.org_name }}</option>
+                            {% endfor %}
+                        </select>
+                        <button type="submit" class="btn">Save</button>
+                    </form>
+                </td>
+            </tr>
+        {% else %}
+            <tr><td colspan="2" class="muted">No projects.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+{% endblock %}

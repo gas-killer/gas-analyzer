@@ -1,0 +1,6 @@
+<div class="diagnose-result">
+    <div class="diagnose-content">{{ html|safe }}</div>
+    <div class="muted diagnose-meta">
+        model={{ model }} · tokens={{ tokens_in }}+{{ tokens_out }} · {{ duration_ms }}ms{% if cached %} · cached{% endif %}
+    </div>
+</div>

@@ -1,0 +1,38 @@
+#!/bin/sh
+# Sourced by the nginx docker-entrypoint (filename ends in .envsh) BEFORE
+# 20-envsubst-on-templates.sh, so these exports are visible to envsubst when it
+# renders default.conf.template.
+#
+# Splits UPSTREAM_RPC_URL (the real chain RPC URL) into the scheme/host/port/
+# path pieces the template needs. This keeps a single RPC_URL source of truth:
+# compose passes UPSTREAM_RPC_URL=${RPC_URL} and the indexer services point
+# their RPC_URL at this proxy instead.
+
+if [ -z "${UPSTREAM_RPC_URL:-}" ]; then
+    echo "rpc-proxy: UPSTREAM_RPC_URL is required" >&2
+    exit 1
+fi
+
+url="$UPSTREAM_RPC_URL"
+scheme="${url%%://*}"
+rest="${url#*://}"
+hostport="${rest%%/*}"
+
+# Everything after the host[:port] is the upstream path (default "/").
+case "$rest" in
+    */*) path="/${rest#*/}" ;;
+    *)   path="/" ;;
+esac
+
+# Split optional :port; default by scheme.
+case "$hostport" in
+    *:*) host="${hostport%%:*}"; port="${hostport##*:}" ;;
+    *)   host="$hostport"
+         if [ "$scheme" = "https" ]; then port=443; else port=80; fi ;;
+esac
+
+export UPSTREAM_SCHEME="$scheme"
+export UPSTREAM_HOST="$host"
+export UPSTREAM_PORT="$port"
+export UPSTREAM_PATH="$path"
+export RPC_PROXY_RATE="${RPC_PROXY_RATE:-40}"

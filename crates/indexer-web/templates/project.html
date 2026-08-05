@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block title %}{{ project_name }} — Gas Killer Indexer{% endblock %}
+{% block content %}
+
+<header class="project-header">
+    <h2>{{ project_name }}</h2>
+    <div class="muted">
+        slug <code>{{ project_slug }}</code> · category {{ category }}
+        {% if !contact_email.is_empty() %} · <a href="mailto:{{ contact_email }}">{{ contact_email }}</a>{% endif %}
+        {% if !contact_url.is_empty() %} · <a href="{{ contact_url }}" rel="noopener" target="_blank">link</a>{% endif %}
+    </div>
+</header>
+
+<section class="totals-grid">
+    <div class="card">
+        <h3>Lifetime</h3>
+        <div class="metric">{{ totals_lifetime.usd_saved }}</div>
+        <div class="muted">{{ totals_lifetime.eth_saved }} · {{ totals_lifetime.tx_count }} txs</div>
+    </div>
+    <div class="card">
+        <h3>Last 30d</h3>
+        <div class="metric">{{ totals_30d.usd_saved }}</div>
+        <div class="muted">{{ totals_30d.eth_saved }} · {{ totals_30d.tx_count }} txs</div>
+    </div>
+    <div class="card">
+        <h3>Avg savings · 30d</h3>
+        <div class="metric">{{ avg_savings_pct_30d }}</div>
+    </div>
+</section>
+
+<section class="card chart-card">
+    <h3>USD saved · last 90 days</h3>
+    <canvas id="projectDailyChart"></canvas>
+</section>
+
+{% if top_contracts.len() > 1 %}
+<section class="card">
+    <h3>Contracts in this project · last 30d</h3>
+    <table class="data-table">
+        <thead>
+            <tr><th>Address</th><th class="right">Txs</th><th class="right">Gas saved</th><th class="right">ETH saved</th></tr>
+        </thead>
+        <tbody>
+        {% for c in top_contracts %}
+            <tr>
+                <td><a href="/contracts/{{ c.address_hex }}"><code>{{ c.address_hex }}</code></a></td>
+                <td class="right">{{ c.tx_count }}</td>
+                <td class="right">{{ c.gas_saved_total }}</td>
+                <td class="right">{{ c.wei_saved_total }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
+
+<section class="card">
+    <h3>Top function selectors · last 30d</h3>
+    <table class="data-table">
+        <thead>
+            <tr><th>Selector</th><th class="right">Txs</th><th class="right">Gas saved</th><th class="right">ETH saved</th></tr>
+        </thead>
+        <tbody>
+        {% for s in top_selectors %}
+            <tr>
+                <td><code>{{ s.selector_hex }}</code></td>
+                <td class="right">{{ s.tx_count }}</td>
+                <td class="right">{{ s.gas_saved_total }}</td>
+                <td class="right">{{ s.wei_saved_total }}</td>
+            </tr>
+        {% else %}
+            <tr><td colspan="4" class="muted">No txs in window.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<section class="card">
+    <h3>Recent transactions</h3>
+    <form method="get" class="tx-filter-bar">
+        <label>From <input type="date" name="from" value="{{ paging.from }}"></label>
+        <label>To <input type="date" name="to" value="{{ paging.to }}"></label>
+        <label>Min gas saved <input type="number" name="min_gas_saved" min="0" value="{{ paging.min_gas_saved }}" placeholder="any"></label>
+        <button type="submit">Apply</button>
+        <a href="?" class="muted">Reset</a>
+    </form>
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Block</th>
+                <th>Tx hash</th>
+                <th class="right">Gas used</th>
+                <th class="right">Gas saved</th>
+                <th class="right">ETH saved</th>
+                <th class="right">When</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for t in recent_txs %}
+            <tr>
+                <td>{{ t.block_number }}</td>
+                <td><a href="{{ explorer_tx_url }}{{ t.tx_hash_hex }}" target="_blank" rel="noopener"><code>{{ t.tx_hash_hex }}</code></a></td>
+                <td class="right">{{ t.gas_used }}</td>
+                <td class="right">{{ t.gas_saved }}</td>
+                <td class="right">{{ t.wei_saved }}</td>
+                <td class="right">{{ t.when }}</td>
+            </tr>
+        {% else %}
+            <tr><td colspan="6" class="muted">No transactions match.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    <nav class="paging">
+        {% if paging.has_prev %}<a href="?{{ paging.prev_qs }}">← Prev</a>{% else %}<span class="muted">← Prev</span>{% endif %}
+        <span class="muted">Page {{ paging.page }}</span>
+        {% if paging.has_next %}<a href="?{{ paging.next_qs }}">Next →</a>{% else %}<span class="muted">Next →</span>{% endif %}
+    </nav>
+</section>
+
+<script id="project-daily-data" type="application/json">{
+    "labels": [{% for p in daily_90d %}"{{ p.day }}"{% if !loop.last %},{% endif %}{% endfor %}],
+    "values": [{% for p in daily_90d %}{{ p.usd_saved }}{% if !loop.last %},{% endif %}{% endfor %}]
+}</script>
+<script>
+window.addEventListener("DOMContentLoaded", () => {
+    const d = JSON.parse(document.getElementById("project-daily-data").textContent);
+    new Chart(document.getElementById("projectDailyChart"), {
+        type: "line",
+        data: { labels: d.labels, datasets: [{ label: "USD saved", data: d.values, borderColor: "#7ec8a4", backgroundColor: "rgba(126,200,164,0.18)", tension: 0.25, fill: true }] },
+        options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { ticks: { callback: v => "$" + Number(v).toLocaleString() } } } }
+    });
+});
+</script>
+{% endblock %}

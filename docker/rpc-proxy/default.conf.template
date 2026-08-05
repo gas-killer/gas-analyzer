@@ -1,0 +1,59 @@
+# --- Egress rate-limiting proxy for the chain RPC --------------------------
+# Why this exists: gas-analyzer-evmsketch builds its OWN alloy provider from
+# RPC_URL and issues eth_getStorageAt / getBalance / getCode reads that BYPASS
+# the in-process token-bucket limiter (indexer-rpc). Pointing the indexer's
+# RPC_URL at this proxy funnels *all* upstream RPC — head-tracker polls,
+# debug_traceTransaction, and the EvmSketch state reads — through one global
+# limiter the indexer code cannot bypass, with zero changes to the
+# gas-analyzer crates.
+#
+# limit_req runs in DELAY mode (note: no `nodelay`): over-rate requests are
+# held, not rejected. revm's DatabaseRef issues reads one-at-a-time and blocks
+# on each (see crates/evmsketch/src/simple_rpc_db.rs), so delaying a response
+# throttles that worker's *next* read — natural backpressure. Workers just run
+# slower; the in-flight + queued count never exceeds the few concurrent clients.
+
+limit_req_zone $server_name zone=rpc:1m rate=${RPC_PROXY_RATE}r/s;
+
+upstream rpc_upstream {
+    server ${UPSTREAM_HOST}:${UPSTREAM_PORT};
+    # Pool upstream connections — serial reads would otherwise pay a fresh TLS
+    # handshake on every single call.
+    keepalive 16;
+}
+
+server {
+    listen 8545;
+    server_name rpcproxy;
+
+    # Liveness probe — never touches the upstream, never consumes rate budget.
+    location = /healthz {
+        access_log off;
+        add_header Content-Type text/plain;
+        return 200 "ok\n";
+    }
+
+    location / {
+        # Global bucket (single server_name key). Excess is delayed up to the
+        # burst queue; a 503 only happens under absurd overload, which the
+        # worker's existing retry/backoff absorbs.
+        limit_req zone=rpc burst=200;
+
+        proxy_pass ${UPSTREAM_SCHEME}://rpc_upstream${UPSTREAM_PATH};
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";        # required for upstream keepalive
+        proxy_set_header Host ${UPSTREAM_HOST}; # upstream TLS vhost / routing
+        proxy_ssl_server_name on;              # send SNI so the TLS vhost resolves
+        proxy_ssl_name ${UPSTREAM_HOST};       # SNI/cert host — without this it
+                                               # defaults to the upstream{} block
+                                               # name ("rpc_upstream") and TLS fails
+
+        # debug_traceTransaction bodies are huge — stream, never buffer or cap.
+        proxy_buffering off;
+        client_max_body_size 0;
+
+        proxy_connect_timeout 10s;
+        proxy_send_timeout 120s;
+        proxy_read_timeout 120s;               # >= worker's 60s analyze backstop
+    }
+}

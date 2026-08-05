@@ -1,0 +1,29 @@
+# Curated address → project overlay. Highest-priority resolution source.
+#
+# Add entries here when:
+#   - DefiLlama doesn't expose an address for the contract (most common)
+#   - DefiLlama's labelling is wrong or coarse for our BD purposes
+#   - You want to attach contact info (email, discord) for outreach
+#
+# Schema (all addresses lowercase, 0x-prefixed):
+#   - chain_id: 1
+#     address: "0x..."
+#     project_slug: "uniswap-v3"
+#     project_name: "Uniswap V3"
+#     category: "dex"               # optional
+#     contact:                       # optional
+#       primary: "team@example.com"
+#       url: "https://discord.gg/..."
+
+# Examples — replace with real entries before deploying.
+- chain_id: 1
+  address: "0xe592427a0aece92de3edee1f18e0157c05861564"
+  project_slug: "uniswap-v3"
+  project_name: "Uniswap V3"
+  category: "dex"
+
+- chain_id: 1
+  address: "0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45"
+  project_slug: "uniswap-v3"
+  project_name: "Uniswap V3"
+  category: "dex"

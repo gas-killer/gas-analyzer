@@ -1,0 +1,14 @@
+<span class="label-cell" id="label-cell-{{ address_hex }}">
+    {% if is_unknown %}
+        <a href="/projects/{{ project_slug }}" class="label-unknown">{{ display_name }}</a>
+    {% else %}
+        <a href="/projects/{{ project_slug }}">{{ display_name }}</a>
+    {% endif %}
+    {% if is_manual %}<span class="label-manual" title="Manually overridden — auto-labeler will not change this">●</span>{% endif %}
+    <a class="label-edit-icon"
+       href="#"
+       hx-get="/api/labels/edit?address={{ address_hex }}&chain_id={{ chain_id }}"
+       hx-target="#label-cell-{{ address_hex }}"
+       hx-swap="outerHTML"
+       title="Edit label">✎</a>
+</span>

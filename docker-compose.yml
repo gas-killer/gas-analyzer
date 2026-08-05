@@ -1,25 +1,193 @@
-version: "3.8"
-
 services:
-  ethereum:
-    platform: linux/amd64
-    image: ghcr.io/breadchaincoop/ethereum:dev
-    env_file:
-      - .env
-    ports:
-      - "8545:8545"
-
-  test-runner:
-    build: .
-    env_file:
-      - .env
+  postgres:
+    image: postgres:16
     environment:
-      RPC_URL: "http://ethereum:8545" # Override RPC_URL from .env
+      POSTGRES_USER: indexer
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: indexer
     volumes:
-      - .:/app # Mount the source code for faster development
-      - cargo-cache:/usr/local/cargo # Mount cargo cache for faster builds
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      # Loopback only — the DB must not be reachable from the public internet.
+      # Host-local psql still works (-h 127.0.0.1); cross-container access goes
+      # over the compose network, not this mapping.
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "indexer", "-d", "indexer"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # Egress rate-limiter for the chain RPC. All indexer RPC traffic — including
+  # EvmSketch's own eth_getStorageAt/getBalance/getCode reads, which bypass the
+  # in-process limiter — is routed here by pointing the services' RPC_URL at
+  # this proxy. nginx enforces ONE global request rate against the upstream that
+  # the indexer code cannot bypass. Config-only; no app image rebuild.
+  rpc-proxy:
+    image: nginx:1.27-alpine
+    mem_limit: 128m
+    environment:
+      # Real upstream RPC; the proxy splits this into host/port/path at boot.
+      UPSTREAM_RPC_URL: ${RPC_URL:?set RPC_URL}
+      # Sustained requests/sec allowed upstream (keep well under the plan cap).
+      RPC_PROXY_RATE: ${RPC_PROXY_RATE:-40}
+      # Only substitute our vars in the template; leave nginx's own $vars intact.
+      NGINX_ENVSUBST_FILTER: "UPSTREAM_|RPC_PROXY_"
+    volumes:
+      - ./docker/rpc-proxy/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./docker/rpc-proxy/05-parse-rpc-url.envsh:/docker-entrypoint.d/05-parse-rpc-url.envsh:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8545/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  indexer-build:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gas-killer/indexer-service:local
+    entrypoint: ["true"]
+    profiles: ["build"]
+
+  head-tracker:
+    image: gas-killer/indexer-service:local
+    command: ["/usr/local/bin/indexer-service", "head-tracker"]
+    mem_limit: 512m
+    environment:
+      # Routed through the egress rate-limiter, not the upstream directly.
+      RPC_URL: http://rpc-proxy:8545
+      CHAIN_ID: ${CHAIN_ID:-1}
+      DATABASE_URL: postgres://indexer:${POSTGRES_PASSWORD}@postgres:5432/indexer
+      REDIS_URL: redis://redis:6379
+      RPC_RPS_BUDGET: ${RPC_RPS_BUDGET:-100}
+      # >= weights::ANALYZE_TX (250) so the in-process limiter stops clamping;
+      # the rpc-proxy is now the authoritative rate limit.
+      RPC_BURST: ${RPC_BURST:-250}
+      RPC_MAX_CONCURRENCY: ${RPC_MAX_CONCURRENCY:-8}
+      MIN_GAS_USED: ${MIN_GAS_USED:-50000}
+      MAX_QUEUE_DEPTH: ${MAX_QUEUE_DEPTH:-1000}
+      HEAD_POLL_MS: ${HEAD_POLL_MS:-4000}
+      RUST_LOG: ${RUST_LOG:-info}
     depends_on:
-      - ethereum
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rpc-proxy:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    image: gas-killer/indexer-service:local
+    command: ["/usr/local/bin/indexer-service", "worker"]
+    mem_limit: 1g
+    deploy:
+      replicas: 2
+    environment:
+      # Routed through the egress rate-limiter, not the upstream directly. This
+      # is what finally gates EvmSketch's eth_getStorageAt storm.
+      RPC_URL: http://rpc-proxy:8545
+      CHAIN_ID: ${CHAIN_ID:-1}
+      DATABASE_URL: postgres://indexer:${POSTGRES_PASSWORD}@postgres:5432/indexer
+      REDIS_URL: redis://redis:6379
+      RPC_RPS_BUDGET: ${RPC_RPS_BUDGET:-100}
+      # >= weights::ANALYZE_TX (250) so the in-process limiter stops clamping;
+      # the rpc-proxy is now the authoritative rate limit.
+      RPC_BURST: ${RPC_BURST:-250}
+      RPC_MAX_CONCURRENCY: ${RPC_MAX_CONCURRENCY:-8}
+      MIN_GAS_USED: ${MIN_GAS_USED:-50000}
+      WORKER_MAX_RETRIES: ${WORKER_MAX_RETRIES:-3}
+      OVERLAY_PATH: /etc/indexer/overlay.yaml
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rpc-proxy:
+        condition: service_healthy
+    restart: unless-stopped
+
+  refresher:
+    image: gas-killer/indexer-service:local
+    command: ["/usr/local/bin/indexer-service", "refresher"]
+    mem_limit: 768m
+    environment:
+      RPC_URL: ${RPC_URL:?set RPC_URL}
+      CHAIN_ID: ${CHAIN_ID:-1}
+      DATABASE_URL: postgres://indexer:${POSTGRES_PASSWORD}@postgres:5432/indexer
+      REDIS_URL: redis://redis:6379
+      OVERLAY_PATH: /etc/indexer/overlay.yaml
+      DEFILLAMA_URL: ${DEFILLAMA_URL:-https://api.llama.fi/protocols}
+      PRICE_URL: ${PRICE_URL:-https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd}
+      RESOLVER_REFRESH_SECS: ${RESOLVER_REFRESH_SECS:-86400}
+      PRICE_REFRESH_SECS: ${PRICE_REFRESH_SECS:-3600}
+      ROLLUP_REFRESH_SECS: ${ROLLUP_REFRESH_SECS:-3600}
+      ETHERSCAN_API_KEY: ${ETHERSCAN_API_KEY:-}
+      LABELER_PRODUCER_INTERVAL_SECS: ${LABELER_PRODUCER_INTERVAL_SECS:-3600}
+      LABELER_BATCH_SIZE: ${LABELER_BATCH_SIZE:-200}
+      LABELER_RETRY_DAYS: ${LABELER_RETRY_DAYS:-7}
+      LABELER_MIN_DELAY_MS: ${LABELER_MIN_DELAY_MS:-250}
+      KNOWN_NAMES_PATH: /etc/indexer/known_names.yaml
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  indexer-web:
+    image: gas-killer/indexer-service:local
+    command: ["/usr/local/bin/indexer-web"]
+    mem_limit: 512m
+    environment:
+      OPENROUTER_KEY: ${OPENROUTER_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-anthropic/claude-sonnet-4-6}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      DATABASE_URL: postgres://indexer:${POSTGRES_PASSWORD}@postgres:5432/indexer
+      REDIS_URL: redis://redis:6379
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET}
+      AUTH_ALLOWLIST_PATH: /etc/indexer/users.yaml
+      BIND_ADDR: 0.0.0.0:3000
+      CHAIN_ID: ${CHAIN_ID:-1}
+      EXPLORER_TX_URL: ${EXPLORER_TX_URL:-https://etherscan.io/tx/}
+      EXPLORER_ADDRESS_URL: ${EXPLORER_ADDRESS_URL:-https://etherscan.io/address/}
+      STATIC_DIR: /opt/indexer-web/static
+      # Mirror the refresh-source vars from the refresher so the manual
+      # refresh buttons hit the same upstreams.
+      DEFILLAMA_URL: ${DEFILLAMA_URL:-https://api.llama.fi/protocols}
+      PRICE_URL: ${PRICE_URL:-https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd}
+      LABELER_BATCH_SIZE: ${LABELER_BATCH_SIZE:-200}
+      LABELER_RETRY_DAYS: ${LABELER_RETRY_DAYS:-7}
+      # Used by the AI diagnostics bundle to flag whether the labeler
+      # pipeline is configured. Value is treated as a boolean (empty/non-empty).
+      ETHERSCAN_API_KEY: ${ETHERSCAN_API_KEY:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./users.yaml:/etc/indexer/users.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
-  cargo-cache:
+  postgres-data:
+  redis-data:
