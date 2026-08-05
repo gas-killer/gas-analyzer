@@ -809,7 +809,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 ///
 /// # Returns
 /// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`
-#[tracing::instrument(name = "evmsketch.encode", skip_all, fields(block_number, encoding = ?encoding, state_update_count = tracing::field::Empty))]
+#[tracing::instrument(name = "evmsketch.encode", skip_all, fields(block_number, encoding = ?encoding, extraction = tracing::field::Empty, state_update_count = tracing::field::Empty))]
 pub async fn call_to_encoded_state_updates_with_evmsketch_mode(
     cache: &EvmSketchExecutorCache,
     rpc_url: impl AsRef<str>,
@@ -881,15 +881,27 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_mode(
 ///
 /// The fast path (`prestateTracer` diff + `callTracer` logs, `O(changed slots)`) is what lets
 /// heavy-compute tracked functions — whose struct-log trace times out the node — be extracted at all.
-/// It is taken only when [`classify_prestate_eligibility`] proves it sound (no cross-contract storage,
-/// no regular CALL / CREATE / SELFDESTRUCT); otherwise, and on any tracer error (e.g. a node that does
-/// not support these tracers), we fall back to `get_trace_from_call` plus the
-/// [`StateEncoding`]-selected struct-log extractor, which is the previous behaviour. The fallback owns
+/// It is taken only when [`classify_prestate_eligibility`] proves it sound; otherwise, and on any
+/// tracer error (e.g. a node that does not support these tracers), we fall back to
+/// `get_trace_from_call` plus the [`StateEncoding`]-selected struct-log extractor. The fallback owns
 /// `tx_request`, so the fast path only borrows it.
 ///
-/// The fast path's result is valid under both encodings: eligibility rejects every regular
-/// `CALL`/`CREATE` at target depth, so no external code runs mid-program and the canonical encoder
-/// degenerates to what a net diff already is — one final storage image plus the logs.
+/// The fast path's result is valid under *both* encodings, because eligibility rejects every regular
+/// `CALL`/`CREATE` at target depth — so no external code runs mid-program, and the canonical encoder
+/// would degenerate to exactly what a net diff already is: one final storage image plus the logs. Two
+/// consequences worth knowing:
+///
+/// * The fast path's updates are net-deduplicated, so a slot written several times (or written back to
+///   its original value) costs one store (or none) instead of one per write. Same end state, lower gas
+///   estimate than the struct-log paths report for the same call.
+/// * Like [`StateEncoding::Canonical`] and unlike [`StateEncoding::Legacy`], a net diff cannot contain
+///   writes from a reverted `DELEGATECALL` — the EVM rolled them back, so they are absent by
+///   construction.
+///
+/// `skipped_opcodes` is always empty on the fast path: neither tracer reports opcodes, so `TSTORE`
+/// (which [`StateEncoding::Canonical`] flags) is invisible here. That only affects reporting —
+/// transient storage is discarded at the end of the transaction and eligibility already rules out the
+/// external calls that could observe it, so it cannot change the extracted diff.
 async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
     provider: &P,
     tx_request: TransactionRequest,
@@ -897,10 +909,17 @@ async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
     consumer: Address,
     encoding: StateEncoding,
 ) -> Result<(Vec<StateUpdate>, HashSet<Opcode>)> {
-    if let Ok(Some(updates)) = try_prestate_fast_path(provider, &tx_request, block, consumer).await
-    {
-        return Ok((updates, HashSet::new()));
+    match try_prestate_fast_path(provider, &tx_request, block, consumer).await {
+        Ok(Some(updates)) => {
+            tracing::Span::current().record("extraction", "prestate");
+            return Ok((updates, HashSet::new()));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::debug!(error = %e, "prestate tracers failed; using struct-log path");
+        }
     }
+    tracing::Span::current().record("extraction", "struct_log");
     let trace = get_trace_from_call(provider, tx_request, block).await?;
     let (state_updates, skipped_opcodes, _call_gas_total) = match encoding {
         StateEncoding::Legacy => compute_state_updates(trace)?,
@@ -918,8 +937,13 @@ async fn try_prestate_fast_path<P: Provider + DebugApi>(
     block: BlockId,
     consumer: Address,
 ) -> Result<Option<Vec<StateUpdate>>> {
-    let diff = get_prestate_diff_from_call(provider, tx_request.clone(), block).await?;
-    let frame = get_call_frame_from_call(provider, tx_request.clone(), block).await?;
+    // Each tracer re-simulates the call, and for the heavy-compute calls this path exists to serve
+    // that simulation dominates the request — so issue both concurrently rather than paying for two
+    // sequential executions.
+    let (diff, frame) = tokio::try_join!(
+        get_prestate_diff_from_call(provider, tx_request.clone(), block),
+        get_call_frame_from_call(provider, tx_request.clone(), block),
+    )?;
     match classify_prestate_eligibility(&frame, &diff, consumer) {
         PrestateEligibility::Eligible => Ok(Some(build_state_updates_from_prestate(
             consumer, &diff, &frame,

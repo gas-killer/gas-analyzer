@@ -45,11 +45,27 @@ pub enum PrestateEligibility {
 ///     struct-log path skips them too).
 ///
 /// `STATICCALL` is read-only and ignored.
+///
+/// Two structural preconditions also force a fallback. `frame` must be the consumer's own frame — the
+/// diff is filtered by `consumer`, so a mismatched pair would silently drop every store. And the
+/// top-level call must have succeeded: a reverted call leaves an empty net diff, whereas the struct-log
+/// extractors still emit the rolled-back writes, and the fast path must not quietly turn one behaviour
+/// into the other.
 pub fn classify_prestate_eligibility(
     frame: &CallFrame,
     diff: &DiffMode,
     consumer: Address,
 ) -> PrestateEligibility {
+    if let Some(to) = frame.to
+        && to != consumer
+    {
+        return PrestateEligibility::Fallback(format!(
+            "root frame targets {to}, not consumer {consumer}"
+        ));
+    }
+    if let Some(err) = &frame.error {
+        return PrestateEligibility::Fallback(format!("top-level call reverted: {err}"));
+    }
     let mut accounts: BTreeSet<Address> = BTreeSet::new();
     accounts.extend(diff.pre.keys().copied());
     accounts.extend(diff.post.keys().copied());
@@ -163,7 +179,9 @@ fn ordered_target_depth_logs(frame: &CallFrame) -> Vec<&CallLogFrame> {
     let mut logs: Vec<&CallLogFrame> = Vec::new();
     collect_target_depth_logs(frame, &mut logs);
     if logs.len() > 1 && logs.iter().all(|l| l.index.is_some()) {
-        logs.sort_by_key(|l| l.index.unwrap()); // global truth; stable, never worsens position order
+        // Global truth when every log carries it; a stable sort on `Option<u64>` (ascending, `None`
+        // first) never worsens the position order established above.
+        logs.sort_by_key(|l| l.index);
     }
     logs
 }
@@ -172,6 +190,11 @@ fn ordered_target_depth_logs(frame: &CallFrame) -> Vec<&CallLogFrame> {
 /// after `p` sub-calls, so it belongs immediately before sub-call `p`. We recurse only into transparent
 /// `DELEGATECALL`/`CALLCODE` children; `STATICCALL`/regular-`CALL` children are excluded but still
 /// advance the position counter.
+///
+/// A reverted sub-call's events never made it into the receipt, so frames carrying an `error` are
+/// skipped entirely. Geth-family `callTracer` implementations already strip logs under a failed frame,
+/// but the diff must not depend on that: emitting a log the EVM discarded would put an event on chain
+/// that the traced execution never produced.
 fn collect_target_depth_logs<'a>(frame: &'a CallFrame, out: &mut Vec<&'a CallLogFrame>) {
     let mut logs: Vec<&CallLogFrame> = frame.logs.iter().collect();
     logs.sort_by_key(|l| l.position.unwrap_or(0)); // stable → preserves vector order within a position
@@ -181,7 +204,7 @@ fn collect_target_depth_logs<'a>(frame: &'a CallFrame, out: &mut Vec<&'a CallLog
             out.push(logs[li]);
             li += 1;
         }
-        if c.typ == "DELEGATECALL" || c.typ == "CALLCODE" {
+        if (c.typ == "DELEGATECALL" || c.typ == "CALLCODE") && c.error.is_none() {
             collect_target_depth_logs(c, out);
         }
     }
@@ -523,6 +546,56 @@ mod tests {
         assert!(!is_eligible(classify_prestate_eligibility(
             &f, &diff, CONSUMER
         )));
+    }
+
+    #[test]
+    fn fallback_when_top_level_call_reverted() {
+        let f = CallFrame {
+            error: Some("execution reverted".into()),
+            ..frame("CALL", vec![], vec![])
+        };
+        assert!(
+            !is_eligible(classify_prestate_eligibility(
+                &f,
+                &diff_consumer_only(),
+                CONSUMER
+            )),
+            "a reverted call has an empty net diff but the struct-log paths still emit its writes"
+        );
+    }
+
+    #[test]
+    fn fallback_when_root_frame_targets_another_address() {
+        let f = CallFrame {
+            to: Some(Address::repeat_byte(0xBB)),
+            ..frame("CALL", vec![], vec![])
+        };
+        assert!(
+            !is_eligible(classify_prestate_eligibility(
+                &f,
+                &diff_consumer_only(),
+                CONSUMER
+            )),
+            "frame and consumer must describe the same call"
+        );
+    }
+
+    #[test]
+    fn reverted_delegatecall_logs_are_excluded() {
+        let reverted = CallFrame {
+            error: Some("execution reverted".into()),
+            ..frame("DELEGATECALL", vec![log(&[b256(0xDE)], 1)], vec![])
+        };
+        let f = frame("CALL", vec![log(&[b256(0xA1)], 1)], vec![reverted]);
+        let u: Vec<StateUpdate> = ordered_target_depth_logs(&f)
+            .into_iter()
+            .map(log_to_update)
+            .collect();
+        assert_eq!(
+            log1_topics(&u),
+            vec![b256(0xA1)],
+            "the EVM discarded the reverted frame's events; the diff must not re-emit them"
+        );
     }
 
     #[test]
