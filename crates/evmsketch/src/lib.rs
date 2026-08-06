@@ -111,11 +111,14 @@ pub mod simple_rpc_db;
 use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 
 use gas_analyzer_core::{
-    Opcode, StateUpdate, compute_state_updates, compute_state_updates_canonical,
+    Opcode, PrestateEligibility, StateUpdate, build_state_updates_from_prestate,
+    classify_prestate_eligibility, compute_state_updates, compute_state_updates_canonical,
     encode_state_updates_to_abi, estimate_gas_from_operations, extract_operation_counts_from_trace,
 };
 use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
-use gas_analyzer_rpc::get_trace_from_call;
+use gas_analyzer_rpc::{
+    get_call_frame_from_call, get_prestate_diff_from_call, get_trace_from_call,
+};
 
 // ============================================================================
 // Executor Types
@@ -754,6 +757,11 @@ fn hints_from_state_updates(
 }
 
 /// How the target's storage mutations are laid out in the emitted update program.
+///
+/// This selects the *signed representation*, not merely how the program is obtained: the encoded
+/// updates are hashed into the task digest every validator recomputes and must match. Two encodings
+/// can reproduce the same final state and still commit to different bytes, so the choice is
+/// consensus-critical — a deployment must run one encoding fleet-wide and roll changes out atomically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StateEncoding {
     /// Legacy: raw depth-1 `SSTORE`s in trace order; nested writes are dropped and
@@ -769,6 +777,47 @@ pub enum StateEncoding {
     /// final state is correct even if a re-entrant replay diverged. See
     /// [`gas_analyzer_core::compute_state_updates_canonical`].
     Canonical,
+    /// The target's **net** storage diff (one slot-sorted store per changed slot) plus its logs,
+    /// read from `prestateTracer` + `callTracer` instead of a struct-log trace. Costs
+    /// `O(changed slots)` rather than `O(execution steps)`, which is what makes heavy-compute
+    /// tracked functions — whose struct-log trace times out the node — extractable at all. See
+    /// [`gas_analyzer_core::prestate`].
+    ///
+    /// The net form is only defined for calls that make no regular `CALL`, `CREATE`, or
+    /// `SELFDESTRUCT` at target depth: with external code running mid-program there is no single
+    /// end-state image to commit to. [`gas_analyzer_core::classify_prestate_eligibility`] decides
+    /// this from the call tree and the diff, so every prover reaches the same verdict for a given
+    /// call; the ones it rejects are encoded as [`Self::Canonical`].
+    ///
+    /// Byte-different from both other encodings for the same call, deliberately: repeated writes to
+    /// one slot collapse to a single store, and a slot written back to its original value produces
+    /// none. That is why it is a distinct encoding rather than an optimisation applied under the
+    /// others — mixing the two representations across a fleet forks the digest.
+    PrestateNet,
+}
+
+/// The struct-log extractor that produces the signed program when the prestate net form is not used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StructLogEncoder {
+    Legacy,
+    Canonical,
+}
+
+impl StateEncoding {
+    /// Whether this encoding signs the prestate net form for the calls that admit it.
+    fn signs_prestate_net(self) -> bool {
+        matches!(self, Self::PrestateNet)
+    }
+
+    /// The struct-log extractor backing this encoding. For [`Self::PrestateNet`] it produces the
+    /// program for calls the net form cannot represent; pairing with [`Self::Canonical`] keeps both
+    /// of its representations revert-aware and slot-sorted.
+    fn struct_log_encoder(self) -> StructLogEncoder {
+        match self {
+            Self::Legacy => StructLogEncoder::Legacy,
+            Self::Canonical | Self::PrestateNet => StructLogEncoder::Canonical,
+        }
+    }
 }
 
 /// Compute encoded state updates and gas estimate for a transaction call using EvmSketch.
@@ -806,7 +855,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 ///
 /// # Returns
 /// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`
-#[tracing::instrument(name = "evmsketch.encode", skip_all, fields(block_number, encoding = ?encoding, state_update_count = tracing::field::Empty))]
+#[tracing::instrument(name = "evmsketch.encode", skip_all, fields(block_number, encoding = ?encoding, extraction = tracing::field::Empty, state_update_count = tracing::field::Empty))]
 pub async fn call_to_encoded_state_updates_with_evmsketch_mode(
     cache: &EvmSketchExecutorCache,
     rpc_url: impl AsRef<str>,
@@ -842,18 +891,13 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_mode(
 
     let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
 
-    // Run debug_traceCall and executor cache lookup concurrently — they are
-    // fully independent. On a cache miss this hides the entire executor build
-    // behind the trace fetch.
-    let (trace, executor) = tokio::try_join!(
-        get_trace_from_call(&provider, tx_request, block_id),
+    // Extract the state updates (hybrid prestate/struct-log path) and build the executor
+    // concurrently — they are independent, so on a cache miss this hides the executor build behind
+    // the trace fetch.
+    let ((state_updates, skipped_opcodes), executor) = tokio::try_join!(
+        extract_state_updates_hybrid(&provider, tx_request, block_id, contract_address, encoding),
         cache.get_or_build(rpc_url, block_number),
     )?;
-
-    let (state_updates, skipped_opcodes, _call_gas_total) = match encoding {
-        StateEncoding::Legacy => compute_state_updates(trace)?,
-        StateEncoding::Canonical => compute_state_updates_canonical(trace, contract_address)?,
-    };
     tracing::Span::current().record("state_update_count", state_updates.len());
 
     let storage_updates = encode_state_updates_to_abi(&state_updates);
@@ -876,6 +920,71 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_mode(
         .await?;
 
     Ok((storage_updates, gas_estimate, false, skipped_opcodes))
+}
+
+/// Extract `(state_updates, skipped_opcodes)` for a simulated call under `encoding`.
+///
+/// [`StateEncoding::PrestateNet`] reads the cheap tracers and emits the net form for calls that admit
+/// it, encoding the rest with its struct-log extractor; the other encodings always take the struct-log
+/// path. The struct-log path owns `tx_request`, so the prestate path only borrows it.
+///
+/// A tracer failure under `PrestateNet` is an **error**, never a quiet downgrade to the struct-log
+/// representation. The encoded updates are hashed into the signed task digest, so an operator whose
+/// node lacks `prestateTracer`/`callTracer` silently switching representations would sign a digest no
+/// other operator can match — turning a node-configuration difference into a consensus split. Failing
+/// the task is recoverable; signing a divergent digest is not.
+///
+/// `skipped_opcodes` is always empty on the net form: neither tracer reports opcodes, so `TSTORE`
+/// (which the canonical extractor flags) is invisible there. That only affects reporting — transient
+/// storage is discarded at the end of the transaction and eligibility already rules out the external
+/// calls that could observe it, so it cannot change the extracted diff.
+async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
+    provider: &P,
+    tx_request: TransactionRequest,
+    block: BlockId,
+    consumer: Address,
+    encoding: StateEncoding,
+) -> Result<(Vec<StateUpdate>, HashSet<Opcode>)> {
+    if encoding.signs_prestate_net()
+        && let Some(updates) = try_prestate_net(provider, &tx_request, block, consumer).await?
+    {
+        tracing::Span::current().record("extraction", "prestate_net");
+        return Ok((updates, HashSet::new()));
+    }
+    tracing::Span::current().record("extraction", "struct_log");
+    let trace = get_trace_from_call(provider, tx_request, block).await?;
+    let (state_updates, skipped_opcodes, _call_gas_total) = match encoding.struct_log_encoder() {
+        StructLogEncoder::Legacy => compute_state_updates(trace)?,
+        StructLogEncoder::Canonical => compute_state_updates_canonical(trace, consumer)?,
+    };
+    Ok((state_updates, skipped_opcodes))
+}
+
+/// Build the prestate net form: `Ok(Some(updates))` when the call admits it, `Ok(None)` when the net
+/// form cannot represent the call and the struct-log extractor must produce the program, `Err` when
+/// the tracers are unavailable or fail. Never returns an unsound diff.
+async fn try_prestate_net<P: Provider + DebugApi>(
+    provider: &P,
+    tx_request: &TransactionRequest,
+    block: BlockId,
+    consumer: Address,
+) -> Result<Option<Vec<StateUpdate>>> {
+    // Each tracer re-simulates the call, and for the heavy-compute calls this encoding exists to
+    // serve that simulation dominates the request — so issue both concurrently rather than paying
+    // for two sequential executions.
+    let (diff, frame) = tokio::try_join!(
+        get_prestate_diff_from_call(provider, tx_request.clone(), block),
+        get_call_frame_from_call(provider, tx_request.clone(), block),
+    )?;
+    match classify_prestate_eligibility(&frame, &diff, consumer) {
+        PrestateEligibility::Eligible => Ok(Some(build_state_updates_from_prestate(
+            consumer, &diff, &frame,
+        ))),
+        PrestateEligibility::Fallback(reason) => {
+            tracing::debug!(reason = %reason, "call has no net form; using struct-log encoder");
+            Ok(None)
+        }
+    }
 }
 
 // ============================================================================
@@ -1368,5 +1477,39 @@ mod tests {
 
         assert_eq!(hints.get(&contract), Some(&vec![]));
         assert_eq!(hints.len(), 1);
+    }
+
+    /// The net form is byte-different from both struct-log encodings, so it must never be produced
+    /// under an encoding that did not ask for it — that is what would fork the task digest across a
+    /// fleet whose nodes differ in tracer support.
+    #[test]
+    fn only_prestate_net_encoding_signs_the_net_form() {
+        assert!(StateEncoding::PrestateNet.signs_prestate_net());
+        assert!(!StateEncoding::Legacy.signs_prestate_net());
+        assert!(!StateEncoding::Canonical.signs_prestate_net());
+    }
+
+    /// Calls with no net form fall back to a struct-log encoder within the same encoding. Legacy keeps
+    /// its own; PrestateNet pairs with Canonical so both of its representations stay revert-aware.
+    #[test]
+    fn struct_log_encoder_pairs_with_the_selected_encoding() {
+        assert_eq!(
+            StateEncoding::Legacy.struct_log_encoder(),
+            StructLogEncoder::Legacy
+        );
+        assert_eq!(
+            StateEncoding::Canonical.struct_log_encoder(),
+            StructLogEncoder::Canonical
+        );
+        assert_eq!(
+            StateEncoding::PrestateNet.struct_log_encoder(),
+            StructLogEncoder::Canonical
+        );
+    }
+
+    /// Adding an encoding must not change what an existing deployment signs.
+    #[test]
+    fn default_encoding_is_legacy() {
+        assert_eq!(StateEncoding::default(), StateEncoding::Legacy);
     }
 }
