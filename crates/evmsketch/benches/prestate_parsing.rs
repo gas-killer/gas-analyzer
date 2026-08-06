@@ -1,14 +1,16 @@
-//! Offline benchmark contrasting the two extraction paths on the SAME logical workload:
+//! Offline benchmark contrasting the two extraction costs on the SAME logical workload:
 //! a heavy-compute call (many execution steps) that collapses to a small storage diff.
 //!
 //!   `compute_state_updates`              walks the full struct-log trace — O(execution steps)
 //!   `build_state_updates_from_prestate`  walks the prestateTracer diff   — O(changed slots)
 //!
-//! Both yield the same state updates; the wall-time gap is the prestate fast path's win, and the
-//! reason heavy-compute tracked functions (whose struct-log trace times out the node) become
-//! extractable. The companion `trace_parsing/compute_state_updates` bench shows the same struct-log
-//! cost on a real 141k-step Sepolia trace (~73 ms in CI); here we hold the *logical diff* fixed and
-//! vary only the representation, so the two numbers are directly comparable.
+//! This measures extraction *cost*, not equivalence: the two encoders emit different programs in
+//! general (`gas_analyzer_core::prestate::tests::net_form_omits_slots_the_canonical_encoder_re_asserts`
+//! pins where they diverge). The workload below is deliberately chosen so the logical diff is held
+//! fixed and only the representation varies, making the wall-time gap the thing being compared — and
+//! the reason heavy-compute tracked functions, whose struct-log trace times out the node, become
+//! extractable at all. The companion `trace_parsing/compute_state_updates` bench shows the same
+//! struct-log cost on a real 141k-step Sepolia trace (~73 ms in CI).
 //!
 //! Fully synthetic — no RPC, no fixture, no LFS — so it always runs in CI. `TOTAL_STEPS` models the
 //! execution length of a heavy on-chain computation; `CHANGED_SLOTS` is the handful of words it
@@ -110,19 +112,24 @@ fn bench_extraction_paths(c: &mut Criterion) {
     let trace = synthetic_trace();
     let (diff, frame) = synthetic_prestate();
 
-    // Sanity: both paths must yield the same number of state updates (CHANGED_SLOTS stores + 1 log).
+    // Fixture guard: the two inputs must describe the same logical diff, or the timings below are
+    // comparing different amounts of work rather than two representations of one workload. Equal
+    // update counts hold *for this workload* — every slot is written once, in ascending slot order,
+    // with a single trailing log — not as a property of the encoders. Asserting vector equality here
+    // would pass for the same narrow reason and read as proof of a general equivalence that does not
+    // hold; see the `core` test named in the module docs for where they actually diverge.
     let n_struct = compute_state_updates(trace.clone())
         .map(|(u, _, _)| u.len())
         .unwrap_or(0);
     let n_pre = build_state_updates_from_prestate(CONSUMER, &diff, &frame).len();
     eprintln!(
-        "prestate_parsing: struct-log path -> {n_struct} updates from {} steps; \
-         prestate path -> {n_pre} updates from {CHANGED_SLOTS} changed slots",
+        "prestate_parsing: struct-log encoder -> {n_struct} updates from {} steps; \
+         prestate net form -> {n_pre} updates from {CHANGED_SLOTS} changed slots",
         trace.struct_logs.len()
     );
     assert_eq!(
         n_struct, n_pre,
-        "both paths must produce the same number of updates"
+        "the two inputs must model the same logical diff for the timings to be comparable"
     );
 
     let mut group = c.benchmark_group("prestate_parsing");

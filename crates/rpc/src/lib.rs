@@ -92,7 +92,7 @@ where
 ///
 /// Cost is `O(changed slots)` rather than `O(execution steps)`, so this succeeds on heavy-compute
 /// tracked functions whose struct-log trace would time out the node. Used together with
-/// [`get_call_frame_from_call`] by the prestate fast path (see `gas_analyzer_core::prestate`).
+/// [`get_call_frame_from_call`] to build the prestate net form (see `gas_analyzer_core::prestate`).
 pub async fn get_prestate_diff_from_call<P, Req>(
     provider: &P,
     tx_request: Req,
@@ -122,8 +122,8 @@ where
 
 /// Simulate a call and return the `callTracer` frame (with logs): the call tree + emitted events.
 ///
-/// Used together with [`get_prestate_diff_from_call`] by the prestate fast path to recover events and to
-/// classify whether the cheap path is sound (no regular CALL / CREATE / cross-contract storage).
+/// Used together with [`get_prestate_diff_from_call`] to recover events for the prestate net form and
+/// to classify whether that form exists (no regular CALL / CREATE / cross-contract storage).
 pub async fn get_call_frame_from_call<P, Req>(
     provider: &P,
     tx_request: Req,

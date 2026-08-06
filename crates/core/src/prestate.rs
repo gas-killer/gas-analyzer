@@ -31,21 +31,20 @@ use alloy_rpc_types::trace::geth::{CallFrame, CallLogFrame, DiffMode};
 
 use crate::types::{IStateUpdateTypes, StateUpdate};
 
-/// Whether the prestate fast path can soundly reconstruct the diff, or the caller must fall back to the
-/// struct-log path.
+/// Whether a call has a net form, or must be encoded from its struct-log trace instead.
 #[derive(Debug, Clone)]
 pub enum PrestateEligibility {
-    /// The fast path is sound: call [`build_state_updates_from_prestate`].
+    /// The net form is sound for this call: build it with [`build_state_updates_from_prestate`].
     Eligible,
-    /// The fast path cannot represent this call; fall back to `compute_state_updates`. Carries a
+    /// The net form cannot represent this call; encode it from the struct-log trace. Carries a
     /// human-readable reason for logging.
     Fallback(String),
 }
 
-/// Decide whether the prestate fast path is sound for a call, given its `callTracer` frame and
-/// `prestateTracer` diff. Mirrors `compute_state_updates`'s replay-script model: STORE/LOG/CALL live at
-/// "target depth" (the `consumer` frame), `DELEGATECALL`/`CALLCODE` are transparent. We must fall back
-/// when the consumer:
+/// Decide whether a call has a net form, given its `callTracer` frame and `prestateTracer` diff.
+/// Mirrors `compute_state_updates`'s replay-script model: STORE/LOG/CALL live at "target depth" (the
+/// `consumer` frame), `DELEGATECALL`/`CALLCODE` are transparent. There is no net form when the
+/// consumer:
 ///   * changes a non-consumer account's storage (only CALL replay reproduces that), or
 ///   * makes a regular `CALL` at target depth (its internals re-execute; a net diff can't separate
 ///     those from top-level writes), or
@@ -54,11 +53,10 @@ pub enum PrestateEligibility {
 ///
 /// `STATICCALL` is read-only and ignored.
 ///
-/// Two structural preconditions also force a fallback. `frame` must be the consumer's own frame — the
-/// diff is filtered by `consumer`, so a mismatched pair would silently drop every store. And the
+/// Two structural preconditions also rule out the net form. `frame` must be the consumer's own frame —
+/// the diff is filtered by `consumer`, so a mismatched pair would silently drop every store. And the
 /// top-level call must have succeeded: a reverted call leaves an empty net diff, whereas the struct-log
-/// extractors still emit the rolled-back writes, and the fast path must not quietly turn one behaviour
-/// into the other.
+/// extractors still emit the rolled-back writes, so the two would disagree on more than representation.
 pub fn classify_prestate_eligibility(
     frame: &CallFrame,
     diff: &DiffMode,
@@ -91,7 +89,7 @@ pub fn classify_prestate_eligibility(
 }
 
 /// Walk the target-depth context (root + `DELEGATECALL`/`CALLCODE` descendants) for a frame type that
-/// forces the struct-log fallback. Returns the first disqualifying reason, if any.
+/// rules out the net form. Returns the first disqualifying reason, if any.
 fn scan_target_depth(frame: &CallFrame) -> Option<String> {
     for c in &frame.calls {
         match c.typ.as_str() {
