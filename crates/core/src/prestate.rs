@@ -654,6 +654,23 @@ mod tests {
         );
     }
 
+    /// A reverted `STATICCALL` changes nothing on either path, so it must not cost the call its net
+    /// form — the revert guards above are about frames that could have written state, not any failure
+    /// anywhere in the tree.
+    #[test]
+    fn reverted_staticcall_child_stays_eligible() {
+        let reverted = CallFrame {
+            error: Some("execution reverted".into()),
+            ..frame("STATICCALL", vec![], vec![])
+        };
+        let f = frame("CALL", vec![], vec![reverted]);
+        assert!(is_eligible(classify_prestate_eligibility(
+            &f,
+            &diff_consumer_only(),
+            CONSUMER
+        )));
+    }
+
     // ---- net form vs the canonical struct-log encoder --------------------------------------------
 
     /// Pins the two ways the net form's bytes differ from the canonical encoder's for the same call,
