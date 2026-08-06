@@ -1479,502 +1479,525 @@ mod tests {
         assert_eq!(hints.len(), 1);
     }
 
-    // ========================================================================
-    // Hybrid prestate/struct-log extraction — anvil integration tests
-    //
-    // These spawn a local `anvil` (installed in CI via foundry-toolchain) and
-    // exercise the REAL tracers end-to-end: the prestate fast path and the
-    // struct-log path are run against the same deployed bytecode and their
-    // outputs compared. Contracts are hand-assembled runtime bytecode set via
-    // `anvil_setCode` — no solc/forge build step.
-    // ========================================================================
+    /// End-to-end coverage of the extraction dispatcher and the `rpc` tracer helpers against a
+    /// real node, rather than synthetic tracer output.
+    ///
+    /// Gated behind the `anvil` feature because these spawn a local `anvil`: `evmsketch` is a
+    /// workspace default member, so without the gate a plain `cargo test` would hard-fail for any
+    /// contributor who has not installed foundry. Mirrors how `gas-analyzer-cli` gates its own
+    /// anvil-backed tests. CI runs them via a dedicated step.
+    #[cfg(feature = "anvil")]
+    mod anvil_integration {
+        use super::*;
 
-    /// A local anvil instance on an OS-assigned free port, killed on drop.
-    struct LocalAnvil {
-        child: std::process::Child,
-        url: String,
-    }
+        // ========================================================================
+        // Hybrid prestate/struct-log extraction — anvil integration tests
+        //
+        // These spawn a local `anvil` (installed in CI via foundry-toolchain) and
+        // exercise the REAL tracers end-to-end: the prestate fast path and the
+        // struct-log path are run against the same deployed bytecode and their
+        // outputs compared. Contracts are hand-assembled runtime bytecode set via
+        // `anvil_setCode` — no solc/forge build step.
+        // ========================================================================
 
-    impl LocalAnvil {
-        async fn spawn() -> LocalAnvil {
-            // Grab a free port, release it, and hand it to anvil. The tiny
-            // reuse window is acceptable for tests.
-            let port = std::net::TcpListener::bind("127.0.0.1:0")
-                .expect("bind to pick a free port")
-                .local_addr()
-                .expect("local_addr")
-                .port();
-            let child = std::process::Command::new("anvil")
-                .args(["--port", &port.to_string(), "--silent"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect(
-                    "failed to spawn `anvil` — these tests need foundry \
+        /// A local anvil instance on an OS-assigned free port, killed on drop.
+        struct LocalAnvil {
+            child: std::process::Child,
+            url: String,
+        }
+
+        impl LocalAnvil {
+            async fn spawn() -> LocalAnvil {
+                // Grab a free port, release it, and hand it to anvil. The tiny
+                // reuse window is acceptable for tests.
+                let port = std::net::TcpListener::bind("127.0.0.1:0")
+                    .expect("bind to pick a free port")
+                    .local_addr()
+                    .expect("local_addr")
+                    .port();
+                let child = std::process::Command::new("anvil")
+                    .args(["--port", &port.to_string(), "--silent"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect(
+                        "failed to spawn `anvil` — these tests need foundry \
                      (https://getfoundry.sh) on PATH; CI installs it via foundry-toolchain",
-                );
-            let anvil = LocalAnvil {
-                child,
-                url: format!("http://127.0.0.1:{port}"),
-            };
-            let provider = anvil.provider();
-            let mut last_err = None;
-            for _ in 0..100 {
-                match provider.get_chain_id().await {
-                    Ok(_) => return anvil,
-                    // Yield to the runtime instead of blocking the executor thread.
-                    Err(e) => last_err = Some(e),
+                    );
+                let anvil = LocalAnvil {
+                    child,
+                    url: format!("http://127.0.0.1:{port}"),
+                };
+                let provider = anvil.provider();
+                let mut last_err = None;
+                for _ in 0..100 {
+                    match provider.get_chain_id().await {
+                        Ok(_) => return anvil,
+                        // Yield to the runtime instead of blocking the executor thread.
+                        Err(e) => last_err = Some(e),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                // stdout/stderr are suppressed, so surface the last probe error.
+                panic!("anvil did not become ready within 5s; last error: {last_err:?}");
             }
-            // stdout/stderr are suppressed, so surface the last probe error.
-            panic!("anvil did not become ready within 5s; last error: {last_err:?}");
+
+            fn provider(&self) -> RootProvider<Ethereum> {
+                RootProvider::<Ethereum>::new_http(Url::parse(&self.url).expect("valid url"))
+            }
         }
 
-        fn provider(&self) -> RootProvider<Ethereum> {
-            RootProvider::<Ethereum>::new_http(Url::parse(&self.url).expect("valid url"))
+        impl Drop for LocalAnvil {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
         }
-    }
 
-    impl Drop for LocalAnvil {
-        fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        async fn set_code(provider: &RootProvider<Ethereum>, addr: Address, code: Bytes) {
+            let _: serde_json::Value = provider
+                .raw_request("anvil_setCode".into(), (addr, code))
+                .await
+                .expect("anvil_setCode");
         }
-    }
 
-    async fn set_code(provider: &RootProvider<Ethereum>, addr: Address, code: Bytes) {
-        let _: serde_json::Value = provider
-            .raw_request("anvil_setCode".into(), (addr, code))
-            .await
-            .expect("anvil_setCode");
-    }
+        async fn set_storage(
+            provider: &RootProvider<Ethereum>,
+            addr: Address,
+            slot: B256,
+            value: B256,
+        ) {
+            let _: serde_json::Value = provider
+                .raw_request("anvil_setStorageAt".into(), (addr, slot, value))
+                .await
+                .expect("anvil_setStorageAt");
+        }
 
-    async fn set_storage(
-        provider: &RootProvider<Ethereum>,
-        addr: Address,
-        slot: B256,
-        value: B256,
-    ) {
-        let _: serde_json::Value = provider
-            .raw_request("anvil_setStorageAt".into(), (addr, slot, value))
-            .await
-            .expect("anvil_setStorageAt");
-    }
+        /// A `debug_traceCall` request from anvil's first funded account.
+        fn call_request(to: Address) -> TransactionRequest {
+            TransactionRequest::default()
+                .from(address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"))
+                .to(to)
+                .gas_limit(3_000_000)
+        }
 
-    /// A `debug_traceCall` request from anvil's first funded account.
-    fn call_request(to: Address) -> TransactionRequest {
-        TransactionRequest::default()
-            .from(address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"))
-            .to(to)
-            .gas_limit(3_000_000)
-    }
+        /// 32-byte topic with the given last byte, as hex for a PUSH32 immediate.
+        fn topic_hex(last: u8) -> String {
+            format!("{}{last:02x}", "00".repeat(31))
+        }
 
-    /// 32-byte topic with the given last byte, as hex for a PUSH32 immediate.
-    fn topic_hex(last: u8) -> String {
-        format!("{}{last:02x}", "00".repeat(31))
-    }
+        fn hex_code(spaced_hex: &str) -> Bytes {
+            Bytes::from(alloy::hex::decode(spaced_hex.replace(' ', "")).expect("valid hex"))
+        }
 
-    fn hex_code(spaced_hex: &str) -> Bytes {
-        Bytes::from(alloy::hex::decode(spaced_hex.replace(' ', "")).expect("valid hex"))
-    }
+        fn addr_hex(a: Address) -> String {
+            alloy::hex::encode(a.as_slice())
+        }
 
-    fn addr_hex(a: Address) -> String {
-        alloy::hex::encode(a.as_slice())
-    }
+        /// SSTORE(1,0x42); MSTORE(0,0xab); LOG1(mem[0..32], topic 0xaa);
+        /// SSTORE(2,5); SSTORE(2,0) — net zero; SSTORE(5,0) — zeroes a pre-seeded slot; STOP.
+        fn eligible_code() -> Bytes {
+            hex_code(&format!(
+                "6042600155 60ab600052 7f{}60206000a1 6005600255 6000600255 6000600555 00",
+                topic_hex(0xaa),
+            ))
+        }
 
-    /// SSTORE(1,0x42); MSTORE(0,0xab); LOG1(mem[0..32], topic 0xaa);
-    /// SSTORE(2,5); SSTORE(2,0) — net zero; SSTORE(5,0) — zeroes a pre-seeded slot; STOP.
-    fn eligible_code() -> Bytes {
-        hex_code(&format!(
-            "6042600155 60ab600052 7f{}60206000a1 6005600255 6000600255 6000600555 00",
-            topic_hex(0xaa),
-        ))
-    }
+        /// LOG1(topic 0xaa); DELEGATECALL(lib); POP; LOG1(topic 0xbb); STOP.
+        /// True emission order with the lib's log is aa, cc, bb — a naive DFS
+        /// over the call tree would give aa, bb, cc.
+        fn delegate_root_code(lib: Address) -> Bytes {
+            hex_code(&format!(
+                "7f{}60006000a1 6000600060006000 73{} 5af450 7f{}60006000a1 00",
+                topic_hex(0xaa),
+                addr_hex(lib),
+                topic_hex(0xbb),
+            ))
+        }
 
-    /// LOG1(topic 0xaa); DELEGATECALL(lib); POP; LOG1(topic 0xbb); STOP.
-    /// True emission order with the lib's log is aa, cc, bb — a naive DFS
-    /// over the call tree would give aa, bb, cc.
-    fn delegate_root_code(lib: Address) -> Bytes {
-        hex_code(&format!(
-            "7f{}60006000a1 6000600060006000 73{} 5af450 7f{}60006000a1 00",
-            topic_hex(0xaa),
-            addr_hex(lib),
-            topic_hex(0xbb),
-        ))
-    }
+        /// LOG1(topic 0xcc); SSTORE(3,7); STOP — runs in the root's storage context.
+        fn delegate_lib_code() -> Bytes {
+            hex_code(&format!("7f{}60006000a1 6007600355 00", topic_hex(0xcc)))
+        }
 
-    /// LOG1(topic 0xcc); SSTORE(3,7); STOP — runs in the root's storage context.
-    fn delegate_lib_code() -> Bytes {
-        hex_code(&format!("7f{}60006000a1 6007600355 00", topic_hex(0xcc)))
-    }
+        /// CALL(callee, no args, no value); POP; SSTORE(4,1); STOP.
+        fn caller_code(callee: Address) -> Bytes {
+            hex_code(&format!(
+                "60006000600060006000 73{} 5af150 6001600455 00",
+                addr_hex(callee),
+            ))
+        }
 
-    /// CALL(callee, no args, no value); POP; SSTORE(4,1); STOP.
-    fn caller_code(callee: Address) -> Bytes {
-        hex_code(&format!(
-            "60006000600060006000 73{} 5af150 6001600455 00",
-            addr_hex(callee),
-        ))
-    }
+        /// SSTORE(1,9); STOP — the callee's own storage, reproduced only by CALL replay.
+        fn callee_code() -> Bytes {
+            hex_code("6009600155 00")
+        }
 
-    /// SSTORE(1,9); STOP — the callee's own storage, reproduced only by CALL replay.
-    fn callee_code() -> Bytes {
-        hex_code("6009600155 00")
-    }
+        /// SSTORE(1,0x42); LOG1(topic 0xdd, no data); REVERT(0,0).
+        fn reverter_code() -> Bytes {
+            hex_code(&format!(
+                "6042600155 7f{}60006000a1 60006000fd",
+                topic_hex(0xdd)
+            ))
+        }
 
-    /// SSTORE(1,0x42); LOG1(topic 0xdd, no data); REVERT(0,0).
-    fn reverter_code() -> Bytes {
-        hex_code(&format!(
-            "6042600155 7f{}60006000a1 60006000fd",
-            topic_hex(0xdd)
-        ))
-    }
+        /// DELEGATECALL(reverter); POP — swallow the failure; SSTORE(2,0x22); STOP.
+        fn catcher_code(lib: Address) -> Bytes {
+            hex_code(&format!(
+                "6000600060006000 73{} 5af450 6022600255 00",
+                addr_hex(lib),
+            ))
+        }
 
-    /// DELEGATECALL(reverter); POP — swallow the failure; SSTORE(2,0x22); STOP.
-    fn catcher_code(lib: Address) -> Bytes {
-        hex_code(&format!(
-            "6000600060006000 73{} 5af450 6022600255 00",
-            addr_hex(lib),
-        ))
-    }
+        fn store_up(slot: u8, value: u8) -> StateUpdate {
+            StateUpdate::Store(IStateUpdateTypes::Store {
+                slot: B256::with_last_byte(slot),
+                value: B256::with_last_byte(value),
+            })
+        }
 
-    fn store_up(slot: u8, value: u8) -> StateUpdate {
-        StateUpdate::Store(IStateUpdateTypes::Store {
-            slot: B256::with_last_byte(slot),
-            value: B256::with_last_byte(value),
-        })
-    }
+        fn log1_up(topic: u8, data: Bytes) -> StateUpdate {
+            StateUpdate::Log1(IStateUpdateTypes::Log1 {
+                data,
+                topic1: B256::with_last_byte(topic),
+            })
+        }
 
-    fn log1_up(topic: u8, data: Bytes) -> StateUpdate {
-        StateUpdate::Log1(IStateUpdateTypes::Log1 {
-            data,
-            topic1: B256::with_last_byte(topic),
-        })
-    }
+        /// Compare update lists by their ABI encoding — the equality that matters,
+        /// since the encoded bytes are what ships to `verifyAndUpdate`.
+        fn assert_updates_eq(actual: &[StateUpdate], expected: &[StateUpdate], ctx: &str) {
+            assert_eq!(
+                encode_state_updates_to_abi(actual),
+                encode_state_updates_to_abi(expected),
+                "{ctx}:\n  actual:   {actual:?}\n  expected: {expected:?}"
+            );
+        }
 
-    /// Compare update lists by their ABI encoding — the equality that matters,
-    /// since the encoded bytes are what ships to `verifyAndUpdate`.
-    fn assert_updates_eq(actual: &[StateUpdate], expected: &[StateUpdate], ctx: &str) {
-        assert_eq!(
-            encode_state_updates_to_abi(actual),
-            encode_state_updates_to_abi(expected),
-            "{ctx}:\n  actual:   {actual:?}\n  expected: {expected:?}"
-        );
-    }
+        /// Classify a call the way `try_prestate_net` does, using the real tracers.
+        async fn classify_call(
+            provider: &RootProvider<Ethereum>,
+            to: Address,
+        ) -> PrestateEligibility {
+            let (diff, frame) = tokio::try_join!(
+                get_prestate_diff_from_call(provider, call_request(to), BlockId::latest()),
+                get_call_frame_from_call(provider, call_request(to), BlockId::latest()),
+            )
+            .expect("prestate/callTracer debug_traceCall failed");
+            classify_prestate_eligibility(&frame, &diff, to)
+        }
 
-    /// Classify a call the way `try_prestate_net` does, using the real tracers.
-    async fn classify_call(provider: &RootProvider<Ethereum>, to: Address) -> PrestateEligibility {
-        let (diff, frame) = tokio::try_join!(
-            get_prestate_diff_from_call(provider, call_request(to), BlockId::latest()),
-            get_call_frame_from_call(provider, call_request(to), BlockId::latest()),
-        )
-        .expect("prestate/callTracer debug_traceCall failed");
-        classify_prestate_eligibility(&frame, &diff, to)
-    }
-
-    /// Extract the same call under an encoding, through the real dispatcher.
-    async fn extract_under(
-        provider: &RootProvider<Ethereum>,
-        to: Address,
-        encoding: StateEncoding,
-    ) -> (Vec<StateUpdate>, HashSet<Opcode>) {
-        extract_state_updates_hybrid(provider, call_request(to), BlockId::latest(), to, encoding)
+        /// Extract the same call under an encoding, through the real dispatcher.
+        async fn extract_under(
+            provider: &RootProvider<Ethereum>,
+            to: Address,
+            encoding: StateEncoding,
+        ) -> (Vec<StateUpdate>, HashSet<Opcode>) {
+            extract_state_updates_hybrid(
+                provider,
+                call_request(to),
+                BlockId::latest(),
+                to,
+                encoding,
+            )
             .await
             .expect("extraction failed")
-    }
+        }
 
-    /// Run the `PrestateNet` dispatcher and, for comparison, each struct-log encoder directly.
-    ///
-    /// `PrestateNet` falls back to the *canonical* encoder for calls with no net form, so that — not
-    /// legacy — is what a fallback result must equal. Legacy is returned too because several tests
-    /// contrast the three representations.
-    async fn extract_all(
-        provider: &RootProvider<Ethereum>,
-        to: Address,
-    ) -> (Vec<StateUpdate>, Vec<StateUpdate>, Vec<StateUpdate>) {
-        let (net, _) = extract_under(provider, to, StateEncoding::PrestateNet).await;
-        let trace = get_trace_from_call(provider, call_request(to), BlockId::latest())
-            .await
-            .expect("struct-log debug_traceCall failed");
-        let (legacy, _, _) =
-            compute_state_updates(trace.clone()).expect("compute_state_updates failed");
-        let (canonical, _, _) =
-            compute_state_updates_canonical(trace, to).expect("canonical extraction failed");
-        (net, legacy, canonical)
-    }
-
-    /// Eligible call, against a real tracer: the net form reaches the same end state and event
-    /// stream as the struct-log encoders while committing to different bytes — the write-then-restore
-    /// of slot 2 disappears, intermediate values collapse, stores are slot-sorted ahead of logs.
-    /// Pinning both outputs is what keeps that difference deliberate rather than incidental.
-    #[tokio::test]
-    async fn test_net_form_differs_from_struct_log_on_eligible_call() {
-        let anvil = LocalAnvil::spawn().await;
-        let provider = anvil.provider();
-        let consumer = address!("0x0000000000000000000000000000000000001001");
-        set_code(&provider, consumer, eligible_code()).await;
-        // Pre-seed slot 5 so the contract's SSTORE(5,0) is a real zeroing write.
-        set_storage(
-            &provider,
-            consumer,
-            B256::with_last_byte(5),
-            B256::with_last_byte(0x99),
-        )
-        .await;
-
-        assert!(
-            matches!(
-                classify_call(&provider, consumer).await,
-                PrestateEligibility::Eligible
-            ),
-            "self-contained SSTORE+LOG call must be prestate-eligible"
-        );
-
-        let (_, skipped) = extract_under(&provider, consumer, StateEncoding::PrestateNet).await;
-        assert!(skipped.is_empty(), "net form reports no skipped opcodes");
-
-        let (net, legacy, _) = extract_all(&provider, consumer).await;
-        let word_ab = Bytes::copy_from_slice(B256::with_last_byte(0xab).as_slice());
-        assert_updates_eq(
-            &net,
-            &[
-                store_up(1, 0x42),
-                store_up(5, 0),
-                log1_up(0xaa, word_ab.clone()),
-            ],
-            "net form: net stores (slot-sorted, net-zero slot 2 omitted, zeroing kept), then logs",
-        );
-        assert_updates_eq(
-            &legacy,
-            &[
-                store_up(1, 0x42),
-                log1_up(0xaa, word_ab),
-                store_up(2, 5),
-                store_up(2, 0),
-                store_up(5, 0),
-            ],
-            "legacy: every write in execution order",
-        );
-    }
-
-    /// Logs emitted around a DELEGATECALL must come out in true emission order
-    /// (root log, lib log, root log) on BOTH paths — this is the `position`/
-    /// `index` interleaving working against a real tracer, and the delegatecall
-    /// SSTORE must land on the root's storage.
-    #[tokio::test]
-    async fn test_delegatecall_log_ordering_matches_between_paths() {
-        let anvil = LocalAnvil::spawn().await;
-        let provider = anvil.provider();
-        let root = address!("0x0000000000000000000000000000000000001002");
-        let lib = address!("0x0000000000000000000000000000000000001003");
-        set_code(&provider, root, delegate_root_code(lib)).await;
-        set_code(&provider, lib, delegate_lib_code()).await;
-
-        assert!(
-            matches!(
-                classify_call(&provider, root).await,
-                PrestateEligibility::Eligible
-            ),
-            "delegatecall-only call must be prestate-eligible"
-        );
-
-        let (net, legacy, _) = extract_all(&provider, root).await;
-        assert_updates_eq(
-            &net,
-            &[
-                store_up(3, 7),
-                log1_up(0xaa, Bytes::new()),
-                log1_up(0xcc, Bytes::new()),
-                log1_up(0xbb, Bytes::new()),
-            ],
-            "net form: delegatecall store on root, logs interleaved aa, cc, bb",
-        );
-
-        // Event order is the one thing every encoding must agree on — it is observable on chain via
-        // the receipt, unlike the storage-write layout. This is the check that validates the
-        // `position`/`index` reconstruction against a real tracer rather than a synthetic frame.
-        let logs_only = |updates: &[StateUpdate]| -> Vec<String> {
-            updates
-                .iter()
-                .filter(|u| matches!(u, StateUpdate::Log1(_)))
-                .map(|u| format!("{u:?}"))
-                .collect()
-        };
-        assert_eq!(
-            logs_only(&net),
-            logs_only(&legacy),
-            "event order must match the struct-log encoder's true emission order"
-        );
-    }
-
-    /// A regular CALL at target depth is not representable by a net diff: the dispatcher must fall
-    /// back and return exactly what `PrestateNet`'s struct-log encoder — the *canonical* one —
-    /// returns (a replayable CALL op + the consumer's own store; the callee's internals excluded).
-    #[tokio::test]
-    async fn test_hybrid_falls_back_on_regular_call() {
-        let anvil = LocalAnvil::spawn().await;
-        let provider = anvil.provider();
-        let caller = address!("0x0000000000000000000000000000000000001004");
-        let callee = address!("0x0000000000000000000000000000000000001005");
-        set_code(&provider, caller, caller_code(callee)).await;
-        set_code(&provider, callee, callee_code()).await;
-
-        assert!(
-            matches!(
-                classify_call(&provider, caller).await,
-                PrestateEligibility::Fallback(_)
-            ),
-            "regular CALL must force the struct-log fallback"
-        );
-
-        let (net, _, canonical) = extract_all(&provider, caller).await;
-        assert_updates_eq(
-            &net,
-            &canonical,
-            "on fallback, PrestateNet must equal its paired canonical encoder",
-        );
-        assert_updates_eq(
-            &net,
-            &[
-                StateUpdate::Call(IStateUpdateTypes::Call {
-                    target: callee,
-                    value: U256::ZERO,
-                    callargs: Bytes::new(),
-                }),
-                store_up(4, 1),
-            ],
-            "fallback output: CALL op (callee internals excluded) then own store",
-        );
-    }
-
-    /// A reverted call must fall back. Without the classifier's failure check the net form would
-    /// classify this Eligible and emit the LOG the tracer still reports for the reverted root frame —
-    /// anvil does not prune it, though geth does — on top of an empty storage diff, i.e. an event
-    /// that never happened. This is the test that makes that guard load-bearing rather than
-    /// defensive, and it fails if the guard is removed.
-    #[tokio::test]
-    async fn test_hybrid_falls_back_on_reverted_call() {
-        let anvil = LocalAnvil::spawn().await;
-        let provider = anvil.provider();
-        let reverter = address!("0x0000000000000000000000000000000000001006");
-        set_code(&provider, reverter, reverter_code()).await;
-
-        assert!(
-            matches!(
-                classify_call(&provider, reverter).await,
-                PrestateEligibility::Fallback(_)
-            ),
-            "reverted call must force the struct-log fallback"
-        );
-
-        let (net, _, canonical) = extract_all(&provider, reverter).await;
-        assert_updates_eq(
-            &net,
-            &canonical,
-            "on fallback, PrestateNet must equal its paired canonical encoder",
-        );
-    }
-
-    /// A DELEGATECALL child that reverts while its parent succeeds: the child's
-    /// ops rolled back (absent from the net diff) but the struct-log path still
-    /// extracts them at target depth. This is the sharpest difference between the three encodings,
-    /// and the case where `Legacy` is outright wrong.
-    ///
-    /// The catcher DELEGATECALLs a library that stores slot 1 and emits a log before reverting,
-    /// discards the failure flag, then stores slot 2 and returns successfully. Because DELEGATECALL
-    /// runs in the catcher's storage context, the rolled-back write targeted the catcher's own slot 1
-    /// — so only the slot-2 write survives on chain, and no event is emitted at all.
-    ///
-    /// `Legacy` nonetheless emits the rolled-back store *and* the rolled-back log. Applying that
-    /// program through `verifyAndUpdate` would write slot 1 and emit an event that never happened —
-    /// the silent-corruption hazard `Legacy`'s own docs warn about, reproduced here against a real
-    /// node. It is pinned rather than fixed because `Legacy` is frozen: changing it would change the
-    /// digest of every deployment still signing it. See gas-analyzer#178.
-    #[tokio::test]
-    async fn test_caught_reverted_delegatecall_is_dropped_by_net_form_but_kept_by_legacy() {
-        let anvil = LocalAnvil::spawn().await;
-        let provider = anvil.provider();
-        let catcher = address!("0x0000000000000000000000000000000000001007");
-        let reverter = address!("0x0000000000000000000000000000000000001006");
-        set_code(&provider, catcher, catcher_code(reverter)).await;
-        set_code(&provider, reverter, reverter_code()).await;
-
-        // The parent frame succeeded, so the call keeps its net form: a reverted child's effects are
-        // absent from the net diff by construction, and its logs are excluded when collecting.
-        assert!(
-            matches!(
-                classify_call(&provider, catcher).await,
-                PrestateEligibility::Eligible
-            ),
-            "a caught revert inside a transparent frame does not cost the call its net form"
-        );
-
-        let (net, legacy, canonical) = extract_all(&provider, catcher).await;
-        assert_updates_eq(
-            &net,
-            &[store_up(2, 0x22)],
-            "net form: only the write that survived the revert, and no event",
-        );
-        assert_updates_eq(
-            &canonical,
-            &[store_up(2, 0x22)],
-            "canonical journals per frame and discards the reverted child, agreeing on the effect",
-        );
-        assert_updates_eq(
-            &legacy,
-            &[
-                store_up(1, 0x42),
-                log1_up(0xdd, Bytes::new()),
-                store_up(2, 0x22),
-            ],
-            "legacy replays the rolled-back store and log — a known unsoundness, pinned so a change \
-             to it is a deliberate digest migration rather than an accident",
-        );
-    }
-
-    /// Shape contract of the two new rpc helpers against a real node: the
-    /// prestate diff carries the consumer's changed slots, and the call frame
-    /// carries logs with `position` populated.
-    #[tokio::test]
-    async fn test_prestate_rpc_helpers_return_diff_and_frame() {
-        let anvil = LocalAnvil::spawn().await;
-        let provider = anvil.provider();
-        let consumer = address!("0x0000000000000000000000000000000000001001");
-        set_code(&provider, consumer, eligible_code()).await;
-
-        let diff =
-            get_prestate_diff_from_call(&provider, call_request(consumer), BlockId::latest())
+        /// Run the `PrestateNet` dispatcher and, for comparison, each struct-log encoder directly.
+        ///
+        /// `PrestateNet` falls back to the *canonical* encoder for calls with no net form, so that — not
+        /// legacy — is what a fallback result must equal. Legacy is returned too because several tests
+        /// contrast the three representations.
+        async fn extract_all(
+            provider: &RootProvider<Ethereum>,
+            to: Address,
+        ) -> (Vec<StateUpdate>, Vec<StateUpdate>, Vec<StateUpdate>) {
+            let (net, _) = extract_under(provider, to, StateEncoding::PrestateNet).await;
+            let trace = get_trace_from_call(provider, call_request(to), BlockId::latest())
                 .await
-                .expect("prestate tracer");
-        let post_storage = &diff
-            .post
-            .get(&consumer)
-            .expect("consumer must appear in post state")
-            .storage;
-        assert_eq!(
-            post_storage.get(&B256::with_last_byte(1)),
-            Some(&B256::with_last_byte(0x42)),
-            "diff must carry the consumer's changed slot"
-        );
+                .expect("struct-log debug_traceCall failed");
+            let (legacy, _, _) =
+                compute_state_updates(trace.clone()).expect("compute_state_updates failed");
+            let (canonical, _, _) =
+                compute_state_updates_canonical(trace, to).expect("canonical extraction failed");
+            (net, legacy, canonical)
+        }
 
-        let frame = get_call_frame_from_call(&provider, call_request(consumer), BlockId::latest())
-            .await
-            .expect("call tracer");
-        assert_eq!(
-            frame.logs.len(),
-            1,
-            "callTracer must return the emitted log"
-        );
-        assert!(
-            frame.logs[0].position.is_some(),
-            "log position must be populated — ordered_target_depth_logs depends on it"
-        );
-        assert_eq!(
-            frame.logs[0].topics.as_deref(),
-            Some(&[B256::with_last_byte(0xaa)][..]),
-            "log topic must round-trip"
-        );
+        /// Eligible call, against a real tracer: the net form reaches the same end state and event
+        /// stream as the struct-log encoders while committing to different bytes — the write-then-restore
+        /// of slot 2 disappears, intermediate values collapse, stores are slot-sorted ahead of logs.
+        /// Pinning both outputs is what keeps that difference deliberate rather than incidental.
+        #[tokio::test]
+        async fn test_net_form_differs_from_struct_log_on_eligible_call() {
+            let anvil = LocalAnvil::spawn().await;
+            let provider = anvil.provider();
+            let consumer = address!("0x0000000000000000000000000000000000001001");
+            set_code(&provider, consumer, eligible_code()).await;
+            // Pre-seed slot 5 so the contract's SSTORE(5,0) is a real zeroing write.
+            set_storage(
+                &provider,
+                consumer,
+                B256::with_last_byte(5),
+                B256::with_last_byte(0x99),
+            )
+            .await;
+
+            assert!(
+                matches!(
+                    classify_call(&provider, consumer).await,
+                    PrestateEligibility::Eligible
+                ),
+                "self-contained SSTORE+LOG call must be prestate-eligible"
+            );
+
+            let (_, skipped) = extract_under(&provider, consumer, StateEncoding::PrestateNet).await;
+            assert!(skipped.is_empty(), "net form reports no skipped opcodes");
+
+            let (net, legacy, _) = extract_all(&provider, consumer).await;
+            let word_ab = Bytes::copy_from_slice(B256::with_last_byte(0xab).as_slice());
+            assert_updates_eq(
+                &net,
+                &[
+                    store_up(1, 0x42),
+                    store_up(5, 0),
+                    log1_up(0xaa, word_ab.clone()),
+                ],
+                "net form: net stores (slot-sorted, net-zero slot 2 omitted, zeroing kept), then logs",
+            );
+            assert_updates_eq(
+                &legacy,
+                &[
+                    store_up(1, 0x42),
+                    log1_up(0xaa, word_ab),
+                    store_up(2, 5),
+                    store_up(2, 0),
+                    store_up(5, 0),
+                ],
+                "legacy: every write in execution order",
+            );
+        }
+
+        /// Logs emitted around a DELEGATECALL must come out in true emission order
+        /// (root log, lib log, root log) on BOTH paths — this is the `position`/
+        /// `index` interleaving working against a real tracer, and the delegatecall
+        /// SSTORE must land on the root's storage.
+        #[tokio::test]
+        async fn test_delegatecall_log_ordering_matches_between_paths() {
+            let anvil = LocalAnvil::spawn().await;
+            let provider = anvil.provider();
+            let root = address!("0x0000000000000000000000000000000000001002");
+            let lib = address!("0x0000000000000000000000000000000000001003");
+            set_code(&provider, root, delegate_root_code(lib)).await;
+            set_code(&provider, lib, delegate_lib_code()).await;
+
+            assert!(
+                matches!(
+                    classify_call(&provider, root).await,
+                    PrestateEligibility::Eligible
+                ),
+                "delegatecall-only call must be prestate-eligible"
+            );
+
+            let (net, legacy, _) = extract_all(&provider, root).await;
+            assert_updates_eq(
+                &net,
+                &[
+                    store_up(3, 7),
+                    log1_up(0xaa, Bytes::new()),
+                    log1_up(0xcc, Bytes::new()),
+                    log1_up(0xbb, Bytes::new()),
+                ],
+                "net form: delegatecall store on root, logs interleaved aa, cc, bb",
+            );
+
+            // Event order is the one thing every encoding must agree on — it is observable on chain via
+            // the receipt, unlike the storage-write layout. This is the check that validates the
+            // `position`/`index` reconstruction against a real tracer rather than a synthetic frame.
+            let logs_only = |updates: &[StateUpdate]| -> Vec<String> {
+                updates
+                    .iter()
+                    .filter(|u| matches!(u, StateUpdate::Log1(_)))
+                    .map(|u| format!("{u:?}"))
+                    .collect()
+            };
+            assert_eq!(
+                logs_only(&net),
+                logs_only(&legacy),
+                "event order must match the struct-log encoder's true emission order"
+            );
+        }
+
+        /// A regular CALL at target depth is not representable by a net diff: the dispatcher must fall
+        /// back and return exactly what `PrestateNet`'s struct-log encoder — the *canonical* one —
+        /// returns (a replayable CALL op + the consumer's own store; the callee's internals excluded).
+        #[tokio::test]
+        async fn test_hybrid_falls_back_on_regular_call() {
+            let anvil = LocalAnvil::spawn().await;
+            let provider = anvil.provider();
+            let caller = address!("0x0000000000000000000000000000000000001004");
+            let callee = address!("0x0000000000000000000000000000000000001005");
+            set_code(&provider, caller, caller_code(callee)).await;
+            set_code(&provider, callee, callee_code()).await;
+
+            assert!(
+                matches!(
+                    classify_call(&provider, caller).await,
+                    PrestateEligibility::Fallback(_)
+                ),
+                "regular CALL must force the struct-log fallback"
+            );
+
+            let (net, _, canonical) = extract_all(&provider, caller).await;
+            assert_updates_eq(
+                &net,
+                &canonical,
+                "on fallback, PrestateNet must equal its paired canonical encoder",
+            );
+            assert_updates_eq(
+                &net,
+                &[
+                    StateUpdate::Call(IStateUpdateTypes::Call {
+                        target: callee,
+                        value: U256::ZERO,
+                        callargs: Bytes::new(),
+                    }),
+                    store_up(4, 1),
+                ],
+                "fallback output: CALL op (callee internals excluded) then own store",
+            );
+        }
+
+        /// A reverted call must fall back. Without the classifier's failure check the net form would
+        /// classify this Eligible and emit the LOG the tracer still reports for the reverted root frame —
+        /// anvil does not prune it, though geth does — on top of an empty storage diff, i.e. an event
+        /// that never happened. This is the test that makes that guard load-bearing rather than
+        /// defensive, and it fails if the guard is removed.
+        #[tokio::test]
+        async fn test_hybrid_falls_back_on_reverted_call() {
+            let anvil = LocalAnvil::spawn().await;
+            let provider = anvil.provider();
+            let reverter = address!("0x0000000000000000000000000000000000001006");
+            set_code(&provider, reverter, reverter_code()).await;
+
+            assert!(
+                matches!(
+                    classify_call(&provider, reverter).await,
+                    PrestateEligibility::Fallback(_)
+                ),
+                "reverted call must force the struct-log fallback"
+            );
+
+            let (net, _, canonical) = extract_all(&provider, reverter).await;
+            assert_updates_eq(
+                &net,
+                &canonical,
+                "on fallback, PrestateNet must equal its paired canonical encoder",
+            );
+        }
+
+        /// A DELEGATECALL child that reverts while its parent succeeds: the child's
+        /// ops rolled back (absent from the net diff) but the struct-log path still
+        /// extracts them at target depth. This is the sharpest difference between the three encodings,
+        /// and the case where `Legacy` is outright wrong.
+        ///
+        /// The catcher DELEGATECALLs a library that stores slot 1 and emits a log before reverting,
+        /// discards the failure flag, then stores slot 2 and returns successfully. Because DELEGATECALL
+        /// runs in the catcher's storage context, the rolled-back write targeted the catcher's own slot 1
+        /// — so only the slot-2 write survives on chain, and no event is emitted at all.
+        ///
+        /// `Legacy` nonetheless emits the rolled-back store *and* the rolled-back log. Applying that
+        /// program through `verifyAndUpdate` would write slot 1 and emit an event that never happened —
+        /// the silent-corruption hazard `Legacy`'s own docs warn about, reproduced here against a real
+        /// node. It is pinned rather than fixed because `Legacy` is frozen: changing it would change the
+        /// digest of every deployment still signing it. See gas-analyzer#178.
+        #[tokio::test]
+        async fn test_caught_reverted_delegatecall_is_dropped_by_net_form_but_kept_by_legacy() {
+            let anvil = LocalAnvil::spawn().await;
+            let provider = anvil.provider();
+            let catcher = address!("0x0000000000000000000000000000000000001007");
+            let reverter = address!("0x0000000000000000000000000000000000001006");
+            set_code(&provider, catcher, catcher_code(reverter)).await;
+            set_code(&provider, reverter, reverter_code()).await;
+
+            // The parent frame succeeded, so the call keeps its net form: a reverted child's effects are
+            // absent from the net diff by construction, and its logs are excluded when collecting.
+            assert!(
+                matches!(
+                    classify_call(&provider, catcher).await,
+                    PrestateEligibility::Eligible
+                ),
+                "a caught revert inside a transparent frame does not cost the call its net form"
+            );
+
+            let (net, legacy, canonical) = extract_all(&provider, catcher).await;
+            assert_updates_eq(
+                &net,
+                &[store_up(2, 0x22)],
+                "net form: only the write that survived the revert, and no event",
+            );
+            assert_updates_eq(
+                &canonical,
+                &[store_up(2, 0x22)],
+                "canonical journals per frame and discards the reverted child, agreeing on the effect",
+            );
+            assert_updates_eq(
+                &legacy,
+                &[
+                    store_up(1, 0x42),
+                    log1_up(0xdd, Bytes::new()),
+                    store_up(2, 0x22),
+                ],
+                "legacy replays the rolled-back store and log — a known unsoundness, pinned so a change \
+             to it is a deliberate digest migration rather than an accident",
+            );
+        }
+
+        /// Shape contract of the two new rpc helpers against a real node: the
+        /// prestate diff carries the consumer's changed slots, and the call frame
+        /// carries logs with `position` populated.
+        #[tokio::test]
+        async fn test_prestate_rpc_helpers_return_diff_and_frame() {
+            let anvil = LocalAnvil::spawn().await;
+            let provider = anvil.provider();
+            let consumer = address!("0x0000000000000000000000000000000000001001");
+            set_code(&provider, consumer, eligible_code()).await;
+
+            let diff =
+                get_prestate_diff_from_call(&provider, call_request(consumer), BlockId::latest())
+                    .await
+                    .expect("prestate tracer");
+            let post_storage = &diff
+                .post
+                .get(&consumer)
+                .expect("consumer must appear in post state")
+                .storage;
+            assert_eq!(
+                post_storage.get(&B256::with_last_byte(1)),
+                Some(&B256::with_last_byte(0x42)),
+                "diff must carry the consumer's changed slot"
+            );
+
+            let frame =
+                get_call_frame_from_call(&provider, call_request(consumer), BlockId::latest())
+                    .await
+                    .expect("call tracer");
+            assert_eq!(
+                frame.logs.len(),
+                1,
+                "callTracer must return the emitted log"
+            );
+            assert!(
+                frame.logs[0].position.is_some(),
+                "log position must be populated — ordered_target_depth_logs depends on it"
+            );
+            assert_eq!(
+                frame.logs[0].topics.as_deref(),
+                Some(&[B256::with_last_byte(0xaa)][..]),
+                "log topic must round-trip"
+            );
+        }
     }
+
     /// The net form is byte-different from both struct-log encodings, so it must never be produced
     /// under an encoding that did not ask for it — that is what would fork the task digest across a
     /// fleet whose nodes differ in tracer support.
