@@ -48,8 +48,10 @@ pub enum PrestateEligibility {
 ///   * changes a non-consumer account's storage (only CALL replay reproduces that), or
 ///   * makes a regular `CALL` at target depth (its internals re-execute; a net diff can't separate
 ///     those from top-level writes), or
-///   * does `CREATE`/`CREATE2`/`SELFDESTRUCT` (no `StateUpdate` variant represents them — the
-///     struct-log path skips them too).
+///   * does `CREATE`/`CREATE2` — the struct-log encoders extract a `Create`/`Create2` op carrying the
+///     initcode to re-execute on replay, which a net diff has no way to reconstruct — or
+///     `SELFDESTRUCT`, which no `StateUpdate` variant represents at all (the canonical encoder
+///     surfaces it through `skipped_opcodes`).
 ///
 /// `STATICCALL` is read-only and ignored.
 ///
@@ -69,7 +71,7 @@ pub fn classify_prestate_eligibility(
             "root frame targets {to}, not consumer {consumer}"
         ));
     }
-    if let Some(err) = &frame.error {
+    if let Some(err) = frame_failure(frame) {
         return PrestateEligibility::Fallback(format!("top-level call reverted: {err}"));
     }
     let mut accounts: BTreeSet<Address> = BTreeSet::new();
@@ -118,6 +120,15 @@ fn scan_target_depth(frame: &CallFrame) -> Option<String> {
         }
     }
     None
+}
+
+/// The failure reason a `callTracer` frame carries, or `None` if it completed successfully.
+///
+/// Clients disagree on which field they populate — geth-family tracers set `error` and add
+/// `revertReason` when the reason decodes, while others report only the latter — so a frame is
+/// treated as failed if either is present.
+fn frame_failure(frame: &CallFrame) -> Option<&str> {
+    frame.error.as_deref().or(frame.revert_reason.as_deref())
 }
 
 /// True iff `addr`'s storage actually changed between pre and post (ignores balance/nonce-only deltas).
@@ -203,10 +214,10 @@ fn ordered_target_depth_logs(frame: &CallFrame) -> Vec<&CallLogFrame> {
 /// `DELEGATECALL`/`CALLCODE` children; `STATICCALL`/regular-`CALL` children are excluded but still
 /// advance the position counter.
 ///
-/// A reverted sub-call's events never made it into the receipt, so frames carrying an `error` are
-/// skipped entirely. Geth-family `callTracer` implementations already strip logs under a failed frame,
-/// but the diff must not depend on that: emitting a log the EVM discarded would put an event on chain
-/// that the traced execution never produced.
+/// A reverted sub-call's events never made it into the receipt, so failed frames are skipped entirely
+/// (see [`frame_failure`]). Geth-family `callTracer` implementations strip logs under a failed frame,
+/// but anvil does not, and the diff must not depend on which client answered: emitting a log the EVM
+/// discarded would put an event on chain that the traced execution never produced.
 fn collect_target_depth_logs<'a>(frame: &'a CallFrame, out: &mut Vec<&'a CallLogFrame>) {
     let mut logs: Vec<&CallLogFrame> = frame.logs.iter().collect();
     logs.sort_by_key(|l| l.position.unwrap_or(0)); // stable → preserves vector order within a position
@@ -216,7 +227,7 @@ fn collect_target_depth_logs<'a>(frame: &'a CallFrame, out: &mut Vec<&'a CallLog
             out.push(logs[li]);
             li += 1;
         }
-        if (c.typ == "DELEGATECALL" || c.typ == "CALLCODE") && c.error.is_none() {
+        if (c.typ == "DELEGATECALL" || c.typ == "CALLCODE") && frame_failure(c).is_none() {
             collect_target_depth_logs(c, out);
         }
     }
@@ -573,6 +584,39 @@ mod tests {
                 CONSUMER
             )),
             "a reverted call has an empty net diff but the struct-log paths still emit its writes"
+        );
+    }
+
+    /// A client that decodes the revert reason but leaves `error` unset must still be recognised as a
+    /// failure, or the guard above depends on which node answered.
+    #[test]
+    fn fallback_when_only_revert_reason_is_populated() {
+        let f = CallFrame {
+            revert_reason: Some("Custom()".into()),
+            ..frame("CALL", vec![], vec![])
+        };
+        assert!(!is_eligible(classify_prestate_eligibility(
+            &f,
+            &diff_consumer_only(),
+            CONSUMER
+        )));
+    }
+
+    #[test]
+    fn reverted_delegatecall_logs_are_excluded_via_revert_reason_alone() {
+        let reverted = CallFrame {
+            revert_reason: Some("Custom()".into()),
+            ..frame("DELEGATECALL", vec![log(&[b256(0xDE)], 1)], vec![])
+        };
+        let f = frame("CALL", vec![log(&[b256(0xA1)], 1)], vec![reverted]);
+        let u: Vec<StateUpdate> = ordered_target_depth_logs(&f)
+            .into_iter()
+            .map(log_to_update)
+            .collect();
+        assert_eq!(
+            log1_topics(&u),
+            vec![b256(0xA1)],
+            "a frame reporting only a revert reason is still a failed frame"
         );
     }
 
