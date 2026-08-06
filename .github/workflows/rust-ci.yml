@@ -18,10 +18,30 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy (default workspace)
-        run: cargo clippy --workspace --exclude gas-killer-wasm --exclude gas-analyzer-anvil --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace \
+            --exclude gas-killer-wasm \
+            --exclude gas-analyzer-anvil \
+            --exclude indexer-api \
+            --exclude indexer-rpc \
+            --exclude indexer-store \
+            --exclude indexer-resolver \
+            --exclude indexer-service \
+            --exclude indexer-web \
+            --all-targets -- -D warnings
 
       - name: cargo check (default workspace)
-        run: cargo check --workspace --exclude gas-killer-wasm --exclude gas-analyzer-anvil --all-targets
+        run: |
+          cargo check --workspace \
+            --exclude gas-killer-wasm \
+            --exclude gas-analyzer-anvil \
+            --exclude indexer-api \
+            --exclude indexer-rpc \
+            --exclude indexer-store \
+            --exclude indexer-resolver \
+            --exclude indexer-service \
+            --exclude indexer-web \
+            --all-targets
 
   test-native:
     runs-on: ubuntu-latest
@@ -74,3 +94,41 @@ jobs:
       - name: Run WASM RPC integration test (Node.js)
         if: env.RPC_URL != ''
         run: node crates/wasm/tests/rpc_wasm.mjs
+
+  test-indexer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo clippy (indexer crates)
+        run: |
+          cargo clippy \
+            -p indexer-api \
+            -p indexer-rpc \
+            -p indexer-store \
+            -p indexer-resolver \
+            -p indexer-service \
+            -p indexer-web \
+            --all-targets -- -D warnings
+
+      - name: cargo check (indexer crates)
+        run: |
+          cargo check \
+            -p indexer-api \
+            -p indexer-rpc \
+            -p indexer-store \
+            -p indexer-resolver \
+            -p indexer-service \
+            -p indexer-web \
+            --all-targets
+
+      - name: cargo test (indexer crates)
+        run: |
+          cargo test \
+            -p indexer-api \
+            -p indexer-rpc \
+            -p indexer-store \
+            -p indexer-resolver \
+            -p indexer-service \
+            -p indexer-web

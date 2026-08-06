@@ -1,0 +1,20 @@
+[package]
+name = "indexer-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gas-analyzer-core = { path = "../core" }
+gas-analyzer-rpc = { path = "../rpc" }
+gas-analyzer-evmsketch = { path = "../evmsketch" }
+indexer-rpc = { path = "../indexer-rpc" }
+alloy = { version = "1.0.37", features = ["rpc", "rpc-types"] }
+alloy-eips = "1.0.37"
+alloy-provider = { version = "1.0.37", features = ["debug-api"] }
+alloy-rpc-types = "1.0.37"
+async-trait = "0.1"
+hex = "0.4"
+serde = { version = "1.0.219", features = ["derive"] }
+thiserror = "1.0"
+tracing = "0.1"
+url = "2.5.4"

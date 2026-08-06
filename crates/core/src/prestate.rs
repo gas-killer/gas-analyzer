@@ -1,19 +1,26 @@
-//! Prestate-based state-update extraction (the cheap fast path).
+//! The prestate **net form** of a state-update program.
 //!
-//! `compute_state_updates` (see [`crate::trace`]) builds the replay script from a full struct-log
-//! trace, which is `O(execution steps)` and times out on heavy-compute tracked functions even when the
-//! resulting diff is tiny. This module reconstructs the SAME state updates from two far cheaper
+//! `compute_state_updates` (see [`crate::trace`]) builds the program from a full struct-log trace,
+//! which is `O(execution steps)` and times out on heavy-compute tracked functions even when the
+//! resulting diff is tiny. This module builds an equivalent-effect program from two far cheaper
 //! tracers — `prestateTracer` in `diffMode` (net storage diff, `O(changed slots)`) and `callTracer`
-//! with logs (the call tree + events) — but ONLY when doing so is sound.
+//! with logs (the call tree + events) — for the calls where doing so is sound.
+//!
+//! **The net form is a different program, not a cheaper route to the same one.** It carries one store
+//! per *changed* slot, so repeated writes to a slot collapse into one and a slot written back to its
+//! original value produces none — the struct-log encoders emit those, having no pre-state to compare
+//! against. Applying either program reaches the same end state and emits the same events, but they are
+//! not byte-identical, and the encoded bytes are what the task digest commits to. So this is a
+//! distinct signed encoding a deployment selects fleet-wide, never an opportunistic substitution
+//! inside another one.
 //!
 //! A net storage diff cannot distinguish the consumer's top-level writes from writes induced by a
 //! sub-`CALL` (which `compute_state_updates` represents as a CALL op whose internals re-execute on
 //! replay). So [`classify_prestate_eligibility`] reproduces that model: the consumer's frame is
-//! "target depth", `DELEGATECALL`/`CALLCODE` are transparent, and the fast path is sound only when the
-//! call and every transparent frame completed without reverting, the consumer touches no other
-//! account's storage, and it makes no regular `CALL`, `CREATE`, or `SELFDESTRUCT`. Callers run the
-//! cheap tracers, classify, and either [`build_state_updates_from_prestate`] (eligible) or fall back
-//! to the struct-log path (not eligible / tracers unsupported).
+//! "target depth", `DELEGATECALL`/`CALLCODE` are transparent, and a net form exists only when the
+//! consumer touches no other account's storage and makes no regular `CALL`, `CREATE`, or
+//! `SELFDESTRUCT`. It reads only the call tree and the diff, both fixed by the call and the block, so
+//! every prover reaches the same verdict; the calls it rejects are encoded from the struct-log trace.
 //!
 //! These are pure functions over the tracer outputs — no async, no I/O — to keep them in `core`.
 
@@ -24,46 +31,48 @@ use alloy_rpc_types::trace::geth::{CallFrame, CallLogFrame, DiffMode};
 
 use crate::types::{IStateUpdateTypes, StateUpdate};
 
-/// Whether the prestate fast path can soundly reconstruct the diff, or the caller must fall back to the
-/// struct-log path.
+/// Whether a call has a net form, or must be encoded from its struct-log trace instead.
 #[derive(Debug, Clone)]
 pub enum PrestateEligibility {
-    /// The fast path is sound: call [`build_state_updates_from_prestate`].
+    /// The net form is sound for this call: build it with [`build_state_updates_from_prestate`].
     Eligible,
-    /// The fast path cannot represent this call; fall back to `compute_state_updates`. Carries a
+    /// The net form cannot represent this call; encode it from the struct-log trace. Carries a
     /// human-readable reason for logging.
     Fallback(String),
 }
 
-/// Decide whether the prestate fast path is sound for a call, given its `callTracer` frame and
-/// `prestateTracer` diff. Mirrors `compute_state_updates`'s replay-script model: STORE/LOG/CALL live at
-/// "target depth" (the `consumer` frame), `DELEGATECALL`/`CALLCODE` are transparent. We must fall back
-/// when:
-///   * the call (or a transparent frame at target depth) reverted — `compute_state_updates` is
-///     revert-unaware and extracts the rolled-back ops from the struct log, while they are absent
-///     from a net diff (and clients disagree on pruning reverted frames' logs), so the two paths
-///     would diverge, or
-///   * the consumer changes a non-consumer account's storage (only CALL replay reproduces that), or
-///   * the consumer makes a regular `CALL` at target depth (its internals re-execute; a net diff
-///     can't separate those from top-level writes), or
-///   * the consumer does `CREATE`/`CREATE2` (the struct-log path extracts a `Create`/`Create2` op
-///     that re-executes the captured initcode on replay; a net diff cannot reconstruct it) or
-///     `SELFDESTRUCT` (the struct-log path reports it via `skipped_opcodes`).
+/// Decide whether a call has a net form, given its `callTracer` frame and `prestateTracer` diff.
+/// Mirrors `compute_state_updates`'s replay-script model: STORE/LOG/CALL live at "target depth" (the
+/// `consumer` frame), `DELEGATECALL`/`CALLCODE` are transparent. There is no net form when the
+/// consumer:
+///   * changes a non-consumer account's storage (only CALL replay reproduces that), or
+///   * makes a regular `CALL` at target depth (its internals re-execute; a net diff can't separate
+///     those from top-level writes), or
+///   * does `CREATE`/`CREATE2` — the struct-log encoders extract a `Create`/`Create2` op carrying the
+///     initcode to re-execute on replay, which a net diff has no way to reconstruct — or
+///     `SELFDESTRUCT`, which no `StateUpdate` variant represents at all (the canonical encoder
+///     surfaces it through `skipped_opcodes`).
 ///
-/// `STATICCALL` is read-only and ignored. Known caveat shared with nothing we can detect here:
-/// `TSTORE` leaves no trace in either cheap tracer, so an eligible call using transient storage
-/// loses the struct-log path's `TSTORE` skipped-opcode warning — the extracted diff itself is
-/// unaffected (transient storage never outlives the transaction).
+/// `STATICCALL` is read-only and ignored.
+///
+/// Two structural preconditions also rule out the net form. `frame` must be the consumer's own frame —
+/// the diff is filtered by `consumer`, so a mismatched pair would silently drop every store. And the
+/// top-level call must have succeeded: a reverted call leaves an empty net diff, whereas the struct-log
+/// extractors still emit the rolled-back writes, so the two would disagree on more than representation.
 pub fn classify_prestate_eligibility(
     frame: &CallFrame,
     diff: &DiffMode,
     consumer: Address,
 ) -> PrestateEligibility {
-    if let Some(err) = frame.error.as_deref().or(frame.revert_reason.as_deref()) {
+    if let Some(to) = frame.to
+        && to != consumer
+    {
         return PrestateEligibility::Fallback(format!(
-            "call reverted/failed ({err:?}); struct-log extraction of rolled-back ops can't be \
-             mirrored by a net diff"
+            "root frame targets {to}, not consumer {consumer}"
         ));
+    }
+    if let Some(err) = frame_failure(frame) {
+        return PrestateEligibility::Fallback(format!("top-level call reverted: {err}"));
     }
     let mut accounts: BTreeSet<Address> = BTreeSet::new();
     accounts.extend(diff.pre.keys().copied());
@@ -81,9 +90,8 @@ pub fn classify_prestate_eligibility(
     PrestateEligibility::Eligible
 }
 
-/// Walk the target-depth context (root + `DELEGATECALL`/`CALLCODE` descendants) for a frame type or
-/// a reverted transparent frame that forces the struct-log fallback. Returns the first disqualifying
-/// reason, if any.
+/// Walk the target-depth context (root + `DELEGATECALL`/`CALLCODE` descendants) for a frame type that
+/// rules out the net form. Returns the first disqualifying reason, if any.
 fn scan_target_depth(frame: &CallFrame) -> Option<String> {
     for c in &frame.calls {
         match c.typ.as_str() {
@@ -103,15 +111,6 @@ fn scan_target_depth(frame: &CallFrame) -> Option<String> {
                 return Some("SELFDESTRUCT at target depth (not representable)".into());
             }
             "DELEGATECALL" | "CALLCODE" => {
-                if let Some(err) = c.error.as_deref().or(c.revert_reason.as_deref()) {
-                    // The child's writes rolled back (absent from the net diff), but the
-                    // struct-log path still extracts them — only fallback keeps the paths equal.
-                    return Some(format!(
-                        "reverted {} at target depth ({err:?}); rolled-back ops need the \
-                         struct-log path",
-                        c.typ
-                    ));
-                }
                 if let Some(r) = scan_target_depth(c) {
                     return Some(r);
                 }
@@ -121,6 +120,15 @@ fn scan_target_depth(frame: &CallFrame) -> Option<String> {
         }
     }
     None
+}
+
+/// The failure reason a `callTracer` frame carries, or `None` if it completed successfully.
+///
+/// Clients disagree on which field they populate — geth-family tracers set `error` and add
+/// `revertReason` when the reason decodes, while others report only the latter — so a frame is
+/// treated as failed if either is present.
+fn frame_failure(frame: &CallFrame) -> Option<&str> {
+    frame.error.as_deref().or(frame.revert_reason.as_deref())
 }
 
 /// True iff `addr`'s storage actually changed between pre and post (ignores balance/nonce-only deltas).
@@ -136,11 +144,17 @@ fn account_storage_changed(diff: &DiffMode, addr: Address) -> bool {
     })
 }
 
-/// Build `Vec<StateUpdate>` for an eligible call from its prestate `diff` (consumer storage → STORE)
-/// and `callTracer` `frame` (events → LOGn). Storage is emitted slot-sorted (deterministic) with the
-/// net final value per slot; logs in true emission order. Mirrors the slot set `compute_state_updates`
-/// produces for a no-sub-call function (minus its redundant intermediate writes), so the applied diff
-/// reproduces the same final state and events.
+/// Build the net-form `Vec<StateUpdate>` for an eligible call from its prestate `diff` (consumer
+/// storage → STORE) and `callTracer` `frame` (events → LOGn). Storage is emitted slot-sorted
+/// (deterministic) with the net final value per slot; logs in true emission order.
+///
+/// Only slots whose value actually changed produce a store — this is what makes the net form byte-
+/// different from the struct-log encoders, which emit one store per write with no pre-state to
+/// compare against. Ordering stores before logs is unobservable here because eligibility rules out
+/// any external call that could run between them.
+///
+/// The caller must have classified the call [`PrestateEligibility::Eligible`] first; this function
+/// does not re-check.
 pub fn build_state_updates_from_prestate(
     consumer: Address,
     diff: &DiffMode,
@@ -188,7 +202,9 @@ fn ordered_target_depth_logs(frame: &CallFrame) -> Vec<&CallLogFrame> {
     let mut logs: Vec<&CallLogFrame> = Vec::new();
     collect_target_depth_logs(frame, &mut logs);
     if logs.len() > 1 && logs.iter().all(|l| l.index.is_some()) {
-        logs.sort_by_key(|l| l.index.unwrap()); // global truth; stable, never worsens position order
+        // Global truth when every log carries it; a stable sort on `Option<u64>` (ascending, `None`
+        // first) never worsens the position order established above.
+        logs.sort_by_key(|l| l.index);
     }
     logs
 }
@@ -197,6 +213,11 @@ fn ordered_target_depth_logs(frame: &CallFrame) -> Vec<&CallLogFrame> {
 /// after `p` sub-calls, so it belongs immediately before sub-call `p`. We recurse only into transparent
 /// `DELEGATECALL`/`CALLCODE` children; `STATICCALL`/regular-`CALL` children are excluded but still
 /// advance the position counter.
+///
+/// A reverted sub-call's events never made it into the receipt, so failed frames are skipped entirely
+/// (see [`frame_failure`]). Geth-family `callTracer` implementations strip logs under a failed frame,
+/// but anvil does not, and the diff must not depend on which client answered: emitting a log the EVM
+/// discarded would put an event on chain that the traced execution never produced.
 fn collect_target_depth_logs<'a>(frame: &'a CallFrame, out: &mut Vec<&'a CallLogFrame>) {
     let mut logs: Vec<&CallLogFrame> = frame.logs.iter().collect();
     logs.sort_by_key(|l| l.position.unwrap_or(0)); // stable → preserves vector order within a position
@@ -206,7 +227,7 @@ fn collect_target_depth_logs<'a>(frame: &'a CallFrame, out: &mut Vec<&'a CallLog
             out.push(logs[li]);
             li += 1;
         }
-        if c.typ == "DELEGATECALL" || c.typ == "CALLCODE" {
+        if (c.typ == "DELEGATECALL" || c.typ == "CALLCODE") && frame_failure(c).is_none() {
             collect_target_depth_logs(c, out);
         }
     }
@@ -551,38 +572,29 @@ mod tests {
     }
 
     #[test]
-    fn fallback_on_reverted_root_frame() {
-        // A reverted call rolls everything back: the net diff is empty, but the struct-log path
-        // still extracts the pre-revert ops. Some clients (anvil/revm-inspectors) even keep the
-        // reverted root frame's logs in callTracer output — without this fallback the fast path
-        // would emit events that never happened.
-        let mut f = frame("CALL", vec![log(&[b256(1)], 1)], vec![]);
-        f.error = Some("execution reverted".into());
-        assert!(!is_eligible(classify_prestate_eligibility(
-            &f,
-            &DiffMode::default(),
-            CONSUMER
-        )));
+    fn fallback_when_top_level_call_reverted() {
+        let f = CallFrame {
+            error: Some("execution reverted".into()),
+            ..frame("CALL", vec![], vec![])
+        };
+        assert!(
+            !is_eligible(classify_prestate_eligibility(
+                &f,
+                &diff_consumer_only(),
+                CONSUMER
+            )),
+            "a reverted call has an empty net diff but the struct-log paths still emit its writes"
+        );
     }
 
+    /// A client that decodes the revert reason but leaves `error` unset must still be recognised as a
+    /// failure, or the guard above depends on which node answered.
     #[test]
-    fn fallback_on_revert_reason_only_root_frame() {
-        let mut f = frame("CALL", vec![], vec![]);
-        f.revert_reason = Some("Custom()".into());
-        assert!(!is_eligible(classify_prestate_eligibility(
-            &f,
-            &DiffMode::default(),
-            CONSUMER
-        )));
-    }
-
-    #[test]
-    fn fallback_on_reverted_delegatecall_child() {
-        // Caught revert: the delegatecall's writes rolled back (absent from the net diff), but the
-        // struct-log path extracts them at target depth — the paths would diverge.
-        let mut child = frame("DELEGATECALL", vec![], vec![]);
-        child.error = Some("execution reverted".into());
-        let f = frame("CALL", vec![], vec![child]);
+    fn fallback_when_only_revert_reason_is_populated() {
+        let f = CallFrame {
+            revert_reason: Some("Custom()".into()),
+            ..frame("CALL", vec![], vec![])
+        };
         assert!(!is_eligible(classify_prestate_eligibility(
             &f,
             &diff_consumer_only(),
@@ -591,16 +603,145 @@ mod tests {
     }
 
     #[test]
-    fn reverted_staticcall_child_still_eligible() {
-        // A reverted STATICCALL cannot have changed state or emitted logs on either path.
-        let mut child = frame("STATICCALL", vec![], vec![]);
-        child.error = Some("execution reverted".into());
-        let f = frame("CALL", vec![], vec![child]);
+    fn reverted_delegatecall_logs_are_excluded_via_revert_reason_alone() {
+        let reverted = CallFrame {
+            revert_reason: Some("Custom()".into()),
+            ..frame("DELEGATECALL", vec![log(&[b256(0xDE)], 1)], vec![])
+        };
+        let f = frame("CALL", vec![log(&[b256(0xA1)], 1)], vec![reverted]);
+        let u: Vec<StateUpdate> = ordered_target_depth_logs(&f)
+            .into_iter()
+            .map(log_to_update)
+            .collect();
+        assert_eq!(
+            log1_topics(&u),
+            vec![b256(0xA1)],
+            "a frame reporting only a revert reason is still a failed frame"
+        );
+    }
+
+    #[test]
+    fn fallback_when_root_frame_targets_another_address() {
+        let f = CallFrame {
+            to: Some(Address::repeat_byte(0xBB)),
+            ..frame("CALL", vec![], vec![])
+        };
+        assert!(
+            !is_eligible(classify_prestate_eligibility(
+                &f,
+                &diff_consumer_only(),
+                CONSUMER
+            )),
+            "frame and consumer must describe the same call"
+        );
+    }
+
+    #[test]
+    fn reverted_delegatecall_logs_are_excluded() {
+        let reverted = CallFrame {
+            error: Some("execution reverted".into()),
+            ..frame("DELEGATECALL", vec![log(&[b256(0xDE)], 1)], vec![])
+        };
+        let f = frame("CALL", vec![log(&[b256(0xA1)], 1)], vec![reverted]);
+        let u: Vec<StateUpdate> = ordered_target_depth_logs(&f)
+            .into_iter()
+            .map(log_to_update)
+            .collect();
+        assert_eq!(
+            log1_topics(&u),
+            vec![b256(0xA1)],
+            "the EVM discarded the reverted frame's events; the diff must not re-emit them"
+        );
+    }
+
+    /// A reverted `STATICCALL` changes nothing on either path, so it must not cost the call its net
+    /// form — the revert guards above are about frames that could have written state, not any failure
+    /// anywhere in the tree.
+    #[test]
+    fn reverted_staticcall_child_stays_eligible() {
+        let reverted = CallFrame {
+            error: Some("execution reverted".into()),
+            ..frame("STATICCALL", vec![], vec![])
+        };
+        let f = frame("CALL", vec![], vec![reverted]);
         assert!(is_eligible(classify_prestate_eligibility(
             &f,
             &diff_consumer_only(),
             CONSUMER
         )));
+    }
+
+    // ---- net form vs the canonical struct-log encoder --------------------------------------------
+
+    /// Pins the two ways the net form's bytes differ from the canonical encoder's for the same call,
+    /// so neither encoding can drift into the other unnoticed. Both are correct programs reaching the
+    /// same end state; they are not interchangeable, because the digest commits to the bytes.
+    ///
+    /// Workload (no external calls, so canonical emits a single final slice):
+    ///   * `0xAA` 0 → 1 → 2   — written twice, net change
+    ///   * `0xBB` 5 → 9 → 5   — written twice, net zero
+    ///   * `0xCC` 0 → 7       — written once
+    #[test]
+    fn net_form_omits_slots_the_canonical_encoder_re_asserts() {
+        use crate::trace::compute_state_updates_canonical;
+        use alloy_primitives::U256;
+        use alloy_rpc_types::trace::geth::{DefaultFrame, StructLog};
+
+        const TARGET: Address = Address::repeat_byte(0x77);
+        fn s(n: u64) -> B256 {
+            B256::from(U256::from(n))
+        }
+        // SSTORE struct log; the stack is stored bottom-to-top, so the extractor sees [slot, value].
+        fn sstore(slot: B256, value: B256) -> StructLog {
+            StructLog {
+                op: "SSTORE".into(),
+                depth: 1,
+                stack: Some(vec![value.into(), slot.into()]),
+                memory: Some(Vec::new()),
+                ..Default::default()
+            }
+        }
+
+        let canonical = compute_state_updates_canonical(
+            DefaultFrame {
+                struct_logs: vec![
+                    sstore(s(0xAA), s(1)),
+                    sstore(s(0xAA), s(2)),
+                    sstore(s(0xBB), s(9)),
+                    sstore(s(0xBB), s(5)),
+                    sstore(s(0xCC), s(7)),
+                ],
+                ..Default::default()
+            },
+            TARGET,
+        )
+        .expect("canonical extraction")
+        .0;
+
+        // The same call as prestateTracer diffMode reports it: net-zero `0xBB` is dropped from both
+        // sides, and zero pre-values are omitted too, so only `0xAA` and `0xCC` survive, in `post`.
+        // (A slot listed in `pre` alone would mean a zeroing, which is a real change.)
+        let mut diff = DiffMode::default();
+        diff.pre.insert(TARGET, acct(&[]));
+        diff.post
+            .insert(TARGET, acct(&[(s(0xAA), s(2)), (s(0xCC), s(7))]));
+        let net = build_state_updates_from_prestate(TARGET, &diff, &frame("CALL", vec![], vec![]));
+
+        assert_eq!(
+            stores(&canonical),
+            vec![(s(0xAA), s(2)), (s(0xBB), s(5)), (s(0xCC), s(7))],
+            "canonical collapses repeated writes but has no pre-state, so it re-asserts 0xBB"
+        );
+        assert_eq!(
+            stores(&net),
+            vec![(s(0xAA), s(2)), (s(0xCC), s(7))],
+            "the net form drops 0xBB entirely — prestateTracer never reports a net-zero slot"
+        );
+        assert_ne!(
+            stores(&canonical),
+            stores(&net),
+            "the two encodings must stay distinct; collapsing them silently would fork the digest"
+        );
     }
 
     #[test]

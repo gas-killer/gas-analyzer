@@ -7,9 +7,13 @@
 # Ignore dotenv environment variable files
 .env
 
+# Ignore the indexer-web user allowlist (contains password hashes)
+users.yaml
+
 # Ignore IDE/editor config files
 .idea/
 .vscode/
+.claude/
 
 # Ignore OS metadata files
 .DS_Store

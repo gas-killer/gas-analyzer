@@ -112,8 +112,8 @@ use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 
 use gas_analyzer_core::{
     Opcode, PrestateEligibility, StateUpdate, build_state_updates_from_prestate,
-    classify_prestate_eligibility, compute_state_updates, encode_state_updates_to_abi,
-    estimate_gas_from_operations, extract_operation_counts_from_trace,
+    classify_prestate_eligibility, compute_state_updates, compute_state_updates_canonical,
+    encode_state_updates_to_abi, estimate_gas_from_operations, extract_operation_counts_from_trace,
 };
 use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
 use gas_analyzer_rpc::{
@@ -756,24 +756,112 @@ fn hints_from_state_updates(
     hints
 }
 
+/// How the target's storage mutations are laid out in the emitted update program.
+///
+/// This selects the *signed representation*, not merely how the program is obtained: the encoded
+/// updates are hashed into the task digest every validator recomputes and must match. Two encodings
+/// can reproduce the same final state and still commit to different bytes, so the choice is
+/// consensus-critical — a deployment must run one encoding fleet-wide and roll changes out atomically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StateEncoding {
+    /// Legacy: raw depth-1 `SSTORE`s in trace order; nested writes are dropped and
+    /// left to replay natively inside their emitted `CALL`. No guarantee about the
+    /// storage an external (re-entrant) call observes mid-program, and reverted
+    /// `DELEGATECALL` writes can leak in.
+    #[default]
+    Legacy,
+    /// Canonical checkpointing: before every emitted external `CALL`/`CREATE` the
+    /// program brings the target's storage to the exact image native execution had
+    /// at that point, and a final slice re-asserts the canonical end state. A
+    /// re-entrant call therefore observes canonical storage, and the committed
+    /// final state is correct even if a re-entrant replay diverged. See
+    /// [`gas_analyzer_core::compute_state_updates_canonical`].
+    Canonical,
+    /// The target's **net** storage diff (one slot-sorted store per changed slot) plus its logs,
+    /// read from `prestateTracer` + `callTracer` instead of a struct-log trace. Costs
+    /// `O(changed slots)` rather than `O(execution steps)`, which is what makes heavy-compute
+    /// tracked functions — whose struct-log trace times out the node — extractable at all. See
+    /// [`gas_analyzer_core::prestate`].
+    ///
+    /// The net form is only defined for calls that make no regular `CALL`, `CREATE`, or
+    /// `SELFDESTRUCT` at target depth: with external code running mid-program there is no single
+    /// end-state image to commit to. [`gas_analyzer_core::classify_prestate_eligibility`] decides
+    /// this from the call tree and the diff, so every prover reaches the same verdict for a given
+    /// call; the ones it rejects are encoded as [`Self::Canonical`].
+    ///
+    /// Byte-different from both other encodings for the same call, deliberately: repeated writes to
+    /// one slot collapse to a single store, and a slot written back to its original value produces
+    /// none. That is why it is a distinct encoding rather than an optimisation applied under the
+    /// others — mixing the two representations across a fleet forks the digest.
+    PrestateNet,
+}
+
+/// The struct-log extractor that produces the signed program when the prestate net form is not used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StructLogEncoder {
+    Legacy,
+    Canonical,
+}
+
+impl StateEncoding {
+    /// Whether this encoding signs the prestate net form for the calls that admit it.
+    fn signs_prestate_net(self) -> bool {
+        matches!(self, Self::PrestateNet)
+    }
+
+    /// The struct-log extractor backing this encoding. For [`Self::PrestateNet`] it produces the
+    /// program for calls the net form cannot represent; pairing with [`Self::Canonical`] keeps both
+    /// of its representations revert-aware and slot-sorted.
+    fn struct_log_encoder(self) -> StructLogEncoder {
+        match self {
+            Self::Legacy => StructLogEncoder::Legacy,
+            Self::Canonical | Self::PrestateNet => StructLogEncoder::Canonical,
+        }
+    }
+}
+
 /// Compute encoded state updates and gas estimate for a transaction call using EvmSketch.
 ///
-/// Simulates the call via `debug_traceCall` at the given block, extracts state updates,
-/// encodes them to ABI, and estimates gas. The executor build step (~50–70 ms,
-/// 1× `eth_getBlockByNumber`; plus `eth_chainId` on the first miss per URL) is
-/// skipped on cache hits. The HTTP connection pool for
-/// `rpc_url` is managed by `cache` and shared across calls — pass a persistent
-/// `EvmSketchExecutorCache` for best performance; for one-shot use pass
-/// `&EvmSketchExecutorCache::new(1)`.
+/// Legacy-encoding convenience wrapper over
+/// [`call_to_encoded_state_updates_with_evmsketch_mode`].
 ///
 /// # Returns
 /// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`
-#[tracing::instrument(name = "evmsketch.encode", skip_all, fields(block_number, state_update_count = tracing::field::Empty))]
 pub async fn call_to_encoded_state_updates_with_evmsketch(
     cache: &EvmSketchExecutorCache,
     rpc_url: impl AsRef<str>,
     tx_request: TransactionRequest,
     block_number: u64,
+) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
+    call_to_encoded_state_updates_with_evmsketch_mode(
+        cache,
+        rpc_url,
+        tx_request,
+        block_number,
+        StateEncoding::Legacy,
+    )
+    .await
+}
+
+/// Compute encoded state updates and gas estimate for a transaction call using EvmSketch.
+///
+/// Simulates the call via `debug_traceCall` at the given block, extracts state updates
+/// under the chosen [`StateEncoding`], encodes them to ABI, and estimates gas. The
+/// executor build step (~50–70 ms, 1× `eth_getBlockByNumber`; plus `eth_chainId` on the
+/// first miss per URL) is skipped on cache hits. The HTTP connection pool for `rpc_url`
+/// is managed by `cache` and shared across calls — pass a persistent
+/// `EvmSketchExecutorCache` for best performance; for one-shot use pass
+/// `&EvmSketchExecutorCache::new(1)`.
+///
+/// # Returns
+/// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`
+#[tracing::instrument(name = "evmsketch.encode", skip_all, fields(block_number, encoding = ?encoding, extraction = tracing::field::Empty, state_update_count = tracing::field::Empty))]
+pub async fn call_to_encoded_state_updates_with_evmsketch_mode(
+    cache: &EvmSketchExecutorCache,
+    rpc_url: impl AsRef<str>,
+    tx_request: TransactionRequest,
+    block_number: u64,
+    encoding: StateEncoding,
 ) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
     let rpc_url = rpc_url.as_ref();
     let provider = cache.get_or_create_trace_provider(rpc_url)?;
@@ -807,7 +895,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
     // concurrently — they are independent, so on a cache miss this hides the executor build behind
     // the trace fetch.
     let ((state_updates, skipped_opcodes), executor) = tokio::try_join!(
-        extract_state_updates_hybrid(&provider, tx_request, block_id, contract_address),
+        extract_state_updates_hybrid(&provider, tx_request, block_id, contract_address, encoding),
         cache.get_or_build(rpc_url, block_number),
     )?;
     tracing::Span::current().record("state_update_count", state_updates.len());
@@ -834,42 +922,56 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
     Ok((storage_updates, gas_estimate, false, skipped_opcodes))
 }
 
-/// Extract `(state_updates, skipped_opcodes)` for a simulated call, preferring the cheap prestate fast
-/// path and falling back to the struct-log path when it can't be used.
+/// Extract `(state_updates, skipped_opcodes)` for a simulated call under `encoding`.
 ///
-/// The fast path (`prestateTracer` diff + `callTracer` logs, `O(changed slots)`) is what lets
-/// heavy-compute tracked functions — whose struct-log trace times out the node — be extracted at all.
-/// It is taken only when [`classify_prestate_eligibility`] proves it sound (no revert of the top-level
-/// call or a transparent DELEGATECALL/CALLCODE frame — a reverted STATICCALL is read-only and stays
-/// eligible — no cross-contract storage, no regular CALL / CREATE / SELFDESTRUCT); otherwise, and on any tracer error (e.g. a node that does
-/// not support these tracers), we fall back to `get_trace_from_call` + `compute_state_updates`, which is
-/// the previous behaviour. The fallback owns `tx_request`, so the fast path only borrows it.
+/// [`StateEncoding::PrestateNet`] reads the cheap tracers and emits the net form for calls that admit
+/// it, encoding the rest with its struct-log extractor; the other encodings always take the struct-log
+/// path. The struct-log path owns `tx_request`, so the prestate path only borrows it.
+///
+/// A tracer failure under `PrestateNet` is an **error**, never a quiet downgrade to the struct-log
+/// representation. The encoded updates are hashed into the signed task digest, so an operator whose
+/// node lacks `prestateTracer`/`callTracer` silently switching representations would sign a digest no
+/// other operator can match — turning a node-configuration difference into a consensus split. Failing
+/// the task is recoverable; signing a divergent digest is not.
+///
+/// `skipped_opcodes` is always empty on the net form: neither tracer reports opcodes, so `TSTORE`
+/// (which the canonical extractor flags) is invisible there. That only affects reporting — transient
+/// storage is discarded at the end of the transaction and eligibility already rules out the external
+/// calls that could observe it, so it cannot change the extracted diff.
 async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
     provider: &P,
     tx_request: TransactionRequest,
     block: BlockId,
     consumer: Address,
+    encoding: StateEncoding,
 ) -> Result<(Vec<StateUpdate>, HashSet<Opcode>)> {
-    if let Ok(Some(updates)) = try_prestate_fast_path(provider, &tx_request, block, consumer).await
+    if encoding.signs_prestate_net()
+        && let Some(updates) = try_prestate_net(provider, &tx_request, block, consumer).await?
     {
+        tracing::Span::current().record("extraction", "prestate_net");
         return Ok((updates, HashSet::new()));
     }
+    tracing::Span::current().record("extraction", "struct_log");
     let trace = get_trace_from_call(provider, tx_request, block).await?;
-    let (state_updates, skipped_opcodes, _call_gas_total) = compute_state_updates(trace)?;
+    let (state_updates, skipped_opcodes, _call_gas_total) = match encoding.struct_log_encoder() {
+        StructLogEncoder::Legacy => compute_state_updates(trace)?,
+        StructLogEncoder::Canonical => compute_state_updates_canonical(trace, consumer)?,
+    };
     Ok((state_updates, skipped_opcodes))
 }
 
-/// Try the prestate fast path: `Ok(Some(updates))` when eligible, `Ok(None)` when the call needs the
-/// struct-log fallback, `Err` when the prestate/call tracers are unavailable or fail (also a fallback
-/// signal). Never returns an unsound diff.
-async fn try_prestate_fast_path<P: Provider + DebugApi>(
+/// Build the prestate net form: `Ok(Some(updates))` when the call admits it, `Ok(None)` when the net
+/// form cannot represent the call and the struct-log extractor must produce the program, `Err` when
+/// the tracers are unavailable or fail. Never returns an unsound diff.
+async fn try_prestate_net<P: Provider + DebugApi>(
     provider: &P,
     tx_request: &TransactionRequest,
     block: BlockId,
     consumer: Address,
 ) -> Result<Option<Vec<StateUpdate>>> {
-    // The two tracer calls are independent — run them concurrently so the fast path costs one
-    // round-trip, not two.
+    // Each tracer re-simulates the call, and for the heavy-compute calls this encoding exists to
+    // serve that simulation dominates the request — so issue both concurrently rather than paying
+    // for two sequential executions.
     let (diff, frame) = tokio::try_join!(
         get_prestate_diff_from_call(provider, tx_request.clone(), block),
         get_call_frame_from_call(provider, tx_request.clone(), block),
@@ -879,7 +981,7 @@ async fn try_prestate_fast_path<P: Provider + DebugApi>(
             consumer, &diff, &frame,
         ))),
         PrestateEligibility::Fallback(reason) => {
-            tracing::debug!(reason = %reason, "prestate fast path not eligible; using struct-log path");
+            tracing::debug!(reason = %reason, "call has no net form; using struct-log encoder");
             Ok(None)
         }
     }
@@ -1560,7 +1662,7 @@ mod tests {
         );
     }
 
-    /// Classify a call the way `try_prestate_fast_path` does, using the real tracers.
+    /// Classify a call the way `try_prestate_net` does, using the real tracers.
     async fn classify_call(provider: &RootProvider<Ethereum>, to: Address) -> PrestateEligibility {
         let (diff, frame) = tokio::try_join!(
             get_prestate_diff_from_call(provider, call_request(to), BlockId::latest()),
@@ -1570,29 +1672,43 @@ mod tests {
         classify_prestate_eligibility(&frame, &diff, to)
     }
 
-    /// Run BOTH extraction paths against the same deployed call.
-    /// Returns (hybrid result, struct-log-only result).
-    async fn extract_both(
+    /// Extract the same call under an encoding, through the real dispatcher.
+    async fn extract_under(
         provider: &RootProvider<Ethereum>,
         to: Address,
-    ) -> ((Vec<StateUpdate>, HashSet<Opcode>), Vec<StateUpdate>) {
-        let hybrid =
-            extract_state_updates_hybrid(provider, call_request(to), BlockId::latest(), to)
-                .await
-                .expect("hybrid extraction failed");
+        encoding: StateEncoding,
+    ) -> (Vec<StateUpdate>, HashSet<Opcode>) {
+        extract_state_updates_hybrid(provider, call_request(to), BlockId::latest(), to, encoding)
+            .await
+            .expect("extraction failed")
+    }
+
+    /// Run the `PrestateNet` dispatcher and, for comparison, each struct-log encoder directly.
+    ///
+    /// `PrestateNet` falls back to the *canonical* encoder for calls with no net form, so that — not
+    /// legacy — is what a fallback result must equal. Legacy is returned too because several tests
+    /// contrast the three representations.
+    async fn extract_all(
+        provider: &RootProvider<Ethereum>,
+        to: Address,
+    ) -> (Vec<StateUpdate>, Vec<StateUpdate>, Vec<StateUpdate>) {
+        let (net, _) = extract_under(provider, to, StateEncoding::PrestateNet).await;
         let trace = get_trace_from_call(provider, call_request(to), BlockId::latest())
             .await
             .expect("struct-log debug_traceCall failed");
-        let (structlog, _, _) = compute_state_updates(trace).expect("compute_state_updates failed");
-        (hybrid, structlog)
+        let (legacy, _, _) =
+            compute_state_updates(trace.clone()).expect("compute_state_updates failed");
+        let (canonical, _, _) =
+            compute_state_updates_canonical(trace, to).expect("canonical extraction failed");
+        (net, legacy, canonical)
     }
 
-    /// Eligible call: the fast path must produce the same final storage and the
-    /// same event stream as the struct-log path — net-deduplicated (the write-
-    /// then-restore of slot 2 disappears, intermediate values collapse) with
-    /// STOREs slot-sorted ahead of logs.
+    /// Eligible call, against a real tracer: the net form reaches the same end state and event
+    /// stream as the struct-log encoders while committing to different bytes — the write-then-restore
+    /// of slot 2 disappears, intermediate values collapse, stores are slot-sorted ahead of logs.
+    /// Pinning both outputs is what keeps that difference deliberate rather than incidental.
     #[tokio::test]
-    async fn test_fast_path_matches_struct_log_on_eligible_call() {
+    async fn test_net_form_differs_from_struct_log_on_eligible_call() {
         let anvil = LocalAnvil::spawn().await;
         let provider = anvil.provider();
         let consumer = address!("0x0000000000000000000000000000000000001001");
@@ -1614,21 +1730,22 @@ mod tests {
             "self-contained SSTORE+LOG call must be prestate-eligible"
         );
 
-        let ((fast, skipped), structlog) = extract_both(&provider, consumer).await;
-        assert!(skipped.is_empty(), "fast path reports no skipped opcodes");
+        let (_, skipped) = extract_under(&provider, consumer, StateEncoding::PrestateNet).await;
+        assert!(skipped.is_empty(), "net form reports no skipped opcodes");
 
+        let (net, legacy, _) = extract_all(&provider, consumer).await;
         let word_ab = Bytes::copy_from_slice(B256::with_last_byte(0xab).as_slice());
         assert_updates_eq(
-            &fast,
+            &net,
             &[
                 store_up(1, 0x42),
                 store_up(5, 0),
                 log1_up(0xaa, word_ab.clone()),
             ],
-            "fast path: net stores (slot-sorted, net-zero slot 2 omitted, zeroing kept), then logs",
+            "net form: net stores (slot-sorted, net-zero slot 2 omitted, zeroing kept), then logs",
         );
         assert_updates_eq(
-            &structlog,
+            &legacy,
             &[
                 store_up(1, 0x42),
                 log1_up(0xaa, word_ab),
@@ -1636,7 +1753,7 @@ mod tests {
                 store_up(2, 0),
                 store_up(5, 0),
             ],
-            "struct-log path: every write in execution order",
+            "legacy: every write in execution order",
         );
     }
 
@@ -1661,18 +1778,21 @@ mod tests {
             "delegatecall-only call must be prestate-eligible"
         );
 
-        let ((fast, _), structlog) = extract_both(&provider, root).await;
+        let (net, legacy, _) = extract_all(&provider, root).await;
         assert_updates_eq(
-            &fast,
+            &net,
             &[
                 store_up(3, 7),
                 log1_up(0xaa, Bytes::new()),
                 log1_up(0xcc, Bytes::new()),
                 log1_up(0xbb, Bytes::new()),
             ],
-            "fast path: delegatecall store on root, logs interleaved aa, cc, bb",
+            "net form: delegatecall store on root, logs interleaved aa, cc, bb",
         );
 
+        // Event order is the one thing every encoding must agree on — it is observable on chain via
+        // the receipt, unlike the storage-write layout. This is the check that validates the
+        // `position`/`index` reconstruction against a real tracer rather than a synthetic frame.
         let logs_only = |updates: &[StateUpdate]| -> Vec<String> {
             updates
                 .iter()
@@ -1681,16 +1801,15 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            logs_only(&fast),
-            logs_only(&structlog),
-            "event order must match the struct-log path's true emission order"
+            logs_only(&net),
+            logs_only(&legacy),
+            "event order must match the struct-log encoder's true emission order"
         );
     }
 
-    /// A regular CALL at target depth is not representable by a net diff: the
-    /// dispatcher must fall back and return exactly what the struct-log path
-    /// returns (a replayable CALL op + the consumer's own store; the callee's
-    /// internals excluded).
+    /// A regular CALL at target depth is not representable by a net diff: the dispatcher must fall
+    /// back and return exactly what `PrestateNet`'s struct-log encoder — the *canonical* one —
+    /// returns (a replayable CALL op + the consumer's own store; the callee's internals excluded).
     #[tokio::test]
     async fn test_hybrid_falls_back_on_regular_call() {
         let anvil = LocalAnvil::spawn().await;
@@ -1708,14 +1827,14 @@ mod tests {
             "regular CALL must force the struct-log fallback"
         );
 
-        let ((hybrid, _), structlog) = extract_both(&provider, caller).await;
+        let (net, _, canonical) = extract_all(&provider, caller).await;
         assert_updates_eq(
-            &hybrid,
-            &structlog,
-            "hybrid must equal the struct-log path on fallback",
+            &net,
+            &canonical,
+            "on fallback, PrestateNet must equal its paired canonical encoder",
         );
         assert_updates_eq(
-            &hybrid,
+            &net,
             &[
                 StateUpdate::Call(IStateUpdateTypes::Call {
                     target: callee,
@@ -1728,11 +1847,11 @@ mod tests {
         );
     }
 
-    /// A reverted call must fall back. Without the classifier's `error` check
-    /// the fast path would classify this Eligible and emit the LOG the tracer
-    /// still reports for the reverted root frame (anvil does not prune it) on
-    /// top of an empty storage diff — an event that never happened. Fallback
-    /// keeps the hybrid path byte-identical to the previous behaviour.
+    /// A reverted call must fall back. Without the classifier's failure check the net form would
+    /// classify this Eligible and emit the LOG the tracer still reports for the reverted root frame —
+    /// anvil does not prune it, though geth does — on top of an empty storage diff, i.e. an event
+    /// that never happened. This is the test that makes that guard load-bearing rather than
+    /// defensive, and it fails if the guard is removed.
     #[tokio::test]
     async fn test_hybrid_falls_back_on_reverted_call() {
         let anvil = LocalAnvil::spawn().await;
@@ -1748,19 +1867,31 @@ mod tests {
             "reverted call must force the struct-log fallback"
         );
 
-        let ((hybrid, _), structlog) = extract_both(&provider, reverter).await;
+        let (net, _, canonical) = extract_all(&provider, reverter).await;
         assert_updates_eq(
-            &hybrid,
-            &structlog,
-            "hybrid must equal the struct-log path for reverted calls",
+            &net,
+            &canonical,
+            "on fallback, PrestateNet must equal its paired canonical encoder",
         );
     }
 
     /// A DELEGATECALL child that reverts while its parent succeeds: the child's
     /// ops rolled back (absent from the net diff) but the struct-log path still
-    /// extracts them at target depth. Only fallback keeps the two paths equal.
+    /// extracts them at target depth. This is the sharpest difference between the three encodings,
+    /// and the case where `Legacy` is outright wrong.
+    ///
+    /// The catcher DELEGATECALLs a library that stores slot 1 and emits a log before reverting,
+    /// discards the failure flag, then stores slot 2 and returns successfully. Because DELEGATECALL
+    /// runs in the catcher's storage context, the rolled-back write targeted the catcher's own slot 1
+    /// — so only the slot-2 write survives on chain, and no event is emitted at all.
+    ///
+    /// `Legacy` nonetheless emits the rolled-back store *and* the rolled-back log. Applying that
+    /// program through `verifyAndUpdate` would write slot 1 and emit an event that never happened —
+    /// the silent-corruption hazard `Legacy`'s own docs warn about, reproduced here against a real
+    /// node. It is pinned rather than fixed because `Legacy` is frozen: changing it would change the
+    /// digest of every deployment still signing it. See gas-analyzer#178.
     #[tokio::test]
-    async fn test_hybrid_falls_back_on_caught_reverted_delegatecall() {
+    async fn test_caught_reverted_delegatecall_is_dropped_by_net_form_but_kept_by_legacy() {
         let anvil = LocalAnvil::spawn().await;
         let provider = anvil.provider();
         let catcher = address!("0x0000000000000000000000000000000000001007");
@@ -1768,29 +1899,36 @@ mod tests {
         set_code(&provider, catcher, catcher_code(reverter)).await;
         set_code(&provider, reverter, reverter_code()).await;
 
+        // The parent frame succeeded, so the call keeps its net form: a reverted child's effects are
+        // absent from the net diff by construction, and its logs are excluded when collecting.
         assert!(
             matches!(
                 classify_call(&provider, catcher).await,
-                PrestateEligibility::Fallback(_)
+                PrestateEligibility::Eligible
             ),
-            "caught-revert delegatecall must force the struct-log fallback"
+            "a caught revert inside a transparent frame does not cost the call its net form"
         );
 
-        let ((hybrid, _), structlog) = extract_both(&provider, catcher).await;
+        let (net, legacy, canonical) = extract_all(&provider, catcher).await;
         assert_updates_eq(
-            &hybrid,
-            &structlog,
-            "hybrid must equal the struct-log path when a transparent frame reverted",
+            &net,
+            &[store_up(2, 0x22)],
+            "net form: only the write that survived the revert, and no event",
         );
         assert_updates_eq(
-            &hybrid,
+            &canonical,
+            &[store_up(2, 0x22)],
+            "canonical journals per frame and discards the reverted child, agreeing on the effect",
+        );
+        assert_updates_eq(
+            &legacy,
             &[
                 store_up(1, 0x42),
                 log1_up(0xdd, Bytes::new()),
                 store_up(2, 0x22),
             ],
-            "struct-log output includes the rolled-back delegatecall ops (pre-existing \
-             struct-log behaviour) plus the parent's store",
+            "legacy replays the rolled-back store and log — a known unsoundness, pinned so a change \
+             to it is a deliberate digest migration rather than an accident",
         );
     }
 
@@ -1836,5 +1974,38 @@ mod tests {
             Some(&[B256::with_last_byte(0xaa)][..]),
             "log topic must round-trip"
         );
+    }
+    /// The net form is byte-different from both struct-log encodings, so it must never be produced
+    /// under an encoding that did not ask for it — that is what would fork the task digest across a
+    /// fleet whose nodes differ in tracer support.
+    #[test]
+    fn only_prestate_net_encoding_signs_the_net_form() {
+        assert!(StateEncoding::PrestateNet.signs_prestate_net());
+        assert!(!StateEncoding::Legacy.signs_prestate_net());
+        assert!(!StateEncoding::Canonical.signs_prestate_net());
+    }
+
+    /// Calls with no net form fall back to a struct-log encoder within the same encoding. Legacy keeps
+    /// its own; PrestateNet pairs with Canonical so both of its representations stay revert-aware.
+    #[test]
+    fn struct_log_encoder_pairs_with_the_selected_encoding() {
+        assert_eq!(
+            StateEncoding::Legacy.struct_log_encoder(),
+            StructLogEncoder::Legacy
+        );
+        assert_eq!(
+            StateEncoding::Canonical.struct_log_encoder(),
+            StructLogEncoder::Canonical
+        );
+        assert_eq!(
+            StateEncoding::PrestateNet.struct_log_encoder(),
+            StructLogEncoder::Canonical
+        );
+    }
+
+    /// Adding an encoding must not change what an existing deployment signs.
+    #[test]
+    fn default_encoding_is_legacy() {
+        assert_eq!(StateEncoding::default(), StateEncoding::Legacy);
     }
 }

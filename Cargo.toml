@@ -8,6 +8,12 @@ members = [
     "crates/gas-estimator",
     "crates/rpc",
     "crates/wasm",
+    "crates/indexer-api",
+    "crates/indexer-rpc",
+    "crates/indexer-store",
+    "crates/indexer-resolver",
+    "crates/indexer-service",
+    "crates/indexer-web",
 ]
 default-members = [
     "crates/core",

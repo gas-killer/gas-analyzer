@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Blacklist — Gas Killer Indexer{% endblock %}
+{% block content %}
+
+<h2>Blacklist</h2>
+<p class="muted">
+    Exclude specific contracts or `(contract, selector)` pairs from every BD-visible
+    aggregate. Filter is applied at query time, so rows stay in the analysis table —
+    removing an entry brings the data back instantly.
+</p>
+
+<section class="card">
+    <h3>Add entry</h3>
+    <form method="post" action="/admin/blacklist/add" class="blacklist-form">
+        <label>Contract address
+            <input type="text" name="address" required placeholder="0x...">
+        </label>
+        <label>Selector <span class="muted">(optional, hides one function)</span>
+            <input type="text" name="selector" placeholder="0xa9059cbb">
+        </label>
+        <label>Reason
+            <input type="text" name="reason" required placeholder="known non-candidate (token transfer)">
+        </label>
+        <button type="submit" class="btn">Add</button>
+    </form>
+</section>
+
+<section class="card">
+    <h3>Current entries</h3>
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Contract</th>
+                <th>Selector</th>
+                <th>Reason</th>
+                <th>By</th>
+                <th>When</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for r in rows %}
+            <tr>
+                <td><a href="/contracts/{{ r.address_hex }}"><code>{{ r.address_hex }}</code></a></td>
+                <td><code>{{ r.selector_hex }}</code></td>
+                <td>{{ r.reason }}</td>
+                <td>{{ r.created_by }}</td>
+                <td class="muted">{{ r.when }}</td>
+                <td>
+                    <form method="post" action="/admin/blacklist/remove" style="display:inline;">
+                        <input type="hidden" name="address" value="{{ r.address_hex }}">
+                        {% if r.selector_hex != "(whole contract)" %}
+                            <input type="hidden" name="selector" value="{{ r.selector_hex }}">
+                        {% endif %}
+                        <button type="submit" class="btn btn-danger"
+                                onclick="return confirm('Remove this blacklist entry? It will reappear in aggregates immediately.')">Remove</button>
+                    </form>
+                </td>
+            </tr>
+        {% else %}
+            <tr><td colspan="6" class="muted">No entries. Aggregates show every analyzed contract.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+{% endblock %}
