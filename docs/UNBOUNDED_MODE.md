@@ -12,29 +12,59 @@ block gas limit (and post-Osaka, the EIP-7825 2^24 tx cap) — even though nothi
 about the *payload* required that bound.
 
 `SimProfile::Unbounded` removes the bound. The tracked function is simulated
-under pinned, protocol-versioned limits ~24,000× a mainnet block:
+under pinned protocol limits ~24,000× a mainnet block:
 
 | Constant | Value | Meaning |
 |---|---|---|
 | `UNBOUNDED_BLOCK_GAS_LIMIT` | `1 << 40` (~1.1 Tgas) | block env gas limit during simulation |
 | `UNBOUNDED_TX_GAS_LIMIT` | `1 << 40` | tx gas limit during simulation (EIP-7825 cap deliberately not applied) |
 
-In exchange, the extracted payload must pass the **single-slot shape gate**
-(`validate_unbounded_shape`):
+In exchange, the extracted payload must fit in a single on-chain transaction
+(`validate_unbounded_cost`):
 
-- at most **one `Store`** — the consumer's commitment slot;
-- **no `CREATE`/`CREATE2`** — initcode replays on-chain at real gas;
-- any number of `Call` / `Log*` ops — but `Call`s re-execute on-chain at real
-  gas prices, so compute inside them is *not* killed. Multi-call forwarding
-  (`applyForwardedUpdates`, one commitment write per sibling contract) rides in
-  this category.
+| Constant | Value | Meaning |
+|---|---|---|
+| `UNBOUNDED_PAYLOAD_GAS_BUDGET` | `1 << 24` (16,777,216) | ceiling on the gas needed to apply the payload — EIP-7825's per-transaction cap |
+| `UNBOUNDED_COLD_SSTORE_COST` | `22,100` | price charged per `Store`: cold SLOAD (2,100) + zero→nonzero SSTORE (20,000) |
 
-The result: **unbounded Solidity, O(1) on-chain state.** A tracked function may
-iterate a million-entry order book, verify a multi-megabyte witness against a
-commitment, or run a whole matching epoch — what ships to `verifyAndUpdate` is
-one SSTORE, some logs, and bounded calls. The intended consumer shape is the
+- Applying the payload — transaction base cost, the signature-verification
+  floor, every `Store`/`Log*`, plus the measured gas of any `Call` ops — must
+  come to no more than the budget.
+- **No `CREATE`/`CREATE2`.** Not a cost question: a net diff cannot reconstruct
+  replayable initcode, so contract creation is unrepresentable at any price.
+- Any number of `Call` / `Log*` ops within budget — but `Call`s re-execute
+  on-chain at real gas prices, so compute inside them is *not* killed.
+  Multi-call forwarding (`applyForwardedUpdates`) rides in this category.
+
+So the profile **lifts EIP-7825 for the simulation, where the cap protects
+nothing, and enforces it on the payload, where it is binding.**
+
+The result: **unbounded Solidity, on-chain state bounded by what a transaction
+can carry.** A tracked function may iterate a million-entry order book, verify a
+multi-megabyte witness, or run a whole matching epoch, and write however many
+slots it likes — roughly 700 cold writes fit under the cap — as long as the diff
+can actually be mined.
+
+The constraint is *priced*, not counted. Consumers whose state is too large for
+one transaction can commit it into fewer slots; in the limit that is the
 single-slot commitment pattern of solidity-sdk PR #51, where the expanded state
-travels as a calldata witness and only its hash lives in storage.
+travels as a calldata witness and only its hash lives in storage. **That pattern
+is an option for contracts that need it, not a requirement of this mode.**
+
+### Why the bound is analytic
+
+The gate prices the payload with a pure function of the payload
+(`estimate_applied_payload_gas`), not with the revm estimate the same call
+computes for reporting. Accept/reject is part of what operators must agree on: a
+verdict derived from live-fetched state could put two honest operators on
+opposite sides of the boundary and split quorum. For the same reason the gate
+carries its own `UNBOUNDED_COLD_SSTORE_COST` rather than reusing the tuned
+figure in `gas_analyzer_core::heuristic` — that one approximates typical cost for
+user-facing savings numbers, and a gate that under-prices a write would admit
+payloads that do not fit.
+
+Payloads are priced against the **more expensive** signature scheme's floor,
+since the payload is signed before the scheme is fixed.
 
 ### Calldata
 
@@ -64,9 +94,9 @@ Semantics under `Unbounded`:
    `debug_traceCall` with `tx.gas = 2^40` and `blockOverrides.gasLimit = 2^40`.
    The caller's `gas` field is overridden unconditionally — the profile is a
    pinned protocol environment, not a hint.
-2. The extracted updates are validated against the shape gate; a violation is a
-   **hard error** (a consumer writing N slots scales on-chain like a plain
-   contract and defeats the mode).
+2. The extracted updates are priced against the payload budget; a violation is a
+   **hard error** — signing a payload that cannot be mined produces a task
+   nobody can settle.
 3. The **gas estimate still uses the real chain env** — `verifyAndUpdate` lands
    in a real block, so applying the payload is priced under real limits.
 
@@ -94,8 +124,8 @@ being precise about what a mis-provisioned operator actually produces:
 - If the call OOGs before writing anything, the payload is **empty**.
 - If it writes and *then* runs out of gas, the payload contains the writes that
   landed before the halt — a **partial** state commitment the real execution
-  never ended at. This passes the single-slot shape gate, because one store is
-  exactly what the gate is looking for.
+  never ended at. This passes the payload budget — one store is well inside it —
+  so the budget gate cannot catch it either.
 
 So a clamped node signs a payload that disagrees with every correctly-provisioned
 one. A minority of such nodes is outvoted and simply never reaches quorum. A
@@ -192,11 +222,11 @@ version in its public values.
 
 ## Test coverage
 
-- `gas_analyzer_core::sim_profile` unit tests: profile overrides, shape gate
+- `gas_analyzer_core::sim_profile` unit tests: profile overrides, payload budget
   (single store / multi store / CREATE rejection / empty payload).
 - `gas-analyzer-evmsketch` anvil-backed integration tests
   (`test_unbounded_profile_*`): a ~40M-gas busy-loop consumer OOGs under
   `Chain` (classified `Fallback`, per #165's revert soundness rule) and
   extracts exactly `[Store, Log1]` under `Unbounded` against a real anvil
   with `--disable-block-gas-limit`; a two-slot writer extracts but fails the
-  shape gate with `TooManyStores { count: 2 }`.
+  budget with `PayloadTooExpensive` once its diff exceeds one transaction.

@@ -115,10 +115,10 @@ use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 pub use gas_analyzer_core::SimProfile;
 
 use gas_analyzer_core::{
-    Opcode, PrestateEligibility, StateUpdate, build_state_updates_from_prestate,
+    Opcode, PrestateEligibility, SignatureType, StateUpdate, build_state_updates_from_prestate,
     classify_prestate_eligibility, compute_state_updates, compute_state_updates_canonical,
     encode_state_updates_to_abi, estimate_gas_from_operations, extract_operation_counts_from_trace,
-    validate_unbounded_shape,
+    validate_unbounded_cost,
 };
 use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
 use gas_analyzer_rpc::{
@@ -889,9 +889,9 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_mode(
 ///
 /// Under [`SimProfile::Unbounded`] the call is simulated with the pinned unbounded gas limits
 /// (`gas_analyzer_core::sim_profile`) so arbitrarily heavy compute can execute off-chain, and the
-/// extracted updates must pass [`validate_unbounded_shape`] (at most one `Store`, no `CREATE`) — a
-/// violation is a hard error, because a payload that writes N slots scales on-chain like a plain
-/// contract and defeats the mode's purpose.
+/// extracted updates must pass [`validate_unbounded_cost`]: applying the payload on-chain must cost
+/// no more than the profile's budget, and it must contain no `CREATE`. A violation is a hard error —
+/// signing a payload that cannot be mined produces a task nobody can settle.
 ///
 /// Two things intentionally stay on the real chain's environment:
 /// - the **gas estimate** for applying the payload (`verifyAndUpdate` lands in a real block, so it
@@ -944,7 +944,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
     // Extract the state updates (hybrid prestate/struct-log path) and build the executor
     // concurrently — they are independent, so on a cache miss this hides the executor build behind
     // the trace fetch.
-    let ((state_updates, skipped_opcodes), executor) = tokio::try_join!(
+    let ((state_updates, skipped_opcodes, call_gas_total), executor) = tokio::try_join!(
         extract_state_updates_hybrid(
             &provider,
             tx_request,
@@ -957,19 +957,30 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
     )?;
     tracing::Span::current().record("state_update_count", state_updates.len());
 
-    // The unbounded profile's whole bargain: compute may be unbounded, the
-    // on-chain payload may not. Enforce it before signing/estimating anything.
-    if profile.requires_unbounded_shape() {
-        let shape = validate_unbounded_shape(&state_updates).map_err(|violation| {
-            anyhow!(
-                "unbounded-profile payload shape violation for consumer {contract_address}: {violation}"
-            )
-        })?;
+    // The unbounded profile's whole bargain: compute may be unbounded, the payload that lands
+    // on-chain may not. Enforced before signing/estimating anything.
+    //
+    // Priced against the more expensive signature scheme's verification floor, because the payload
+    // is signed before the scheme is fixed — accepting under the cheaper one could admit a payload
+    // the other cannot carry. The bound is analytic (a pure function of the payload) rather than the
+    // revm estimate computed below: this verdict is part of what operators must agree on, and
+    // anything derived from live-fetched state could put two honest operators on opposite sides of
+    // the boundary.
+    if let Some(budget) = profile.payload_gas_budget() {
+        let signature_floor = SignatureType::Bls.turetzky_upper_gas_limit();
+        let cost = validate_unbounded_cost(&state_updates, call_gas_total, signature_floor, budget)
+            .map_err(|violation| {
+                anyhow!(
+                    "unbounded-profile payload rejected for consumer {contract_address}: {violation}"
+                )
+            })?;
         tracing::debug!(
-            stores = shape.stores,
-            calls = shape.calls,
-            logs = shape.logs,
-            "unbounded payload shape OK"
+            stores = cost.stores,
+            calls = cost.calls,
+            logs = cost.logs,
+            applied_gas_upper_bound = cost.applied_gas_upper_bound,
+            budget,
+            "unbounded payload fits the on-chain transaction budget"
         );
     }
 
@@ -1018,21 +1029,23 @@ async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
     consumer: Address,
     encoding: StateEncoding,
     profile: SimProfile,
-) -> Result<(Vec<StateUpdate>, HashSet<Opcode>)> {
+) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64)> {
     if encoding.signs_prestate_net()
         && let Some(updates) =
             try_prestate_net(provider, &tx_request, block, consumer, profile).await?
     {
         tracing::Span::current().record("extraction", "prestate_net");
-        return Ok((updates, HashSet::new()));
+        // The net form carries no `Call` ops by construction (eligibility rejects them), so no
+        // external call gas rides with it.
+        return Ok((updates, HashSet::new(), 0));
     }
     tracing::Span::current().record("extraction", "struct_log");
     let trace = get_trace_from_call_with_profile(provider, tx_request, block, profile).await?;
-    let (state_updates, skipped_opcodes, _call_gas_total) = match encoding.struct_log_encoder() {
+    let (state_updates, skipped_opcodes, call_gas_total) = match encoding.struct_log_encoder() {
         StructLogEncoder::Legacy => compute_state_updates(trace)?,
         StructLogEncoder::Canonical => compute_state_updates_canonical(trace, consumer)?,
     };
-    Ok((state_updates, skipped_opcodes))
+    Ok((state_updates, skipped_opcodes, call_gas_total))
 }
 
 /// Build the prestate net form: `Ok(Some(updates))` when the call admits it, `Ok(None)` when the net
@@ -1566,6 +1579,7 @@ mod tests {
     /// via a dedicated step.
     mod anvil_integration {
         use super::*;
+        use gas_analyzer_core::UNBOUNDED_PAYLOAD_GAS_BUDGET;
         use gas_analyzer_rpc::{
             get_call_frame_from_call, get_prestate_diff_from_call, get_trace_from_call,
         };
@@ -1781,7 +1795,7 @@ mod tests {
             to: Address,
             encoding: StateEncoding,
         ) -> (Vec<StateUpdate>, HashSet<Opcode>) {
-            extract_state_updates_hybrid(
+            let (updates, skipped, _) = extract_state_updates_hybrid(
                 provider,
                 call_request(to),
                 BlockId::latest(),
@@ -1790,7 +1804,8 @@ mod tests {
                 SimProfile::Chain,
             )
             .await
-            .expect("extraction failed")
+            .expect("extraction failed");
+            (updates, skipped)
         }
 
         /// Extract under a simulation profile, holding the encoding at `PrestateNet`.
@@ -1799,7 +1814,7 @@ mod tests {
             to: Address,
             profile: SimProfile,
         ) -> (Vec<StateUpdate>, HashSet<Opcode>) {
-            extract_state_updates_hybrid(
+            let (updates, skipped, _) = extract_state_updates_hybrid(
                 provider,
                 call_request(to),
                 BlockId::latest(),
@@ -1808,7 +1823,8 @@ mod tests {
                 profile,
             )
             .await
-            .expect("extraction failed")
+            .expect("extraction failed");
+            (updates, skipped)
         }
 
         /// Run the `PrestateNet` dispatcher and, for comparison, each struct-log encoder directly.
@@ -2139,8 +2155,17 @@ mod tests {
             hex_code("6042600155 620f4240 5b 80 15 6016 57 6001 90 03 6009 56 5b 50 00")
         }
 
+        /// Writes slots 1,000 down to 1, one `SSTORE` each — a diff far too large to apply in a
+        /// single transaction, used to exercise the payload budget.
+        ///
+        /// Layout: PUSH2 1000; loop{ DUP1 ISZERO PUSH1 end JUMPI; DUP1 PUSH1 1 SWAP1 SSTORE;
+        /// PUSH1 1 SWAP1 SUB; PUSH1 3 JUMP }; end: STOP.
+        fn thousand_slot_writer_code() -> Bytes {
+            hex_code("6103e8 5b 80 15 6015 57 80 6001 90 55 6001 90 03 6003 56 5b 00")
+        }
+
         /// Same busy loop, but writing TWO slots — a consumer that is not
-        /// commitment-shaped and must be rejected by the unbounded profile.
+        /// single-slot-commitment-shaped, which the payload budget now permits.
         fn gigagas_two_slot_code() -> Bytes {
             hex_code("620f4240 5b 80 15 6011 57 6001 90 03 6004 56 5b 50 6042600155 6043600255 00")
         }
@@ -2154,9 +2179,8 @@ mod tests {
         /// executed call reports the same. So the payload is neither correct nor empty: it commits an
         /// intermediate state the real execution never ended at.
         ///
-        /// Nothing downstream catches this. It passes the single-slot shape gate (one store is
-        /// exactly what the gate wants), and it is a plain `Ok`, so no caller can distinguish it from
-        /// a genuine result. It is caught only by every operator running a cap-lifted node: a
+        /// Nothing downstream catches this. A one-store payload is comfortably inside the on-chain
+        /// budget, and it is a plain `Ok`, so no caller can distinguish it from a genuine result. It is caught only by every operator running a cap-lifted node: a
         /// minority of clamped nodes are outvoted, but a majority would reach quorum on the partial
         /// write. That is why node provisioning is a consensus requirement here, not a performance
         /// tuning knob.
@@ -2228,7 +2252,7 @@ mod tests {
 
             // Unbounded: identical request; the profile's pinned tx-gas override
             // replaces the request's 3M and the burner completes.
-            let (updates, skipped) = extract_state_updates_hybrid(
+            let (updates, skipped, _) = extract_state_updates_hybrid(
                 &provider,
                 call_request(consumer),
                 BlockId::latest(),
@@ -2244,21 +2268,27 @@ mod tests {
                 &[store_up(1, 0x42), log1_up(0xee, Bytes::new())],
                 "40M gas of compute must reduce to one Store and one Log",
             );
-            validate_unbounded_shape(&updates).expect("burner payload is commitment-shaped");
+            validate_unbounded_cost(
+                &updates,
+                0,
+                SignatureType::Bls.turetzky_upper_gas_limit(),
+                UNBOUNDED_PAYLOAD_GAS_BUDGET,
+            )
+            .expect("a one-store payload is far under the transaction budget");
         }
 
-        /// A two-slot writer extracts fine but must fail the unbounded shape
-        /// gate — the exact check `call_to_encoded_state_updates_with_evmsketch_profiled`
-        /// applies before estimating/encoding.
+        /// A two-slot writer is **accepted**. The gate prices the payload instead of counting its
+        /// writes, so a consumer that is not single-slot-commitment-shaped is fine as long as
+        /// applying its diff fits in one transaction — which two writes comfortably do.
         #[tokio::test(flavor = "multi_thread")]
         #[ignore = "spawns a local anvil; requires foundry on PATH"]
-        async fn test_unbounded_profile_rejects_multi_slot_payload() {
+        async fn unbounded_profile_accepts_a_multi_slot_payload_that_fits() {
             let anvil = LocalAnvil::spawn_with(&["--disable-block-gas-limit"]).await;
             let provider = anvil.provider();
             let consumer = address!("0x0000000000000000000000000000000000002002");
             set_code(&provider, consumer, gigagas_two_slot_code()).await;
 
-            let (updates, _) = extract_state_updates_hybrid(
+            let (updates, ..) = extract_state_updates_hybrid(
                 &provider,
                 call_request(consumer),
                 BlockId::latest(),
@@ -2267,13 +2297,65 @@ mod tests {
                 SimProfile::Unbounded,
             )
             .await
-            .expect("extraction itself succeeds; only the shape gate rejects");
+            .expect("extraction succeeds");
 
-            let violation = validate_unbounded_shape(&updates)
-                .expect_err("two Store ops must violate the single-slot invariant");
-            assert_eq!(
-                violation,
-                gas_analyzer_core::UnboundedShapeViolation::TooManyStores { count: 2 }
+            let cost = validate_unbounded_cost(
+                &updates,
+                0,
+                SignatureType::Bls.turetzky_upper_gas_limit(),
+                UNBOUNDED_PAYLOAD_GAS_BUDGET,
+            )
+            .expect("two writes are cheap enough to apply on-chain");
+            assert_eq!(cost.stores, 2);
+            assert!(cost.applied_gas_upper_bound < UNBOUNDED_PAYLOAD_GAS_BUDGET);
+        }
+
+        /// The bound that replaced the single-slot rule. A transition writing 1,000 distinct slots
+        /// costs more to apply than EIP-7825 permits a single transaction to spend, so it is
+        /// rejected before anything is encoded or signed.
+        ///
+        /// This is the case the profile actually has to catch: the off-chain compute was affordable
+        /// — that is the point of lifting the limit — but the diff it produced cannot be put on
+        /// chain, and signing it would create a task nobody can settle.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
+        async fn unbounded_profile_rejects_a_payload_over_the_transaction_budget() {
+            let anvil = LocalAnvil::spawn_with(&["--disable-block-gas-limit"]).await;
+            let provider = anvil.provider();
+            let consumer = address!("0x0000000000000000000000000000000000002004");
+            set_code(&provider, consumer, thousand_slot_writer_code()).await;
+
+            let (updates, ..) = extract_state_updates_hybrid(
+                &provider,
+                call_request(consumer),
+                BlockId::latest(),
+                consumer,
+                StateEncoding::PrestateNet,
+                SimProfile::Unbounded,
+            )
+            .await
+            .expect("extraction itself succeeds; only the budget gate rejects");
+            assert_eq!(updates.len(), 1_000, "one Store per slot written");
+
+            let violation = validate_unbounded_cost(
+                &updates,
+                0,
+                SignatureType::Bls.turetzky_upper_gas_limit(),
+                UNBOUNDED_PAYLOAD_GAS_BUDGET,
+            )
+            .expect_err("1,000 cold writes cannot fit in one transaction");
+            let gas_analyzer_core::UnboundedCostViolation::PayloadTooExpensive {
+                estimated,
+                budget,
+                stores,
+            } = violation
+            else {
+                panic!("expected PayloadTooExpensive, got {violation:?}");
+            };
+            assert_eq!(stores, 1_000);
+            assert!(
+                estimated > budget,
+                "{estimated} must exceed the {budget} budget"
             );
         }
     }

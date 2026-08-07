@@ -4,12 +4,16 @@
 //! under. `Chain` mirrors the real chain (today's behaviour everywhere).
 //! `Unbounded` is the Gas Killer *unbounded execution* profile: the tracked
 //! function is simulated with gas limits far above any real block, so
-//! arbitrarily heavy Solidity can be executed off-chain — provided its **net
-//! effect** still fits the Gas Killer on-chain payload shape (at most one
-//! storage write per consumer contract, plus external calls and logs; see
-//! [`validate_unbounded_shape`]). The intended consumer shape is the
-//! single-slot commitment pattern (solidity-sdk PR #51), fanned out across
-//! contracts via multi-call forwarding (solidity-sdk PRs #47/#48).
+//! arbitrarily heavy Solidity can be executed off-chain — provided the payload
+//! it produces still fits in one on-chain transaction (see
+//! [`validate_unbounded_cost`]).
+//!
+//! The constraint is *priced*, not counted: what has to stay bounded is the gas
+//! needed to apply the diff, so a transition may write as many slots as fit
+//! under [`UNBOUNDED_PAYLOAD_GAS_BUDGET`]. Consumers whose state is too large
+//! for that can commit it into fewer slots — in the limit, the single-slot
+//! commitment pattern (solidity-sdk PR #51) — and fan out across contracts via
+//! multi-call forwarding (solidity-sdk PRs #47/#48), but neither is required.
 //!
 //! # Determinism is protocol-critical
 //!
@@ -48,7 +52,7 @@ use alloy_primitives::{B256, b256};
 /// extracted diff carries a Store to this slot; `verifyAndUpdate`'s own
 /// modifier writes the same value on-chain, making the payload copy
 /// idempotent. It is a fixed protocol slot — one per consumer regardless of
-/// state size — and is therefore exempt from the single-slot shape count.
+/// state size — so it is reported separately from the consumer's own writes.
 pub const STATE_TRACKER_SLOT: B256 =
     b256!("0xdebfdfd5a50ad117c10898d68b5ccf0893c6b40d4f443f902e2e7646601bdeaf");
 
@@ -79,8 +83,8 @@ pub enum SimProfile {
     #[default]
     Chain,
     /// Gas Killer unbounded execution: simulate with
-    /// [`UNBOUNDED_BLOCK_GAS_LIMIT`] / [`UNBOUNDED_TX_GAS_LIMIT`] and
-    /// enforce the single-slot payload shape on the extracted updates.
+    /// [`UNBOUNDED_BLOCK_GAS_LIMIT`] / [`UNBOUNDED_TX_GAS_LIMIT`] and require the
+    /// extracted payload to cost no more than [`UNBOUNDED_PAYLOAD_GAS_BUDGET`] to apply.
     Unbounded,
 }
 
@@ -101,16 +105,56 @@ impl SimProfile {
         }
     }
 
-    /// Whether extracted updates must satisfy [`validate_unbounded_shape`].
-    pub fn requires_unbounded_shape(&self) -> bool {
-        matches!(self, SimProfile::Unbounded)
+    /// The ceiling this profile places on the on-chain cost of the extracted payload, if any.
+    ///
+    /// `Chain` needs none: the simulation ran under the real chain's limits, so anything it produced
+    /// was already affordable there. `Unbounded` lifts those limits for the simulation and therefore
+    /// has to reimpose a bound on the result — see [`validate_unbounded_cost`].
+    pub fn payload_gas_budget(&self) -> Option<u64> {
+        match self {
+            SimProfile::Chain => None,
+            SimProfile::Unbounded => Some(UNBOUNDED_PAYLOAD_GAS_BUDGET),
+        }
     }
 }
 
-/// Summary of a payload that passed [`validate_unbounded_shape`].
+/// Ceiling on the on-chain cost of an extracted payload under the `Unbounded` profile: EIP-7825's
+/// per-transaction gas cap, `2^24`.
+///
+/// This is the protocol's own maximum for a single transaction, so a payload priced above it can
+/// never be applied by `verifyAndUpdate` on a post-Osaka chain no matter how empty the block is. The
+/// profile therefore *lifts* EIP-7825 for the off-chain simulation, where the cap protects nothing,
+/// and *enforces* it on the payload, where it is binding. Picking the protocol limit rather than a
+/// tuned number also keeps this from becoming a knob: like the gas limits above it is a pinned
+/// constant, and changing it changes which payloads honest operators accept.
+pub const UNBOUNDED_PAYLOAD_GAS_BUDGET: u64 = 1 << 24;
+
+/// Worst-case cost charged per `Store` by [`estimate_applied_payload_gas`]: EIP-2929 cold SLOAD
+/// (2100) plus a zero→nonzero `SSTORE` (20000).
+///
+/// Deliberately *not* shared with `crate::heuristic`'s reporting estimator. That one approximates
+/// the typical cost to produce user-facing savings figures and is tuned over time; this one must be
+/// a stable upper bound, because it decides which payloads are valid. If the two shared a
+/// definition, tuning a displayed number would silently change what operators accept — and a gate
+/// that under-prices a write accepts payloads that do not actually fit.
+pub const UNBOUNDED_COLD_SSTORE_COST: u64 = 22_100;
+
+/// The gate must never price a write below the reporting heuristic: that one models a *typical*
+/// warm write, and a gate charging less than typical would admit payloads that do not fit.
+const _: () = assert!(UNBOUNDED_COLD_SSTORE_COST > crate::heuristic::WARM_SSTORE_COST);
+
+/// Cost of a `LOG*` op: base, plus per topic, plus per byte of data.
+const LOG_BASE: u64 = 375;
+const LOG_TOPIC: u64 = 375;
+const LOG_BYTE: u64 = 8;
+
+/// Intrinsic cost of the `verifyAndUpdate` transaction that carries the payload.
+const TX_BASE: u64 = 21_000;
+
+/// Summary of a payload that passed [`validate_unbounded_cost`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UnboundedShape {
-    /// Number of `Store` ops other than the [`STATE_TRACKER_SLOT`] (0 or 1).
+pub struct UnboundedCost {
+    /// Number of `Store` ops other than the [`STATE_TRACKER_SLOT`].
     pub stores: usize,
     /// Number of `Store` ops to the fixed [`STATE_TRACKER_SLOT`] (0 or 1).
     pub tracker_stores: usize,
@@ -121,91 +165,148 @@ pub struct UnboundedShape {
     pub calls: usize,
     /// Number of `Log0`–`Log4` ops.
     pub logs: usize,
+    /// Upper bound on the gas needed to apply this payload on-chain, including the transaction's
+    /// intrinsic cost and the signature-verification floor.
+    pub applied_gas_upper_bound: u64,
 }
 
 /// Why a payload is not valid under the unbounded profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UnboundedShapeViolation {
-    /// More than one storage write. The unbounded profile exists precisely
-    /// because compute is unbounded while *state* stays O(1): a consumer that
-    /// writes N slots per transition pays N cold SSTOREs on-chain and scales
-    /// like a plain contract. Restructure the consumer around a single-slot
-    /// commitment (solidity-sdk PR #51) instead.
-    TooManyStores {
-        /// Total `Store` ops found.
-        count: usize,
+pub enum UnboundedCostViolation {
+    /// Applying the payload costs more than [`UNBOUNDED_PAYLOAD_GAS_BUDGET`].
+    ///
+    /// The unbounded profile's bargain is that *compute* may be unbounded while the payload that
+    /// lands on-chain still fits in one transaction. A consumer that writes enough slots to exceed
+    /// the cap has not moved work off-chain — it has moved it into a transaction nobody can mine.
+    /// Either reduce the state each transition touches, or commit it into fewer slots (for the
+    /// extreme case, the single-slot commitment pattern in solidity-sdk PR #51).
+    PayloadTooExpensive {
+        /// Upper-bound gas to apply the payload.
+        estimated: u64,
+        /// The ceiling it exceeded.
+        budget: u64,
+        /// Non-tracker `Store` ops, the usual driver when this trips.
+        stores: usize,
     },
-    /// `CREATE`/`CREATE2` found. Initcode replays on-chain inside
-    /// `verifyAndUpdate` at real gas prices, so a deployment produced by an
-    /// unbounded simulation may simply not fit in a real block; the struct-log
-    /// path also cannot reconstruct replayable initcode from a net diff.
+    /// `CREATE`/`CREATE2` found. Not a cost question: the struct-log path extracts a
+    /// `Create`/`Create2` op carrying initcode to re-execute on replay, and a net diff cannot
+    /// reconstruct that, so contract creation is unrepresentable here regardless of price.
     CreateNotAllowed {
         /// Index of the offending op in the update list.
         index: usize,
     },
 }
 
-impl core::fmt::Display for UnboundedShapeViolation {
+impl core::fmt::Display for UnboundedCostViolation {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            UnboundedShapeViolation::TooManyStores { count } => write!(
+            UnboundedCostViolation::PayloadTooExpensive {
+                estimated,
+                budget,
+                stores,
+            } => write!(
                 f,
-                "unbounded profile requires at most one storage write per consumer \
-                 (single-slot commitment pattern), found {count} Store ops; \
-                 restructure the consumer to commit its state into one slot"
+                "unbounded payload costs up to {estimated} gas to apply, over the {budget} budget \
+                 ({stores} storage writes); reduce the state each transition touches or commit it \
+                 into fewer slots"
             ),
-            UnboundedShapeViolation::CreateNotAllowed { index } => write!(
+            UnboundedCostViolation::CreateNotAllowed { index } => write!(
                 f,
-                "unbounded profile does not allow CREATE/CREATE2 (update #{index}): \
-                 initcode replays on-chain at real gas prices and may not fit a real block"
+                "unbounded profile does not allow CREATE/CREATE2 (update #{index}): a net diff \
+                 cannot reconstruct replayable initcode"
             ),
         }
     }
 }
 
-impl std::error::Error for UnboundedShapeViolation {}
+impl std::error::Error for UnboundedCostViolation {}
 
-/// Enforce the `Unbounded` payload-shape invariant on extracted updates:
-/// at most one `Store` beyond the fixed [`STATE_TRACKER_SLOT`] (which every
-/// `trackState` diff carries), no `CREATE`/`CREATE2`; `Call`/`Log*` ops pass.
+/// Upper bound on the gas required to apply `updates` on-chain via `verifyAndUpdate`.
 ///
-/// This is what makes "play fast and loose with the gas limit" sound: the
-/// simulation may burn a terabyte of gas, but the thing that lands on-chain
-/// is provably one SSTORE plus bounded calls/logs. A violation means the
-/// consumer contract is not commitment-shaped — failing loudly here beats
-/// signing a payload whose on-chain application costs O(slots touched).
-pub fn validate_unbounded_shape(
+/// `external_call_gas` is the measured cost of the payload's `Call` ops, taken from the trace — they
+/// re-execute on-chain at real prices, so they are charged at what they actually cost rather than
+/// estimated. `signature_floor` is the scheme's verification cost
+/// (`SignatureType::turetzky_upper_gas_limit`); pass the larger scheme's when the scheme is not yet
+/// known, since the payload is signed independently of it.
+///
+/// A pure function of its arguments, which is the point: it decides whether a payload is acceptable,
+/// so every operator must reach the same verdict from the same payload. Anything that consulted live
+/// chain state could put two honest operators on opposite sides of the boundary.
+pub fn estimate_applied_payload_gas(
     updates: &[StateUpdate],
-) -> Result<UnboundedShape, UnboundedShapeViolation> {
-    let mut shape = UnboundedShape {
+    external_call_gas: u64,
+    signature_floor: u64,
+) -> u64 {
+    let mut gas = TX_BASE
+        .saturating_add(signature_floor)
+        .saturating_add(external_call_gas);
+    for update in updates {
+        gas = gas.saturating_add(match update {
+            StateUpdate::Store(_) => UNBOUNDED_COLD_SSTORE_COST,
+            // Charged through `external_call_gas` from the trace.
+            StateUpdate::Call(_) => 0,
+            StateUpdate::Log0(l) => LOG_BASE + l.data.len() as u64 * LOG_BYTE,
+            StateUpdate::Log1(l) => LOG_BASE + LOG_TOPIC + l.data.len() as u64 * LOG_BYTE,
+            StateUpdate::Log2(l) => LOG_BASE + LOG_TOPIC * 2 + l.data.len() as u64 * LOG_BYTE,
+            StateUpdate::Log3(l) => LOG_BASE + LOG_TOPIC * 3 + l.data.len() as u64 * LOG_BYTE,
+            StateUpdate::Log4(l) => LOG_BASE + LOG_TOPIC * 4 + l.data.len() as u64 * LOG_BYTE,
+            // Rejected by the caller; priced at zero so the bound stays defined either way.
+            StateUpdate::Create(_) | StateUpdate::Create2(_) => 0,
+        });
+    }
+    gas
+}
+
+/// Enforce the `Unbounded` profile's payload invariant: applying the extracted updates on-chain must
+/// cost no more than `budget`, and must not contain `CREATE`/`CREATE2`.
+///
+/// This is what makes lifting the simulation gas limit sound. The simulation may burn a terabyte of
+/// gas; what lands on-chain still has to fit in a single transaction, so the constraint is priced
+/// rather than counted. Writing many slots is fine — writing more than fits is not.
+///
+/// The [`STATE_TRACKER_SLOT`] is counted in the cost (it is a real write) but reported separately,
+/// since every `trackState` diff carries exactly one and `verifyAndUpdate`'s own modifier rewrites
+/// it idempotently.
+pub fn validate_unbounded_cost(
+    updates: &[StateUpdate],
+    external_call_gas: u64,
+    signature_floor: u64,
+    budget: u64,
+) -> Result<UnboundedCost, UnboundedCostViolation> {
+    let mut cost = UnboundedCost {
         stores: 0,
         tracker_stores: 0,
         calls: 0,
         logs: 0,
+        applied_gas_upper_bound: 0,
     };
     for (index, update) in updates.iter().enumerate() {
         match update {
             StateUpdate::Store(store) if store.slot == STATE_TRACKER_SLOT => {
-                shape.tracker_stores += 1
+                cost.tracker_stores += 1
             }
-            StateUpdate::Store(_) => shape.stores += 1,
-            StateUpdate::Call(_) => shape.calls += 1,
+            StateUpdate::Store(_) => cost.stores += 1,
+            StateUpdate::Call(_) => cost.calls += 1,
             StateUpdate::Log0(_)
             | StateUpdate::Log1(_)
             | StateUpdate::Log2(_)
             | StateUpdate::Log3(_)
-            | StateUpdate::Log4(_) => shape.logs += 1,
+            | StateUpdate::Log4(_) => cost.logs += 1,
             StateUpdate::Create(_) | StateUpdate::Create2(_) => {
-                return Err(UnboundedShapeViolation::CreateNotAllowed { index });
+                return Err(UnboundedCostViolation::CreateNotAllowed { index });
             }
         }
     }
-    if shape.stores > 1 {
-        return Err(UnboundedShapeViolation::TooManyStores {
-            count: shape.stores,
+    cost.applied_gas_upper_bound =
+        estimate_applied_payload_gas(updates, external_call_gas, signature_floor);
+    if cost.applied_gas_upper_bound > budget {
+        return Err(UnboundedCostViolation::PayloadTooExpensive {
+            estimated: cost.applied_gas_upper_bound,
+            budget,
+            stores: cost.stores,
         });
     }
-    Ok(shape)
+    Ok(cost)
 }
 
 #[cfg(test)]
@@ -243,11 +344,16 @@ mod tests {
         })
     }
 
+    /// Budget with no signature floor and no call gas, so tests price only the payload ops.
+    fn check(updates: &[StateUpdate]) -> Result<UnboundedCost, UnboundedCostViolation> {
+        validate_unbounded_cost(updates, 0, 0, UNBOUNDED_PAYLOAD_GAS_BUDGET)
+    }
+
     #[test]
     fn chain_profile_overrides_nothing() {
         assert_eq!(SimProfile::Chain.tx_gas_limit_override(), None);
         assert_eq!(SimProfile::Chain.block_gas_limit_override(), None);
-        assert!(!SimProfile::Chain.requires_unbounded_shape());
+        assert_eq!(SimProfile::Chain.payload_gas_budget(), None);
         assert_eq!(SimProfile::default(), SimProfile::Chain);
     }
 
@@ -261,71 +367,119 @@ mod tests {
             SimProfile::Unbounded.block_gas_limit_override(),
             Some(UNBOUNDED_BLOCK_GAS_LIMIT)
         );
-        assert!(SimProfile::Unbounded.requires_unbounded_shape());
+        assert_eq!(
+            SimProfile::Unbounded.payload_gas_budget(),
+            Some(UNBOUNDED_PAYLOAD_GAS_BUDGET)
+        );
         // The constants are protocol-pinned: a change here is a consensus
         // break with the SP1 slashing guest and must ship as a new version.
         assert_eq!(UNBOUNDED_BLOCK_GAS_LIMIT, 1 << 40);
         assert_eq!(UNBOUNDED_TX_GAS_LIMIT, 1 << 40);
+        // EIP-7825's per-transaction cap — the ceiling a payload must fit under.
+        assert_eq!(UNBOUNDED_PAYLOAD_GAS_BUDGET, 1 << 24);
+    }
+
+    #[test]
+    fn many_stores_are_valid_while_they_fit() {
+        // The point of pricing rather than counting: a consumer that writes far more than one slot
+        // is fine, because the payload still fits in a transaction.
+        let updates: Vec<StateUpdate> = (0..500).map(|_| store()).collect();
+        let cost = check(&updates).expect("500 writes fit under the cap");
+        assert_eq!(cost.stores, 500);
+        assert!(cost.applied_gas_upper_bound < UNBOUNDED_PAYLOAD_GAS_BUDGET);
+    }
+
+    #[test]
+    fn a_payload_over_the_budget_is_rejected() {
+        let n = (UNBOUNDED_PAYLOAD_GAS_BUDGET / UNBOUNDED_COLD_SSTORE_COST) as usize + 2;
+        let updates: Vec<StateUpdate> = (0..n).map(|_| store()).collect();
+        let err = check(&updates).unwrap_err();
+        let UnboundedCostViolation::PayloadTooExpensive {
+            estimated, budget, ..
+        } = err
+        else {
+            panic!("expected PayloadTooExpensive, got {err:?}");
+        };
+        assert!(estimated > budget);
+        assert!(err.to_string().contains("over the"));
+    }
+
+    #[test]
+    fn the_budget_boundary_is_where_arithmetic_says_it_is() {
+        // Exactly at the cap passes; one more store does not. Pins the comparison as `>` rather
+        // than `>=`, so a payload that precisely fills a transaction is still usable.
+        let per_store = UNBOUNDED_COLD_SSTORE_COST;
+        let room = UNBOUNDED_PAYLOAD_GAS_BUDGET - TX_BASE;
+        let n = (room / per_store) as usize;
+        let updates: Vec<StateUpdate> = (0..n).map(|_| store()).collect();
+        let cost = check(&updates).expect("the largest payload that fits must be accepted");
+        assert!(cost.applied_gas_upper_bound <= UNBOUNDED_PAYLOAD_GAS_BUDGET);
+
+        let one_more: Vec<StateUpdate> = (0..n + 1).map(|_| store()).collect();
+        assert!(
+            check(&one_more).is_err(),
+            "one store past the cap must fail"
+        );
+    }
+
+    #[test]
+    fn the_signature_floor_and_call_gas_count_against_the_budget() {
+        // A payload that fits on its own can be pushed over by what rides with it on-chain.
+        let updates = vec![store()];
+        assert!(
+            validate_unbounded_cost(&updates, 0, 250_000, UNBOUNDED_PAYLOAD_GAS_BUDGET).is_ok()
+        );
+        assert!(
+            validate_unbounded_cost(
+                &updates,
+                UNBOUNDED_PAYLOAD_GAS_BUDGET,
+                250_000,
+                UNBOUNDED_PAYLOAD_GAS_BUDGET
+            )
+            .is_err(),
+            "external call gas is real on-chain cost and must count"
+        );
     }
 
     #[test]
     fn single_store_with_calls_and_logs_is_valid() {
         let updates = vec![call(), store(), log1(), call(), log1()];
-        let shape = validate_unbounded_shape(&updates).unwrap();
-        assert_eq!(
-            shape,
-            UnboundedShape {
-                stores: 1,
-                tracker_stores: 0,
-                calls: 2,
-                logs: 2
-            }
-        );
+        let cost = check(&updates).unwrap();
+        assert_eq!(cost.stores, 1);
+        assert_eq!(cost.calls, 2);
+        assert_eq!(cost.logs, 2);
     }
 
     #[test]
     fn zero_stores_is_valid() {
-        let shape = validate_unbounded_shape(&[call(), log1()]).unwrap();
-        assert_eq!(shape.stores, 0);
+        assert_eq!(check(&[call(), log1()]).unwrap().stores, 0);
     }
 
     #[test]
     fn empty_payload_is_valid() {
-        let shape = validate_unbounded_shape(&[]).unwrap();
-        assert_eq!(
-            shape,
-            UnboundedShape {
-                stores: 0,
-                tracker_stores: 0,
-                calls: 0,
-                logs: 0
-            }
-        );
+        let cost = check(&[]).unwrap();
+        assert_eq!(cost.stores, 0);
+        assert_eq!(cost.applied_gas_upper_bound, TX_BASE);
     }
 
     #[test]
-    fn tracker_slot_store_is_exempt() {
+    fn tracker_slot_store_is_counted_but_reported_separately() {
         // The realistic trackState diff: counter bump + one commitment write + log.
         let tracker = StateUpdate::Store(IStateUpdateTypes::Store {
             slot: STATE_TRACKER_SLOT,
             value: B256::with_last_byte(1),
         });
-        let shape = validate_unbounded_shape(&[tracker, store(), log1()]).unwrap();
-        assert_eq!(shape.stores, 1);
-        assert_eq!(shape.tracker_stores, 1);
-    }
-
-    #[test]
-    fn two_stores_is_rejected() {
-        let err = validate_unbounded_shape(&[store(), log1(), store()]).unwrap_err();
-        assert_eq!(err, UnboundedShapeViolation::TooManyStores { count: 2 });
-        assert!(err.to_string().contains("single-slot commitment"));
+        let cost = check(&[tracker, store(), log1()]).unwrap();
+        assert_eq!(cost.stores, 1);
+        assert_eq!(cost.tracker_stores, 1);
+        // It is a real write, so it is priced even though it is not counted in `stores`.
+        assert!(cost.applied_gas_upper_bound >= TX_BASE + 2 * UNBOUNDED_COLD_SSTORE_COST);
     }
 
     #[test]
     fn create_is_rejected_at_index() {
-        let err = validate_unbounded_shape(&[store(), create()]).unwrap_err();
-        assert_eq!(err, UnboundedShapeViolation::CreateNotAllowed { index: 1 });
+        let err = check(&[store(), create()]).unwrap_err();
+        assert_eq!(err, UnboundedCostViolation::CreateNotAllowed { index: 1 });
     }
 
     #[test]
@@ -335,10 +489,10 @@ mod tests {
             value: U256::ZERO,
             initcode: Bytes::new(),
         });
-        let err = validate_unbounded_shape(&[update]).unwrap_err();
+        let err = check(&[update]).unwrap_err();
         assert!(matches!(
             err,
-            UnboundedShapeViolation::CreateNotAllowed { index: 0 }
+            UnboundedCostViolation::CreateNotAllowed { index: 0 }
         ));
     }
 }
