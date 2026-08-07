@@ -35,7 +35,11 @@ use gas_analyzer_estimator::PrecedingTx;
 /// block gas limit, so unbounded extraction requires a node started with the
 /// cap lifted (`anvil --disable-block-gas-limit`, `geth --rpc.gascap=0`).
 /// A silently-clamping node makes heavy calls OOG, which surfaces as a revert
-/// classified for fallback rather than an unsound diff.
+/// classified for fallback rather than an unsound diff — but extraction still
+/// returns `Ok`, with an empty payload, or a partial one if writes landed before
+/// the halt. Nothing downstream can distinguish that from a real result, so
+/// cap-lifted nodes are a consensus requirement across the operator set, not a
+/// per-node performance choice. See `docs/UNBOUNDED_MODE.md`.
 fn apply_sim_profile(
     tx_request: &mut alloy::rpc::types::eth::TransactionRequest,
     options: &mut GethDebugTracingCallOptions,

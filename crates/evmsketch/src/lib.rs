@@ -1793,6 +1793,24 @@ mod tests {
             .expect("extraction failed")
         }
 
+        /// Extract under a simulation profile, holding the encoding at `PrestateNet`.
+        async fn extract_under_profile(
+            provider: &RootProvider<Ethereum>,
+            to: Address,
+            profile: SimProfile,
+        ) -> (Vec<StateUpdate>, HashSet<Opcode>) {
+            extract_state_updates_hybrid(
+                provider,
+                call_request(to),
+                BlockId::latest(),
+                to,
+                StateEncoding::PrestateNet,
+                profile,
+            )
+            .await
+            .expect("extraction failed")
+        }
+
         /// Run the `PrestateNet` dispatcher and, for comparison, each struct-log encoder directly.
         ///
         /// `PrestateNet` falls back to the *canonical* encoder for calls with no net form, so that — not
@@ -2115,10 +2133,59 @@ mod tests {
             ))
         }
 
+        /// `SSTORE(1, 0x42)` and then the same busy loop, so the write lands before the gas runs
+        /// out. Jump targets are shifted by the 5 bytes of the leading store.
+        fn write_then_gigagas_code() -> Bytes {
+            hex_code("6042600155 620f4240 5b 80 15 6016 57 6001 90 03 6009 56 5b 50 00")
+        }
+
         /// Same busy loop, but writing TWO slots — a consumer that is not
         /// commitment-shaped and must be rejected by the unbounded profile.
         fn gigagas_two_slot_code() -> Bytes {
             hex_code("620f4240 5b 80 15 6011 57 6001 90 03 6004 56 5b 50 6042600155 6043600255 00")
+        }
+
+        /// The consequence of running `Unbounded` against a node whose execution cap was never
+        /// lifted, pinned so it cannot drift.
+        ///
+        /// The consumer writes one slot and then runs out of gas. Extraction does not fail — it
+        /// succeeds with the writes that happened *before* the gas ran out, because the struct-log
+        /// encoders journal the root frame and never discard it, and a prestate diff of a partly
+        /// executed call reports the same. So the payload is neither correct nor empty: it commits an
+        /// intermediate state the real execution never ended at.
+        ///
+        /// Nothing downstream catches this. It passes the single-slot shape gate (one store is
+        /// exactly what the gate wants), and it is a plain `Ok`, so no caller can distinguish it from
+        /// a genuine result. It is caught only by every operator running a cap-lifted node: a
+        /// minority of clamped nodes are outvoted, but a majority would reach quorum on the partial
+        /// write. That is why node provisioning is a consensus requirement here, not a performance
+        /// tuning knob.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
+        async fn chain_profile_oog_after_a_write_yields_a_partial_payload() {
+            let anvil = LocalAnvil::spawn_with(&["--disable-block-gas-limit"]).await;
+            let provider = anvil.provider();
+            let consumer = address!("0x0000000000000000000000000000000000002003");
+            set_code(&provider, consumer, write_then_gigagas_code()).await;
+
+            let (clamped, _) = extract_under_profile(&provider, consumer, SimProfile::Chain).await;
+            assert_updates_eq(
+                &clamped,
+                &[store_up(1, 0x42)],
+                "a clamped node signs the pre-OOG write, not an error and not an empty payload",
+            );
+
+            // The same call on a correctly-provisioned node completes the loop and reaches the same
+            // single store — here the payloads agree, but only because this fixture's write happens
+            // to be its final state. The hazard is that the clamped result is indistinguishable from
+            // a real one regardless.
+            let (lifted, _) =
+                extract_under_profile(&provider, consumer, SimProfile::Unbounded).await;
+            assert_updates_eq(
+                &lifted,
+                &[store_up(1, 0x42)],
+                "the cap-lifted run completes the loop and commits the same slot",
+            );
         }
 
         /// Under `Chain` the burner OOGs (tx gas 3M < 40M needed): the #165 revert
@@ -2143,6 +2210,20 @@ mod tests {
                 ),
                 "OOG under Chain profile must force the struct-log fallback, never an unsound diff; \
                  got {chain_classification:?}"
+            );
+
+            // Pin what the fallback actually *returns*, not just how it classifies. A node whose
+            // execution cap has not been lifted behaves exactly like this: the call OOGs and
+            // extraction succeeds with an empty payload rather than failing. That is not unsound —
+            // an empty diff writes nothing — but it is also not an error the caller can detect, so
+            // a mis-provisioned operator silently signs a payload that disagrees with every
+            // correctly-provisioned one. See `chain_profile_oog_after_a_write_yields_a_partial_payload`
+            // for the sharper case.
+            let (chain_updates, _) =
+                extract_under_profile(&provider, consumer, SimProfile::Chain).await;
+            assert!(
+                chain_updates.is_empty(),
+                "a clamped node yields an empty payload, not an error: {chain_updates:?}"
             );
 
             // Unbounded: identical request; the profile's pinned tx-gas override

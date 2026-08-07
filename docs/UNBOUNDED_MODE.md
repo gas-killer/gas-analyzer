@@ -80,9 +80,29 @@ The node serving `debug_traceCall` has the last word on simulation gas:
 | geth | `--rpc.gascap=0` (or ≥ the profile limit) |
 | reth | `--rpc.gascap` raised accordingly |
 
-A clamping node makes heavy calls OOG inside the tracer. This fails safe: the
-reverted root frame forces the struct-log fallback classification (PR #165), so
-a clamped simulation can produce an error — never an unsound diff.
+This is a **consensus requirement, not a performance setting.** Every operator
+must run a cap-lifted node, and a deployment should verify it rather than assume
+it.
+
+A clamping node makes heavy calls OOG inside the tracer. The reverted root frame
+forces the struct-log fallback classification (PR #165), so the diff is never
+*unsound* — but the failure is quieter than that makes it sound, and it is worth
+being precise about what a mis-provisioned operator actually produces:
+
+- Extraction **succeeds**. It returns `Ok`, not an error, so no caller can tell a
+  clamped result from a real one.
+- If the call OOGs before writing anything, the payload is **empty**.
+- If it writes and *then* runs out of gas, the payload contains the writes that
+  landed before the halt — a **partial** state commitment the real execution
+  never ended at. This passes the single-slot shape gate, because one store is
+  exactly what the gate is looking for.
+
+So a clamped node signs a payload that disagrees with every correctly-provisioned
+one. A minority of such nodes is outvoted and simply never reaches quorum. A
+majority would form quorum on the empty or partial payload and commit it. Both
+cases are pinned by `chain_profile_oog_after_a_write_yields_a_partial_payload`
+and `test_unbounded_profile_extracts_beyond_block_gas_limit` in
+`crates/evmsketch`.
 
 ## Determinism: why the constants are versioned
 
