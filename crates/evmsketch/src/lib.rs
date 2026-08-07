@@ -1558,11 +1558,12 @@ mod tests {
     /// End-to-end coverage of the extraction dispatcher and the `rpc` tracer helpers against a
     /// real node, rather than synthetic tracer output.
     ///
-    /// Gated behind the `anvil` feature because these spawn a local `anvil`: `evmsketch` is a
-    /// workspace default member, so without the gate a plain `cargo test` would hard-fail for any
-    /// contributor who has not installed foundry. Mirrors how `gas-analyzer-cli` gates its own
-    /// anvil-backed tests. CI runs them via a dedicated step.
-    #[cfg(feature = "anvil")]
+    /// Every test here is `#[ignore]`d because they spawn a local `anvil`: `evmsketch` is a
+    /// workspace default member, so otherwise a plain `cargo test` would hard-fail for any
+    /// contributor without foundry installed. `#[ignore]` rather than a `#[cfg(feature)]` gate so
+    /// the code still compiles — and therefore still gets linted — in the default build; a feature
+    /// that guards only test code buys nothing but a configuration clippy cannot see. CI runs them
+    /// via a dedicated step.
     mod anvil_integration {
         use super::*;
         use gas_analyzer_rpc::{
@@ -1817,6 +1818,7 @@ mod tests {
         /// of slot 2 disappears, intermediate values collapse, stores are slot-sorted ahead of logs.
         /// Pinning both outputs is what keeps that difference deliberate rather than incidental.
         #[tokio::test]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
         async fn test_net_form_differs_from_struct_log_on_eligible_call() {
             let anvil = LocalAnvil::spawn().await;
             let provider = anvil.provider();
@@ -1871,6 +1873,7 @@ mod tests {
         /// `index` interleaving working against a real tracer, and the delegatecall
         /// SSTORE must land on the root's storage.
         #[tokio::test]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
         async fn test_delegatecall_log_ordering_matches_between_paths() {
             let anvil = LocalAnvil::spawn().await;
             let provider = anvil.provider();
@@ -1920,6 +1923,7 @@ mod tests {
         /// back and return exactly what `PrestateNet`'s struct-log encoder — the *canonical* one —
         /// returns (a replayable CALL op + the consumer's own store; the callee's internals excluded).
         #[tokio::test]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
         async fn test_hybrid_falls_back_on_regular_call() {
             let anvil = LocalAnvil::spawn().await;
             let provider = anvil.provider();
@@ -1962,6 +1966,7 @@ mod tests {
         /// that never happened. This is the test that makes that guard load-bearing rather than
         /// defensive, and it fails if the guard is removed.
         #[tokio::test]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
         async fn test_hybrid_falls_back_on_reverted_call() {
             let anvil = LocalAnvil::spawn().await;
             let provider = anvil.provider();
@@ -2000,6 +2005,7 @@ mod tests {
         /// node. It is pinned rather than fixed because `Legacy` is frozen: changing it would change the
         /// digest of every deployment still signing it. See gas-analyzer#178.
         #[tokio::test]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
         async fn test_caught_reverted_delegatecall_is_dropped_by_net_form_but_kept_by_legacy() {
             let anvil = LocalAnvil::spawn().await;
             let provider = anvil.provider();
@@ -2045,6 +2051,7 @@ mod tests {
         /// prestate diff carries the consumer's changed slots, and the call frame
         /// carries logs with `position` populated.
         #[tokio::test]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
         async fn test_prestate_rpc_helpers_return_diff_and_frame() {
             let anvil = LocalAnvil::spawn().await;
             let provider = anvil.provider();
@@ -2119,6 +2126,7 @@ mod tests {
         /// request, gas lifted to the pinned 2^40 override — extracts exactly
         /// [Store(1,0x42), Log1(0xee)] via the prestate fast path.
         #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
         async fn test_unbounded_profile_extracts_beyond_block_gas_limit() {
             let anvil = LocalAnvil::spawn_with(&["--disable-block-gas-limit"]).await;
             let provider = anvil.provider();
@@ -2162,6 +2170,7 @@ mod tests {
         /// gate — the exact check `call_to_encoded_state_updates_with_evmsketch_profiled`
         /// applies before estimating/encoding.
         #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
         async fn test_unbounded_profile_rejects_multi_slot_payload() {
             let anvil = LocalAnvil::spawn_with(&["--disable-block-gas-limit"]).await;
             let provider = anvil.provider();

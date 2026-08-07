@@ -5,9 +5,6 @@ edition = "2024"
 
 [features]
 heap-profile = []
-# Enables the anvil-backed integration tests, which spawn a local `anvil` and so require foundry on
-# PATH. Off by default so a plain `cargo test` needs no external tooling.
-anvil = []
 
 [dependencies]
 alloy = { version = "1.0.37", features = ["rpc", "rpc-types"] }

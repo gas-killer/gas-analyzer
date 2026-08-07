@@ -28,7 +28,6 @@ jobs:
             --exclude indexer-resolver \
             --exclude indexer-service \
             --exclude indexer-web \
-            --features gas-analyzer-evmsketch/anvil \
             --all-targets -- -D warnings
 
       # A single clippy run only ever sees one feature configuration, so anything behind a
@@ -82,8 +81,11 @@ jobs:
       - name: cargo test (anvil)
         run: cargo test -p gas-analyzer-anvil -p gas-analyzer-cli --features gas-analyzer-cli/anvil --no-default-features
 
+      # `#[ignore]`d so a `cargo test` without foundry skips rather than fails; foundry is installed
+      # above, so run them explicitly here. Name-filtered to this module so the RPC-backed ignored
+      # tests (which need RPC_URL) are not pulled in.
       - name: cargo test (evmsketch anvil integration)
-        run: cargo test -p gas-analyzer-evmsketch --features anvil
+        run: cargo test -p gas-analyzer-evmsketch anvil_integration -- --ignored
 
   test-wasm:
     runs-on: ubuntu-latest
