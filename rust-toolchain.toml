@@ -1,0 +1,12 @@
+# Pins the toolchain used by CI and by contributors.
+#
+# Without this file every runner resolves `stable` afresh, so a Rust release can turn a branch red
+# without anyone having touched it — clippy gains lints with each release, and `-D warnings` promotes
+# every one of them to a build failure. It also lets a contributor's local `cargo clippy` disagree
+# with CI, which makes a green local run meaningless as a pre-push check.
+#
+# Bumping `channel` is therefore a deliberate, reviewable change: expect new lints to surface and fix
+# them in the same PR.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
