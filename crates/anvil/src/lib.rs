@@ -539,7 +539,7 @@ pub async fn gas_estimate_block(
     println!("got {} receipts for block {}", receipts.len(), block_number);
     let mut reports = Vec::new();
     for receipt in receipts {
-        println!("processing {}", &receipt.transaction_hash);
+        println!("processing {}", receipt.transaction_hash);
         reports.push(
             get_report(&provider, receipt.transaction_hash, &receipt, &gk)
                 .await
