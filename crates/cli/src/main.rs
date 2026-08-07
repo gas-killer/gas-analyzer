@@ -1,9 +1,12 @@
+#[cfg(feature = "evmsketch")]
 use alloy::consensus::Transaction as _;
+#[cfg(feature = "evmsketch")]
 use alloy::sol_types::SolError;
 use alloy::{hex, providers::ProviderBuilder};
 use alloy_provider::Provider;
 use anyhow::Result;
 use colored::Colorize;
+#[cfg(feature = "evmsketch")]
 use gas_analyzer_core::RevertingContext;
 use std::env;
 use url::Url;
@@ -13,6 +16,7 @@ use url::Url;
 /// Looks for hex-encoded revert data in the error message (the format revm
 /// produces: "Gas estimation reverted (gas: N): 0x...") and attempts to
 /// ABI-decode it as a `RevertingContext`.
+#[cfg(feature = "evmsketch")]
 fn decode_reverting_context(e: &anyhow::Error) -> Option<RevertingContext> {
     let msg = format!("{e:?}");
     let hex_start = msg.rfind("0x")?;
@@ -127,17 +131,20 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             let block_number = receipt
                 .block_number
                 .expect("couldn't retrieve block number");
+            #[cfg(feature = "evmsketch")]
             let tx_index = receipt
                 .transaction_index
                 .expect("couldn't retrieve transaction index");
             let gas_used = receipt.gas_used;
             let original_status = receipt.status();
+            #[cfg(feature = "evmsketch")]
             let tx_sender = receipt.from;
 
             // Fetch the original tx so we can mirror its `msg.value` during
             // simulation. Pass-through contracts (deposit-then-forward, intent
             // settlers, swap routers) lose ETH otherwise and value-bearing
             // CALL state updates halt with OutOfFunds.
+            #[cfg(feature = "evmsketch")]
             let tx = provider
                 .get_transaction_by_hash(bytes.into())
                 .await?
@@ -147,6 +154,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                         hex::encode(bytes)
                     )
                 })?;
+            #[cfg(feature = "evmsketch")]
             let tx_value = tx.value();
 
             #[cfg(feature = "anvil")]

@@ -31,6 +31,25 @@ jobs:
             --features gas-analyzer-evmsketch/anvil \
             --all-targets -- -D warnings
 
+      # A single clippy run only ever sees one feature configuration, so anything behind a
+      # `#[cfg(feature = ...)]` that is off in that run is never linted. `--each-feature` lints every
+      # feature of the crates that have them, in both directions, and picks up new features
+      # automatically instead of relying on someone remembering to enumerate them here.
+      #
+      # `--exclude-no-default-features` skips the all-features-off build of `gas-analyzer-cli`: with
+      # neither `evmsketch` nor `anvil` the binary has no analysis backend at all, so it is not a
+      # configuration anyone runs.
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+
+      - name: cargo clippy (feature matrix)
+        run: |
+          cargo hack clippy \
+            -p gas-analyzer-evmsketch \
+            -p gas-analyzer-cli \
+            --each-feature --exclude-no-default-features \
+            --all-targets -- -D warnings
+
       - name: cargo check (default workspace)
         run: |
           cargo check --workspace \
