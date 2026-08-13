@@ -8,6 +8,7 @@ pub mod constants;
 pub mod encoding;
 pub mod heuristic;
 pub mod prestate;
+pub mod sim_profile;
 pub mod trace;
 pub mod types;
 
@@ -23,6 +24,10 @@ pub use heuristic::{
 };
 pub use prestate::{
     PrestateEligibility, build_state_updates_from_prestate, classify_prestate_eligibility,
+};
+pub use sim_profile::{
+    SimProfile, UNBOUNDED_BLOCK_GAS_LIMIT, UNBOUNDED_TX_GAS_LIMIT, UnboundedShape,
+    UnboundedShapeViolation, validate_unbounded_shape,
 };
 pub use trace::{
     compute_state_updates, compute_state_updates_canonical, copy_memory, parse_trace_memory,
