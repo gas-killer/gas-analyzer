@@ -1,12 +1,8 @@
 //! Polls the chain head, fans out one job per qualifying tx into Redis.
 //!
 //! Backpressure: if the queue depth exceeds `max_queue_depth`, we stop
-//! enqueueing new blocks and wait for the workers to drain. By default we
-//! never *drop* blocks — we just lag, then catch up (comprehensiveness >
-//! speed). When analysis capacity permanently trails chain volume (e.g.
-//! heuristic-only workers on a busy chain), `max_blocks_behind` bounds that
-//! lag instead: the cursor skips forward and the intermediate blocks are
-//! dropped, keeping analyses near head.
+//! enqueueing new blocks and wait for the workers to drain. We never *drop*
+//! blocks — we just lag, then catch up. Comprehensiveness > speed.
 
 use std::time::Duration;
 
@@ -69,19 +65,6 @@ pub async fn run(common: CommonConfig, cfg: HeadTrackerConfig) -> Result<()> {
             continue;
         }
 
-        // Bounded lag: skip ahead rather than grind through a backlog of
-        // ever-staler blocks (0 = disabled, never drop).
-        if cfg.max_blocks_behind > 0 && head.saturating_sub(next_block) > cfg.max_blocks_behind {
-            let new_start = head - cfg.max_blocks_behind;
-            tracing::warn!(
-                skipped = new_start - next_block,
-                from = next_block,
-                to = new_start,
-                "lag exceeds max_blocks_behind, skipping ahead"
-            );
-            next_block = new_start;
-        }
-
         if head < next_block {
             sleep(Duration::from_millis(cfg.head_poll_ms)).await;
             continue;
@@ -132,7 +115,6 @@ async fn enqueue_block(
             block_number,
             tx_index: idx as u64,
             attempt: 0,
-            enqueued_at: chrono::Utc::now().timestamp(),
         };
         queue.enqueue(&job).await.context("enqueue job")?;
         enqueued += 1;

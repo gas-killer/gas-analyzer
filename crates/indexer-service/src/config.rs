@@ -36,14 +36,6 @@ pub struct CommonConfig {
     #[arg(long, env = "MIN_GAS_USED", default_value_t = 50_000)]
     pub min_gas_used: u64,
 
-    /// Heuristic-only estimation (#162): skip the preceding-tx replay and the
-    /// EvmSketch fork, estimating from extracted state updates alone. Cuts
-    /// per-analysis RPC usage roughly 300× at the cost of estimate accuracy
-    /// (call-dominated txs report zero savings). Reports get
-    /// `is_heuristic = true`.
-    #[arg(long, env = "HEURISTIC_ONLY", default_value_t = false)]
-    pub heuristic_only: bool,
-
     /// Path to the curated address-overlay YAML.
     #[arg(
         long,
@@ -79,13 +71,6 @@ pub struct HeadTrackerConfig {
     /// Polling interval for new blocks (ms).
     #[arg(long, env = "HEAD_POLL_MS", default_value_t = 4000)]
     pub head_poll_ms: u64,
-
-    /// Skip the fan-out cursor forward when it falls more than this many
-    /// blocks behind head, dropping the intermediate blocks. Bounds analysis
-    /// staleness when capacity can't keep up with chain volume. `0` keeps
-    /// the never-drop catch-up behavior.
-    #[arg(long, env = "MAX_BLOCKS_BEHIND", default_value_t = 0)]
-    pub max_blocks_behind: u64,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -98,12 +83,6 @@ pub struct WorkerConfig {
     /// RPC reads pinning the worker. On timeout the job is requeued.
     #[arg(long, env = "WORKER_ANALYZE_TIMEOUT_SECS", default_value_t = 60)]
     pub analyze_timeout_secs: u64,
-
-    /// Drop queued jobs older than this many seconds at claim time instead
-    /// of analyzing them. Bounds queue depth and staleness when enqueue rate
-    /// outpaces analysis capacity. `0` disables expiry.
-    #[arg(long, env = "QUEUE_JOB_TTL_SECS", default_value_t = 3600)]
-    pub queue_job_ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, clap::Args)]

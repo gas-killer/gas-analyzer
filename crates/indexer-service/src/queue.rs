@@ -33,20 +33,6 @@ pub struct AnalyzeTxJob {
     pub tx_index: u64,
     /// Number of times this job has been claimed and failed. 0 = first try.
     pub attempt: u32,
-    /// Unix seconds when the job was first enqueued. Requeues keep the
-    /// original value so the TTL spans the job's whole lifetime, retries
-    /// included. `0` on payloads enqueued before this field existed; those
-    /// never expire.
-    #[serde(default)]
-    pub enqueued_at: i64,
-}
-
-impl AnalyzeTxJob {
-    /// Seconds since first enqueue, or `None` for legacy payloads without a
-    /// timestamp.
-    pub fn age_secs(&self, now: i64) -> Option<i64> {
-        (self.enqueued_at > 0).then(|| now - self.enqueued_at)
-    }
 }
 
 #[derive(Clone)]
@@ -125,35 +111,5 @@ impl Queue {
         let mut conn = self.conn.clone();
         let _: () = conn.rpush(DEAD_KEY, payload).await?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::AnalyzeTxJob;
-
-    fn job(enqueued_at: i64) -> AnalyzeTxJob {
-        AnalyzeTxJob {
-            chain_id: 1,
-            tx_hash: [7u8; 32],
-            block_number: 100,
-            tx_index: 3,
-            attempt: 0,
-            enqueued_at,
-        }
-    }
-
-    #[test]
-    fn legacy_payload_without_enqueued_at_never_expires() {
-        let mut v = serde_json::to_value(job(1_234)).unwrap();
-        v.as_object_mut().unwrap().remove("enqueued_at");
-        let legacy: AnalyzeTxJob = serde_json::from_value(v).unwrap();
-        assert_eq!(legacy.enqueued_at, 0);
-        assert_eq!(legacy.age_secs(i64::MAX), None);
-    }
-
-    #[test]
-    fn age_is_measured_from_first_enqueue() {
-        assert_eq!(job(900).age_secs(1_000), Some(100));
     }
 }

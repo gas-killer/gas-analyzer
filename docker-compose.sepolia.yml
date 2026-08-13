@@ -103,9 +103,6 @@ services:
       RPC_MAX_CONCURRENCY: ${SEPOLIA_RPC_MAX_CONCURRENCY:-8}
       MIN_GAS_USED: ${MIN_GAS_USED:-50000}
       MAX_QUEUE_DEPTH: ${MAX_QUEUE_DEPTH:-1000}
-      # Sepolia analyses are heuristic-only and low-priority: keep them near
-      # head, drop what capacity can't cover (~1h of blocks at 12s each).
-      MAX_BLOCKS_BEHIND: ${SEPOLIA_MAX_BLOCKS_BEHIND:-300}
       HEAD_POLL_MS: ${HEAD_POLL_MS:-4000}
       RUST_LOG: ${RUST_LOG:-info}
     depends_on:
@@ -137,10 +134,6 @@ services:
       RPC_BURST: ${SEPOLIA_RPC_BURST:-250}
       RPC_MAX_CONCURRENCY: ${SEPOLIA_RPC_MAX_CONCURRENCY:-8}
       MIN_GAS_USED: ${MIN_GAS_USED:-50000}
-      # Namespaced like the rate knobs so mainnet and Sepolia toggle
-      # independently from the shared .env.
-      HEURISTIC_ONLY: ${SEPOLIA_HEURISTIC_ONLY:-false}
-      QUEUE_JOB_TTL_SECS: ${SEPOLIA_QUEUE_JOB_TTL_SECS:-3600}
       WORKER_MAX_RETRIES: ${WORKER_MAX_RETRIES:-3}
       OVERLAY_PATH: /etc/indexer/overlay.yaml
       RUST_LOG: ${RUST_LOG:-info}
