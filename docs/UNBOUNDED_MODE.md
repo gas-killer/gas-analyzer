@@ -1,7 +1,7 @@
 # Unbounded Simulation Mode (`SimProfile::Unbounded`)
 
 **Status:** Implemented (analyzer side) — guest-side mirroring required before slashing ships
-**Related:** [GAS_KILLER_SLASHING_SPEC.md](./GAS_KILLER_SLASHING_SPEC.md), [SP1_REVM_IMPLEMENTATION_SPEC.md](./SP1_REVM_IMPLEMENTATION_SPEC.md), solidity-sdk PRs [#51](https://github.com/gas-killer/solidity-sdk/pull/51) (single-slot commitment), [#47](https://github.com/gas-killer/solidity-sdk/pull/47)/[#48](https://github.com/gas-killer/solidity-sdk/pull/48) (multi-call forwarding)
+**Related:** [GAS_KILLER_SLASHING_SPEC.md](./GAS_KILLER_SLASHING_SPEC.md), [SP1_REVM_IMPLEMENTATION_SPEC.md](./SP1_REVM_IMPLEMENTATION_SPEC.md), solidity-sdk PR [#51](https://github.com/gas-killer/solidity-sdk/pull/51) (single-slot commitment — open, and not a prerequisite for this mode)
 
 ## What it is
 
@@ -33,8 +33,9 @@ In exchange, the extracted payload must fit in a single on-chain transaction
 - **No `CREATE`/`CREATE2`.** Not a cost question: a net diff cannot reconstruct
   replayable initcode, so contract creation is unrepresentable at any price.
 - Any number of `Call` / `Log*` ops within budget — but `Call`s re-execute
-  on-chain at real gas prices, so compute inside them is *not* killed.
-  Multi-call forwarding (`applyForwardedUpdates`) rides in this category.
+  on-chain at real gas prices, so compute inside them is *not* killed. They are
+  priced at the gas the trace measured, so an expensive call spends the same
+  budget a batch of writes would.
 
 So the profile **lifts EIP-7825 for the simulation, where the cap protects
 nothing, and enforces it on the payload, where it is binding.**
@@ -134,7 +135,7 @@ cases are pinned by `chain_profile_oog_after_a_write_yields_a_partial_payload`
 and `test_unbounded_profile_extracts_beyond_block_gas_limit` in
 `crates/evmsketch`.
 
-## Determinism: why the constants are versioned
+## Determinism: why the constants are pinned
 
 The environment override is **part of the protocol**, not a local tunable.
 Three parties re-execute the same tracked function and must get bit-identical
@@ -155,11 +156,14 @@ boundary. Hence:
 - The limits are `pub const` in `gas_analyzer_core::sim_profile` — the guest
   crate must import them from there (the crate is pure/WASM-safe and compiles
   in a zkVM guest).
-- Any change to the values is a **new profile version** (`UnboundedV2`, …),
-  coordinated across operators and the committed guest ELF — never a silent
-  edit. The guest's public values should commit to the profile version
-  alongside the chain-config hash so a proof under the wrong profile cannot
-  satisfy the verifier.
+- Changing a value is a **lockstep fleet rollout** across operators and the
+  committed guest ELF — never a silent edit. What distinguishes one set of
+  limits from another is not the Rust identifier but the values themselves: the
+  guest binds the overrides into `chainConfigHash`
+  (`ChainConfigWithEnvOverrides`), so a proof produced under different limits
+  cannot satisfy a verifier expecting these ones. An operator fleet that has
+  half-rolled a change does not produce quietly-divergent proofs; it produces
+  proofs that fail verification.
 
 ### Fork support (implemented)
 
@@ -198,22 +202,28 @@ any real block) under `gas_limits(1 << 40)`.
 > above ~16.7M gas would have OOG'd in host prefetch and guest re-execution
 > even in "bounded" mode.
 
-Remaining before slashing ships: merge the fork branch into `cancun-v1`, and
-have the slashing guest program (per `SP1_REVM_IMPLEMENTATION_SPEC.md`) pass
-`EnvOverrides::gas_limits(UNBOUNDED_BLOCK_GAS_LIMIT)` — importing the
-constant from `gas-analyzer-core`, never restating it — and commit the profile
-version in its public values.
+Remaining before slashing ships: merge the fork branch into `cancun-v1`
+([sp1-contract-call#12](https://github.com/BreadchainCoop/sp1-contract-call/pull/12),
+still open), and have the slashing guest program (per
+`SP1_REVM_IMPLEMENTATION_SPEC.md`) pass
+`EnvOverrides::gas_limits(UNBOUNDED_BLOCK_GAS_LIMIT)` — importing the constant
+from `gas-analyzer-core`, never restating it — so the limits it executed under
+are bound into the `chainConfigHash` its proof commits to.
 
 ## What this mode does *not* change
 
 - **Trust model.** The quorum still signs the diff; the proof (when it ships)
   is a fraud proof, not a validity proof. Unbounded mode widens what operators
   can compute, not what users must trust.
-- **On-chain application costs.** One commitment SSTORE (~5–22k gas) + BLS/ECDSA
-  verification overhead per `verifyAndUpdate`, regardless of off-chain compute.
-- **`Call` op costs.** Calls in the payload re-execute on-chain at real gas.
-  A forwarded multi-call bundle costs one commitment write per sibling contract
-  plus call overhead — still O(contracts), not O(compute).
+- **On-chain application costs.** Applying a payload costs the transaction base,
+  the BLS/ECDSA verification floor, and the writes and logs the diff actually
+  carries — capped by `UNBOUNDED_PAYLOAD_GAS_BUDGET`, never scaling with
+  off-chain compute. A commitment-shaped consumer stays at one SSTORE; a
+  consumer that writes 300 slots pays for 300, and one that writes 1,000 is
+  rejected rather than made cheap.
+- **`Call` op costs.** Calls in the payload re-execute on-chain at real gas, so
+  compute inside a `Call` is not killed — it is charged against the payload
+  budget at the gas the trace measured.
 - **The serialization model.** One transition per `transitionIndex` per
   consumer; a direct on-chain call to a tracked function still invalidates
   in-flight signed updates. Heavy simulations widen this race window
@@ -222,11 +232,22 @@ version in its public values.
 
 ## Test coverage
 
-- `gas_analyzer_core::sim_profile` unit tests: profile overrides, payload budget
-  (single store / multi store / CREATE rejection / empty payload).
-- `gas-analyzer-evmsketch` anvil-backed integration tests
-  (`test_unbounded_profile_*`): a ~40M-gas busy-loop consumer OOGs under
-  `Chain` (classified `Fallback`, per #165's revert soundness rule) and
-  extracts exactly `[Store, Log1]` under `Unbounded` against a real anvil
-  with `--disable-block-gas-limit`; a two-slot writer extracts but fails the
-  budget with `PayloadTooExpensive` once its diff exceeds one transaction.
+`gas_analyzer_core::sim_profile` unit tests cover the profile overrides and the
+budget arithmetic: the pinned constants, many stores accepted while they fit, the
+exact boundary (largest fitting payload accepted, one store past it rejected),
+the signature floor and external call gas counting against the budget, the
+tracker slot priced but reported separately, empty and zero-store payloads, and
+`CREATE`/`CREATE2` rejection with the offending index.
+
+`gas-analyzer-evmsketch`'s `anvil_integration` module covers the same ground
+against a real anvil started with `--disable-block-gas-limit`. These tests are
+`#[ignore]`d so a plain `cargo test` without foundry on PATH skips rather than
+fails, and CI runs them explicitly (`cargo test -p gas-analyzer-evmsketch
+anvil_integration -- --ignored`):
+
+| test | pins |
+|---|---|
+| `test_unbounded_profile_extracts_beyond_block_gas_limit` | a ~40M-gas busy loop OOGs under `Chain` — classified `Fallback` per #165's revert rule, returning an **empty** payload rather than an error — and reduces to exactly `[Store, Log1]` under `Unbounded` |
+| `chain_profile_oog_after_a_write_yields_a_partial_payload` | a clamped node that writes *then* OOGs returns the pre-OOG write: `Ok`, non-empty, and indistinguishable from a correct result |
+| `unbounded_profile_accepts_a_multi_slot_payload_that_fits` | a two-slot writer is **accepted** — the gate prices the payload rather than counting its writes |
+| `unbounded_profile_rejects_a_payload_over_the_transaction_budget` | a 1,000-slot writer extracts fine and is rejected with `PayloadTooExpensive { stores: 1000 }` |

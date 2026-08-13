@@ -2133,12 +2133,12 @@ mod tests {
         // These spawn anvil with `--disable-block-gas-limit` (the node-side
         // requirement the profile documents) and prove the mode's two halves:
         // compute beyond any real block extracts fine, and the extracted payload
-        // must still be single-slot shaped.
+        // must still fit in one on-chain transaction.
         // ========================================================================
 
         /// ~40M-gas busy loop (1,000,000 iterations × ~40 gas), then exactly one
-        /// SSTORE(1, 0x42) and one LOG1(topic 0xee) — the single-slot commitment
-        /// shape with compute far beyond a 30M block.
+        /// SSTORE(1, 0x42) and one LOG1(topic 0xee) — a minimal payload with
+        /// compute far beyond a 30M block.
         ///
         /// Layout: PUSH3 1_000_000; loop{ DUP1 ISZERO PUSH1 end JUMPI; PUSH1 1
         /// SWAP1 SUB; PUSH1 4 JUMP }; end: POP; SSTORE; LOG1; STOP.

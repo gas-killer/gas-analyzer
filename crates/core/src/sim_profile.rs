@@ -12,8 +12,8 @@
 //! needed to apply the diff, so a transition may write as many slots as fit
 //! under [`UNBOUNDED_PAYLOAD_GAS_BUDGET`]. Consumers whose state is too large
 //! for that can commit it into fewer slots — in the limit, the single-slot
-//! commitment pattern (solidity-sdk PR #51) — and fan out across contracts via
-//! multi-call forwarding (solidity-sdk PRs #47/#48), but neither is required.
+//! commitment pattern (solidity-sdk PR #51) — but that pattern is an option for
+//! contracts that need it, not a requirement of this mode.
 //!
 //! # Determinism is protocol-critical
 //!
@@ -160,8 +160,8 @@ pub struct UnboundedCost {
     pub tracker_stores: usize,
     /// Number of `Call` ops. These re-execute **on-chain at real gas prices**
     /// when the payload is applied — unbounded compute inside a `Call` is NOT
-    /// killed. Forwarded multi-call sub-payloads (`applyForwardedUpdates`)
-    /// ride in this category by design.
+    /// killed, and is charged against the budget at the gas the trace measured
+    /// for it.
     pub calls: usize,
     /// Number of `Log0`–`Log4` ops.
     pub logs: usize,
