@@ -179,9 +179,12 @@ All via env vars. See `.env.example` for the full list. Most important:
 | `RPC_BURST` | Short-spike allowance. | `25` |
 | `RPC_MAX_CONCURRENCY` | Hard cap on simultaneous outbound calls. | `8` |
 | `MIN_GAS_USED` | Skip txs below this. | `50000` |
+| `HEURISTIC_ONLY` | Estimate from state updates alone — no preceding-tx replay, no EvmSketch fork. ~300× fewer RPC calls per analysis; estimates are cruder (call-heavy txs report zero savings) and rows get `is_heuristic = true`. | `false` |
 | `MAX_QUEUE_DEPTH` | Backpressure threshold for head-tracker. | `1000` |
+| `MAX_BLOCKS_BEHIND` | Bound head-tracker lag: when the cursor falls more than this many blocks behind head, skip it forward and drop the intermediate blocks. `0` = never drop, lag and catch up. | `0` |
 | `WORKER_MAX_RETRIES` | Per-job retry count before dead-letter. | `3` |
 | `WORKER_ANALYZE_TIMEOUT_SECS` | Hard cap on a single `analyze_tx`. Backstop against hung HTTP reads pinning a worker. | `60` |
+| `QUEUE_JOB_TTL_SECS` | Workers drop queued jobs older than this at claim time instead of analyzing them stale. `0` disables expiry. | `3600` |
 | `OVERLAY_PATH` | Curated address overlay YAML. | `/etc/indexer/overlay.yaml` |
 | `DEFILLAMA_URL`, `PRICE_URL` | Empty disables the corresponding refresh. | (set) |
 | `ETHERSCAN_API_KEY` | Empty disables the auto-labeler loop. Free key from etherscan.io/myapikey. | — |

@@ -90,6 +90,12 @@ pub struct AnalyzerConfig {
     /// Skip transactions whose `gas_used` is below this. Default 50_000 — same
     /// spirit as the README's "ignores transactions below the gas limit".
     pub min_gas_used: u64,
+    /// Heuristic-only mode (#162): estimate from the extracted state updates
+    /// alone, skipping the preceding-tx replay and the EvmSketch fork. Cuts
+    /// per-analysis RPC usage from ~1,600 calls to ~5 (the debug trace stays —
+    /// state extraction needs it). Trades accuracy for quota: the heuristic
+    /// overshoots on call-dominated txs, clamping their savings to zero.
+    pub heuristic_only: bool,
 }
 
 impl Default for AnalyzerConfig {
@@ -97,6 +103,7 @@ impl Default for AnalyzerConfig {
         Self {
             chain_id: 1,
             min_gas_used: 50_000,
+            heuristic_only: false,
         }
     }
 }
@@ -219,44 +226,52 @@ impl Analyzer for EvmSketchAnalyzer {
             return Err(AnalyzerError::Skipped(SkipReason::NoStateUpdates));
         }
 
-        // 5. Mid-block state — fetch preceding transactions.
-        let preceding_txs = match get_preceding_transactions(provider, block_number, tx_index).await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(error = %e, "get_preceding_transactions failed");
-                Vec::new()
-            }
-        };
+        // 5+6. Estimate. Heuristic-only mode stops here: everything below
+        // (preceding-tx replay, EvmSketch fork build) is where ~all of the
+        // per-analysis RPC volume lives (#119, #162).
+        let (gaskiller_gas_estimate, is_heuristic, failure_reason) = if self.config.heuristic_only {
+            let heuristic = estimate_gas_from_state_updates(&state_updates, call_gas_total);
+            // Not a failure: the measured path was never attempted.
+            (heuristic + TURETZKY_UPPER_GAS_LIMIT_BLS, true, None)
+        } else {
+            // 5. Mid-block state — fetch preceding transactions.
+            let preceding_txs =
+                match get_preceding_transactions(provider, block_number, tx_index).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "get_preceding_transactions failed");
+                        Vec::new()
+                    }
+                };
 
-        // 6. Estimate: measured first, heuristic fallback (non-empty set).
-        let gk = GasKillerEvmSketchDefault::builder(self.rpc_url.clone())
-            .at_block(BlockNumberOrTag::Number(block_number))
-            .build()
-            .await
-            .map_err(|e| AnalyzerError::Estimation(format!("builder.build: {e}")))?;
+            // 6. Estimate: measured first, heuristic fallback (non-empty set).
+            let gk = GasKillerEvmSketchDefault::builder(self.rpc_url.clone())
+                .at_block(BlockNumberOrTag::Number(block_number))
+                .build()
+                .await
+                .map_err(|e| AnalyzerError::Estimation(format!("builder.build: {e}")))?;
 
-        // Single-estimate schema: report the conservative BLS floor (250k).
-        // Surfacing the lower Schnorr floor (27k) alongside it needs a schema
-        // change — `gaskiller_gas_estimate` is one column.
-        let (gaskiller_gas_estimate, is_heuristic, failure_reason) = match gk
-            .estimate_state_changes_gas_with_preceding(
+            // Single-estimate schema: report the conservative BLS floor (250k).
+            // Surfacing the lower Schnorr floor (27k) alongside it needs a schema
+            // change — `gaskiller_gas_estimate` is one column.
+            match gk.estimate_state_changes_gas_with_preceding(
                 to,
                 tx_sender,
                 &state_updates,
                 &preceding_txs,
                 tx_value,
             ) {
-            Ok(g) => (g + TURETZKY_UPPER_GAS_LIMIT_BLS, false, None),
-            Err(e) => {
-                let heuristic = estimate_gas_from_state_updates(&state_updates, call_gas_total);
-                let reason = format!("{e}");
-                let truncated = reason.lines().next().unwrap_or("unknown").to_string();
-                (
-                    heuristic + TURETZKY_UPPER_GAS_LIMIT_BLS,
-                    true,
-                    Some(truncated),
-                )
+                Ok(g) => (g + TURETZKY_UPPER_GAS_LIMIT_BLS, false, None),
+                Err(e) => {
+                    let heuristic = estimate_gas_from_state_updates(&state_updates, call_gas_total);
+                    let reason = format!("{e}");
+                    let truncated = reason.lines().next().unwrap_or("unknown").to_string();
+                    (
+                        heuristic + TURETZKY_UPPER_GAS_LIMIT_BLS,
+                        true,
+                        Some(truncated),
+                    )
+                }
             }
         };
 
@@ -306,5 +321,6 @@ mod tests {
         let cfg = AnalyzerConfig::default();
         assert_eq!(cfg.chain_id, 1);
         assert_eq!(cfg.min_gas_used, 50_000);
+        assert!(!cfg.heuristic_only);
     }
 }
