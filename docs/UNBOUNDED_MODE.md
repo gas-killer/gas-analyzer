@@ -26,10 +26,20 @@ In exchange, the extracted payload must fit in a single on-chain transaction
 |---|---|---|
 | `UNBOUNDED_PAYLOAD_GAS_BUDGET` | `1 << 24` (16,777,216) | ceiling on the gas needed to apply the payload — EIP-7825's per-transaction cap |
 | `UNBOUNDED_COLD_SSTORE_COST` | `22,100` | price charged per `Store`: cold SLOAD (2,100) + zero→nonzero SSTORE (20,000) |
+| `UNBOUNDED_APPLY_BASE_GAS` | `2,000` | fixed cost of entering `verifyAndUpdate`'s decode/apply loop |
+| `UNBOUNDED_APPLY_GAS_PER_PAYLOAD_BYTE` | `14` | decoding and dispatching one byte of encoded payload |
 
-- Applying the payload — transaction base cost, the signature-verification
-  floor, every `Store`/`Log*`, plus the measured gas of any `Call` ops — must
-  come to no more than the budget.
+Applying the payload must come to no more than the budget, counting all three of:
+
+- **Execution** — every `Store`/`Log*` at its EVM price, plus the measured gas
+  of any `Call` ops, plus the signature-verification floor.
+- **Transport** — the transaction base cost and intrinsic gas for the encoded
+  payload's own bytes (4 per zero byte, 16 per non-zero), or the EIP-7623 floor
+  where that is larger. This scales with payload size, so a gate that omitted it
+  would over-admit every multi-slot payload.
+- **Dispatch** — `UNBOUNDED_APPLY_BASE_GAS` plus
+  `UNBOUNDED_APPLY_GAS_PER_PAYLOAD_BYTE` per byte, for decoding the payload and
+  walking it inside `verifyAndUpdate`.
 - **No `CREATE`/`CREATE2`.** Not a cost question: a net diff cannot reconstruct
   replayable initcode, so contract creation is unrepresentable at any price.
 - Any number of `Call` / `Log*` ops within budget — but `Call`s re-execute
@@ -43,8 +53,9 @@ nothing, and enforces it on the payload, where it is binding.**
 The result: **unbounded Solidity, on-chain state bounded by what a transaction
 can carry.** A tracked function may iterate a million-entry order book, verify a
 multi-megabyte witness, or run a whole matching epoch, and write however many
-slots it likes — roughly 700 cold writes fit under the cap — as long as the diff
-can actually be mined.
+slots it likes — roughly 650 cold writes fit under the cap, a little fewer when
+the slots and values are dense (their bytes cost more to carry) — as long as the
+diff can actually be mined.
 
 The constraint is *priced*, not counted. Consumers whose state is too large for
 one transaction can commit it into fewer slots; in the limit that is the
@@ -66,6 +77,25 @@ payloads that do not fit.
 
 Payloads are priced against the **more expensive** signature scheme's floor,
 since the payload is signed before the scheme is fixed.
+
+That independence has a cost worth being explicit about: the analytic model is a
+hand-written reimplementation of something the measured path gets for free.
+`estimate_state_changes_gas` runs the real encoded payload through revm, so revm
+charges intrinsic calldata gas and the handler's decode loop automatically,
+without anyone having to think about them. A hand-written model contains exactly
+the terms someone remembered to write down — and the first version of this gate
+priced execution only, omitting both transport and dispatch (together ~11% per
+store). That is invisible except within a few percent of the ceiling, which is
+precisely where an admission gate lives.
+
+So the measured path is used as an *oracle* for the analytic one:
+`analytic_bound_dominates_measured_apply_cost` in `gas-analyzer-estimator`
+asserts that `estimate_applied_payload_gas` is never below what revm actually
+charges to apply the same payload, across store-shaped, log-shaped, and mixed
+payloads from 1 to 650 updates, with sparse and dense slot values. It passes the
+signature floor as zero on purpose — at 250,000 a fixed floor would mask a
+missing per-update term until payloads grew past ~200 updates. Any future dropped
+term fails that test instead of shipping as an over-admitting gate.
 
 ### Calldata
 
@@ -235,9 +265,16 @@ are bound into the `chainConfigHash` its proof commits to.
 `gas_analyzer_core::sim_profile` unit tests cover the profile overrides and the
 budget arithmetic: the pinned constants, many stores accepted while they fit, the
 exact boundary (largest fitting payload accepted, one store past it rejected),
-the signature floor and external call gas counting against the budget, the
-tracker slot priced but reported separately, empty and zero-store payloads, and
-`CREATE`/`CREATE2` rejection with the offending index.
+the signature floor and external call gas counting against the budget, transport
+and dispatch priced on top of execution, the tracker slot priced but reported
+separately, empty and zero-store payloads, and `CREATE`/`CREATE2` rejection with
+the offending index.
+
+`gas-analyzer-estimator`'s `analytic_bound_dominates_measured_apply_cost` is the
+one that guards the model rather than its arithmetic — see [Why the bound is
+analytic](#why-the-bound-is-analytic). It measures the real cost with revm and
+asserts the analytic bound never falls below it, so a dropped term fails a test
+instead of loosening the gate.
 
 `gas-analyzer-evmsketch`'s `anvil_integration` module covers the same ground
 against a real anvil started with `--disable-block-gas-limit`. These tests are

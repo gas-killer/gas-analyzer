@@ -151,6 +151,45 @@ const LOG_BYTE: u64 = 8;
 /// Intrinsic cost of the `verifyAndUpdate` transaction that carries the payload.
 const TX_BASE: u64 = 21_000;
 
+/// Intrinsic gas per byte of payload calldata: 4 per zero byte, 16 per non-zero byte
+/// (EIP-2028 pricing, i.e. 4 gas per EIP-7623 *token*).
+const CALLDATA_ZERO_BYTE: u64 = 4;
+const CALLDATA_NONZERO_BYTE: u64 = 16;
+
+/// EIP-7623 floor price per calldata token, where a token is one zero byte or a quarter of a
+/// non-zero byte. A transaction pays the *larger* of its execution total and this floor, so
+/// [`estimate_applied_payload_gas`] has to evaluate both.
+const CALLDATA_FLOOR_TOKEN: u64 = 10;
+const CALLDATA_FLOOR_NONZERO_TOKENS: u64 = 4;
+
+/// Fixed cost of entering `verifyAndUpdate`'s apply loop: decoding the two outer arrays and
+/// setting up memory, independent of what they hold.
+///
+/// Together with [`UNBOUNDED_APPLY_GAS_PER_PAYLOAD_BYTE`] this covers the difference between an
+/// op's raw EVM price and what it costs to *dispatch* that op out of an ABI-encoded payload — a
+/// term the reporting estimators never needed, because revm charges it automatically when it
+/// executes real calldata.
+pub const UNBOUNDED_APPLY_BASE_GAS: u64 = 2_000;
+
+/// Cost of decoding and dispatching one byte of encoded payload inside `verifyAndUpdate`:
+/// `calldataload`ing it, copying it into memory, and walking the element it belongs to.
+///
+/// Charged per payload byte rather than per update because that is what the work is proportional
+/// to — an update's decode cost tracks the bytes it occupies, not its existence. Measured against
+/// the `StateChangeHandlerGasEstimator` handler across store- and log-shaped payloads at 7.9–12.9
+/// gas per byte (the top of that range being logs, which carry more envelope per byte), so 14
+/// dominates every observed shape with ≥8% margin.
+///
+/// `analytic_bound_dominates_measured_apply_cost` in `gas-analyzer-estimator` pins this and
+/// [`UNBOUNDED_APPLY_BASE_GAS`] against that measurement, so neither can silently drift below what
+/// applying a payload really costs.
+///
+/// Caveat worth knowing: the measurement is against the estimator handler, which is what this
+/// analyzer's own gas figures run through — not the production `verifyAndUpdate` in the
+/// solidity-sdk. If that handler's decode loop is materially more expensive, this constant needs
+/// re-measuring against it.
+pub const UNBOUNDED_APPLY_GAS_PER_PAYLOAD_BYTE: u64 = 14;
+
 /// Summary of a payload that passed [`validate_unbounded_cost`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnboundedCost {
@@ -165,8 +204,10 @@ pub struct UnboundedCost {
     pub calls: usize,
     /// Number of `Log0`–`Log4` ops.
     pub logs: usize,
-    /// Upper bound on the gas needed to apply this payload on-chain, including the transaction's
-    /// intrinsic cost and the signature-verification floor.
+    /// Upper bound on the gas needed to apply this payload on-chain: the transaction's intrinsic
+    /// cost, the signature-verification floor, each op's execution cost, the intrinsic gas for the
+    /// encoded payload's own bytes, and `verifyAndUpdate`'s decode/dispatch overhead. See
+    /// [`estimate_applied_payload_gas`].
     pub applied_gas_upper_bound: u64,
 }
 
@@ -232,6 +273,21 @@ impl std::error::Error for UnboundedCostViolation {}
 /// A pure function of its arguments, which is the point: it decides whether a payload is acceptable,
 /// so every operator must reach the same verdict from the same payload. Anything that consulted live
 /// chain state could put two honest operators on opposite sides of the boundary.
+///
+/// Three things are priced, and the payload has to carry all of them:
+///
+/// 1. **Execution** — the raw EVM cost of each op ([`UNBOUNDED_COLD_SSTORE_COST`], the `LOG*`
+///    schedule) plus `external_call_gas`.
+/// 2. **Transport** — intrinsic gas for the ABI-encoded payload's bytes. This scales with the
+///    number of updates, so unlike the reporting estimators (which get it for free from revm
+///    executing real calldata) the gate must charge it explicitly or it under-prices every
+///    multi-slot payload.
+/// 3. **Dispatch** — [`UNBOUNDED_APPLY_BASE_GAS`] plus
+///    [`UNBOUNDED_APPLY_GAS_PER_PAYLOAD_BYTE`] for decoding the payload and walking it inside
+///    `verifyAndUpdate`.
+///
+/// The return value is `max(execution + transport, EIP-7623 floor)`, mirroring how a transaction is
+/// actually priced: a payload whose bytes dominate its execution pays the floor instead.
 pub fn estimate_applied_payload_gas(
     updates: &[StateUpdate],
     external_call_gas: u64,
@@ -239,7 +295,8 @@ pub fn estimate_applied_payload_gas(
 ) -> u64 {
     let mut gas = TX_BASE
         .saturating_add(signature_floor)
-        .saturating_add(external_call_gas);
+        .saturating_add(external_call_gas)
+        .saturating_add(UNBOUNDED_APPLY_BASE_GAS);
     for update in updates {
         gas = gas.saturating_add(match update {
             StateUpdate::Store(_) => UNBOUNDED_COLD_SSTORE_COST,
@@ -254,7 +311,26 @@ pub fn estimate_applied_payload_gas(
             StateUpdate::Create(_) | StateUpdate::Create2(_) => 0,
         });
     }
-    gas
+
+    // Transport and dispatch, both priced off the real encoded payload rather than a per-op
+    // approximation: that keeps dense and sparse slot values honest, covers a log's data bytes,
+    // and stays correct if the encoding changes. The payload is what a `verifyAndUpdate`
+    // transaction carries, bar the selector and attestation, which ride inside `signature_floor`.
+    let payload = crate::encoding::encode_state_updates_to_abi(updates);
+    gas = gas.saturating_add(
+        (payload.len() as u64).saturating_mul(UNBOUNDED_APPLY_GAS_PER_PAYLOAD_BYTE),
+    );
+    let zero_bytes = payload.iter().filter(|byte| **byte == 0).count() as u64;
+    let nonzero_bytes = payload.len() as u64 - zero_bytes;
+    let transport = zero_bytes
+        .saturating_mul(CALLDATA_ZERO_BYTE)
+        .saturating_add(nonzero_bytes.saturating_mul(CALLDATA_NONZERO_BYTE));
+
+    let tokens =
+        zero_bytes.saturating_add(nonzero_bytes.saturating_mul(CALLDATA_FLOOR_NONZERO_TOKENS));
+    let floor = TX_BASE.saturating_add(tokens.saturating_mul(CALLDATA_FLOOR_TOKEN));
+
+    gas.saturating_add(transport).max(floor)
 }
 
 /// Enforce the `Unbounded` profile's payload invariant: applying the extracted updates on-chain must
@@ -408,9 +484,16 @@ mod tests {
     fn the_budget_boundary_is_where_arithmetic_says_it_is() {
         // Exactly at the cap passes; one more store does not. Pins the comparison as `>` rather
         // than `>=`, so a payload that precisely fills a transaction is still usable.
-        let per_store = UNBOUNDED_COLD_SSTORE_COST;
-        let room = UNBOUNDED_PAYLOAD_GAS_BUDGET - TX_BASE;
-        let n = (room / per_store) as usize;
+        //
+        // The boundary is found by search rather than division: per-store cost is no longer a
+        // single constant, since transport depends on how the encoded payload's bytes fall.
+        let mut n = 0usize;
+        while check(&(0..n + 1).map(|_| store()).collect::<Vec<_>>()).is_ok() {
+            n += 1;
+            assert!(n < 10_000, "boundary search must terminate");
+        }
+        assert!(n > 0, "at least one store must fit");
+
         let updates: Vec<StateUpdate> = (0..n).map(|_| store()).collect();
         let cost = check(&updates).expect("the largest payload that fits must be accepted");
         assert!(cost.applied_gas_upper_bound <= UNBOUNDED_PAYLOAD_GAS_BUDGET);
@@ -419,6 +502,38 @@ mod tests {
         assert!(
             check(&one_more).is_err(),
             "one store past the cap must fail"
+        );
+    }
+
+    #[test]
+    fn transport_and_dispatch_are_priced_on_top_of_execution() {
+        // The terms this gate exists to not forget. A single store's raw EVM cost is the cold
+        // SSTORE; what a transaction actually pays also includes the bytes that carry it and the
+        // loop that applies it, so the bound must sit strictly above the execution-only figure.
+        let updates = vec![store()];
+        let execution_only = TX_BASE + UNBOUNDED_COLD_SSTORE_COST;
+        let bound = estimate_applied_payload_gas(&updates, 0, 0);
+        assert!(
+            bound > execution_only + UNBOUNDED_APPLY_BASE_GAS,
+            "bound {bound} must exceed execution ({execution_only}) plus the fixed apply cost, \
+             leaving room for the payload's own bytes"
+        );
+
+        // Transport scales with payload bytes: a log carrying data costs more to carry than an
+        // empty one, beyond the 8 gas/byte the LOG opcode itself charges.
+        let empty_log = estimate_applied_payload_gas(&[log1()], 0, 0);
+        let fat_log = estimate_applied_payload_gas(
+            &[StateUpdate::Log1(IStateUpdateTypes::Log1 {
+                data: Bytes::from(vec![0xab; 256]),
+                topic1: B256::ZERO,
+            })],
+            0,
+            0,
+        );
+        assert!(
+            fat_log > empty_log + 256 * 8,
+            "256 data bytes must cost more than the LOG opcode's 8/byte alone: \
+             {fat_log} vs {empty_log}"
         );
     }
 
@@ -459,7 +574,17 @@ mod tests {
     fn empty_payload_is_valid() {
         let cost = check(&[]).unwrap();
         assert_eq!(cost.stores, 0);
-        assert_eq!(cost.applied_gas_upper_bound, TX_BASE);
+        // Not bare `TX_BASE`: an empty payload still encodes two array headers — 128 bytes, being
+        // two offsets and two zero lengths, of which only the offsets' low bytes are non-zero —
+        // and applying it still enters the decode loop. Both are costs a real transaction pays.
+        let transport = 126 * CALLDATA_ZERO_BYTE + 2 * CALLDATA_NONZERO_BYTE;
+        let dispatch = UNBOUNDED_APPLY_BASE_GAS + 128 * UNBOUNDED_APPLY_GAS_PER_PAYLOAD_BYTE;
+        assert_eq!(
+            cost.applied_gas_upper_bound,
+            TX_BASE + transport + dispatch,
+            "an empty payload costs the tx base plus the cost of carrying and decoding two \
+             empty array headers"
+        );
     }
 
     #[test]
