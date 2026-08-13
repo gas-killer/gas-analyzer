@@ -1126,4 +1126,96 @@ mod tests {
         assert_eq!(&bytes[..3], &[0xef, 0x01, 0x00], "delegation prefix");
         assert_eq!(&bytes[3..], delegated.as_slice(), "delegated address");
     }
+
+    // ========================================================================
+    // Unbounded-profile gate: the analytic bound vs. the measured cost
+    // ========================================================================
+
+    /// `gas_analyzer_core::sim_profile::estimate_applied_payload_gas` decides which payloads the
+    /// unbounded profile accepts, and it has to do so *analytically* — a verdict derived from live
+    /// chain state could put two honest operators on opposite sides of the boundary and split
+    /// quorum. That makes it a hand-written reimplementation of a cost model, and a hand-written
+    /// model contains exactly the terms someone remembered to write down. The first version
+    /// omitted the payload's own calldata and the handler's decode/dispatch loop — together ~11%
+    /// per store, which is invisible except within a few percent of the ceiling, exactly where an
+    /// admission gate lives.
+    ///
+    /// This test closes that gap permanently by using the measured path as an oracle for the
+    /// analytic one: revm executing the real payload against the real handler charges intrinsic
+    /// calldata gas and dispatch overhead automatically, so whatever the analytic model forgets
+    /// shows up here as a shortfall. Any future dropped term fails this test rather than shipping
+    /// as an over-admitting gate.
+    ///
+    /// The signature floor is passed as 0, deliberately: at 250,000 it would mask a missing
+    /// per-update term until the payload grew past ~200 updates.
+    #[test]
+    fn analytic_bound_dominates_measured_apply_cost() {
+        use gas_analyzer_core::sim_profile::estimate_applied_payload_gas;
+
+        let target = address!("0x00000000000000000000000000000000000c0de0");
+        let caller = address!("0x000000000000000000000000000000000000beef");
+
+        // CANCUN, not OSAKA: `effective_tx_gas_limit` clamps to EIP-7825's 2^24 under OSAKA, which
+        // would OOG the largest payloads here before they could be measured.
+        let mut sim_env = sim_env_with_spec(SpecId::CANCUN);
+        sim_env.gas_limit = 200_000_000;
+
+        // Slot/value entropy matters: it decides the zero/non-zero split of the encoded payload,
+        // and therefore its transport cost. Cover both ends.
+        let sparse_store = |i: usize| {
+            StateUpdate::Store(IStateUpdateTypes::Store {
+                slot: B256::from(U256::from(i as u64 + 1)),
+                value: B256::from(U256::from(1u64)),
+            })
+        };
+        let dense_store = |i: usize| {
+            StateUpdate::Store(IStateUpdateTypes::Store {
+                slot: B256::from(U256::MAX - U256::from(i as u64)),
+                value: B256::from(U256::MAX - U256::from(i as u64 * 7 + 3)),
+            })
+        };
+        let fat_log = |i: usize| {
+            StateUpdate::Log1(IStateUpdateTypes::Log1 {
+                data: Bytes::from(vec![(i % 251) as u8 + 1; 128]),
+                topic1: B256::from(U256::from(i as u64 + 1)),
+            })
+        };
+
+        /// One payload shape to sweep: a name and a per-index update builder.
+        type Shape<'a> = (&'a str, &'a dyn Fn(usize) -> StateUpdate);
+
+        let mixed = |i: usize| match i % 3 {
+            0 => fat_log(i),
+            1 => dense_store(i),
+            _ => sparse_store(i),
+        };
+        let shapes: [Shape; 4] = [
+            ("sparse stores", &sparse_store),
+            ("dense stores", &dense_store),
+            ("fat logs", &fat_log),
+            ("mixed", &mixed),
+        ];
+
+        for (name, build) in shapes {
+            for n in [1usize, 2, 5, 25, 100, 400, 650] {
+                let updates: Vec<StateUpdate> = (0..n).map(build).collect();
+
+                let mut db = CacheDB::new(EmptyDB::default());
+                fund(&mut db, caller);
+                let measured =
+                    estimate_state_changes_gas(&mut db, target, caller, &updates, &sim_env)
+                        .unwrap_or_else(|e| panic!("{name} n={n}: measurement failed: {e:?}"));
+
+                let analytic = estimate_applied_payload_gas(&updates, 0, 0);
+
+                assert!(
+                    analytic >= measured,
+                    "{name} n={n}: analytic bound {analytic} is BELOW the measured cost \
+                     {measured} (short by {}). The gate would admit a payload that does not fit. \
+                     A term is missing from estimate_applied_payload_gas — see its doc comment.",
+                    measured - analytic
+                );
+            }
+        }
+    }
 }

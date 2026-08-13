@@ -522,9 +522,11 @@ All via env. `*` = required. Empty string disables the noted loops.
 | `MIN_GAS_USED` | `50000` | service | Skip txs below this gas |
 | `HEURISTIC_ONLY` | `false` | worker | Heuristic-only estimation: skip preceding-tx replay + EvmSketch fork (~300× fewer RPC calls, cruder estimates) |
 | `MAX_QUEUE_DEPTH` | `1000` | head-tracker | Backpressure threshold |
+| `MAX_BLOCKS_BEHIND` | `0` | head-tracker | Skip the cursor forward when lag exceeds this many blocks, dropping the skipped blocks (`0` = never drop) |
 | `HEAD_POLL_MS` | `4000` | head-tracker | Head poll interval |
 | `WORKER_MAX_RETRIES` | `3` | worker | Retries before dead-letter |
 | `WORKER_ANALYZE_TIMEOUT_SECS` | `60` | worker | Per-tx analysis timeout |
+| `QUEUE_JOB_TTL_SECS` | `3600` | worker | Drop queued jobs older than this at claim time (`0` disables) |
 | `RESOLVER_REFRESH_SECS` / `PRICE_REFRESH_SECS` / `ROLLUP_REFRESH_SECS` | `86400` / `3600` / `3600` | refresher | Loop cadences |
 | `DEFILLAMA_URL` | llama.fi/protocols | refresher, web | Protocol harvest; `""` disables |
 | `PRICE_URL` | coingecko simple/price | refresher, web | ETH/USD; `""` disables |

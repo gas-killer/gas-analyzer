@@ -79,6 +79,13 @@ pub struct HeadTrackerConfig {
     /// Polling interval for new blocks (ms).
     #[arg(long, env = "HEAD_POLL_MS", default_value_t = 4000)]
     pub head_poll_ms: u64,
+
+    /// Skip the fan-out cursor forward when it falls more than this many
+    /// blocks behind head, dropping the intermediate blocks. Bounds analysis
+    /// staleness when capacity can't keep up with chain volume. `0` keeps
+    /// the never-drop catch-up behavior.
+    #[arg(long, env = "MAX_BLOCKS_BEHIND", default_value_t = 0)]
+    pub max_blocks_behind: u64,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -91,6 +98,12 @@ pub struct WorkerConfig {
     /// RPC reads pinning the worker. On timeout the job is requeued.
     #[arg(long, env = "WORKER_ANALYZE_TIMEOUT_SECS", default_value_t = 60)]
     pub analyze_timeout_secs: u64,
+
+    /// Drop queued jobs older than this many seconds at claim time instead
+    /// of analyzing them. Bounds queue depth and staleness when enqueue rate
+    /// outpaces analysis capacity. `0` disables expiry.
+    #[arg(long, env = "QUEUE_JOB_TTL_SECS", default_value_t = 3600)]
+    pub queue_job_ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, clap::Args)]

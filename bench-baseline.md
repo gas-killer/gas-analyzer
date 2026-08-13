@@ -31,6 +31,25 @@ SHA-256: `9b8ef97f1ae92cbbe49e726bacf75026fa1c382edcb463d81b49e16667740989`
 
 ---
 
+## `prestate_parsing` — extraction cost on the same logical diff
+
+Synthetic, no RPC/fixture (always runs in CI). A heavy compute of `TOTAL_STEPS = 50,000` execution
+steps that collapses to `CHANGED_SLOTS = 16` changed slots + 1 log. The workload is chosen so both
+encoders emit 17 updates and only the *cost* of getting there varies — that equality is a property of
+this fixture, not of the encoders, which produce different programs in general. So the wall-time gap
+is purely O(execution steps) vs O(changed slots).
+
+| benchmark | wall time (median) | walks |
+|-----------|--------------------|-------|
+| `compute_state_updates_heavy` (struct-log encoder) | 967 µs | all 50,001 struct logs |
+| `build_from_prestate` (prestate net form) | 1.03 µs | the 16 changed slots |
+
+≈ **940× faster** on this 50k-step workload, and the gap widens with trace length: the real
+141,855-step `trace_parsing/compute_state_updates` fixture above is ~200 ms here. Absolute times are
+machine-dependent (this file's machine is below); bench-CI compares both paths on the same runner.
+
+---
+
 ## `build_calldata` / `build_gas_estimation_calldata`
 
 Input: 3× `Store` + 1× `Log1` (canned, no RPC)

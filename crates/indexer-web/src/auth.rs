@@ -76,7 +76,10 @@ impl AuthState {
     }
 
     /// Verify a token previously issued by [`issue_token`]. Returns the
-    /// username if the signature is valid and the expiry has not passed.
+    /// username if the signature is valid, the expiry has not passed, and the
+    /// user is still on the allowlist — so removing a user from `users.yaml`
+    /// (+ restart) revokes their outstanding sessions instead of leaving the
+    /// signed cookie valid for the rest of its 7-day TTL.
     pub fn verify_token(&self, token: &str) -> Option<String> {
         let raw = URL_SAFE_NO_PAD.decode(token.as_bytes()).ok()?;
         let raw = std::str::from_utf8(&raw).ok()?;
@@ -88,6 +91,9 @@ impl AuthState {
         let (username, expires) = payload.rsplit_once('|')?;
         let expires: i64 = expires.parse().ok()?;
         if chrono::Utc::now().timestamp() > expires {
+            return None;
+        }
+        if !self.users.iter().any(|u| u.username == username) {
             return None;
         }
         Some(username.to_string())
@@ -139,9 +145,14 @@ where
 }
 
 /// Build a `Set-Cookie` for a freshly issued session token.
+///
+/// `Secure` keeps the cookie off any plaintext hop in front of the TLS
+/// terminator. Browsers still accept Secure cookies on http://localhost, so
+/// local dev logins keep working.
 pub fn session_cookie(token: String) -> tower_cookies::Cookie<'static> {
     let mut c = tower_cookies::Cookie::new(SESSION_COOKIE, token);
     c.set_http_only(true);
+    c.set_secure(true);
     c.set_same_site(SameSite::Strict);
     c.set_path("/");
     c.set_max_age(tower_cookies::cookie::time::Duration::seconds(
@@ -154,6 +165,7 @@ pub fn session_cookie(token: String) -> tower_cookies::Cookie<'static> {
 pub fn clear_cookie() -> tower_cookies::Cookie<'static> {
     let mut c = tower_cookies::Cookie::new(SESSION_COOKIE, "");
     c.set_http_only(true);
+    c.set_secure(true);
     c.set_same_site(SameSite::Strict);
     c.set_path("/");
     c.set_max_age(tower_cookies::cookie::time::Duration::seconds(0));
@@ -204,6 +216,17 @@ mod tests {
         bytes[0] ^= 0x01;
         let tampered = URL_SAFE_NO_PAD.encode(&bytes);
         assert!(auth.verify_token(&tampered).is_none());
+    }
+
+    #[test]
+    fn token_rejected_after_user_removed_from_allowlist() {
+        let auth = auth_with_user("alice", "hunter2");
+        let token = auth.issue_token("alice");
+        let shrunk = AuthState {
+            users: Arc::new(vec![]),
+            secret: auth.secret.clone(),
+        };
+        assert!(shrunk.verify_token(&token).is_none());
     }
 
     #[test]

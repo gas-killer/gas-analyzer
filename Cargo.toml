@@ -21,12 +21,6 @@ default-members = [
     "crates/rpc",
     "crates/evmsketch",
     "crates/cli",
-    "crates/indexer-api",
-    "crates/indexer-rpc",
-    "crates/indexer-store",
-    "crates/indexer-resolver",
-    "crates/indexer-service",
-    "crates/indexer-web",
 ]
 
 [profile.bench]

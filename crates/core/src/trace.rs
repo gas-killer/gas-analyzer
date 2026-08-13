@@ -4,9 +4,9 @@
 //! Geth-format transaction traces (`DefaultFrame`). Contains only
 //! pure computation functions - no async, no I/O, no RPC calls.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use alloy_rpc_types::trace::geth::{DefaultFrame, StructLog};
 use anyhow::{Result, bail};
 
@@ -361,6 +361,335 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
     })
 }
 
+// ============================================================================
+// Canonical-checkpoint extraction
+// ============================================================================
+
+/// An execution frame observed while walking the trace.
+struct CanonFrame {
+    /// Depth of the code executing *inside* this frame (root = 1).
+    depth: u64,
+    /// Whose storage `SSTORE`s in this frame write to. `None` for frames whose
+    /// storage can never be the target (CREATE initcode — the target already
+    /// has code, so a fresh deployment cannot alias it).
+    storage_ctx: Option<Address>,
+    /// Whether state-changing ops in this frame are emitted as updates. True for
+    /// the root frame and for DELEGATECALL/CALLCODE frames entered from an
+    /// emitting frame (their writes hit the target's storage directly); false
+    /// inside any CALL/STATICCALL/CREATE frame — those replay natively on-chain
+    /// as part of the emitted parent update.
+    emitting: bool,
+    /// Writes to the *target's* storage made inside this frame (and merged from
+    /// successfully-completed child frames). Committed into the parent only if
+    /// this frame completes successfully; discarded on revert — exactly
+    /// mirroring EVM journaling.
+    journal: BTreeMap<B256, B256>,
+    /// Emitted updates buffered in this frame, in order. Appended to the parent
+    /// on success, dropped on revert (so a reverted emitting frame's writes/logs
+    /// never reach the signed program). The root frame's buffer *is* the program.
+    out: Vec<StateUpdate>,
+    /// Replay-side view of the target's storage as of this frame's emissions —
+    /// only meaningful in emitting frames. Used to suppress re-emitting a slot
+    /// whose canonical value a prior slice already set (same-value writes).
+    emitted_view: BTreeMap<B256, B256>,
+    /// For frames entered via an *emitted* CALL update: the gas remaining right
+    /// after the CALL opcode, used to account the call's gas on exit.
+    emitted_call_gas: Option<u64>,
+}
+
+/// A frame-creating opcode was just executed; whether a frame actually opens is
+/// only known from the next log's depth (calls to EOAs/precompiles run inline).
+struct PendingFrame {
+    parent_depth: u64,
+    storage_ctx: Option<Address>,
+    emitting: bool,
+    /// Snapshot of the parent's replay-side view, inherited by an emitting child.
+    emitted_view: BTreeMap<B256, B256>,
+    emitted_call_gas: Option<u64>,
+}
+
+/// The target's canonical storage image visible right now = every open frame's
+/// journal merged bottom-up (deeper frames override shallower ones). At an
+/// emitting boundary every open frame is emitting and target-scoped, so this is
+/// exactly what native execution would have in the target's storage.
+fn canonical_visible_image(frames: &[CanonFrame]) -> BTreeMap<B256, B256> {
+    let mut image = BTreeMap::new();
+    for f in frames {
+        for (slot, value) in &f.journal {
+            image.insert(*slot, *value);
+        }
+    }
+    image
+}
+
+/// Compute state updates with **canonical state checkpointing**.
+///
+/// Same extraction as [`compute_state_updates`] for `CALL`/`LOG*`/`CREATE*`
+/// updates, but instead of replaying the target contract's `SSTORE` journal
+/// verbatim, the target's storage image is tracked across *all* frames
+/// (revert-aware, exactly like EVM journaling) and emitted as **state slices**:
+///
+/// - immediately before every emitted `CALL`/`CREATE`/`CREATE2` update — so the
+///   external code that runs during that update (including re-entrant calls
+///   back into the target) observes **exactly the storage the target had at
+///   that moment in native execution**, and
+/// - once at the end — so the signed update program fully determines the
+///   target's final storage, even if a re-entrant call's on-chain replay were
+///   to diverge from the simulation (the final slice re-asserts the canonical
+///   value of every touched slot; when replay matched, those are cheap
+///   same-value writes).
+///
+/// Within a slice, slots are emitted in ascending order and consecutive writes
+/// to the same slot between two boundaries collapse to the boundary value —
+/// intermediate values are unobservable on-chain (no external code runs between
+/// boundaries), so this is both cheaper and byte-deterministic across
+/// independent provers.
+///
+/// Writes made *inside* emitted CALL frames (e.g. by a re-entrant call back
+/// into the target) are never emitted at their journal position — they replay
+/// natively on-chain during that CALL — but they *do* enter the canonical
+/// image, so the next slice (or the final one) re-asserts them.
+///
+/// Returns the same tuple as [`compute_state_updates`].
+#[tracing::instrument(name = "gas.trace_parse_canonical", skip_all, fields(state_update_count = tracing::field::Empty))]
+pub fn compute_state_updates_canonical(
+    trace: DefaultFrame,
+    target: Address,
+) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64)> {
+    let mut skipped_opcodes = HashSet::new();
+    let mut total_call_gas = 0u64;
+
+    let mut frames: Vec<CanonFrame> = vec![CanonFrame {
+        depth: 1,
+        storage_ctx: Some(target),
+        emitting: true,
+        journal: BTreeMap::new(),
+        out: Vec::new(),
+        emitted_view: BTreeMap::new(),
+        emitted_call_gas: None,
+    }];
+    let mut pending: Option<PendingFrame> = None;
+
+    // Emit a canonical state slice into the current (emitting) frame: for every
+    // slot in the target's currently-visible image whose value differs from what
+    // this frame has already emitted, push a Store and advance the emitted view.
+    // Must be called only when the current frame is emitting.
+    fn flush_slice(frames: &mut [CanonFrame]) {
+        let visible = canonical_visible_image(frames);
+        let cur = frames.last_mut().expect("root frame must remain");
+        for (slot, value) in visible {
+            if cur.emitted_view.get(&slot) != Some(&value) {
+                cur.out
+                    .push(StateUpdate::Store(IStateUpdateTypes::Store { slot, value }));
+                cur.emitted_view.insert(slot, value);
+            }
+        }
+    }
+
+    for struct_log in trace.struct_logs {
+        let depth = struct_log.depth;
+        let op = struct_log.op.as_ref().to_string();
+
+        // Resolve a pending frame from the previous log's frame-creating op.
+        if let Some(p) = pending.take() {
+            if depth == p.parent_depth + 1 {
+                frames.push(CanonFrame {
+                    depth,
+                    storage_ctx: p.storage_ctx,
+                    emitting: p.emitting,
+                    journal: BTreeMap::new(),
+                    out: Vec::new(),
+                    emitted_view: p.emitted_view,
+                    emitted_call_gas: p.emitted_call_gas,
+                });
+            } else {
+                // No frame was entered (EOA / precompile / failed call): the
+                // call completed inline. Account its gas now if it was emitted.
+                if let Some(gas_after_opcode) = p.emitted_call_gas {
+                    total_call_gas += gas_after_opcode.saturating_sub(struct_log.gas);
+                }
+            }
+        }
+
+        // Pop frames we have stepped out of. The resume log (this one) carries
+        // the child's success flag on top of the parent's stack.
+        while frames.last().map(|f| f.depth).unwrap_or(1) > depth {
+            let frame = frames.pop().expect("frame stack underflow");
+            if frame.depth != depth + 1 {
+                bail!(
+                    "trace depth jumped from {} to {} without resume logs — cannot attribute frame outcomes",
+                    frame.depth,
+                    depth
+                );
+            }
+            let stack = struct_log
+                .stack
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("resume log at depth {depth} has no stack"))?;
+            let success = stack
+                .last()
+                .map(|v| !v.is_zero())
+                .ok_or_else(|| anyhow::anyhow!("resume log at depth {depth} has empty stack"))?;
+            if let Some(gas_after_opcode) = frame.emitted_call_gas {
+                total_call_gas += gas_after_opcode.saturating_sub(struct_log.gas);
+            }
+            if success {
+                let child_emitting = frame.emitting;
+                let child_view = frame.emitted_view;
+                let parent = frames.last_mut().expect("root frame must remain");
+                // Commit the child's target writes and buffered emissions.
+                for (slot, value) in frame.journal {
+                    parent.journal.insert(slot, value);
+                }
+                parent.out.extend(frame.out);
+                // An emitting child ran while the parent was suspended, so its
+                // emitted view is a superset of the parent's — adopt it.
+                if child_emitting {
+                    parent.emitted_view = child_view;
+                }
+            }
+            // On failure everything (journal, out, view) is dropped — the EVM
+            // rolled the whole sub-frame back.
+        }
+
+        let idx = frames.len() - 1;
+        let cur_emitting = frames[idx].emitting;
+        let cur_ctx = frames[idx].storage_ctx;
+        let op_errored = struct_log.error.is_some();
+
+        match op.as_str() {
+            "SSTORE" => {
+                if cur_ctx == Some(target) && !op_errored {
+                    let mut stack = struct_log
+                        .stack
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("SSTORE log has no stack"))?;
+                    stack.reverse();
+                    let slot: B256 = stack[0].into();
+                    let value: B256 = stack[1].into();
+                    frames[idx].journal.insert(slot, value);
+                }
+            }
+            "TSTORE" | "SELFDESTRUCT" => {
+                if cur_emitting {
+                    skipped_opcodes.insert(op.clone());
+                }
+            }
+            "DELEGATECALL" | "CALLCODE" => {
+                if !op_errored {
+                    // Runs with the target's storage: inherits ctx and emitting.
+                    let emitted_view = if cur_emitting {
+                        frames[idx].emitted_view.clone()
+                    } else {
+                        BTreeMap::new()
+                    };
+                    pending = Some(PendingFrame {
+                        parent_depth: depth,
+                        storage_ctx: cur_ctx,
+                        emitting: cur_emitting,
+                        emitted_view,
+                        emitted_call_gas: None,
+                    });
+                }
+            }
+            "STATICCALL" => {
+                if !op_errored {
+                    // Read-only: never writes, never emitted. Track only for depth.
+                    let stack = struct_log
+                        .stack
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("STATICCALL log has no stack"))?;
+                    let callee = stack
+                        .get(stack.len().wrapping_sub(2))
+                        .map(|v| Address::from_word((*v).into()));
+                    pending = Some(PendingFrame {
+                        parent_depth: depth,
+                        storage_ctx: callee,
+                        emitting: false,
+                        emitted_view: BTreeMap::new(),
+                        emitted_call_gas: None,
+                    });
+                }
+            }
+            "CALL" => {
+                let stack = struct_log
+                    .stack
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("CALL log has no stack"))?;
+                let callee = stack
+                    .get(stack.len().wrapping_sub(2))
+                    .map(|v| Address::from_word((*v).into()));
+                let gas_after_opcode = struct_log.gas;
+                let mut emitted_call_gas = None;
+                if cur_emitting && !op_errored {
+                    // Boundary: external code is about to observe the target's
+                    // storage — bring it to the canonical image first, then emit
+                    // the CALL so on-chain the same external code runs against it.
+                    flush_slice(&mut frames);
+                    if append_state_update_from_struct_log(&mut frames[idx].out, struct_log)?
+                        .is_some()
+                    {
+                        unreachable!("CALL is never a skipped opcode");
+                    }
+                    emitted_call_gas = Some(gas_after_opcode);
+                }
+                if !op_errored {
+                    pending = Some(PendingFrame {
+                        parent_depth: depth,
+                        storage_ctx: callee,
+                        emitting: false,
+                        emitted_view: BTreeMap::new(),
+                        emitted_call_gas,
+                    });
+                }
+            }
+            "CREATE" | "CREATE2" => {
+                if cur_emitting && !op_errored {
+                    // Initcode can call back into the target: boundary here too.
+                    flush_slice(&mut frames);
+                    if append_state_update_from_struct_log(&mut frames[idx].out, struct_log)?
+                        .is_some()
+                    {
+                        unreachable!("CREATE/CREATE2 are never skipped opcodes");
+                    }
+                }
+                if !op_errored {
+                    pending = Some(PendingFrame {
+                        parent_depth: depth,
+                        // A fresh deployment can never alias the target (the
+                        // target already has code), so its writes are never ours.
+                        storage_ctx: None,
+                        emitting: false,
+                        emitted_view: BTreeMap::new(),
+                        emitted_call_gas: None,
+                    });
+                }
+            }
+            "LOG0" | "LOG1" | "LOG2" | "LOG3" | "LOG4" if cur_emitting && !op_errored => {
+                let skipped =
+                    append_state_update_from_struct_log(&mut frames[idx].out, struct_log)?;
+                debug_assert!(skipped.is_none(), "LOG* is never a skipped opcode");
+            }
+            _ => {}
+        }
+    }
+
+    if frames.len() != 1 {
+        bail!(
+            "trace ended with {} unclosed frame(s) — malformed trace",
+            frames.len() - 1
+        );
+    }
+
+    // Final slice: the signed program must fully determine the target's end
+    // state, even if a re-entrant call's on-chain replay diverged.
+    flush_slice(&mut frames);
+
+    let root = frames.pop().expect("root frame present");
+    tracing::Span::current().record("state_update_count", root.out.len());
+    Ok((root.out, skipped_opcodes, total_call_gas))
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::U256;
@@ -585,5 +914,334 @@ mod tests {
 
         assert_eq!(parse_trace_memory(prefixed), expected);
         assert_eq!(parse_trace_memory(mixed), expected);
+    }
+
+    // ========================================================================
+    // Canonical-checkpoint encoder
+    // ========================================================================
+
+    const TARGET_ADDR: Address = Address::new([0x77; 20]);
+
+    fn addr_word(a: Address) -> U256 {
+        U256::from_be_slice(a.as_slice())
+    }
+
+    fn slot(n: u64) -> B256 {
+        B256::from(U256::from(n))
+    }
+
+    fn val(n: u64) -> B256 {
+        B256::from(U256::from(n))
+    }
+
+    /// Build a StructLog. `top_first` is the stack with the TOP element first
+    /// (how you'd read the opcode's args); it is stored bottom-to-top as geth
+    /// emits it. `mem` is memory words (32-byte hex, no 0x). `error` marks the
+    /// op as reverted-in-place.
+    fn log(
+        op: &str,
+        depth: u64,
+        gas: u64,
+        top_first: &[U256],
+        mem: &[&str],
+        error: Option<&str>,
+    ) -> StructLog {
+        let mut stack: Vec<U256> = top_first.to_vec();
+        stack.reverse(); // store bottom-to-top
+        StructLog {
+            pc: 0,
+            op: op.to_string().into(),
+            gas,
+            gas_cost: 0,
+            depth,
+            error: error.map(|e| e.to_string()),
+            stack: Some(stack),
+            return_data: None,
+            memory: Some(mem.iter().map(|s| s.to_string()).collect()),
+            memory_size: None,
+            storage: None,
+            refund_counter: None,
+        }
+    }
+
+    fn sstore(depth: u64, s: B256, v: B256) -> StructLog {
+        log("SSTORE", depth, 100_000, &[s.into(), v.into()], &[], None)
+    }
+
+    /// A CALL with empty callargs (argsOffset=argsLength=0).
+    fn call(depth: u64, gas: u64, callee: Address) -> StructLog {
+        log(
+            "CALL",
+            depth,
+            gas,
+            &[
+                U256::from(gas), // gas
+                addr_word(callee),
+                U256::ZERO, // value
+                U256::ZERO, // argsOffset
+                U256::ZERO, // argsLength
+                U256::ZERO, // retOffset
+                U256::ZERO, // retLength
+            ],
+            &[],
+            None,
+        )
+    }
+
+    fn delegatecall(depth: u64, gas: u64, callee: Address, error: Option<&str>) -> StructLog {
+        log(
+            "DELEGATECALL",
+            depth,
+            gas,
+            &[
+                U256::from(gas),
+                addr_word(callee),
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+            ],
+            &[],
+            error,
+        )
+    }
+
+    /// A resume log at `depth`: the caller's next step after a sub-call returned,
+    /// carrying the sub-call's success flag (1/0) on top of the stack.
+    fn resume(depth: u64, gas: u64, success: bool) -> StructLog {
+        log(
+            "JUMPDEST",
+            depth,
+            gas,
+            &[U256::from(success as u64)],
+            &[],
+            None,
+        )
+    }
+
+    fn stores(updates: &[StateUpdate]) -> Vec<(B256, B256)> {
+        updates
+            .iter()
+            .filter_map(|u| match u {
+                StateUpdate::Store(s) => Some((s.slot, s.value)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn run(logs: Vec<StructLog>) -> Vec<StateUpdate> {
+        let trace = DefaultFrame {
+            failed: false,
+            gas: 0,
+            return_value: Default::default(),
+            struct_logs: logs,
+        };
+        compute_state_updates_canonical(trace, TARGET_ADDR)
+            .expect("canonical extraction")
+            .0
+    }
+
+    #[test]
+    fn canonical_final_slice_sorts_and_collapses() {
+        // A=1, A=2, B=3 with no external calls → one final slice, sorted, A collapsed.
+        let updates = run(vec![
+            sstore(1, slot(0xAA), val(1)),
+            sstore(1, slot(0xAA), val(2)),
+            sstore(1, slot(0xBB), val(3)),
+        ]);
+        assert_eq!(
+            stores(&updates),
+            vec![(slot(0xAA), val(2)), (slot(0xBB), val(3))],
+            "collapsed to boundary values, ascending slot order"
+        );
+    }
+
+    #[test]
+    fn canonical_slice_before_call_shows_pre_call_state() {
+        // A=1; CALL(eoa); A=2. The external call must observe A=1 (the native
+        // value at the call), and the final value A=2 lands after.
+        let eoa = Address::new([0x0E; 20]);
+        let updates = run(vec![
+            sstore(1, slot(0xAA), val(1)),
+            call(1, 50_000, eoa),
+            resume(1, 40_000, true), // EOA call returns inline (same depth), success
+            sstore(1, slot(0xAA), val(2)),
+        ]);
+        // Expect: Store(A,1), Call, Store(A,2) — the call sees A=1, ends at A=2.
+        assert!(
+            matches!(updates[0], StateUpdate::Store(ref s) if s.slot == slot(0xAA) && s.value == val(1))
+        );
+        assert!(
+            matches!(updates[1], StateUpdate::Call(_)),
+            "call emitted after the pre-call slice"
+        );
+        assert!(
+            matches!(updates[2], StateUpdate::Store(ref s) if s.slot == slot(0xAA) && s.value == val(2))
+        );
+        assert_eq!(updates.len(), 3);
+    }
+
+    #[test]
+    fn reentrant_write_is_reasserted_in_final_slice_not_duplicated_before() {
+        // CALL(x); inside, x re-enters TARGET and writes A=5; then the call ends.
+        // The write is NOT emitted at its nested position (it replays natively
+        // during the CALL), but the final slice re-asserts A=5 so the committed
+        // state is canonical even if the re-entrant replay diverged.
+        let x = Address::new([0x11; 20]);
+        let updates = run(vec![
+            call(1, 80_000, x),            // depth1: TARGET calls x  (emitted)
+            call(2, 60_000, TARGET_ADDR),  // depth2: x re-enters TARGET (not emitted)
+            sstore(3, slot(0xAA), val(5)), // depth3: TARGET writes A=5 (journaled)
+            resume(2, 55_000, true),       // TARGET→x returns, success
+            resume(1, 50_000, true),       // x→TARGET returns, success
+        ]);
+        // First update is the CALL (nothing to flush before it); then the final
+        // canonical re-assertion of A=5.
+        assert!(
+            matches!(updates[0], StateUpdate::Call(_)),
+            "the external CALL replays natively"
+        );
+        assert_eq!(
+            stores(&updates),
+            vec![(slot(0xAA), val(5))],
+            "exactly one re-assertion of the re-entrant write, in the final slice"
+        );
+        assert_eq!(updates.len(), 2);
+    }
+
+    #[test]
+    fn reentrant_read_between_two_calls_sees_canonical_image() {
+        // CALL(y) [y re-enters TARGET, writes A=5]; then CALL(x) [x re-enters and
+        // reads A]. Before CALL(x) the encoder asserts A=5 with an explicit Store
+        // so x's re-entrant read is canonical — WITHOUT trusting CALL(y)'s replay
+        // to have produced it. This is the point of the design: canonical state
+        // is switched in *before* each external call, so an external read is
+        // correct even if a prior call's on-chain replay diverged from sim. The
+        // extra Store is a same-value write when replay matched (~cheap).
+        let y = Address::new([0x22; 20]);
+        let x = Address::new([0x11; 20]);
+        let updates = run(vec![
+            call(1, 90_000, y),            // CALL(y) emitted
+            call(2, 70_000, TARGET_ADDR),  // y re-enters TARGET
+            sstore(3, slot(0xAA), val(5)), // TARGET writes A=5 (journaled)
+            resume(2, 65_000, true),
+            resume(1, 60_000, true),
+            call(1, 55_000, x), // CALL(x): pre-call slice asserts A=5 first
+            resume(1, 50_000, true),
+        ]);
+        // Program: Call(y), Store(A,5) [pre-CALL(x) canonical slice], Call(x).
+        let kinds: Vec<&str> = updates
+            .iter()
+            .map(|u| match u {
+                StateUpdate::Call(_) => "call",
+                StateUpdate::Store(_) => "store",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["call", "store", "call"],
+            "A=5 is asserted before CALL(x) so its re-entrant read is canonical"
+        );
+        assert_eq!(stores(&updates), vec![(slot(0xAA), val(5))]);
+    }
+
+    #[test]
+    fn reverted_delegatecall_writes_are_discarded() {
+        // TARGET DELEGATECALLs a library that writes A=9 into TARGET's storage,
+        // then the delegatecall REVERTS. The EVM rolls the write back, so it must
+        // not appear in the program. (The legacy encoder emits it — this is the
+        // journaling fix.)
+        let lib = Address::new([0x33; 20]);
+        let updates = run(vec![
+            delegatecall(1, 80_000, lib, None), // emitting delegatecall
+            sstore(2, slot(0xAA), val(9)),      // writes TARGET storage
+            resume(1, 40_000, false),           // delegatecall FAILED → rollback
+        ]);
+        assert!(
+            updates.is_empty(),
+            "reverted delegatecall writes are dropped, got {updates:?}"
+        );
+    }
+
+    #[test]
+    fn committed_delegatecall_writes_are_emitted() {
+        // Same, but the delegatecall succeeds → its write to TARGET storage is
+        // canonical and appears in the final slice.
+        let lib = Address::new([0x33; 20]);
+        let updates = run(vec![
+            delegatecall(1, 80_000, lib, None),
+            sstore(2, slot(0xAA), val(9)),
+            resume(1, 40_000, true), // success
+        ]);
+        assert_eq!(stores(&updates), vec![(slot(0xAA), val(9))]);
+    }
+
+    #[test]
+    fn errored_call_is_not_emitted() {
+        // A CALL opcode that fails in place (e.g. insufficient gas forwarded) is
+        // not a state change and must not enter the program.
+        let x = Address::new([0x11; 20]);
+        let mut errored = call(1, 10, x);
+        errored.error = Some("out of gas".to_string());
+        let updates = run(vec![sstore(1, slot(0xAA), val(1)), errored]);
+        assert_eq!(stores(&updates), vec![(slot(0xAA), val(1))]);
+        assert!(
+            !updates.iter().any(|u| matches!(u, StateUpdate::Call(_))),
+            "no call emitted"
+        );
+    }
+
+    #[test]
+    fn canonical_total_call_gas_matches_legacy_for_delegatecall_trace() {
+        // TARGET delegatecalls a library, which (still in TARGET's context)
+        // makes an emitted CALL to y. The delegatecall itself is never emitted
+        // and never charged in either encoder — only the CALL is — so both
+        // encoders must agree on total_call_gas despite Canonical hoisting
+        // delegatecall frames instead of emitting them.
+        let lib = Address::new([0x33; 20]);
+        let y = Address::new([0x44; 20]);
+        let logs = vec![
+            delegatecall(1, 80_000, lib, None),
+            call(2, 70_000, y),
+            resume(2, 65_000, true),
+            resume(1, 60_000, true),
+        ];
+        let canonical_trace = DefaultFrame {
+            failed: false,
+            gas: 0,
+            return_value: Default::default(),
+            struct_logs: logs.clone(),
+        };
+        let (_, _, canon_gas) =
+            compute_state_updates_canonical(canonical_trace, TARGET_ADDR).expect("canonical");
+        let legacy_trace = DefaultFrame {
+            failed: false,
+            gas: 0,
+            return_value: Default::default(),
+            struct_logs: logs,
+        };
+        let legacy_gas = compute_state_updates(legacy_trace, None)
+            .expect("legacy")
+            .call_gas_total;
+        assert_eq!(
+            canon_gas, legacy_gas,
+            "total_call_gas must agree between encoders on a delegatecall-heavy trace"
+        );
+    }
+
+    #[test]
+    fn write_by_unrelated_callee_is_not_attributed_to_target() {
+        // Inside CALL(x), x writes ITS OWN storage (storage_ctx = x ≠ TARGET).
+        // That must never enter TARGET's canonical image.
+        let x = Address::new([0x11; 20]);
+        let updates = run(vec![
+            sstore(1, slot(0xAA), val(1)),   // TARGET writes A=1
+            call(1, 80_000, x),              // CALL(x)
+            sstore(2, slot(0xAA), val(999)), // x writes ITS slot A — not TARGET's
+            resume(1, 50_000, true),
+        ]);
+        // Only TARGET's own A=1 is canonical; x's write is x's business.
+        assert_eq!(stores(&updates), vec![(slot(0xAA), val(1))]);
     }
 }

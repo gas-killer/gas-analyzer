@@ -18,10 +18,49 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy (default workspace)
-        run: cargo clippy --workspace --exclude gas-killer-wasm --exclude gas-analyzer-anvil --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace \
+            --exclude gas-killer-wasm \
+            --exclude gas-analyzer-anvil \
+            --exclude indexer-api \
+            --exclude indexer-rpc \
+            --exclude indexer-store \
+            --exclude indexer-resolver \
+            --exclude indexer-service \
+            --exclude indexer-web \
+            --all-targets -- -D warnings
+
+      # A single clippy run only ever sees one feature configuration, so anything behind a
+      # `#[cfg(feature = ...)]` that is off in that run is never linted. `--each-feature` lints every
+      # feature of the crates that have them, in both directions, and picks up new features
+      # automatically instead of relying on someone remembering to enumerate them here.
+      #
+      # `--exclude-no-default-features` skips the all-features-off build of `gas-analyzer-cli`: with
+      # neither `evmsketch` nor `anvil` the binary has no analysis backend at all, so it is not a
+      # configuration anyone runs.
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+
+      - name: cargo clippy (feature matrix)
+        run: |
+          cargo hack clippy \
+            -p gas-analyzer-evmsketch \
+            -p gas-analyzer-cli \
+            --each-feature --exclude-no-default-features \
+            --all-targets -- -D warnings
 
       - name: cargo check (default workspace)
-        run: cargo check --workspace --exclude gas-killer-wasm --exclude gas-analyzer-anvil --all-targets
+        run: |
+          cargo check --workspace \
+            --exclude gas-killer-wasm \
+            --exclude gas-analyzer-anvil \
+            --exclude indexer-api \
+            --exclude indexer-rpc \
+            --exclude indexer-store \
+            --exclude indexer-resolver \
+            --exclude indexer-service \
+            --exclude indexer-web \
+            --all-targets
 
   test-native:
     runs-on: ubuntu-latest
@@ -41,6 +80,12 @@ jobs:
 
       - name: cargo test (anvil)
         run: cargo test -p gas-analyzer-anvil -p gas-analyzer-cli --features gas-analyzer-cli/anvil --no-default-features
+
+      # `#[ignore]`d so a `cargo test` without foundry skips rather than fails; foundry is installed
+      # above, so run them explicitly here. Name-filtered to this module so the RPC-backed ignored
+      # tests (which need RPC_URL) are not pulled in.
+      - name: cargo test (evmsketch anvil integration)
+        run: cargo test -p gas-analyzer-evmsketch anvil_integration -- --ignored
 
   test-wasm:
     runs-on: ubuntu-latest
@@ -74,3 +119,41 @@ jobs:
       - name: Run WASM RPC integration test (Node.js)
         if: env.RPC_URL != ''
         run: node crates/wasm/tests/rpc_wasm.mjs
+
+  test-indexer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo clippy (indexer crates)
+        run: |
+          cargo clippy \
+            -p indexer-api \
+            -p indexer-rpc \
+            -p indexer-store \
+            -p indexer-resolver \
+            -p indexer-service \
+            -p indexer-web \
+            --all-targets -- -D warnings
+
+      - name: cargo check (indexer crates)
+        run: |
+          cargo check \
+            -p indexer-api \
+            -p indexer-rpc \
+            -p indexer-store \
+            -p indexer-resolver \
+            -p indexer-service \
+            -p indexer-web \
+            --all-targets
+
+      - name: cargo test (indexer crates)
+        run: |
+          cargo test \
+            -p indexer-api \
+            -p indexer-rpc \
+            -p indexer-store \
+            -p indexer-resolver \
+            -p indexer-service \
+            -p indexer-web
