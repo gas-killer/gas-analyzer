@@ -146,7 +146,7 @@ the output. Every opcode relevant to state extraction was handled.
 The exact command run for step 2:
 
 ```
-RPC_URL='https://withered-convincing-meadow.quiknode.pro/89fd706450ed0a8279f87c01e52ae78d9b308ce7/' \
+RPC_URL='$RPC_URL  # QuickNode endpoint, key redacted' \
   cargo run -- t 0x2dcd16b5645202184d37532d00f4e34dff1c61332ca325f830ab580f45b0c78a --debug \
   > /tmp/schnorr-run.txt 2>&1; echo "EXIT=$?" | tee -a /tmp/schnorr-run.txt
 ```
