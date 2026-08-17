@@ -2,7 +2,7 @@
 
 Produced by running this repository's own analyzer (`cargo run -- t <hash>`, EvmSketch backend) against Morpho Blue transactions discovered on Ethereum mainnet. Every number below is analyzer output, not an estimate of mine.
 
-> **Revision note.** The first pass of this document reported three Schnorr-only candidates. The top one was a heuristic fallback; it has since been re-measured through the real replay path and **no longer qualifies** — see *"Follow-up: the top result was re-measured and it collapsed"* below. Two trace-based candidates remain.
+> **Revision note.** The first pass of this document reported three Schnorr-only candidates. The top one was a heuristic fallback; it has since been re-measured through the real replay path and **no longer qualifies** — see *"Follow-up: the top result was re-measured and it collapsed"* below. Two trace-based candidates remain. Separately, the one liquidation from the first pass has been double-checked against 5 more liquidations from a much wider window: 2 of the 6 could be measured through the real replay path, and both show zero savings — see *"Second follow-up: liquidations, double-checked"* below. The other 4, including the original, could not be measured at all for reproducible, non-network reasons.
 
 **This is a small opportunistic sample, not a systematic survey.** 20 transactions from a single ~500-block window were analyzed. Nothing here should be read as a population statistic about Morpho.
 
@@ -187,6 +187,48 @@ Two transactions had a genuinely positive surplus yet still scored zero, because
 
 `0x1c71eb76…` is the notable one: a 9-market reallocation that came within **1,473 gas** of qualifying. Slightly more market churn in the same transaction and it would have crossed. This says the Schnorr band is not a rare accident for this shape — reallocations sit right on its edge.
 
+## Second follow-up: liquidations, double-checked
+
+The first pass had exactly one `Liquidate` in its 501-block window, and it fell back to heuristic — so the survey had no usable data on the shape that should, in theory, be GasKiller's best case (oracle + IRM staticcalls, seizure math, small final diff). To close that gap, Morpho Blue was rescanned over a much wider window — **12,001 blocks (25,763,699–25,775,699, ~40 h of mainnet)**, filtered to the `Liquidate` topic0 directly (keccak-verified: `0xa4946ede45d0c6f06a0f5ce92c9ad3b4751452d2fe0e25010783bcab57a67e41`). That produced **6 liquidation transactions total** — confirming liquidations are genuinely rare on Morpho Blue (roughly one per 2,000 blocks), not an artifact of the first window. All 6 were analyzed, including a fresh, isolated re-run of the original transaction from the first pass.
+
+All 6 were successful liquidations with **zero bad debt realized** (`badDebtAssets`/`badDebtShares` both 0 in every `Liquidate` event, decoded from the log data).
+
+| tx | block | idx | gas_used | base_estimate | surplus | Schnorr saved | BLS saved | outcome |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| [`0x584c52d9…`](https://etherscan.io/tx/0x584c52d957c165432f32e42e0ebacc4683d0e6f9cb251d926060701f8f71322b) | 25766097 | 11 | 362,143 | 382,655 | −20,512 | 0 | 0 | ✅ **trace** |
+| [`0x482fb3b2…`](https://etherscan.io/tx/0x482fb3b2dfb2d336237a0112285a14d7847af91006e64e6fd442f11864360e9c) | 25774008 | 625 | 457,129 | 462,926 | −5,797 | 0 | 0 | ✅ **trace** |
+| [`0x9a5fecc6…`](https://etherscan.io/tx/0x9a5fecc64422a0e8f8edb3b914eaed17cd675a09f1e2811a79d0cf0181893851) | 25767442 | 0 | 2,661,881 | 2,335,360 | 326,521 | 299,521 (11.25%) | 76,521 (2.87%) | ⚠️ heuristic — **could not be measured**, see below |
+| [`0x641b76f4…`](https://etherscan.io/tx/0x641b76f483f45a02815116bb7b0213530d0f2aee019b7cc4840a2d71a2940f0e) | 25764980 | 242 | 721,933 | 577,085 | 144,848 | 117,848 (16.32%) | 0 | ⚠️ heuristic — **could not be measured**, see below |
+| [`0x6ed1eaa3…`](https://etherscan.io/tx/0x6ed1eaa33eff8b3b992ee3fc55d5548d2072edd5f32ba437854d784dc9e62946) | 25770383 | 292 | 307,371 | 273,856 | 33,515 | 6,515 (2.12%) | 0 | ⚠️ heuristic — **could not be measured**, see below |
+| [`0x09fd0f6e…`](https://etherscan.io/tx/0x09fd0f6eb66388ce7cdc484b2020d300b5c6d519df89c5bddc73307d9e68bd80) | 25774216 | 76 | 619,024 | 733,358 | −114,334 | 0 | 0 | ⚠️ heuristic — **the original tx, re-run in isolation, still cannot be measured** |
+
+### The two that could actually be measured both show zero savings
+
+`0x584c52d9…` and `0x482fb3b2…` both completed the real `StateChangeHandler` replay and both land where the rest of this survey lands: negative surplus, zero savings under either scheme. `0x584c52d9…` is a flash-loan liquidation — its 8-update diff is almost entirely reentrancy-lock `Store`s (`Store`×6) around two `Call`s (a `flashLoan(address,uint256,bytes)` into Morpho Blue and a USDC `approve(address,uint256)`, both selectors keccak-verified) — the same "leverage bundle nets out to a lock and a call" shape seen earlier in `0x4e547494…`, except here the surplus is negative instead of positive. `0x482fb3b2…`'s diff is 4 `Call`s only, selectors `0xd8eabcb8` (matches Morpho Blue's `liquidate((address,address,address,address,uint256),address,uint256,uint256,bytes)`, keccak-verified) plus two selectors (`0x500d2a0f`, `0x96986a8d`) I could not identify against any signature I constructed — private liquidator-contract functions, not decompiled.
+
+**On the only two liquidations this tool can actually measure, liquidations are not a candidate.**
+
+### Three of six could not be measured at all — and not because of rate limiting
+
+This is a materially different finding from the first pass, where the one liquidation's fallback looked like an ordinary trace hiccup. Re-run in isolation with no other traffic competing for the endpoint, three of six liquidations still fail the measured path, each for a distinct, reproducible, non-network reason:
+
+1. **`0x9a5fecc6…` — the analyzer's simulator rejects the sender outright.** `Reason: Gas estimation failed: Transaction(RejectCallerWithCode)`, reproduced on all 3 attempts. The sender (`0x492d2552…`) calls itself (`to == from`) and carries an **EIP-7702 delegation designator** as its code (`0xef0100…`, verified via `eth_getCode`) — a smart-EOA liquidator bot. The replay environment appears to apply an EIP-3607-style "caller must not have code" check without the EIP-7702 carve-out for delegation designators, so it cannot simulate any transaction sent by a 7702-delegated account. This is a **capability gap in the analyzer**, not a data problem — no amount of retrying fixes it. It is also the transaction with by far the largest calldata (28,407 bytes) and gas (2,661,881) of the six, so it may be disproportionately represented among sophisticated liquidator bots.
+2. **`0x09fd0f6e…` (the original tx) — reproducibly reverts during replay, on a fresh, isolated re-run.** `Reason: RevertingContext CALL #0 to 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb reverted`, `Revert data: 0x82b42900` (a custom error selector I could not match against any signature I constructed), reproduced on all 3 attempts. The reverting call's own calldata decodes to selector `0xd8eabcb8` — Morpho Blue's `liquidate(...)`, keccak-verified — nested inside a larger private wrapper call. So this transaction's heuristic numbers (0% both schemes, unchanged from the first pass) are not a rate-limit artifact as I'd implied for the `0xcd59750e…` case; **this is the ceiling of what this tool can produce for this specific transaction**, confirmed by an isolated re-run.
+3. **`0x6ed1eaa3…` — reverts inside a Uniswap V3 pool swap during replay, on 2 of 3 attempts** (the third hit an unrelated HTTP 429 on a different preceding tx). `Reason: RevertingContext CALL #2 to 0xcEE31C846CbF003F4cEB5Bbd234cBA03C6e940C7 reverted` — that target's calldata selector is `0x128acb08`, Uniswap V3's `swap(address,bool,int256,uint160,bytes)` (keccak-verified), with an unidentified custom error (`0xde9375f2`) on the revert. Because the revert recurred on 2 of 3 attempts and the rate limit only once, this looks like a genuine state-dependent replay failure (e.g. pool state at replay time no longer matching the swap's slippage bounds), not pure infrastructure flakiness — though with only 3 attempts I cannot rule out a persistent-but-intermittent cause.
+
+`0x641b76f4…` is the one genuine rate-limiting case in this batch — all 3 attempts failed on `HTTP error 429` against a *different* address each time, the signature of a saturated request budget rather than a fixed revert.
+
+### Why the heuristic numbers for the unmeasurable ones should not be trusted — with a citable magnitude
+
+All three heuristic liquidations have diffs that are **entirely or almost entirely `Call` updates**: `0x9a5fecc6…` is 8× `Call` and nothing else; `0x641b76f4…` is 3× `Call` + 1× `Log2`; `0x6ed1eaa3…` is 3× `Call` only. This is exactly the diff shape already shown, in this same document, to make the heuristic unreliable: `crates/core/src/heuristic.rs:40` prices every `Call` update at **zero gas**. The one time this survey had a chance to compare a heuristic estimate against a real measurement on a `Call`-heavy diff — `0xcd59750e…`, the reallocation in the *"Follow-up"* section above — the heuristic understated `base_estimate` by **95,744 gas across 10 `Call` updates** (~9,574 gas/call), enough to turn a reported 13.47% Schnorr win into a real loss.
+
+Applying that same per-call magnitude as a sanity check, not a substitute for measurement:
+- `0x9a5fecc6…` (8 calls, reported 11.25% Schnorr / 2.87% BLS): a correction on the order of ~76,000 gas would erase its entire 76,521-gas BLS win outright and cut deep into its 299,521-gas Schnorr win.
+- `0x641b76f4…` (3 calls, reported 16.32% Schnorr): a correction on the order of ~29,000 gas would erase more than half of its 117,848-gas Schnorr margin.
+- `0x6ed1eaa3…` (3 calls, reported 2.12% Schnorr): its entire margin is only 6,515 gas — smaller than even a single call's worth of the observed correction magnitude.
+
+None of this proves the true numbers are zero — the per-call correction is not a fixed constant, and I have not measured these three. But it is not a coincidence that the two liquidations this tool *could* measure both landed at zero, while the three it *could not* measure all show the identical bias signature (pure- or near-pure-`Call` diffs) already demonstrated to produce false positives. **The honest conclusion is that liquidations provide no evidence to overturn the rest of this survey, and what little trace-based evidence exists points the same way as everything else: zero.**
+
 ## What the numbers say structurally
 
 ### Headline: no transaction in this sample saved anything under BLS
@@ -273,8 +315,9 @@ Worth recording, though: its 11,784-byte CREATE2 payload matches the code size o
 - **A 25% heuristic-fallback rate undermines a substantial part of the sample.** 5 of 20 transactions, including the only liquidation, were not measured through the real replay path. One further transaction was originally in this group and has since been re-measured.
 - **The two solid wins are small.** 1.81% and 2.60% of gas. Whether that clears a real deployment's overhead is outside what this survey measured.
 - **One protocol, one narrow slice.** Only transactions emitting a Morpho Blue event were considered; Morpho activity confined to a vault's ERC-4626 layer without touching Blue in the same transaction is absent.
-- **No `CreateMarket` in range.** The brief asked for a spread including it; none occurred in the scanned window, so that event type is genuinely absent rather than omitted. `Liquidate` occurred exactly once.
+- **No `CreateMarket` in range.** The brief asked for a spread including it; none occurred in the scanned window, so that event type is genuinely absent rather than omitted. `Liquidate` occurred exactly once in the original 501-block window; a follow-up widened the search to 12,001 blocks and found 6 total, of which only 2 could be measured (see the second follow-up section) — liquidations are rare enough on Morpho Blue that even ~40 hours of mainnet yields a small sample.
 - **Mid-block replay not independently verified.** The analyzer replays preceding transactions in the block (up to 534 in one case) to rebuild mid-block state. The README itself warns real traces may differ; I did not verify replay fidelity per transaction.
+- **The analyzer cannot measure every transaction shape, independent of rate limits.** Of 6 liquidations analyzed in the second follow-up, 1 was rejected outright because its sender was an EIP-7702-delegated smart-EOA (`RejectCallerWithCode`), and 2 more reproducibly reverted mid-replay against live contracts (Morpho Blue itself in one case, a Uniswap V3 pool in the other). These are tool limitations, not data gaps closeable by re-running with more patience.
 - **Unidentified selectors** are labelled from emitted events only. I did not decompile the callee contracts, so those labels describe observed effects, not intended function semantics.
 - **Savings are the analyzer's model, not measured on-chain outcomes.** Everything rests on `base_estimate + floor` being the right cost model; nothing was re-executed through a deployed GasKiller.
 - **Counterparty identification is by frequency and code size only.** I deliberately did not assert which addresses are "the" MetaMorpho factory, bundler, or public allocator, since I could not verify those names from chain data alone.
