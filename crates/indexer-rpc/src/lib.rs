@@ -43,7 +43,7 @@ pub mod weights {
     /// trace + block + preceding-tx fetch + the bypassed storage reads inside
     /// `GasKillerEvmSketch`. Generous on purpose.
     pub const ANALYZE_TX: u32 = 250;
-    /// One-shot weight for a heuristic-only analysis (#162): receipt + block
+    /// One-shot weight for a heuristic-only analysis: receipt + block
     /// header + tx lookup + `debug_traceTransaction` (≈122), with margin.
     /// No preceding-tx replay and no EvmSketch fork, so none of the bypassed
     /// storage reads [`ANALYZE_TX`] pads for.
