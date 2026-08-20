@@ -20,6 +20,7 @@ use tokio::time::sleep;
 
 use crate::config::{CommonConfig, HeadTrackerConfig};
 use crate::queue::{AnalyzeTxJob, Queue};
+use crate::state;
 
 pub async fn run(common: CommonConfig, cfg: HeadTrackerConfig) -> Result<()> {
     let provider = ProviderBuilder::new()
@@ -47,6 +48,8 @@ pub async fn run(common: CommonConfig, cfg: HeadTrackerConfig) -> Result<()> {
     };
     tracing::info!(start_block = next_block, "head-tracker starting");
 
+    let mut skipped_blocks: u64 = 0;
+
     loop {
         // Probe head every iteration so the admin health view sees a live
         // last-head value even when we're throttled by backpressure.
@@ -73,12 +76,21 @@ pub async fn run(common: CommonConfig, cfg: HeadTrackerConfig) -> Result<()> {
         // ever-staler blocks (0 = disabled, never drop).
         if cfg.max_blocks_behind > 0 && head.saturating_sub(next_block) > cfg.max_blocks_behind {
             let new_start = head - cfg.max_blocks_behind;
+            let skipped = new_start - next_block;
+            skipped_blocks += skipped;
             tracing::warn!(
-                skipped = new_start - next_block,
+                skipped,
+                total_skipped = skipped_blocks,
                 from = next_block,
                 to = new_start,
                 "lag exceeds max_blocks_behind, skipping ahead"
             );
+            // Publish the running total so the completeness gap this mode
+            // creates is readable on /admin, not just inferable from logs.
+            // Best-effort: losing the bookkeeping mustn't stall the cursor.
+            if let Err(e) = queue.incr_dropped(state::SKIPPED_BLOCKS_KEY, skipped).await {
+                tracing::warn!(error = %e, "publishing skipped-block count failed");
+            }
             next_block = new_start;
         }
 

@@ -38,6 +38,12 @@ pub struct ServiceHealth {
     pub pending_queue_depth: i64,
     pub dead_letter_depth: i64,
     pub labeler_queue_depth: i64,
+    /// Deliberate drops: blocks the head-tracker skipped to honour
+    /// `MAX_BLOCKS_BEHIND`, and jobs workers expired past
+    /// `QUEUE_JOB_TTL_SECS`. Nonzero means the row counts below undercount
+    /// real chain activity.
+    pub blocks_skipped: i64,
+    pub jobs_dropped_stale: i64,
     pub last_insert_age_secs: Option<i64>,
     pub total_rows: i64,
 }
@@ -106,6 +112,17 @@ pub async fn collect(state: &AppState) -> DiagnosticsBundle {
         .get::<_, Option<i64>>(indexer_service::state::LAST_HEAD_KEY)
         .await
         .unwrap_or(None);
+    // Absent key = nothing dropped yet, so a missing counter reads as 0.
+    let blocks_skipped: i64 = conn
+        .get::<_, Option<i64>>(indexer_service::state::SKIPPED_BLOCKS_KEY)
+        .await
+        .unwrap_or(None)
+        .unwrap_or(0);
+    let jobs_dropped_stale: i64 = conn
+        .get::<_, Option<i64>>(indexer_service::state::EXPIRED_JOBS_KEY)
+        .await
+        .unwrap_or(None)
+        .unwrap_or(0);
 
     let recent_events = collect_recent_events(&mut conn, 25).await;
 
@@ -128,6 +145,8 @@ pub async fn collect(state: &AppState) -> DiagnosticsBundle {
             pending_queue_depth: pending,
             dead_letter_depth: dead,
             labeler_queue_depth: labeler_depth,
+            blocks_skipped,
+            jobs_dropped_stale,
             last_insert_age_secs,
             total_rows,
         },

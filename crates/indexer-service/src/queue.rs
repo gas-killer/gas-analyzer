@@ -120,6 +120,16 @@ impl Queue {
         Ok(())
     }
 
+    /// Bump one of the completeness counters in [`crate::state`]. Both drop
+    /// paths (`MAX_BLOCKS_BEHIND` skips, `QUEUE_JOB_TTL_SECS` expiries) trade
+    /// data for freshness, so the size of what they threw away belongs on the
+    /// admin health view rather than only in the logs.
+    pub async fn incr_dropped(&self, key: &str, by: u64) -> Result<(), QueueError> {
+        let mut conn = self.conn.clone();
+        let _: u64 = conn.incr(key, by).await?;
+        Ok(())
+    }
+
     pub async fn dead_letter(&self, job: &AnalyzeTxJob, reason: &str) -> Result<(), QueueError> {
         #[derive(Serialize)]
         struct Dead<'a> {
