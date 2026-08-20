@@ -147,8 +147,7 @@ async fn handle(
             // potentially transient, retry up to `max_retries`, then
             // dead-letter.
             if job.attempt + 1 < cfg.max_retries {
-                let mut retried = job.clone();
-                retried.attempt += 1;
+                let retried = job.next_attempt();
                 queue.requeue(&retried).await?;
                 tracing::warn!(
                     tx = %hex::encode(job.tx_hash),

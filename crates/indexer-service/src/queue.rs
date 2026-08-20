@@ -47,6 +47,17 @@ impl AnalyzeTxJob {
     pub fn age_secs(&self, now: i64) -> Option<i64> {
         (self.enqueued_at > 0).then(|| now - self.enqueued_at)
     }
+
+    /// The next attempt at this job. Deliberately derived from `self` rather
+    /// than rebuilt, so `enqueued_at` carries over and the TTL keeps measuring
+    /// from the *first* enqueue — a job that retries its way past the TTL is
+    /// dropped instead of being refreshed into immortality by each requeue.
+    pub fn next_attempt(&self) -> Self {
+        Self {
+            attempt: self.attempt + 1,
+            ..self.clone()
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -155,5 +166,21 @@ mod tests {
     #[test]
     fn age_is_measured_from_first_enqueue() {
         assert_eq!(job(900).age_secs(1_000), Some(100));
+    }
+
+    #[test]
+    fn requeue_advances_the_attempt_without_resetting_the_clock() {
+        let first = job(900);
+        let retried = first.next_attempt();
+        assert_eq!(retried.attempt, first.attempt + 1);
+        // The TTL spans retries: age keeps counting from the first enqueue.
+        assert_eq!(retried.enqueued_at, first.enqueued_at);
+        assert_eq!(retried.age_secs(1_000), Some(100));
+        // And it stays that way across the serialize/claim round trip that a
+        // real requeue goes through.
+        let round_tripped: AnalyzeTxJob =
+            serde_json::from_slice(&serde_json::to_vec(&retried).unwrap()).unwrap();
+        assert_eq!(round_tripped.enqueued_at, first.enqueued_at);
+        assert_eq!(round_tripped.attempt, first.attempt + 1);
     }
 }
