@@ -46,7 +46,7 @@ pub async fn run(common: CommonConfig, cfg: WorkerConfig) -> Result<()> {
 
     // Heuristic-only analyses skip the replay/fork RPC volume, so charge the
     // slimmer weight — at the full ANALYZE_TX cost the limiter would pace the
-    // cheap mode as if it were expensive, eating most of the quota win (#162).
+    // cheap mode as if it were expensive, eating most of the quota win.
     let analyze_weight = if common.heuristic_only {
         weights::HEURISTIC_ANALYZE_TX
     } else {

@@ -36,7 +36,7 @@ pub struct CommonConfig {
     #[arg(long, env = "MIN_GAS_USED", default_value_t = 50_000)]
     pub min_gas_used: u64,
 
-    /// Heuristic-only estimation (#162): skip the preceding-tx replay and the
+    /// Heuristic-only estimation: skip the preceding-tx replay and the
     /// EvmSketch fork, estimating from extracted state updates alone. Cuts
     /// per-analysis RPC usage roughly 300× at the cost of estimate accuracy
     /// (call-dominated txs report zero savings). Reports get
