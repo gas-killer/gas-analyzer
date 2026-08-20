@@ -90,7 +90,7 @@ pub struct AnalyzerConfig {
     /// Skip transactions whose `gas_used` is below this. Default 50_000 — same
     /// spirit as the README's "ignores transactions below the gas limit".
     pub min_gas_used: u64,
-    /// Heuristic-only mode (#162): estimate from the extracted state updates
+    /// Heuristic-only mode: estimate from the extracted state updates
     /// alone, skipping the preceding-tx replay and the EvmSketch fork. Cuts
     /// per-analysis RPC usage from ~1,600 calls to ~5 (the debug trace stays —
     /// state extraction needs it). Trades accuracy for quota: the heuristic
@@ -228,7 +228,7 @@ impl Analyzer for EvmSketchAnalyzer {
 
         // 5+6. Estimate. Heuristic-only mode stops here: everything below
         // (preceding-tx replay, EvmSketch fork build) is where ~all of the
-        // per-analysis RPC volume lives (#119, #162).
+        // per-analysis RPC volume lives.
         let (gaskiller_gas_estimate, is_heuristic, failure_reason) = if self.config.heuristic_only {
             let heuristic = estimate_gas_from_state_updates(&state_updates, call_gas_total);
             // Not a failure: the measured path was never attempted.

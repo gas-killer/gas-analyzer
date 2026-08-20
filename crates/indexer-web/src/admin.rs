@@ -159,6 +159,12 @@ pub struct HealthView {
     pub blocks_behind_threshold: i64,
     pub pending_queue: i64,
     pub dead_letter: i64,
+    /// Blocks the head-tracker skipped past to honour `MAX_BLOCKS_BEHIND`, and
+    /// jobs workers dropped for exceeding `QUEUE_JOB_TTL_SECS`. Both are
+    /// deliberate drops in the staleness-bounded modes; counting them is the
+    /// only way to see how much coverage they cost.
+    pub blocks_skipped: i64,
+    pub jobs_dropped_stale: i64,
     pub last_insert_age_secs: Option<i64>,
     pub total_rows: i64,
     /// Share of analyses in the last 24h that fell back to heuristic
@@ -867,6 +873,17 @@ async fn collect_health(state: &AppState) -> Result<HealthView, WebError> {
         .get::<_, Option<i64>>(indexer_service::state::LAST_HEAD_KEY)
         .await
         .unwrap_or(None);
+    // Absent key = nothing dropped yet, so a missing counter reads as 0.
+    let blocks_skipped: i64 = conn
+        .get::<_, Option<i64>>(indexer_service::state::SKIPPED_BLOCKS_KEY)
+        .await
+        .unwrap_or(None)
+        .unwrap_or(0);
+    let jobs_dropped_stale: i64 = conn
+        .get::<_, Option<i64>>(indexer_service::state::EXPIRED_JOBS_KEY)
+        .await
+        .unwrap_or(None)
+        .unwrap_or(0);
 
     let blocks_behind = match (last_head_raw, analysis.latest_block) {
         (Some(h), Some(a)) => Some(h - a),
@@ -883,6 +900,8 @@ async fn collect_health(state: &AppState) -> Result<HealthView, WebError> {
         blocks_behind_threshold: threshold,
         pending_queue: pending,
         dead_letter: dead,
+        blocks_skipped,
+        jobs_dropped_stale,
         last_insert_age_secs: analysis.last_insert_age_secs.map(|s| s as i64),
         total_rows: analysis.total_rows.unwrap_or(0),
         heuristic_rate_24h,
