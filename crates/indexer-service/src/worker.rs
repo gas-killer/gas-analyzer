@@ -12,6 +12,7 @@ use indexer_store::Store;
 
 use crate::config::{CommonConfig, WorkerConfig};
 use crate::queue::{AnalyzeTxJob, Queue};
+use crate::state;
 
 pub async fn run(common: CommonConfig, cfg: WorkerConfig) -> Result<()> {
     let limiter = RateLimiter::new(indexer_rpc::RateLimiterConfig {
@@ -25,6 +26,7 @@ pub async fn run(common: CommonConfig, cfg: WorkerConfig) -> Result<()> {
         AnalyzerConfig {
             chain_id: common.chain_id,
             min_gas_used: common.min_gas_used,
+            heuristic_only: common.heuristic_only,
         },
     ));
 
@@ -43,7 +45,19 @@ pub async fn run(common: CommonConfig, cfg: WorkerConfig) -> Result<()> {
 
     let queue = Queue::connect(&common.redis_url).await?;
 
+    // Heuristic-only analyses skip the replay/fork RPC volume, so charge the
+    // slimmer weight — at the full ANALYZE_TX cost the limiter would pace the
+    // cheap mode as if it were expensive, eating most of the quota win.
+    let analyze_weight = if common.heuristic_only {
+        weights::HEURISTIC_ANALYZE_TX
+    } else {
+        weights::ANALYZE_TX
+    };
+
     tracing::info!("worker ready");
+
+    let ttl_secs = cfg.queue_job_ttl_secs as i64;
+    let mut expired_dropped: u64 = 0;
 
     loop {
         let job = match queue.claim(Duration::from_secs(5)).await? {
@@ -51,7 +65,32 @@ pub async fn run(common: CommonConfig, cfg: WorkerConfig) -> Result<()> {
             None => continue,
         };
 
-        if let Err(e) = handle(&job, &analyzer, &resolver, &store, &limiter, &cfg, &queue).await {
+        // Enqueue outpaces drain whenever analysis capacity trails chain
+        // volume, so stale jobs are dropped at claim time instead of being
+        // analyzed arbitrarily late. Checked before `acquire` so expired
+        // jobs never spend rate-limiter budget.
+        if ttl_secs > 0 {
+            let expired = job
+                .age_secs(chrono::Utc::now().timestamp())
+                .is_some_and(|age| age > ttl_secs);
+            if expired {
+                expired_dropped += 1;
+                if expired_dropped.is_multiple_of(1000) {
+                    tracing::info!(total = expired_dropped, "expired jobs dropped");
+                }
+                // Same reason the head-tracker publishes its skips: this is
+                // analysis the dashboard will never show, so the total belongs
+                // on the health view. Best-effort, and cheap next to the BLPOP
+                // that surfaced the job.
+                if let Err(e) = queue.incr_dropped(state::EXPIRED_JOBS_KEY, 1).await {
+                    tracing::warn!(error = %e, "publishing expired-job count failed");
+                }
+                continue;
+            }
+        }
+
+        let _permit = limiter.acquire(analyze_weight).await;
+        if let Err(e) = handle(&job, &analyzer, &resolver, &store, &cfg, &queue).await {
             tracing::error!(?job, error = %e, "job handling failed");
         }
     }
@@ -62,11 +101,9 @@ async fn handle(
     analyzer: &Arc<EvmSketchAnalyzer>,
     resolver: &Arc<Resolver>,
     store: &Store,
-    limiter: &RateLimiter,
     cfg: &WorkerConfig,
     queue: &Queue,
 ) -> Result<()> {
-    let _permit = limiter.acquire(weights::ANALYZE_TX).await;
     let hash = FixedBytes::<32>::from(job.tx_hash);
 
     // Backstop: an individual analysis must complete in a bounded time.
@@ -118,8 +155,7 @@ async fn handle(
             // potentially transient, retry up to `max_retries`, then
             // dead-letter.
             if job.attempt + 1 < cfg.max_retries {
-                let mut retried = job.clone();
-                retried.attempt += 1;
+                let retried = job.next_attempt();
                 queue.requeue(&retried).await?;
                 tracing::warn!(
                     tx = %hex::encode(job.tx_hash),

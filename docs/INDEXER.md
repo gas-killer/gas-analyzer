@@ -146,7 +146,8 @@ Axum HTTP server on port 3000. Pages:
 Sessions are stateless — the cookie is `username|expires|HMAC-SHA256(secret, "username|expires")`, base64url-encoded. The HMAC key comes from `SESSION_SECRET` (≥32 bytes; generate with `openssl rand -hex 32`). 7-day TTL, `SameSite=Strict`, `HttpOnly`.
 
 **Admin functions.**
-- *Service health* — every 5s the admin page refreshes counters: latest analyzed block, head-tracker last seen block (read from Redis key `indexer:state:last_head`, set with 60s TTL by the head-tracker), blocks-behind, pending queue depth (`LLEN analyzer:queue:pending`), dead-letter depth (`LLEN analyzer:queue:dead`), last-insert age, total rows.
+- *Service health* — every 5s the admin page refreshes counters: latest analyzed block, head-tracker last seen block (read from Redis key `indexer:state:last_head`, set with 60s TTL by the head-tracker), blocks-behind, pending queue depth (`LLEN analyzer:queue:pending`), dead-letter depth (`LLEN analyzer:queue:dead`), blocks skipped (`indexer:state:skipped_blocks`), jobs dropped as stale (`indexer:state:expired_jobs`), last-insert age, total rows.
+  The last two are the **coverage cost of the staleness bounds**: `MAX_BLOCKS_BEHIND` skips blocks the fan-out can never catch up on, and `QUEUE_JOB_TTL_SECS` drops jobs that waited too long. Both counters are cumulative and untouched by restarts, so a rising number means the savings figures are missing real activity — worth checking before reading totals as full chain coverage.
 
 ## Database schema
 
@@ -164,7 +165,7 @@ Defined in `crates/indexer-store/migrations/20260101000001_init.sql`.
 - **Project leaderboard** — sortable by tx count or avg savings %. The BD call list.
 - **Per-project drill-down** — top 10 contracts, top 10 function selectors, daily 90d trend, recent transactions.
 - **Whales we haven't labeled** — top `unknown:0x...` rows by ETH saved last 30d. The auto-labeler reads the same ranking from `analysis` to prioritize Etherscan lookups.
-- **Service health** — blocks behind head, queue depth, dead-letter depth, last-insert age, total rows.
+- **Service health** — blocks behind head, queue depth, dead-letter depth, blocks skipped, jobs dropped as stale, last-insert age, total rows.
 
 ## Configuration
 
@@ -179,9 +180,12 @@ All via env vars. See `.env.example` for the full list. Most important:
 | `RPC_BURST` | Short-spike allowance. | `25` |
 | `RPC_MAX_CONCURRENCY` | Hard cap on simultaneous outbound calls. | `8` |
 | `MIN_GAS_USED` | Skip txs below this. | `50000` |
+| `HEURISTIC_ONLY` | Estimate from state updates alone — no preceding-tx replay, no EvmSketch fork. ~300× fewer RPC calls per analysis; estimates are cruder (call-heavy txs report zero savings) and rows get `is_heuristic = true`. | `false` |
 | `MAX_QUEUE_DEPTH` | Backpressure threshold for head-tracker. | `1000` |
+| `MAX_BLOCKS_BEHIND` | Bound head-tracker lag: when the cursor falls more than this many blocks behind head, skip it forward and drop the intermediate blocks. `0` = never drop, lag and catch up. | `0` |
 | `WORKER_MAX_RETRIES` | Per-job retry count before dead-letter. | `3` |
 | `WORKER_ANALYZE_TIMEOUT_SECS` | Hard cap on a single `analyze_tx`. Backstop against hung HTTP reads pinning a worker. | `60` |
+| `QUEUE_JOB_TTL_SECS` | Workers drop queued jobs older than this at claim time instead of analyzing them stale. `0` disables expiry. | `3600` |
 | `OVERLAY_PATH` | Curated address overlay YAML. | `/etc/indexer/overlay.yaml` |
 | `DEFILLAMA_URL`, `PRICE_URL` | Empty disables the corresponding refresh. | (set) |
 | `ETHERSCAN_API_KEY` | Empty disables the auto-labeler loop. Free key from etherscan.io/myapikey. | — |

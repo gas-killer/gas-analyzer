@@ -1,8 +1,12 @@
 //! Polls the chain head, fans out one job per qualifying tx into Redis.
 //!
 //! Backpressure: if the queue depth exceeds `max_queue_depth`, we stop
-//! enqueueing new blocks and wait for the workers to drain. We never *drop*
-//! blocks — we just lag, then catch up. Comprehensiveness > speed.
+//! enqueueing new blocks and wait for the workers to drain. By default we
+//! never *drop* blocks — we just lag, then catch up (comprehensiveness >
+//! speed). When analysis capacity permanently trails chain volume (e.g.
+//! heuristic-only workers on a busy chain), `max_blocks_behind` bounds that
+//! lag instead: the cursor skips forward and the intermediate blocks are
+//! dropped, keeping analyses near head.
 
 use std::time::Duration;
 
@@ -16,6 +20,7 @@ use tokio::time::sleep;
 
 use crate::config::{CommonConfig, HeadTrackerConfig};
 use crate::queue::{AnalyzeTxJob, Queue};
+use crate::state;
 
 pub async fn run(common: CommonConfig, cfg: HeadTrackerConfig) -> Result<()> {
     let provider = ProviderBuilder::new()
@@ -43,6 +48,8 @@ pub async fn run(common: CommonConfig, cfg: HeadTrackerConfig) -> Result<()> {
     };
     tracing::info!(start_block = next_block, "head-tracker starting");
 
+    let mut skipped_blocks: u64 = 0;
+
     loop {
         // Probe head every iteration so the admin health view sees a live
         // last-head value even when we're throttled by backpressure.
@@ -63,6 +70,28 @@ pub async fn run(common: CommonConfig, cfg: HeadTrackerConfig) -> Result<()> {
             tracing::warn!(depth, "queue saturated, sleeping");
             sleep(Duration::from_millis(cfg.head_poll_ms.max(2000))).await;
             continue;
+        }
+
+        // Bounded lag: skip ahead rather than grind through a backlog of
+        // ever-staler blocks (0 = disabled, never drop).
+        if cfg.max_blocks_behind > 0 && head.saturating_sub(next_block) > cfg.max_blocks_behind {
+            let new_start = head - cfg.max_blocks_behind;
+            let skipped = new_start - next_block;
+            skipped_blocks += skipped;
+            tracing::warn!(
+                skipped,
+                total_skipped = skipped_blocks,
+                from = next_block,
+                to = new_start,
+                "lag exceeds max_blocks_behind, skipping ahead"
+            );
+            // Publish the running total so the completeness gap this mode
+            // creates is readable on /admin, not just inferable from logs.
+            // Best-effort: losing the bookkeeping mustn't stall the cursor.
+            if let Err(e) = queue.incr_dropped(state::SKIPPED_BLOCKS_KEY, skipped).await {
+                tracing::warn!(error = %e, "publishing skipped-block count failed");
+            }
+            next_block = new_start;
         }
 
         if head < next_block {
@@ -115,6 +144,7 @@ async fn enqueue_block(
             block_number,
             tx_index: idx as u64,
             attempt: 0,
+            enqueued_at: chrono::Utc::now().timestamp(),
         };
         queue.enqueue(&job).await.context("enqueue job")?;
         enqueued += 1;

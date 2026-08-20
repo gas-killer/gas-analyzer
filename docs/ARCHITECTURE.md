@@ -239,9 +239,11 @@ sequenceDiagram
 | `analyzer:queue:pending` | list | Jobs awaiting analysis. `RPUSH` to enqueue, `BLPOP` to claim, `LLEN` for depth. |
 | `analyzer:queue:dead` | list | Jobs that exhausted retries (job + `failed_at` + reason). |
 | `indexer:state:last_head` | string (60s TTL) | Latest head the tracker saw; the health view reads it to compute "blocks behind". |
+| `indexer:state:skipped_blocks` | counter (no TTL) | Blocks the head-tracker skipped past to honour `MAX_BLOCKS_BEHIND`. Never fanned out, so never analyzed. |
+| `indexer:state:expired_jobs` | counter (no TTL) | Jobs workers dropped at claim time for exceeding `QUEUE_JOB_TTL_SECS`. |
 | `labeler:queue` | sorted set | Auto-labeler work queue, scored by `wei_saved` (see [§7](#7-the-auto-labeler-state-machine)). |
 
-**Job payload** (`AnalyzeTxJob`): `{ chain_id, tx_hash, block_number, tx_index, attempt }`.
+**Job payload** (`AnalyzeTxJob`): `{ chain_id, tx_hash, block_number, tx_index, attempt, enqueued_at }`. `enqueued_at` is stamped once at fan-out and carried through requeues (`AnalyzeTxJob::next_attempt`), so `QUEUE_JOB_TTL_SECS` measures a job's whole life rather than restarting on every retry.
 
 **Important properties / gotchas:**
 - **Live-only.** Starts at the current head and only moves forward — *no historical backfill*. A fresh deployment's dashboard is empty until new blocks accrue.
@@ -490,7 +492,7 @@ sequenceDiagram
 - **chain_id** is threaded into every query (`WHERE chain_id = $1`) and rendered as a friendly label in `base.html` (`Ethereum` / `Sepolia` / `chain N`).
 - **Data floor.** Admin sets a date on `/admin` → stored in Redis `analyzer:config:data_floor` (default `2026-05-25`) → loaded at startup into a process global → `queries.rs › floor()` injects `AND <col> >= DATE '…'` into every read. Lets the BD hide unreliable early data without deleting rows.
 - **Admin actions** (htmx POSTs, each returns a status banner): refresh rollups / eth-price / eth-price-backfill / resolver / labeler-tick / relabel — each calls the same function the refresher loop runs. Plus **AI diagnostics** (`/admin/diagnose`): bundles health counters + recent errors and asks OpenRouter to summarize (30s cache, 10s rate-limit).
-- **Health surface** (`/admin/health`, polled every 5s): `last_seen_block` (Redis), `latest_analyzed_block` (Postgres), `blocks_behind` (red banner past `BLOCKS_BEHIND_WARN_THRESHOLD`), pending/dead queue depths, last-insert age, total rows, 24h `heuristic_rate`, top error categories.
+- **Health surface** (`/admin/health`, polled every 5s): `last_seen_block` (Redis), `latest_analyzed_block` (Postgres), `blocks_behind` (red banner past `BLOCKS_BEHIND_WARN_THRESHOLD`), pending/dead queue depths, **blocks skipped / jobs dropped as stale** (the two deliberate-drop counters — nonzero means coverage gaps, see [§13](#13-known-limitations--correctness-caveats)), last-insert age, total rows, 24h `heuristic_rate`, top error categories.
 
 ---
 
@@ -520,10 +522,13 @@ All via env. `*` = required. Empty string disables the noted loops.
 | `REDIS_URL` | `redis://127.0.0.1:6379` | service, web | Redis |
 | `RPC_RPS_BUDGET` / `RPC_BURST` / `RPC_MAX_CONCURRENCY` | `100` / `25` / `8` | service | Rate limiter |
 | `MIN_GAS_USED` | `50000` | service | Skip txs below this gas |
+| `HEURISTIC_ONLY` | `false` | worker | Heuristic-only estimation: skip preceding-tx replay + EvmSketch fork (~300× fewer RPC calls, cruder estimates) |
 | `MAX_QUEUE_DEPTH` | `1000` | head-tracker | Backpressure threshold |
+| `MAX_BLOCKS_BEHIND` | `0` | head-tracker | Skip the cursor forward when lag exceeds this many blocks, dropping the skipped blocks (`0` = never drop) |
 | `HEAD_POLL_MS` | `4000` | head-tracker | Head poll interval |
 | `WORKER_MAX_RETRIES` | `3` | worker | Retries before dead-letter |
 | `WORKER_ANALYZE_TIMEOUT_SECS` | `60` | worker | Per-tx analysis timeout |
+| `QUEUE_JOB_TTL_SECS` | `3600` | worker | Drop queued jobs older than this at claim time (`0` disables) |
 | `RESOLVER_REFRESH_SECS` / `PRICE_REFRESH_SECS` / `ROLLUP_REFRESH_SECS` | `86400` / `3600` / `3600` | refresher | Loop cadences |
 | `DEFILLAMA_URL` | llama.fi/protocols | refresher, web | Protocol harvest; `""` disables |
 | `PRICE_URL` | coingecko simple/price | refresher, web | ETH/USD; `""` disables |
@@ -566,7 +571,7 @@ Start here. Each row: **symptom → likely cause → where to look.**
 | **Sepolia dashboard 502** | Sepolia stack not up on `:3001`, or `SEPOLIA_RPC_URL` unset. | `docker compose -f docker-compose.sepolia.yml ps`; Caddy routes `sepolia.gk.ramgos.io`→`:3001`. |
 | **Template change didn't take effect** | askama compiles templates into the binary. | Rebuild image (`docker compose build indexer-build`) + recreate the web container. |
 
-**Health metrics** (`/admin`): `blocks_behind`, pending/dead queue depths, last-insert age, total rows, 24h heuristic-rate, top error categories.
+**Health metrics** (`/admin`): `blocks_behind`, pending/dead queue depths, blocks skipped, jobs dropped as stale, last-insert age, total rows, 24h heuristic-rate, top error categories.
 
 **Useful first commands on the box** (read-only):
 ```bash
@@ -591,6 +596,7 @@ These materially affect *how much to trust the numbers* — read before quoting 
 7. **Mainnet EVM spec.** `evmsketch` uses the mainnet hardfork schedule; correct for Sepolia in steady state, but re-validate around upgrade windows.
 8. **DefiLlama is mainnet-only** — non-mainnet chains get labels from Etherscan + overlay only.
 9. **Live-only ingestion** — no historical backfill; the dashboard fills forward from deploy time.
+10. **Staleness bounds drop data on purpose.** With `MAX_BLOCKS_BEHIND` set, the head-tracker skips blocks it can never catch up on; with `QUEUE_JOB_TTL_SECS` set, workers drop jobs that waited too long. Both keep the dashboard *fresh* at the cost of being *complete* — the gap is counted on `/admin` ("Blocks skipped", "Dropped as stale"), so check those before reading totals as full chain coverage.
 
 ---
 

@@ -41,6 +41,14 @@
         <div class="muted">Failed to analyze</div>
         <div class="metric">{{ health.dead_letter }}</div>
     </div>
+    <div class="health-cell" data-tip="Blocks we jumped over without analyzing, so that the figures stay close to the live chain when analysis can't keep up with it. Zero means full coverage; a rising number means the savings figures are missing whatever happened in those blocks.">
+        <div class="muted">Blocks skipped</div>
+        <div class="metric">{{ health.blocks_skipped }}</div>
+    </div>
+    <div class="health-cell" data-tip="Transactions dropped from the queue because they had been waiting too long to still be worth analyzing. Like skipped blocks, this is real activity the savings figures don't include.">
+        <div class="muted">Dropped as stale</div>
+        <div class="metric">{{ health.jobs_dropped_stale }}</div>
+    </div>
     <div class="health-cell" data-tip="How long ago we last recorded a newly analyzed transaction. If this keeps climbing, analysis has stalled.">
         <div class="muted">Last analyzed</div>
         <div class="metric">
