@@ -129,8 +129,16 @@ impl SimProfile {
 /// constant, and changing it changes which payloads honest operators accept.
 pub const UNBOUNDED_PAYLOAD_GAS_BUDGET: u64 = 1 << 24;
 
-/// Worst-case cost charged per `Store` by [`estimate_applied_payload_gas`]: EIP-2929 cold SLOAD
-/// (2100) plus a zero→nonzero `SSTORE` (20000).
+/// The gas-schedule prices [`UNBOUNDED_COLD_SSTORE_COST`] is built from: EIP-2929's cold-slot
+/// access surcharge and EIP-2200's zero→nonzero `SSTORE_SET`. Nothing else reads them — they exist
+/// so the gate's price carries its own derivation, and so a repricing fork has exactly one place to
+/// land. Editing either changes which payloads honest operators accept; the doc below says why that
+/// is deliberate rather than tunable.
+const COLD_SLOAD: u64 = 2_100;
+const SSTORE_SET: u64 = 20_000;
+
+/// Worst-case cost charged per `Store` by [`estimate_applied_payload_gas`]: a cold slot access plus
+/// a zero→nonzero `SSTORE`.
 ///
 /// Deliberately *not* shared with `crate::heuristic`'s reporting estimator. That one approximates
 /// the typical cost to produce user-facing savings figures and is tuned over time; this one must be
@@ -138,9 +146,18 @@ pub const UNBOUNDED_PAYLOAD_GAS_BUDGET: u64 = 1 << 24;
 /// definition, tuning a displayed number would silently change what operators accept — and a gate
 /// that under-prices a write accepts payloads that do not actually fit. The gate still never
 /// prices a write below the reporting heuristic: that one charges each write its traced actual
-/// cost, which EIP-2929/2200 cap at exactly this constant, so the bound holds by construction
-/// with no shared definition to assert against.
-pub const UNBOUNDED_COLD_SSTORE_COST: u64 = 22_100;
+/// cost, which EIP-2929/2200 cap at exactly this sum, so the bound holds by construction rather
+/// than by comparing against a shared definition.
+///
+/// Stated as that sum rather than as `22_100` for the same reason the old
+/// `UNBOUNDED_COLD_SSTORE_COST > heuristic::WARM_SSTORE_COST` assert existed: to keep the gate's
+/// price from becoming a number someone can nudge. The assert compared two constants that could
+/// drift apart; deleting `WARM_SSTORE_COST` left nothing to compare, but it also left the better
+/// option — the definition below cannot drift from the protocol cap because it *is* the protocol
+/// cap. What remains checked at test time, and can't be expressed here, is the semantic bound:
+/// `analytic_bound_dominates_measured_apply_cost` in `gas-analyzer-estimator` validates this
+/// against revm-measured apply cost.
+pub const UNBOUNDED_COLD_SSTORE_COST: u64 = COLD_SLOAD + SSTORE_SET;
 
 /// Cost of a `LOG*` op: base, plus per topic, plus per byte of data.
 const LOG_BASE: u64 = 375;
