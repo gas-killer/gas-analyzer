@@ -46,7 +46,7 @@ pub struct AnalysisReport {
     /// A callee called back into the target contract during execution
     /// (Uniswap-style swap callbacks). The heuristic counts that callback gas
     /// as unoptimizable external gas, so heuristic rows with this flag may
-    /// understate savings. Policy: flag, don't correct (#113).
+    /// understate savings. Policy: flag, don't correct.
     pub reentered: bool,
 }
 
@@ -58,7 +58,7 @@ pub enum SkipReason {
     Reverted,
     EmptyTrace,
     /// Trace parsed but yielded no extractable state updates — nothing to
-    /// model, so skip rather than estimate over an empty set (#158).
+    /// model, so skip rather than estimate over an empty set.
     NoStateUpdates,
 }
 
@@ -217,7 +217,7 @@ impl Analyzer for EvmSketchAnalyzer {
         // 4. Compute state updates from the actual historical trace.
         // A trace failure is a real error (worker retries / dead-letters), not
         // an empty state-update list — coercing it to empty produced the bogus
-        // flat ~271k estimate (#158).
+        // flat ~271k estimate.
         let extract = with_retry(&retry_cfg, is_transient_rpc_error, || async {
             compute_state_updates_from_tx(provider, tx_hash, receipt.status(), Some(to)).await
         })
