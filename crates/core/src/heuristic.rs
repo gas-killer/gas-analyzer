@@ -2,14 +2,51 @@
 //!
 //! This module provides shared functions for estimating gas costs heuristically
 //! when exact measurement is not possible. Used by both Anvil and EvmSketch implementations.
+//!
+//! # Known discrepancies
+//!
+//! The heuristic compares against post-refund receipt `gasUsed`, so every bias
+//! below pushes the estimate *up* and reported savings *down* (validated
+//! empirically on mainnet tx `0x19daad7a…a16795`, an MEV arb with 128 depth-1
+//! calls: gross call gas 12.15M vs net gasUsed 10.56M):
+//!
+//! - **Gas refunds** (fixed): `external_call_gas` is measured from struct-log
+//!   gas deltas, which are pre-refund. EIP-3529 refunds (SSTORE clears) are now
+//!   netted out via the trace's final refund counter, capped at 1/5 of the
+//!   gross estimate ([`MAX_REFUND_QUOTIENT`]).
+//! - **SSTORE pricing** (fixed): writes were charged a flat 5,000 regardless
+//!   of cold/new-slot (22,100) or warm-repeat (100). Both estimators now use
+//!   the actual per-write charge from struct-log `gasCost`. Residual error:
+//!   slot warmth during the replay can differ from the original execution.
+//! - **Calldata** (fixed): the replay ships the state updates to the estimator
+//!   as calldata (tens of KB on call-heavy txs); [`calldata_gas`] over the
+//!   ABI-encoded updates is now added. EIP-7623's floor pricing is not
+//!   modeled — replays execute enough that standard token pricing applies.
+//! - **Fallback double-count** (fixed): [`extract_operation_counts_from_trace`]
+//!   used to count SSTORE/LOG at *all* depths on top of `external_call_gas`,
+//!   which already includes nested ops' gas. It now counts only ops the
+//!   external-call gas doesn't cover, mirroring [`compute_state_updates`].
+//! - **Re-entrant callbacks** (flagged, not corrected): a depth-1 CALL whose
+//!   callee re-enters the origin contract (e.g. Uniswap V3 `swap` →
+//!   `uniswapV3SwapCallback`) is counted entirely as unoptimizable external
+//!   gas, but part of that gas is the origin contract's own logic reached via
+//!   the callback. The replay only works because the estimator proxy
+//!   DELEGATECALLs the original bytecode. Deliberate policy: the gas number is
+//!   still produced, and the extraction carries a `reentered` flag so
+//!   consumers can qualify it.
 
 use std::collections::HashMap;
 
+use crate::trace::TraceExtract;
 use crate::types::StateUpdate;
 
 /// Heuristic gas costs for different operations
 pub const BASE_TX_COST: u64 = 21_000;
-pub const WARM_SSTORE_COST: u64 = 5_000;
+/// EIP-3529: refunds are capped at `gas_used / MAX_REFUND_QUOTIENT`.
+pub const MAX_REFUND_QUOTIENT: u64 = 5;
+/// EIP-2028 calldata pricing.
+pub const CALLDATA_ZERO_BYTE_COST: u64 = 4;
+pub const CALLDATA_NONZERO_BYTE_COST: u64 = 16;
 pub const LOG_BASE_COST: u64 = 375;
 pub const LOG_TOPIC_COST: u64 = 375;
 pub const LOG_DATA_COST_PER_BYTE: u64 = 8;
@@ -22,33 +59,65 @@ pub const KECCAK_WORD_COST: u64 = 6;
 /// Operations and gas data extracted from a trace
 #[derive(Debug, Default)]
 pub struct TraceOperations {
-    pub sstore_count: u64,
+    /// Actual charged gas of the counted SSTOREs (from struct-log `gasCost`).
+    pub sstore_gas_total: u64,
     pub log_counts: [u64; 5],   // LOG0-LOG4
     pub external_call_gas: u64, // Total gas used by external calls (extracted from trace)
+    /// Final EIP-3529 refund counter of the traced execution (pre-cap).
+    pub refund_counter: u64,
 }
 
-/// Estimate gas from state updates using heuristic costs.
+/// EIP-2028 gas cost of passing `data` as transaction calldata.
+pub fn calldata_gas(data: &[u8]) -> u64 {
+    data.iter()
+        .map(|&b| {
+            if b == 0 {
+                CALLDATA_ZERO_BYTE_COST
+            } else {
+                CALLDATA_NONZERO_BYTE_COST
+            }
+        })
+        .sum()
+}
+
+/// Net EIP-3529 refunds out of a gross (pre-refund) gas estimate.
 ///
-/// This provides a rough estimate based on known gas costs for each operation type.
+/// Struct-log gas deltas are pre-refund while receipt `gasUsed` is
+/// post-refund; without this, refund-heavy txs (SSTORE clears) overshoot by up
+/// to 20% and their savings clamp to zero. The cap is applied against the
+/// gross *estimate* rather than the original tx's `gasUsed` — the two track
+/// each other closely since the replay re-executes the same operations.
+fn apply_refund(gross: u64, refund_counter: u64) -> u64 {
+    gross - refund_counter.min(gross / MAX_REFUND_QUOTIENT)
+}
+
+/// Estimate gas from a trace extraction using heuristic costs.
 ///
-/// # Arguments
-/// * `state_updates` - The state updates to estimate gas for
-/// * `external_call_gas` - Actual gas used by external calls (cannot be optimized)
+/// This provides a rough estimate based on known gas costs for each operation
+/// type, using the trace-measured aggregates carried by [`TraceExtract`]
+/// (external call gas, refund counter).
 ///
 /// # Returns
 /// Estimated gas cost
-pub fn estimate_gas_from_state_updates(
-    state_updates: &[StateUpdate],
-    external_call_gas: u64,
-) -> u64 {
+pub fn estimate_gas_from_state_updates(extract: &TraceExtract) -> u64 {
     let mut gas = BASE_TX_COST;
 
-    // Add actual gas used by external calls (cannot be optimized)
-    gas += external_call_gas;
+    // The replay ships the state updates to the estimator as ABI-encoded
+    // calldata — real gas the on-chain GasKiller call pays.
+    gas += calldata_gas(&crate::encoding::encode_state_updates_to_abi(
+        &extract.state_updates,
+    ));
 
-    for update in state_updates {
+    // Add actual gas used by external calls (cannot be optimized)
+    gas += extract.call_gas_total;
+
+    // Actual per-write SSTORE charges (cold/warm/dirty) from the trace.
+    gas += extract.sstore_gas_total;
+
+    for update in &extract.state_updates {
         gas += match update {
-            StateUpdate::Store(_) => WARM_SSTORE_COST,
+            // Covered by sstore_gas_total above.
+            StateUpdate::Store(_) => 0,
             // CALL gas is already included in external_call_gas from the trace
             StateUpdate::Call(_) => 0,
             StateUpdate::Log0(log) => {
@@ -77,7 +146,7 @@ pub fn estimate_gas_from_state_updates(
         };
     }
 
-    gas
+    apply_refund(gas, extract.refund_counter)
 }
 
 /// Estimate gas from trace operations using heuristic costs.
@@ -93,8 +162,8 @@ pub fn estimate_gas_from_state_updates(
 pub fn estimate_gas_from_operations(operations: &TraceOperations) -> u64 {
     let mut gas = BASE_TX_COST;
 
-    // Add SSTORE costs (cold SSTORE)
-    gas += operations.sstore_count * WARM_SSTORE_COST;
+    // Actual per-write SSTORE charges (cold/warm/dirty) from the trace.
+    gas += operations.sstore_gas_total;
 
     // Add LOG costs
     // LOG0: base cost only (we don't have data length in operations)
@@ -108,7 +177,7 @@ pub fn estimate_gas_from_operations(operations: &TraceOperations) -> u64 {
     // Add actual gas used by external calls (extracted from trace)
     gas += operations.external_call_gas;
 
-    gas
+    apply_refund(gas, operations.refund_counter)
 }
 
 /// Extract operations and gas usage from a Geth trace (DefaultFrame).
@@ -124,7 +193,17 @@ pub fn estimate_gas_from_operations(operations: &TraceOperations) -> u64 {
 pub fn extract_operation_counts_from_trace(
     trace: &alloy_rpc_types::trace::geth::DefaultFrame,
 ) -> TraceOperations {
-    let mut operations = TraceOperations::default();
+    // The refund counter is transaction-global and cumulative; its value at
+    // the final step is the tx's total pre-cap refund. Geth omits the field
+    // when it is zero.
+    let mut operations = TraceOperations {
+        refund_counter: trace
+            .struct_logs
+            .last()
+            .and_then(|log| log.refund_counter)
+            .unwrap_or(0),
+        ..Default::default()
+    };
 
     // Track gas usage for external calls
     // In Geth traces, struct_log.gas is the remaining gas AFTER the opcode executes
@@ -210,17 +289,26 @@ pub fn extract_operation_counts_from_trace(
             gas_after_call_opcode = Some(struct_log.gas);
         }
 
-        // Count operations
-        match op {
-            "SSTORE" => {
-                operations.sstore_count += 1;
+        // Count operations — only ones whose gas is NOT already inside
+        // `external_call_gas`: depth-1 ops, and depth-2 ops sitting directly
+        // in a DELEGATECALL context (the proxy's own writes). Ops nested in a
+        // tracked CALL used to be double-counted here.
+        let op_gas_counted_separately =
+            depth == 1 || (depth == 2 && call_type_at_depth.get(&2) == Some(&"DELEGATECALL"));
+        if op_gas_counted_separately {
+            match op {
+                "SSTORE" => {
+                    // struct-log gasCost is the actual charge for this write
+                    // (cold/warm/dirty per EIP-2929/2200).
+                    operations.sstore_gas_total += struct_log.gas_cost;
+                }
+                "LOG0" => operations.log_counts[0] += 1,
+                "LOG1" => operations.log_counts[1] += 1,
+                "LOG2" => operations.log_counts[2] += 1,
+                "LOG3" => operations.log_counts[3] += 1,
+                "LOG4" => operations.log_counts[4] += 1,
+                _ => {}
             }
-            "LOG0" => operations.log_counts[0] += 1,
-            "LOG1" => operations.log_counts[1] += 1,
-            "LOG2" => operations.log_counts[2] += 1,
-            "LOG3" => operations.log_counts[3] += 1,
-            "LOG4" => operations.log_counts[4] += 1,
-            _ => {}
         }
 
         previous_depth = depth;
@@ -244,4 +332,76 @@ pub fn extract_operation_counts_from_trace(
     }
 
     operations
+}
+
+#[cfg(test)]
+mod refund_tests {
+    use super::*;
+
+    fn extract(call_gas_total: u64, refund_counter: u64) -> TraceExtract {
+        TraceExtract {
+            call_gas_total,
+            refund_counter,
+            ..Default::default()
+        }
+    }
+
+    /// Calldata cost of shipping an empty state-update set to the estimator
+    /// (the ABI framing alone is nonzero).
+    fn empty_calldata() -> u64 {
+        calldata_gas(&crate::encoding::encode_state_updates_to_abi(&[]))
+    }
+
+    #[test]
+    fn refund_below_cap_subtracts_fully() {
+        // gross = 21_000 base + calldata framing + 100_000 call gas;
+        // the 10_000 refund is below the 1/5 cap, so it applies in full
+        let gross = 121_000 + empty_calldata();
+        assert_eq!(
+            estimate_gas_from_state_updates(&extract(100_000, 10_000)),
+            gross - 10_000
+        );
+    }
+
+    #[test]
+    fn refund_capped_at_fifth_of_gross() {
+        let gross = 121_000 + empty_calldata();
+        assert_eq!(
+            estimate_gas_from_state_updates(&extract(100_000, 1_000_000)),
+            gross - gross / MAX_REFUND_QUOTIENT
+        );
+    }
+
+    #[test]
+    fn zero_refund_changes_nothing() {
+        assert_eq!(
+            estimate_gas_from_state_updates(&extract(100_000, 0)),
+            121_000 + empty_calldata()
+        );
+    }
+
+    #[test]
+    fn sstore_gas_added_verbatim() {
+        let e = TraceExtract {
+            sstore_gas_total: 22_100,
+            ..Default::default()
+        };
+        assert_eq!(
+            estimate_gas_from_state_updates(&e),
+            BASE_TX_COST + 22_100 + empty_calldata()
+        );
+    }
+
+    #[test]
+    fn operations_estimate_nets_refund() {
+        let ops = TraceOperations {
+            sstore_gas_total: 10_000,
+            external_call_gas: 9_000,
+            refund_counter: 5_000,
+            ..Default::default()
+        };
+        // gross = 21_000 + 10_000 + 9_000 = 40_000; cap = 8_000, so the
+        // 5_000 refund applies in full
+        assert_eq!(estimate_gas_from_operations(&ops), 35_000);
+    }
 }

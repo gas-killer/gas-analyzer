@@ -86,6 +86,7 @@ fn test_simple_storage_set() {
         &test_estimator_address(),
         &test_caller_address(),
         None,
+        None,
     )
     .unwrap();
 
@@ -111,6 +112,7 @@ fn test_simple_storage_deposit() {
         &trace,
         &test_estimator_address(),
         &test_caller_address(),
+        None,
         None,
     )
     .unwrap();
@@ -138,6 +140,7 @@ fn test_simple_storage_call_external() {
         &test_estimator_address(),
         &test_caller_address(),
         None,
+        None,
     )
     .unwrap();
 
@@ -164,6 +167,7 @@ fn test_delegatecall() {
         &test_estimator_address(),
         &test_caller_address(),
         None,
+        None,
     )
     .unwrap();
 
@@ -189,6 +193,7 @@ fn test_access_control() {
         &trace,
         &test_estimator_address(),
         &test_caller_address(),
+        None,
         None,
     )
     .unwrap();
@@ -217,10 +222,11 @@ fn test_all_paths_agree_on_simple_storage_set() {
         &test_estimator_address(),
         &test_caller_address(),
         None,
+        None,
     )
     .unwrap();
     let encode = encode_trace_inner(&trace).unwrap();
-    let heuristic = estimate_gas_heuristic_inner(&trace).unwrap();
+    let heuristic = estimate_gas_heuristic_inner(&trace, None).unwrap();
 
     assert_eq!(analyze.state_update_count, encode.state_update_count);
     assert_eq!(analyze.state_update_count, heuristic.state_update_count);
@@ -264,7 +270,7 @@ fn test_encode_real_trace() {
 #[ignore]
 fn test_heuristic_real_trace() {
     let trace = fetch_trace(SIMPLE_STORAGE_SET_TX);
-    let result = estimate_gas_heuristic_inner(&trace).unwrap();
+    let result = estimate_gas_heuristic_inner(&trace, None).unwrap();
 
     assert!(
         result.gas_estimate >= 21_000,

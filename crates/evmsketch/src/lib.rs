@@ -1042,7 +1042,16 @@ async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
     tracing::Span::current().record("extraction", "struct_log");
     let trace = get_trace_from_call_with_profile(provider, tx_request, block, profile).await?;
     let (state_updates, skipped_opcodes, call_gas_total) = match encoding.struct_log_encoder() {
-        StructLogEncoder::Legacy => compute_state_updates(trace)?,
+        // Re-entry detection is off (`None`): the simulation path never surfaces
+        // the flag — only the historical-tx analyzers do.
+        StructLogEncoder::Legacy => {
+            let extract = compute_state_updates(trace, None)?;
+            (
+                extract.state_updates,
+                extract.skipped_opcodes,
+                extract.call_gas_total,
+            )
+        }
         StructLogEncoder::Canonical => compute_state_updates_canonical(trace, consumer)?,
     };
     Ok((state_updates, skipped_opcodes, call_gas_total))
@@ -1840,8 +1849,9 @@ mod tests {
             let trace = get_trace_from_call(provider, call_request(to), BlockId::latest())
                 .await
                 .expect("struct-log debug_traceCall failed");
-            let (legacy, _, _) =
-                compute_state_updates(trace.clone()).expect("compute_state_updates failed");
+            let legacy = compute_state_updates(trace.clone(), None)
+                .expect("compute_state_updates failed")
+                .state_updates;
             let (canonical, _, _) =
                 compute_state_updates_canonical(trace, to).expect("canonical extraction failed");
             (net, legacy, canonical)
