@@ -832,7 +832,7 @@ pub struct EncodedStateUpdates {
     /// The ABI-encoded state-update program: the payload that gets signed and applied on-chain.
     pub storage_updates: Bytes,
     /// How many operations the program carries; zero means the call changes nothing.
-    pub state_update_count: usize,
+    pub update_count: usize,
     /// Gas to apply the program on-chain, priced under the real chain environment.
     pub gas_estimate: u64,
     /// Whether the gas figure came from the heuristic rather than execution.
@@ -1011,7 +1011,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
 
     Ok(EncodedStateUpdates {
         storage_updates,
-        state_update_count: state_updates.len(),
+        update_count: state_updates.len(),
         gas_estimate,
         is_heuristic: false,
         skipped_opcodes,
