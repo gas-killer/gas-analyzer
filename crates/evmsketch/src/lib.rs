@@ -831,15 +831,8 @@ impl StateEncoding {
 pub struct EncodedStateUpdates {
     /// The ABI-encoded state-update program: the payload that gets signed and applied on-chain.
     pub storage_updates: Bytes,
-    /// How many operations the program carries.
-    ///
-    /// Reported separately because the encoding hides it: a program with no operations is not
-    /// zero bytes but a fixed 128-byte blob (two offsets and two zero-length arrays), so a
-    /// consumer holding only `storage_updates` cannot tell "changes nothing" from "changes
-    /// something" without decoding. A consumer that treats an empty diff as a failure — the AVS
-    /// refuses to have its quorum sign a payload that applies nothing — needs this number, and
-    /// deriving it here keeps knowledge of the wire format in the crate that owns it.
-    pub update_count: usize,
+    /// How many operations the program carries; zero means the call changes nothing.
+    pub state_update_count: usize,
     /// Gas to apply the program on-chain, priced under the real chain environment.
     pub gas_estimate: u64,
     /// Whether the gas figure came from the heuristic rather than execution.
@@ -1018,7 +1011,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
 
     Ok(EncodedStateUpdates {
         storage_updates,
-        update_count: state_updates.len(),
+        state_update_count: state_updates.len(),
         gas_estimate,
         is_heuristic: false,
         skipped_opcodes,
