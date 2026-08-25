@@ -826,19 +826,38 @@ impl StateEncoding {
     }
 }
 
+/// What an encode run extracted for one call.
+#[derive(Debug, Clone)]
+pub struct EncodedStateUpdates {
+    /// The ABI-encoded state-update program: the payload that gets signed and applied on-chain.
+    pub storage_updates: Bytes,
+    /// How many operations the program carries.
+    ///
+    /// Reported separately because the encoding hides it: a program with no operations is not
+    /// zero bytes but a fixed 128-byte blob (two offsets and two zero-length arrays), so a
+    /// consumer holding only `storage_updates` cannot tell "changes nothing" from "changes
+    /// something" without decoding. A consumer that treats an empty diff as a failure — the AVS
+    /// refuses to have its quorum sign a payload that applies nothing — needs this number, and
+    /// deriving it here keeps knowledge of the wire format in the crate that owns it.
+    pub update_count: usize,
+    /// Gas to apply the program on-chain, priced under the real chain environment.
+    pub gas_estimate: u64,
+    /// Whether the gas figure came from the heuristic rather than execution.
+    pub is_heuristic: bool,
+    /// Opcodes the extractor could not represent and skipped.
+    pub skipped_opcodes: HashSet<Opcode>,
+}
+
 /// Compute encoded state updates and gas estimate for a transaction call using EvmSketch.
 ///
 /// Legacy-encoding convenience wrapper over
 /// [`call_to_encoded_state_updates_with_evmsketch_mode`].
-///
-/// # Returns
-/// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`
 pub async fn call_to_encoded_state_updates_with_evmsketch(
     cache: &EvmSketchExecutorCache,
     rpc_url: impl AsRef<str>,
     tx_request: TransactionRequest,
     block_number: u64,
-) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
+) -> Result<EncodedStateUpdates> {
     call_to_encoded_state_updates_with_evmsketch_mode(
         cache,
         rpc_url,
@@ -855,16 +874,13 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 /// extracts state updates under the chosen [`StateEncoding`], encodes them to ABI, and estimates gas.
 /// Convenience wrapper over [`call_to_encoded_state_updates_with_evmsketch_profiled`] for the
 /// [`SimProfile::Chain`] case.
-///
-/// # Returns
-/// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`
 pub async fn call_to_encoded_state_updates_with_evmsketch_mode(
     cache: &EvmSketchExecutorCache,
     rpc_url: impl AsRef<str>,
     tx_request: TransactionRequest,
     block_number: u64,
     encoding: StateEncoding,
-) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
+) -> Result<EncodedStateUpdates> {
     call_to_encoded_state_updates_with_evmsketch_profiled(
         cache,
         rpc_url,
@@ -901,9 +917,6 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_mode(
 /// The node serving `debug_traceCall` must have its execution cap lifted
 /// (`anvil --disable-block-gas-limit`, `geth --rpc.gascap=0`); otherwise heavy calls OOG inside the
 /// tracer and extraction fails.
-///
-/// # Returns
-/// `(storage_updates, gas_estimate, is_heuristic, skipped_opcodes)`
 #[tracing::instrument(name = "evmsketch.encode", skip_all, fields(block_number, encoding = ?encoding, profile = ?profile, extraction = tracing::field::Empty, state_update_count = tracing::field::Empty))]
 pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
     cache: &EvmSketchExecutorCache,
@@ -912,7 +925,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
     block_number: u64,
     encoding: StateEncoding,
     profile: SimProfile,
-) -> Result<(Bytes, u64, bool, HashSet<Opcode>)> {
+) -> Result<EncodedStateUpdates> {
     let rpc_url = rpc_url.as_ref();
     let provider = cache.get_or_create_trace_provider(rpc_url)?;
 
@@ -1003,7 +1016,13 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
         )
         .await?;
 
-    Ok((storage_updates, gas_estimate, false, skipped_opcodes))
+    Ok(EncodedStateUpdates {
+        storage_updates,
+        update_count: state_updates.len(),
+        gas_estimate,
+        is_heuristic: false,
+        skipped_opcodes,
+    })
 }
 
 /// Extract `(state_updates, skipped_opcodes)` for a simulated call under `encoding`.
