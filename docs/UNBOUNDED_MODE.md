@@ -110,13 +110,17 @@ real transaction; only the signed payload must fit on-chain.
 ```rust
 use gas_analyzer_core::SimProfile;
 use gas_analyzer_evmsketch::{
-    EvmSketchExecutorCache, call_to_encoded_state_updates_with_evmsketch_profiled,
+    EvmSketchExecutorCache, StateEncoding, call_to_encoded_state_updates_with_evmsketch_profiled,
 };
 
-let (payload, gas, is_heuristic, skipped) =
-    call_to_encoded_state_updates_with_evmsketch_profiled(
-        &cache, rpc_url, tx_request, block_number, SimProfile::Unbounded,
-    ).await?;
+let updates = call_to_encoded_state_updates_with_evmsketch_profiled(
+    &cache,
+    rpc_url,
+    tx_request,
+    block_number,
+    StateEncoding::PrestateNet,
+    SimProfile::Unbounded,
+).await?;
 ```
 
 Semantics under `Unbounded`:

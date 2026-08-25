@@ -190,6 +190,32 @@ pub fn encode_state_updates_to_abi(state_updates: &[StateUpdate]) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{IStateUpdateTypes, StateUpdate};
+    use alloy_primitives::B256;
+
+    /// A program with no operations still encodes to a full tuple: two offsets and two
+    /// zero-length arrays. Nothing about the byte string says "empty" except its content, which
+    /// is why [`encode_state_updates_to_abi`]'s callers are given the operation count rather than
+    /// left to infer it from the payload.
+    #[test]
+    fn no_updates_encode_to_two_empty_arrays() {
+        let encoded = encode_state_updates_to_abi(&[]);
+        assert_eq!(encoded.len(), 128);
+        assert_eq!(&encoded[31..32], &[0x40]); // offset: types
+        assert_eq!(&encoded[63..64], &[0x60]); // offset: datas
+        assert!(encoded[64..].iter().all(|&b| b == 0)); // both lengths zero
+    }
+
+    #[test]
+    fn one_store_encodes_past_the_empty_form() {
+        let store = StateUpdate::Store(IStateUpdateTypes::Store {
+            slot: B256::ZERO,
+            value: B256::with_last_byte(1),
+        });
+        let encoded = encode_state_updates_to_abi(&[store]);
+        assert!(encoded.len() > 128);
+        assert_ne!(encoded, encode_state_updates_to_abi(&[]));
+    }
 
     #[test]
     fn turetzky_upper_gas_limit_matches_scheme() {
