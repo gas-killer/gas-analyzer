@@ -69,13 +69,14 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 | World ID | 2.87% | 0% | direct, but verifier call dominates | all txs direct |
 | Morpho | 2.60% | 0% | bundler multicall reallocation | marginal |
 | Safe | 9.99% | 0% | 5-signature execTransaction | 2 of 565 (0.4%) |
+| **Euler** | 1.31% | 0% | none — EVC router mandatory | **0 of 191 direct** |
 | Chainlink | 0% | 0% | none — all traffic via forwarder | 0 of 242 direct |
 
 ## What predicts a good candidate
 
 Two conditions, both necessary. Every result above is explained by them. Aave adds a third dimension: the two conditions can hold for one *function* of a protocol and fail for another — `borrow` clears the floor 9 times out of 9 while `supply` and `repay` never do, because only the former runs a per-reserve health-factor loop. Screen per entry point, not per protocol.
 
-**1. The expensive work must happen in the contract the transaction is sent to.** The analyzer keeps a regular `CALL` as one instruction and re-executes it on replay, so anything inside it is never stripped (`crates/core/src/trace.rs:255`; `crates/core/src/prestate.rs` documents the same constraint for the net form). Railgun direct vs Railgun RelayAdapt is the same operation on the same contract scoring 80% vs 0% on this alone.
+**1. The expensive work must happen in the contract the transaction is sent to.** The sharpest evidence is Aave vs Euler: identical per-asset risk math, 63.64% vs 1.31%, because Aave permits direct `Pool` calls and Euler mandates the EVC router. The analyzer keeps a regular `CALL` as one instruction and re-executes it on replay, so anything inside it is never stripped (`crates/core/src/trace.rs:255`; `crates/core/src/prestate.rs` documents the same constraint for the net form). Railgun direct vs Railgun RelayAdapt is the same operation on the same contract scoring 80% vs 0% on this alone.
 
 **2. The work must actually be computation, not bookkeeping.** Pendle satisfies condition 1 on its one direct-to-market swap and still scores ~2.7% surplus, because a swap is mostly storage writes. Ether.fi's `claimWithdraw` is the clearest case: its 43,868 gas per claim decomposes as ~25,000 of storage writes + 3,768 of logs + ~15,100 of calls, leaving ~0 for computation.
 
@@ -202,6 +203,49 @@ But solving that would not help Safe, because the gas inside the call is never S
 
 Safe is therefore not a blocked candidate but a thin wrapper in front of other candidates. There is no integration to do with the Safe team that produces savings. The longlist calls it a "near-ideal match for aggregate-signature verification"; the measurements do not support that.
 
+## Euler — the architectural counter-example to Aave
+
+5 transactions measured (3 unmeasurable). Best result **1.31%**; the rest zero.
+
+| tx | gas used | GasKiller cost | surplus | Schnorr saved | state updates |
+|---|---:|---:|---:|---:|---:|
+| [`0x0a06e978…`](https://etherscan.io/tx/0x0a06e9783d4bc563d8b4674112b2dd427597c80a1095c377e6b88e307b31927c) | 548,011 | 513,820 | +34,191 | **7,191** (1.31%) | 29 |
+| [`0x7d1e2345…`](https://etherscan.io/tx/0x7d1e2345c39b884a16eb6b2e06c1c4a4177c5639fe1c91474a356c3eef04fd87) | 2,701,108 | 2,683,478 | +17,630 | 0 | 7 |
+| [`0xa32effd3…`](https://etherscan.io/tx/0xa32effd3b31a02343d8cf4362c4fee2e806ea9dcf00fdea5eb1a2b054ae0ea4a) | 499,524 | 482,833 | +16,691 | 0 | 29 |
+| [`0x10c755ee…`](https://etherscan.io/tx/0x10c755eea1865f9761e49f2e52dd700d8ecc4e0037057bb2ea05df24bb946095) | 203,620 | 244,538 | −40,918 | 0 | 14 |
+| [`0xc3543837…`](https://etherscan.io/tx/0xc3543837e22a84fb06798cb626d7a1cc716329fdf15fb675eafc587911090206) | 1,415,274 | 1,871,874 | **−456,600** | 0 | 158 |
+
+### This is an architectural problem, not a computation problem
+
+Euler does the **same expensive work as Aave** — per-asset risk calculations on every borrow and repay, the exact mechanism that earns Aave's `borrow` 24–64%. The difference is entirely in how users reach it.
+
+Euler V2 mandates the **Ethereum Vault Connector** as its coordination layer. All 20 vaults found in the scan report the same `EVC()` address (`0x0c9a3dd6b8f28529d72d7f9ce918d493519ee383`, discovered on-chain, not from documentation). Users reach vaults through `batch((address,address,uint256,bytes)[])` on the EVC (selector `0xc16ae7a4`, keccak-verified) or through a third-party contract:
+
+| entry point | txs | share |
+|---|---:|---:|
+| EVC `batch(...)` | 58 | 57% |
+| third-party contracts | 44 | 43% |
+| **directly to a vault** | **0** | **0%** |
+
+**Zero of 191 borrow/repay transactions called a vault directly.** So the risk calculation sits behind a `CALL` in every single Euler transaction, and the analyzer re-executes it rather than stripping it out.
+
+The two protocols side by side:
+
+| | Aave | Euler |
+|---|---|---|
+| per-asset risk math on borrow | yes | yes |
+| direct calls to the lending contract | **52% of txs** | **0 of 191** |
+| borrows clearing the Schnorr floor | 9 of 9 | 1 of 5 |
+| best measured | **63.64%** | **1.31%** |
+
+Same category, same computation, ~49× difference in outcome — decided by whether the protocol lets users call the contract that does the work. Euler belongs in `CALL_BLOCKED_CANDIDATES.md` rather than being written off: the compressible work exists, it is simply unreachable through the current encoder.
+
+Two further observations:
+
+- **Routing through a batcher compounds both problems.** `0xc3543837…` is a large EVC batch producing **158 state updates**, so GasKiller costs 1,871,874 to replay a 1,415,274-gas transaction — a surplus of −456,600, the worst measured anywhere in this survey.
+- **Size does not help.** `0x7d1e2345…` burns 2,701,108 gas and yields a 7-update diff with +17,630 surplus. Everything is inside calls.
+
+Three transactions could not be measured: one rate-limited, two reverting reproducibly at a WETH call (`0xC02aaA39…`) during replay on all 3 attempts each.
 ## Limitations
 
 - **Opportunistic samples.** Railgun is the largest at 15 direct transactions from one 40,000-block window; the others are 7–20 transactions each. None is a systematic survey and none should be read as a population statistic.
