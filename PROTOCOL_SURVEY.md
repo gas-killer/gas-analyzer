@@ -10,7 +10,7 @@ Every number in the results tables is analyzer output. Where a figure is my own 
 
 In aggregate: 15,174,097 gas used on chain becomes 3,765,439 under GasKiller with Schnorr — a saving of **11,408,658 gas (75.2%)**.
 
-This is the only protocol surveyed where **BLS also saves**. Across the other six, 0 of ~50 transactions cleared the 250,000 BLS floor.
+Railgun is the only protocol where **every** transaction clears the BLS floor. Aave manages it on 2 of 9 borrows; across the remaining seven protocols, 0 of ~60 transactions cleared it.
 
 ### Why it works
 
@@ -62,7 +62,7 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 | protocol | best measured | BLS | winning shape | how common |
 |---|---:|---:|---|---|
 | **Railgun** | **80.84%** | **60.30%** | direct call to smart wallet | 374 of 704 (53%) |
-| **Aave** | **49.14%** | 0% | direct call, borrower holding many assets | 52% direct, but few multi-asset |
+| **Aave** | **63.64%** | **yes (2 txs)** | direct `borrow` (any borrower); `withdraw` if multi-asset | ~25% of txs are direct borrows |
 | Privacy Pools | 23.39% | 0% | direct call to pool | 2 in 17 days |
 | Ether.fi | 18.99% | 0% | EtherFiAdmin oracle report | every ~4 hours |
 | Pendle | 3.94% | 0% | one large aggregator tx | marginal |
@@ -73,7 +73,7 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 
 ## What predicts a good candidate
 
-Two conditions, both necessary. Every result above is explained by them. Aave adds a third dimension: even where both hold, the *amount* of compressible work can vary per caller (see the Aave section — savings track how many reserves the borrower holds).
+Two conditions, both necessary. Every result above is explained by them. Aave adds a third dimension: the two conditions can hold for one *function* of a protocol and fail for another — `borrow` clears the floor 9 times out of 9 while `supply` and `repay` never do, because only the former runs a per-reserve health-factor loop. Screen per entry point, not per protocol.
 
 **1. The expensive work must happen in the contract the transaction is sent to.** The analyzer keeps a regular `CALL` as one instruction and re-executes it on replay, so anything inside it is never stripped (`crates/core/src/trace.rs:255`; `crates/core/src/prestate.rs` documents the same constraint for the net form). Railgun direct vs Railgun RelayAdapt is the same operation on the same contract scoring 80% vs 0% on this alone.
 
@@ -81,24 +81,49 @@ Two conditions, both necessary. Every result above is explained by them. Aave ad
 
 The winners are cryptographic: Railgun (ZK proofs + Poseidon in its own code), Privacy Pools (Poseidon over a merkle tree), Ether.fi (oracle report processing). Ordinary DeFi arithmetic — swap curves, share conversions, interest accrual — is never large enough to dominate a transaction's gas.
 
-## Aave — second best, and it depends on the user, not the operation
+## Aave — `borrow` is a reliable candidate
 
-8 transactions, all trace-measured. **2 of 8 clear the floor**, at 49.14% and 24.08% — making Aave the strongest result after Railgun.
+20 transactions measured, all trace-based. **11 of 20 clear the floor.** What decides it is **which operation is called**, not who calls it:
 
-| tx | operation | entry | gas used | GasKiller cost | Schnorr saved |
-|---|---|---|---:|---:|---:|
-| [`0x1b708eba…`](https://etherscan.io/tx/0x1b708eba95e753a84558374c488f1557907935272fabc2ffe91f6d8844c06370) | Withdraw | direct to Pool | 408,792 | 180,921 | **200,871** (49.14%) |
-| [`0xb33162e1…`](https://etherscan.io/tx/0xb33162e1275b4e14a4a0de3d327949fb520949cadd898d17718bb813547ca0fb) | Borrow | direct to Pool | 252,529 | 164,712 | **60,817** (24.08%) |
-| [`0x9287f808…`](https://etherscan.io/tx/0x9287f80894eeeacc8af236609401da9f14ce0e655cbb9748e0db2e405aeb2ef5) | LiquidationCall | via 3rd-party contract | 1,165,207 | 1,156,574 | 0 |
-| [`0x6b7563d1…`](https://etherscan.io/tx/0x6b7563d1e117aa90cc1e65b19b10ee525da3bdc89a26d0498a2a7084ab7867b1) | Repay | direct to Pool | 144,130 | 142,631 | 0 |
-| [`0x4eba5f8d…`](https://etherscan.io/tx/0x4eba5f8de29afdcac5703668d41a1f4bee734545dcdb37a129c6341b41c6ea44) | Supply | direct to Pool | 183,352 | 178,041 | 0 |
-| [`0x52b373f5…`](https://etherscan.io/tx/0x52b373f5701425f48c42e3779527b6b7da51e7c764317c07cb40446377113649) | Supply | direct to Pool | 179,856 | 179,187 | 0 |
-| [`0xe41dd331…`](https://etherscan.io/tx/0xe41dd331b63a80add54ec1ef340f252c623538cfe35b69a65b190651aa636691) | Withdraw | direct to Pool | 167,589 | 160,020 | 0 |
-| [`0x9905c35e…`](https://etherscan.io/tx/0x9905c35e963d0c36e66b33d6f2319085daebf2920a8572ce26c01e201d0bbc16) | Withdraw | direct to Pool | 183,126 | 166,710 | 0 |
+| operation | measured | clear the floor | Schnorr range |
+|---|---:|---:|---|
+| **`borrow`** | 9 | **9** | **24.08% – 63.64%** (median 42.93%) |
+| `withdraw` | 4 | 2 | 0% – 49.14% |
+| `supply` / `supplyWithPermit` / `repay` | 6 | **0** | 0% |
+| `liquidationCall` (via 3rd party) | 1 | 0 | 0% |
 
-### The variable is the borrower's position count
+### Every borrow wins, and reserve count sets how much
 
-Three `withdraw` calls with **identical diff shapes** — 8 stores, 1 call, 3 logs — scored 49.14%, 0% and 0%. The opcode profiles explain it:
+| reserves held | gas used | GasKiller cost | Schnorr saved |
+|---:|---:|---:|---:|
+| 8 | 571,333 | 180,741 | **363,592** (63.64%) |
+| 6 | 450,205 | 163,828 | **259,377** (57.61%) |
+| 3 | 371,912 | 173,408 | **171,504** (46.11%) |
+| 4 | 360,781 | 170,263 | **163,518** (45.32%) |
+| 3 | 345,794 | 170,335 | **148,459** (42.93%) |
+| 4 | 365,438 | 181,716 | **156,722** (42.89%) |
+| 2 | 346,272 | 206,699 | **112,573** (32.51%) |
+| 1 | 316,682 | 205,592 | **84,090** (26.55%) |
+| 2 | 252,529 | 164,712 | **60,817** (24.08%) |
+
+**GasKiller's cost barely moves: 163,828–206,699, while gas used runs 252,529–571,333.** The diff is effectively fixed and the computation on top varies — the same fixed-diff/variable-workload signature seen in Ether.fi's oracle report and World ID's identity registration.
+
+Two borrows also clear the **BLS** floor (140,592 and 36,377) — only Railgun has managed that elsewhere in this survey.
+
+### Why the operation decides it
+
+`borrow` and `withdraw` must check the health factor, which walks every reserve the user holds and reads an oracle price per asset. Those reads are `STATICCALL`s — real gas that leaves nothing in the diff, and which the extractor ignores entirely (it tracks only `CALL`, `SSTORE`, `LOG*`, `CREATE`). `supply` and `repay` skip the check, because neither can worsen your own health factor.
+
+Median gas by operation and reserve count, across 471 direct-to-Pool transactions, shows the loop clearly — and shows it is absent from `supply` and `repay`:
+
+| operation | 0–1 reserves | 2–3 | 4+ |
+|---|---:|---:|---:|
+| `withdraw` | 176,867 | 278,596 | **360,926** |
+| `borrow` | 303,803 | 284,079 | **387,564** |
+| `supply` | 184,880 | 150,987 | 160,388 |
+| `repay` | — | 152,022 | 154,444 |
+
+Three `withdraw` calls with **identical diff shapes** (8 stores, 1 call, 3 logs) scored 49.14%, 0% and 0%. Their opcode profiles isolate the mechanism:
 
 | | winner | zero | zero |
 |---|---:|---:|---:|
@@ -110,14 +135,17 @@ Three `withdraw` calls with **identical diff shapes** — 8 stores, 1 call, 3 lo
 | user's active reserves | **5** | 1 | 0 |
 | **Schnorr saved** | **49.14%** | 0 | 0 |
 
-Aave's health-factor check walks every reserve the user holds and reads an oracle price for each. Those are `STATICCALL`s — invisible to the state diff (the extractor tracks only `CALL`, `SSTORE`, `LOG*`, `CREATE`) but costing real gas. Six times the oracle reads, ~2.5× the opcodes, and **the same 12 state updates at the end**.
+Six times the oracle reads, ~2.5× the opcodes, and the same 12 state updates at the end.
 
-So savings scale with **how many assets a borrower holds**, and the diff does not grow with it. Single-asset users save nothing; multi-collateral users save around half their gas. The value concentrates in Aave's largest accounts — the ones paying the most gas.
+> **Revision.** An earlier version of this section, written from an 8-transaction sample that happened to contain only one `borrow`, claimed savings depend on the borrower's position rather than the operation, and that "single-asset users save nothing". Widening to 20 transactions reversed both: a 1-reserve `borrow` saves 26.55%, and 9 of 9 borrows clear the floor regardless of position size. Reserve count is a multiplier, not the gate.
 
-This corrects a conclusion drawn from Morpho. Morpho's 2.60% suggested lending was structurally poor for GasKiller; Aave shows that was about Morpho's design (storage-optimal, little per-transaction computation), not about lending.
+### Practical significance
 
-The one liquidation found in range (1,165,207 gas) went through a third-party liquidator contract, so its diff is 6 updates dominated by one call — 0%. The single Aave transaction with the most computation was reached through a wrapper.
+In the sampled 3,000-block window, direct-to-Pool `borrow` calls were **120 of 471** classified transactions (~25%). At a median 42.93%, that is a large recurring segment rather than an edge case — and Aave is the largest lending market on mainnet, so ~25% of its flow likely exceeds Railgun's entire volume in absolute gas.
 
+This also corrects a conclusion drawn from Morpho. Morpho's 2.60% suggested lending was structurally poor for GasKiller; Aave shows that was about Morpho's design (storage-optimal, little per-transaction computation), not about lending as a category.
+
+The one liquidation in range (1,165,207 gas) went through a third-party liquidator contract, so its diff is 6 updates dominated by one call — 0%. The Aave transaction with the most computation was reached through a wrapper.
 ## Safe — not worth pursuing, and the reason is a hard ceiling
 
 12 transactions measured, plus 3 above ~5M gas that could not be measured at all (empty analyzer output on every attempt — a tool limit on very large struct-log traces).
@@ -182,4 +210,4 @@ Safe is therefore not a blocked candidate but a thin wrapper in front of other c
 - **The prestate/net-form encoder was not exercised.** The CLI's `t` command uses the struct-log encoder. The net form collapses repeated writes to the same slot, which materially changes batched transactions — Ether.fi's `batchClaimWithdraw` has 65 struct-log stores but only 5 net changed slots. Everything measured here is the struct-log path.
 - **Savings are the analyzer's cost model**, not on-chain outcomes; nothing was executed through a deployed GasKiller.
 - **Some very large transactions cannot be measured.** Three Safe transactions (5.9M, 6.4M and 6.5M gas, each with 250–500 logs) produced empty analyzer output on every attempt, apparently a struct-log trace size limit. Size alone is not the trigger — an 11.4M-gas Safe transaction measured fine — but any survey weighted toward large batched transactions will be biased by this.
-- **Aave's result depends on caller composition, which was not sampled systematically.** The 49.14% came from a borrower with 5 active reserves; 6 of 8 sampled Aave transactions were single- or zero-reserve users. The share of Aave traffic that looks like the winner is unmeasured.
+- **Aave's 25% traffic-share figure is a single-window estimate.** Direct-to-Pool borrows were 120 of 471 classified transactions in one 3,000-block window. Borrow share will vary with market conditions, and the 20 analyzed transactions are not a random sample of them — they were chosen to span the operation/reserve-count space.
