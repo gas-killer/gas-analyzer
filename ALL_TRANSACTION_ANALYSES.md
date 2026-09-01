@@ -1,6 +1,6 @@
 # Every transaction analysed, in one place
 
-168 Ethereum mainnet transactions across 15 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Five more could not be run at all; they are listed at the end.
+182 Ethereum mainnet transactions across 15 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Five more could not be run at all; they are listed at the end.
 
 Every number in the tables is the tool's own output. Nothing here is modelled or extrapolated.
 
@@ -23,11 +23,11 @@ Three reasons, and they are different problems:
 | too many writes | The transaction changes so many storage slots that writing them all back costs more than the original transaction. | No. The transaction is bookkeeping, not computation. |
 | under the floor | The transaction's own work is real but smaller than the 27,000-gas signature check. | Only by making the signature check cheaper. |
 
-Across all 168 transactions, **56 save gas** (48 of them properly measured and correctly attributed) and 112 save nothing. Of those 112:
+Across all 182 transactions, **57 save gas** (49 of them properly measured and correctly attributed) and 125 save nothing. Of those 125:
 
-- **102 are blocked by external calls**
+- **108 are blocked by external calls**
 - 18 have too many writes
-- 46 fall under the floor
+- 61 fall under the floor
 
 Those add up to more than the total because a transaction can hit more than one at once — the tables below list every blocker that applies.
 
@@ -51,7 +51,7 @@ Best and typical figures use only properly measured runs, and exclude the two On
 | **Ondo** | 8 | 3 | 2.01% | 1.59% | external calls (3), too many writes (1) |
 | **Euler** | 8 | 1 | 1.31% | 1.31% | external calls (7), too many writes (3), under the floor (2) |
 | **Chainlink** | 8 | 0 | 0.00% | 0.00% | external calls (8) |
-| **Ethena** | 8 | 0 | 0.00% | 0.00% | under the floor (7), external calls (1) |
+| **Ethena** | 22 | 1 | 8.99% | 8.99% | under the floor (15), external calls (6) |
 | **ERC-4337 wallets** | 8 | 0 | 0.00% | 0.00% | external calls (8) |
 | **Panther** | 1 | 0 | 0.00% | 0.00% | external calls (1), too many writes (1) |
 
@@ -105,6 +105,34 @@ These transactions have real compressible work left over and still lost. If the 
 **One caveat on the Safe rows.** A Safe's own work is verifying owner signatures — about 3,000 gas each — and it writes one slot, its nonce. So its surplus is capped by owner count no matter what the transaction does. The gas inside the call belongs to whatever the Safe called, and those protocols would get that saving with or without a Safe in front. Safe is a thin wrapper over other candidates, not a candidate itself.
 
 `CALL_BLOCKED_CANDIDATES.md` has the deeper write-up of this group.
+
+## Warning: `heur` rows are usually rate limiting, not real results
+
+When the analyzer cannot replay a block it falls back to a heuristic estimator and prints
+a normal-looking result with a small `(heuristic - measured estimation failed)` note. The
+estimator prices `Call` at **zero gas**, so it fails in one direction only: it *overstates*
+savings.
+
+During the Ethena runs, 9 of 21 transactions hit this path. The cause was not the
+transactions — it was the RPC provider returning `HTTP 429: 50/second request limit
+reached` mid-replay. Re-running them serially recovered real measurements for 6, and
+**every single one collapsed to 0%**:
+
+| tx | heuristic claimed | true measured |
+|---|---:|---:|
+| `0xae6a3e25…` | 36.96% | 0% |
+| `0xaf1a2df7…` | 34.99% | 0% |
+| `0xd2475759…` | 33.91% | 0% |
+| `0x91e950a3…` | 33.90% | 0% |
+| `0xb3a29f2b…` | 30.95% | 0% |
+| `0x6f12cb87…` | 3.94% | 0% |
+
+On `0xaf1a2df7…` the heuristic was wrong by 86,378 gas.
+
+**Practical rules.** Never quote a `heur` row. Re-run it serially — one analyzer process at
+a time — before drawing any conclusion. The remaining `heur` rows in the table below,
+including those inherited from earlier protocols, were produced under the same throttling
+and should be re-run before use rather than treated as data.
 
 ## Every transaction
 
@@ -278,15 +306,30 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | ERC-4337 wallets | [`0x3923cd22…`](https://etherscan.io/tx/0x3923cd2290d14e7c53073cc4422374369e77630118514ce8086bd0865b8db121) | `handleOps` | 155,664 | 142,542 | +13,122 | **0** (0.00%) | 0 | **external calls** | 9 (·/4C) | EntryPoint v0.6 |
 | ERC-4337 wallets | [`0x773e691e…`](https://etherscan.io/tx/0x773e691ea71b9e0b99e8599fa29e9ea9097c73de92e66d25bad564f17a264dad) | `handleOps` | 145,170 | 183,888 | -38,718 | **0** (0.00%) | 0 | **external calls** | 9 (·/4C) | EntryPoint v0.6 |
 | ERC-4337 wallets | [`0xf6f4f754…`](https://etherscan.io/tx/0xf6f4f754fe0c122c846a559467e388ed0241da15f4252e5a8169c0a4aaed745a) | `handleOps` | 119,160 | 112,774 | +6,386 | **0** (0.00%) | 0 | **external calls** | 8 (·/3C) | EntryPoint v0.6 |
-| Ethena | [`0xe6f15a94…`](https://etherscan.io/tx/0xe6f15a94892f1ec9a52263ba0a8869c081db57bc9c48558b31e9cc1e3609e126) | *mint* `0x96eea750` | 205,401 | 190,844 | +14,557 | **0** (0.00%) | 0 | under the floor | 8 (4S/1L4/2C) |  |
-| Ethena | [`0xba225f3e…`](https://etherscan.io/tx/0xba225f3ef9ad52f911771e967f5e81e83fc0cdebe5eb1cd996012e4aa543ef21) | *mint* `0x96eea750` | 202,207 | 187,626 | +14,581 | **0** (0.00%) | 0 | under the floor | 8 (4S/1L4/2C) |  |
-| Ethena | [`0xe67e1c84…`](https://etherscan.io/tx/0xe67e1c8420c330116b81cb6e9bd73d5016058267d390701dd8fab89e592877d0) | *mint* `0x96eea750` | 202,195 | 187,602 | +14,593 | **0** (0.00%) | 0 | under the floor | 8 (4S/1L4/2C) |  |
-| Ethena | [`0x1c4c1779…`](https://etherscan.io/tx/0x1c4c1779b4b03b196c1e2891be88fb9771f33931fc356597ae5be7f54433b264) | *mint* `0x96eea750` | 200,589 | 186,044 | +14,545 | **0** (0.00%) | 0 | under the floor | 8 (4S/1L4/2C) | calls are plain ERC-20 — surplus is real compute |
-| Ethena | [`0xcfea9cfa…`](https://etherscan.io/tx/0xcfea9cfa79f814a7ff93a431c56dde3b9feeb10a86e8dde41c00ce3adf6d7ec2) | *mint* `0x96eea750` | 185,047 | 170,454 | +14,593 | **0** (0.00%) | 0 | under the floor | 8 (4S/1L4/2C) |  |
-| Ethena | [`0x9786d142…`](https://etherscan.io/tx/0x9786d142e2a872dda2f8af0c108635e8f638b9779b62170fd8692eb3ed633632) | *sUSDe* | 407,179 | 409,604 | -2,425 | **0** (0.00%) | 0 | **external calls** | 5 (·/2C) |  |
-| Ethena | [`0x20437c45…`](https://etherscan.io/tx/0x20437c4593fc6e80acdd78578e134c336cc0a1f827e56cb36a18e8becb5d62e0) | *sUSDe* | 84,342 | 83,451 | +891 | **0** (0.00%) | 0 | under the floor | 3 (·/1C) |  |
-| Ethena | [`0x7a4241aa…`](https://etherscan.io/tx/0x7a4241aa594bf958bdb4c5fa93ef04a12f6cc1f6b854584000349f75c809b11d) | `cooldownShares` ✓ `0x9343d9e1` | 72,371 | 65,909 | +6,462 | **0** (0.00%) | 0 | under the floor | 9 (·/1C) |  |
 | Panther | [`0x63338b98…`](https://etherscan.io/tx/0x63338b98cb3c6bf3390a7f7dcb84e25766424b7a1c6444b4b1b3c89f9059d134) | *staking* `0x7f678334` | 207,193 | 226,374 | -19,181 | **0** (0.00%) | 0 | **external calls** · too many writes | 11 (8S/1L3/2C) | only Panther mainnet tx in 200k blocks |
+
+| Ethena | [`0x5055ea7f…`](https://etherscan.io/tx/0x5055ea7ff088407138215ddbe45b9cedfc334cda7e791d0eba4061aea819015c) | *mint* `0x96eea750` | 241,268 | 192,569 | +48,699 | **21,699** (8.99%) | 0 | — | — | **900B order — 1 of 309 mints** |
+| Ethena | [`0xb3a29f2b…`](https://etherscan.io/tx/0xb3a29f2bdcb1573d2f3b7d613a08415854df6ea60d356c9611248856474a8a21) | *mint* `0x96eea750` | 219,295 | 204,750 | +14,545 | **0** (0.00%) | 0 | under the floor | — |  |
+| Ethena | [`0xae6a3e25…`](https://etherscan.io/tx/0xae6a3e25f711d88ab06a1729ec60acf771c33e83877b2ac7885661cfe0d4d253) | *mint* `0x96eea750` | 210,560 | 192,497 | +18,063 | **0** (0.00%) | 0 | under the floor | — | heuristic first claimed 36.96% |
+| Ethena | [`0xd2475759…`](https://etherscan.io/tx/0xd2475759c71f278896ea7ff15ca213bb17dc9c3e0b29ddfdc8e1e01424995ae0) | *mint* `0x96eea750` | 208,058 | 190,820 | +17,238 | **0** (0.00%) | 0 | under the floor | — | heuristic first claimed 33.91% |
+| Ethena | [`0x91e950a3…`](https://etherscan.io/tx/0x91e950a3e5497de1908db495bd8432a9068865314a8bba6e2ee3f800eb9c0e41) | *mint* `0x96eea750` | 208,046 | 190,808 | +17,238 | **0** (0.00%) | 0 | under the floor | — | heuristic first claimed 33.90% |
+| Ethena | [`0x2bdf6644…`](https://etherscan.io/tx/0x2bdf664447b22de7c275becd81ff56775417e0544812417ee0dadc95232a6fd4) | *mint* `0x96eea750` | 207,927 | 192,581 | +15,346 | **0** (0.00%) | 0 | under the floor | — |  |
+| Ethena | [`0xe6f15a94…`](https://etherscan.io/tx/0xe6f15a94892f1ec9a52263ba0a8869c081db57bc9c48558b31e9cc1e3609e126) | *mint* `0x96eea750` | 205,401 | 190,844 | +14,557 | **0** (0.00%) | 0 | under the floor | — |  |
+| Ethena | [`0xba225f3e…`](https://etherscan.io/tx/0xba225f3ef9ad52f911771e967f5e81e83fc0cdebe5eb1cd996012e4aa543ef21) | *mint* `0x96eea750` | 202,207 | 187,626 | +14,581 | **0** (0.00%) | 0 | under the floor | — |  |
+| Ethena | [`0xe67e1c84…`](https://etherscan.io/tx/0xe67e1c8420c330116b81cb6e9bd73d5016058267d390701dd8fab89e592877d0) | *mint* `0x96eea750` | 202,195 | 187,602 | +14,593 | **0** (0.00%) | 0 | under the floor | — |  |
+| Ethena | [`0x1c4c1779…`](https://etherscan.io/tx/0x1c4c1779b4b03b196c1e2891be88fb9771f33931fc356597ae5be7f54433b264) | *mint* `0x96eea750` | 200,589 | 186,044 | +14,545 | **0** (0.00%) | 0 | under the floor | — |  |
+| Ethena | [`0xaf1a2df7…`](https://etherscan.io/tx/0xaf1a2df790dc89d457abe7cfb14a5be4e6d32d92a547e2f991479dcbdd7321f3) | *mint* `0x96eea750` | 200,023 | 189,422 | +10,601 | **0** (0.00%) | 0 | under the floor | — | heuristic first claimed 34.99% |
+| Ethena | [`0x0e4976bf…`](https://etherscan.io/tx/0x0e4976bf08241feb978fc57172e36ea04a066b0bd242c3952ce06fabfd03ade8) | *mint* `0x96eea750` | 200,023 | 189,422 | +10,601 | **0** (0.00%) | 0 | under the floor | — |  |
+| Ethena | [`0x2b762d27…`](https://etherscan.io/tx/0x2b762d27b09d8f0b8a221a71bc3e3544e55b7c34d9a44edfd566fa5ebc739ed7) | *mint* `0x96eea750` | 200,011 | 189,446 | +10,565 | **0** (0.00%) | 0 | under the floor | — |  |
+| Ethena | [`0xcfea9cfa…`](https://etherscan.io/tx/0xcfea9cfa79f814a7ff93a431c56dde3b9feeb10a86e8dde41c00ce3adf6d7ec2) | *mint* `0x96eea750` | 185,047 | 170,454 | +14,593 | **0** (0.00%) | 0 | under the floor | — |  |
+| Ethena | [`0x9786d142…`](https://etherscan.io/tx/0x9786d142e2a872dda2f8af0c108635e8f638b9779b62170fd8692eb3ed633632) | *sUSDe* | 407,179 | 409,604 | -2,425 | **0** (0.00%) | 0 | **external calls** | — |  |
+| Ethena | [`0xc371b418…`](https://etherscan.io/tx/0xc371b418f7a88c1bcbce3ebee77145ac28e6f9764569d11de55a2a86fc7fd0fb) | `cooldownShares` ✓ `0x9343d9e1` | 89,471 | 103,472 | -14,001 | **0** (0.00%) | 0 | **external calls** | — |  |
+| Ethena | [`0xd6e74eef…`](https://etherscan.io/tx/0xd6e74eef135030ef66c96c65247c0595d81d8de790923139eabe419800752aba) | `cooldownShares` ✓ `0x9343d9e1` | 89,459 | 103,460 | -14,001 | **0** (0.00%) | 0 | **external calls** | — |  |
+| Ethena | [`0x6f12cb87…`](https://etherscan.io/tx/0x6f12cb8706d5c2f6fa999ff37dd5728cd9530d0d9c256efc715800df45d72403) | `deposit` ✓ `0x6e553f65` | 88,423 | 99,316 | -10,893 | **0** (0.00%) | 0 | **external calls** | — | heuristic first claimed 3.94% |
+| Ethena | [`0x20437c45…`](https://etherscan.io/tx/0x20437c4593fc6e80acdd78578e134c336cc0a1f827e56cb36a18e8becb5d62e0) | *sUSDe* | 84,342 | 83,451 | +891 | **0** (0.00%) | 0 | under the floor | — |  |
+| Ethena | [`0xe9eebd35…`](https://etherscan.io/tx/0xe9eebd353a8623401f2106e17a73cf433f31c3f6ac45722ffe61c2f70965e5cd) `heur` | `deposit` ✓ `0x6e553f65` | 83,659 | 57,942 | +25,717 | **0** (0.00%) | 0 | under the floor | — |  |
+| Ethena | [`0x7a4241aa…`](https://etherscan.io/tx/0x7a4241aa594bf958bdb4c5fa93ef04a12f6cc1f6b854584000349f75c809b11d) `heur` | `cooldownShares` ✓ `0x9343d9e1` | 72,371 | 65,909 | +6,462 | **0** (0.00%) | 0 | under the floor | — |  |
+| Ethena | [`0x03c37967…`](https://etherscan.io/tx/0x03c37967a8003d273e3a8b8518689d304fd03c93d429754f0df4a66e663355af) `heur` | `deposit` ✓ `0x6e553f65` | 66,559 | 57,942 | +8,617 | **0** (0.00%) | 0 | under the floor | — |  |
 
 ## Transactions that could not be measured at all
 

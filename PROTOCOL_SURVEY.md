@@ -73,7 +73,7 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 | **Euler** | 1.31% | 0% | none — EVC router mandatory | **0 of 191 direct** |
 | **Ondo** | 2.01% | 0% | mint/redeem via manager | 52 mint/burns in 60k blocks |
 | Chainlink | 0% | 0% | none — all traffic via forwarder | 0 of 242 direct |
-| Ethena | 0% | 0% | none — mint compute is ~14.5k, floor is 27k | 0 of 8 |
+| Ethena | 8.99% | 0% | one 900-byte mint order | **1 of 309 mints (0.3%)** |
 | ERC-4337 wallets | 0% | 0% | none — EntryPoint hides all work in `innerHandleOp` | 0 of 8 |
 | Panther | 0% | 0% | none — shielded pool is not on mainnet | 0 of 1 |
 
@@ -360,34 +360,83 @@ also integrated GasKiller does not automatically solve this; the recursion is in
 It is also the one case in the survey with no commercial path. EntryPoint is immutable,
 shared, unowned infrastructure. ZeroDev cannot change it, and neither can a customer.
 
-## Ethena — no hidden compute, just not enough of it
+## Ethena — one win in 309, and a lesson about the tool
 
-Eight transactions, all **0%**, but the failure mode is the opposite of ZeroDev's and is
-worth separating.
+**22 transactions measured, 19 of them cleanly. One real win: 8.99%.**
 
 `EthenaMinting.mint` (`0x96eea750`, selector unverified) reduces to four storage writes,
-one `Log4`, and two calls — a USDT `transferFrom` (`0x23b872dd`) and a USDe `mint`
-(`0x40c10f19`). Both calls are plain ERC-20 operations. Nothing large is hiding inside
-them, which means the measured surplus really is the protocol's own compute: the EIP-712
-signature check over the signed order, plus order bookkeeping.
+one `Log4`, and two calls — a token `transferFrom` and a USDe `mint`. Both calls are plain
+ERC-20 operations, so nothing large is hiding inside them. The measured surplus really is
+Ethena's own compute: the EIP-712 check over the signed order, plus order bookkeeping.
 
-That surplus is strikingly consistent across five mints — 14,545 / 14,557 / 14,581 /
-14,593 / 14,593 — and it is **just over half the 27,000 Schnorr floor**. Ethena is not
-blocked by external calls or by write-heaviness. It simply does not do enough work.
+Across 11 cleanly measured mints that surplus sits in a tight band of **10,565–18,063**,
+against a 27,000 Schnorr floor. Ethena is not blocked by external calls and not blocked by
+write-heaviness. It simply does not do enough work.
 
-| tx | function | gas used | base estimate | surplus | Schnorr |
-|---|---|---:|---:|---:|---:|
-| `0x1c4c1779b4b03b196c1e2891be88fb9771f33931fc356597ae5be7f54433b264` | *mint* | 200,589 | 186,044 | 14,545 | 0% |
-| `0xe67e1c8420c330116b81cb6e9bd73d5016058267d390701dd8fab89e592877d0` | *mint* | 202,195 | 187,602 | 14,593 | 0% |
-| `0xe6f15a94892f1ec9a52263ba0a8869c081db57bc9c48558b31e9cc1e3609e126` | *mint* | 205,401 | 190,844 | 14,557 | 0% |
-| `0xba225f3ef9ad52f911771e967f5e81e83fc0cdebe5eb1cd996012e4aa543ef21` | *mint* | 202,207 | 187,626 | 14,581 | 0% |
-| `0xcfea9cfa79f814a7ff93a431c56dde3b9feeb10a86e8dde41c00ce3adf6d7ec2` | *mint* | 185,047 | 170,454 | 14,593 | 0% |
-| `0x7a4241aa594bf958bdb4c5fa93ef04a12f6cc1f6b854584000349f75c809b11d` | `cooldownShares` | 72,371 | 65,909 | 6,462 | 0% |
-| `0x20437c4593fc6e80acdd78578e134c336cc0a1f827e56cb36a18e8becb5d62e0` | sUSDe | 84,342 | 83,451 | 891 | 0% |
-| `0x9786d142e2a872dda2f8af0c108635e8f638b9779b62170fd8692eb3ed633632` | sUSDe | 407,179 | 409,604 | −2,425 | 0% |
+| tx | gas used | base estimate | surplus | Schnorr |
+|---|---:|---:|---:|---:|
+| `0x5055ea7ff088407138215ddbe45b9cedfc334cda7e791d0eba4061aea819015c` | 241,268 | 192,569 | **+48,699** | **8.99%** |
+| `0xb3a29f2bdcb1573d2f3b7d613a08415854df6ea60d356c9611248856474a8a21` | 219,295 | 204,750 | +14,545 | 0% |
+| `0xae6a3e25f711d88ab06a1729ec60acf771c33e83877b2ac7885661cfe0d4d253` | 210,560 | 192,497 | +18,063 | 0% |
+| `0xd2475759c71f278896ea7ff15ca213bb17dc9c3e0b29ddfdc8e1e01424995ae0` | 208,058 | 190,820 | +17,238 | 0% |
+| `0x91e950a3e5497de1908db495bd8432a9068865314a8bba6e2ee3f800eb9c0e41` | 208,046 | 190,808 | +17,238 | 0% |
+| `0x2bdf664447b22de7c275becd81ff56775417e0544812417ee0dadc95232a6fd4` | 207,927 | 192,581 | +15,346 | 0% |
+| `0xe6f15a94892f1ec9a52263ba0a8869c081db57bc9c48558b31e9cc1e3609e126` | 205,401 | 190,844 | +14,557 | 0% |
+| `0xba225f3ef9ad52f911771e967f5e81e83fc0cdebe5eb1cd996012e4aa543ef21` | 202,207 | 187,626 | +14,581 | 0% |
+| `0xe67e1c8420c330116b81cb6e9bd73d5016058267d390701dd8fab89e592877d0` | 202,195 | 187,602 | +14,593 | 0% |
+| `0x1c4c1779b4b03b196c1e2891be88fb9771f33931fc356597ae5be7f54433b264` | 200,589 | 186,044 | +14,545 | 0% |
+| `0xaf1a2df790dc89d457abe7cfb14a5be4e6d32d92a547e2f991479dcbdd7321f3` | 200,023 | 189,422 | +10,601 | 0% |
+| `0x0e4976bf08241feb978fc57172e36ea04a066b0bd242c3952ce06fabfd03ade8` | 200,023 | 189,422 | +10,601 | 0% |
+| `0x2b762d27b09d8f0b8a221a71bc3e3544e55b7c34d9a44edfd566fa5ebc739ed7` | 200,011 | 189,446 | +10,565 | 0% |
+| `0xcfea9cfa79f814a7ff93a431c56dde3b9feeb10a86e8dde41c00ce3adf6d7ec2` | 185,047 | 170,454 | +14,593 | 0% |
 
-`cooldownShares(uint256)` = `0x9343d9e1`, verified by keccak. The `mint` selector could not
-be matched against any candidate signature tried and is left unverified rather than guessed.
+Staking is lighter still and several rows are net-negative: `cooldownShares` (`0x9343d9e1`,
+keccak-verified) at 89,471 gas measures a base of 103,472, and `deposit(uint256,address)`
+(`0x6e553f65`, keccak-verified) at 88,423 gas measures 99,316. GasKiller would cost more
+than the transaction does.
+
+### The one win is a statistical freak, not a segment
+
+`0x5055ea7f…` is real — measured via `StateChangeHandler`, and reproduced with identical
+numbers on a second independent run. Its surplus is 48,699, more than triple the
+next-highest. The difference is order size: **900 bytes of calldata against the usual 836**,
+one extra collateral asset. The state-update shape is unchanged (8 updates, 2 calls), so
+the extra ~33,000 gas is pure verification work that writes nothing — precisely what the
+co-processor strips.
+
+That sounds like a targetable segment until you count them. Over 30,000 blocks
+(25,854,266–25,884,265), **309 mints: 308 at 836 bytes, exactly one at 900 bytes.**
+
+**0.3%.** One freak order in a month. Ethena is a no.
+
+### What this cost to find out — a warning about `heur` rows
+
+Nine of the first twenty-one runs fell back to the heuristic estimator, and every one of
+them reported a large, plausible-looking saving. All were false:
+
+| tx | heuristic said | true measured value |
+|---|---:|---:|
+| `0xae6a3e25…` | 36.96% | **0%** |
+| `0xaf1a2df7…` | 34.99% | **0%** |
+| `0xd2475759…` | 33.91% | **0%** |
+| `0x91e950a3…` | 33.90% | **0%** |
+| `0xb3a29f2b…` | 30.95% | **0%** |
+| `0x6f12cb87…` | 3.94% | **0%** |
+
+The cause was not a defect in the transactions. It was **RPC rate limiting** — the provider
+returned `HTTP 429, 50/second request limit reached` while replaying preceding
+transactions, the replay aborted, and the tool silently substituted the heuristic. The
+heuristic prices `Call` at zero gas, so it always errs toward *overstating* savings; on
+`0xaf1a2df7…` it was wrong by 86,378 gas.
+
+Two consequences worth acting on:
+
+1. **Never report a `heur` row as a result.** Re-run it serially first. Every one of the six
+   above collapsed to 0% on retry.
+2. **The 16 `heur` rows carried in `ALL_TRANSACTION_ANALYSES.md` from earlier protocols are
+   suspect for the same reason** and may be recoverable as real measurements. They were
+   produced under the same throttling conditions, some of them while two analyzer batches
+   ran concurrently.
 
 ## Panther — the target is not on this chain
 
