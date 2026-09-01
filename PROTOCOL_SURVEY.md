@@ -65,6 +65,7 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 | **Aave** | **63.64%** | **yes (2 txs)** | direct `borrow` (any borrower); `withdraw` if multi-asset | ~25% of txs are direct borrows |
 | Privacy Pools | 23.39% | 0% | direct call to pool | 2 in 17 days |
 | Ether.fi | 18.99% | 0% | EtherFiAdmin oracle report | every ~4 hours |
+| EigenLayer | 5.15% | 0% | EigenPod checkpoint proof | 4 of 5 pod checkpoints |
 | Pendle | 3.94% | 0% | one large aggregator tx | marginal |
 | World ID | 2.87% | 0% | direct, but verifier call dominates | all txs direct |
 | Morpho | 2.60% | 0% | bundler multicall reallocation | marginal |
@@ -278,6 +279,36 @@ Their savings come from the bot's own routing work, not from anything Ondo does.
 **Volume is thin.** 302 USDY transactions in a 60,000-block window (~8 days), of which 52 involve a mint or burn; OUSG had **8 transactions in total**. Even at a good percentage the absolute gas is orders of magnitude below Aave or Railgun.
 
 On this evidence the RWA category looks unpromising as a whole — Midas, Centrifuge, Maple and Backed share the mint/redeem-plus-allowlist shape that produced 1–2% here.
+## EigenLayer — the beacon-chain proofs are the only thing worth anything
+
+13 transactions measured, 2 more too large for the tool to handle at all. **6 clear the floor**, the best at **5.15%**. Everything that isn't a beacon-chain proof loses money.
+
+| tx | function | gas used | GasKiller cost | surplus | Schnorr saved | updates |
+|---|---|---:|---:|---:|---:|---:|
+| [`0x4ce09132…`](https://etherscan.io/tx/0x4ce0913231fcb4ac1351f81c6632f53165a5a80dc1f44fc7ea9c31021e5c7b04) | *checkpoint-proof verification* | 229,856 | 191,015 | +38,841 | **11,841** (5.15%) | 11 |
+| [`0x03d50d7f…`](https://etherscan.io/tx/0x03d50d7f761256ff7ddcab530c0535f352ad8101d5d2912d67339e65e3c61b5d) | `forwardEigenPodCall` ✓ | 134,366 | 103,398 | +30,968 | **3,968** (2.95%) | 1 |
+| [`0xbbc8abcb…`](https://etherscan.io/tx/0xbbc8abcb0eeb0f311b36ab4274e8629bd2b8c1395ffe79ffdebbcbf4536fbe29) | `forwardEigenPodCall` ✓ | 417,028 | 386,243 | +30,785 | **3,785** (0.91%) | 1 |
+| [`0xc770332c…`](https://etherscan.io/tx/0xc770332c7e516902481cc309756988fbe452f58f89a1144713150fe083c1105e) | `forwardEigenPodCall` ✓ | 417,090 | 386,305 | +30,785 | **3,785** (0.91%) | 1 |
+| [`0x95fa2d07…`](https://etherscan.io/tx/0x95fa2d07b579aaac9fa7e0fbd3545bcdb408c197956e0b4e34b9b29fa0f1cd9c) | *rewards claim* | 108,528 | 81,086 | +27,442 | **442** (0.41%) | 5 |
+| [`0x6fa0fbbf…`](https://etherscan.io/tx/0x6fa0fbbf87072c3315c4801db2ac55a1e6c58b009d9ff07234e9c84b7a84801e) | *rewards claim* | 125,638 | 98,174 | +27,464 | **464** (0.37%) | 5 |
+| [`0x065a18a2…`](https://etherscan.io/tx/0x065a18a2af1e2d80514ad79067794b7c34e92ba2c2754c5cb7ddb5157eb111b8) | `queueWithdrawals` ✓ | 439,868 | 469,142 | -29,274 | 0 | 24 |
+| [`0x22b2c58c…`](https://etherscan.io/tx/0x22b2c58ced9f209d9ec2d21415436e9395067b377764d600927c8b54625f6d4f) | `startCheckpoint` ✓ | 76,444 | 52,517 | +23,927 | 0 | 4 |
+| [`0x5ce19358…`](https://etherscan.io/tx/0x5ce19358229301efda44bc79908632dfc69c1609477d52438c3cd9add6950792) | `completeQueuedWithdrawal` ✓ | 190,728 | 190,504 | +224 | 0 | 17 |
+| [`0xaa858fcd…`](https://etherscan.io/tx/0xaa858fcd781a6a5afa142ccd9a802d0df1e2f68292f0abf8546426cda3fe6644) | *rewards claim* | 156,150 | 135,165 | +20,985 | 0 | 8 |
+| [`0xe5de910b…`](https://etherscan.io/tx/0xe5de910bc96de735b7bc040855d99c5b565baa1de8e14c373af2febb5076d19b) | `completeQueuedWithdrawals` ✓ | 183,232 | 185,594 | -2,362 | 0 | 17 |
+| [`0xf09b9b69…`](https://etherscan.io/tx/0xf09b9b69b3640f7b018509045180218c1c7acff17eb665fbc40bb9ad2003ed0b) | `queueWithdrawals` ✓ | 440,373 | 471,942 | -31,569 | 0 | 24 |
+| [`0xfb18ffe1…`](https://etherscan.io/tx/0xfb18ffe1164630f6d3a2c818f28404fcdc1782103870eadeaea75aaa0de4f0b9) | `completeQueuedWithdrawals` ✓ | 186,142 | 188,312 | -2,170 | 0 | 17 |
+
+### The proof work is real but it sits on a fixed ceiling
+
+The five EigenPod checkpoint transactions have surpluses of **23,927 / 30,785 / 30,785 / 30,968 / 38,841** regardless of how much gas they burn (76,444 up to 417,090). That is a fixed cost — verifying beacon-chain Merkle proofs and BLS-adjacent balance checks — sitting just above the 27,000 floor. Four of five clear it, but only by 4,000–12,000 gas.
+
+Withdrawals go the other way. `queueWithdrawals` produces 24 state updates for a 440,000-gas transaction, so GasKiller costs **31,569 more** than the transaction did. Share accounting again: many writes, little compute.
+
+### Two more things
+
+- **The two biggest checkpoint proofs could not be measured** — ~3.4M gas and 85 KB of calldata, and the tool produces no output on traces that size. EigenLayer's real ceiling is therefore unknown, and probably above 5.15%.
+- **129 of 136 pod transactions in the scan window came through Ether.fi's `EtherFiNodesManager` (`0x8b71140a…`) via `forwardEigenPodCall`**, not from pod owners directly. So most EigenPod traffic already has a wrapper in front of it — the same routing problem that sinks Euler, arriving from a different direction.
 ## Limitations
 
 - **Opportunistic samples.** Railgun is the largest at 15 direct transactions from one 40,000-block window; the others are 7–20 transactions each. None is a systematic survey and none should be read as a population statistic.
