@@ -74,7 +74,7 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 | **Ondo** | 2.01% | 0% | mint/redeem via manager | 52 mint/burns in 60k blocks |
 | Chainlink | 0% | 0% | none — all traffic via forwarder | 0 of 242 direct |
 | Ethena | 0% | 0% | none — mint compute is ~14.5k, floor is 27k | 0 of 8 |
-| ZeroDev / ERC-4337 | 0% | 0% | none — EntryPoint hides all work in `innerHandleOp` | 0 of 8 |
+| ERC-4337 wallets | 0% | 0% | none — EntryPoint hides all work in `innerHandleOp` | 0 of 8 |
 | Panther | 0% | 0% | none — shielded pool is not on mainnet | 0 of 1 |
 
 ## What predicts a good candidate
@@ -312,9 +312,17 @@ Withdrawals go the other way. `queueWithdrawals` produces 24 state updates for a
 
 - **The two biggest checkpoint proofs could not be measured** — ~3.4M gas and 85 KB of calldata, and the tool produces no output on traces that size. EigenLayer's real ceiling is therefore unknown, and probably above 5.15%.
 - **129 of 136 pod transactions in the scan window came through Ether.fi's `EtherFiNodesManager` (`0x8b71140a…`) via `forwardEigenPodCall`**, not from pod owners directly. So most EigenPod traffic already has a wrapper in front of it — the same routing problem that sinks Euler, arriving from a different direction.
-## ZeroDev / ERC-4337 — the sharpest external-call case in the survey
+## ERC-4337 smart wallets — the sharpest external-call case in the survey
 
 Enormous volume, zero savings, and the reason is not fixable by a partnership.
+
+**Scope caveat.** These are transactions through the shared ERC-4337 EntryPoint, not
+transactions verified to belong to ZeroDev. The wallet vendor behind each userOp was not
+identified — four of six sampled accounts use non-ERC-1967 storage and none could be
+attributed to a vendor without a contract-label source. The finding is therefore about the
+4337 category as a whole, which is the level at which it matters: every smart-wallet vendor
+routes through this same EntryPoint, so the blocker applies to all of them regardless of brand.
+ZeroDev specifically has *not* been measured.
 
 EntryPoint v0.7 processed **23,336 userOps in 10,000 blocks** — the largest transaction
 pipeline measured anywhere in this survey. Eight `handleOps` transactions across

@@ -52,7 +52,7 @@ Best and typical figures use only properly measured runs, and exclude the two On
 | **Euler** | 8 | 1 | 1.31% | 1.31% | external calls (7), too many writes (3), under the floor (2) |
 | **Chainlink** | 8 | 0 | 0.00% | 0.00% | external calls (8) |
 | **Ethena** | 8 | 0 | 0.00% | 0.00% | under the floor (7), external calls (1) |
-| **ZeroDev / 4337** | 8 | 0 | 0.00% | 0.00% | external calls (8) |
+| **ERC-4337 wallets** | 8 | 0 | 0.00% | 0.00% | external calls (8) |
 | **Panther** | 1 | 0 | 0.00% | 0.00% | external calls (1), too many writes (1) |
 
 ## What actually predicts a win
@@ -270,14 +270,14 @@ A **✓** on a function name means I confirmed the 4-byte selector by hashing th
 
 Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many topics, `Cr` contract creation.
 
-| ZeroDev / 4337 | [`0xb752f16b…`](https://etherscan.io/tx/0xb752f16bd51240342af289dfffebd5276e28ec313eb12ba8bf4ad654794bd807) | `handleOps` | 1,103,781 | 1,124,914 | -21,133 | **0** (0.00%) | 0 | **external calls** | 8 (4S/1L1/3C) | EntryPoint self-call `innerHandleOp` hides all 1.1M gas |
-| ZeroDev / 4337 | [`0xc01499ee…`](https://etherscan.io/tx/0xc01499ee6820c815e202a36fe3f34ffa1447834e7599d2102e7f04e525d50da7) | `handleOps` | 207,188 | 218,651 | -11,463 | **0** (0.00%) | 0 | **external calls** | 8 (·/3C) |  |
-| ZeroDev / 4337 | [`0xf177394e…`](https://etherscan.io/tx/0xf177394e40b6e52101c309fa9be07aa66711250e6e981c996c2080324a1a9c89) | `handleOps` | 177,986 | 228,174 | -50,188 | **0** (0.00%) | 0 | **external calls** | 9 (·/4C) |  |
-| ZeroDev / 4337 | [`0xe64e4eb1…`](https://etherscan.io/tx/0xe64e4eb1fc3306f4eb081b65fc8b3bdf3e2e21c7478980fa9c13aa70540e8e2b) | `handleOps` | 177,986 | 159,895 | +18,091 | **0** (0.00%) | 0 | **external calls** | 9 (·/4C) |  |
-| ZeroDev / 4337 | [`0x92f6ec5b…`](https://etherscan.io/tx/0x92f6ec5bede29c44849b7bd1f12f86ff4965022525ada840029eaa676c4ceedb) | `handleOps` | 165,688 | 207,785 | -42,097 | **0** (0.00%) | 0 | **external calls** | 9 (·/4C) | EntryPoint v0.6 |
-| ZeroDev / 4337 | [`0x3923cd22…`](https://etherscan.io/tx/0x3923cd2290d14e7c53073cc4422374369e77630118514ce8086bd0865b8db121) | `handleOps` | 155,664 | 142,542 | +13,122 | **0** (0.00%) | 0 | **external calls** | 9 (·/4C) | EntryPoint v0.6 |
-| ZeroDev / 4337 | [`0x773e691e…`](https://etherscan.io/tx/0x773e691ea71b9e0b99e8599fa29e9ea9097c73de92e66d25bad564f17a264dad) | `handleOps` | 145,170 | 183,888 | -38,718 | **0** (0.00%) | 0 | **external calls** | 9 (·/4C) | EntryPoint v0.6 |
-| ZeroDev / 4337 | [`0xf6f4f754…`](https://etherscan.io/tx/0xf6f4f754fe0c122c846a559467e388ed0241da15f4252e5a8169c0a4aaed745a) | `handleOps` | 119,160 | 112,774 | +6,386 | **0** (0.00%) | 0 | **external calls** | 8 (·/3C) | EntryPoint v0.6 |
+| ERC-4337 wallets | [`0xb752f16b…`](https://etherscan.io/tx/0xb752f16bd51240342af289dfffebd5276e28ec313eb12ba8bf4ad654794bd807) | `handleOps` | 1,103,781 | 1,124,914 | -21,133 | **0** (0.00%) | 0 | **external calls** | 8 (4S/1L1/3C) | EntryPoint self-call `innerHandleOp` hides all 1.1M gas |
+| ERC-4337 wallets | [`0xc01499ee…`](https://etherscan.io/tx/0xc01499ee6820c815e202a36fe3f34ffa1447834e7599d2102e7f04e525d50da7) | `handleOps` | 207,188 | 218,651 | -11,463 | **0** (0.00%) | 0 | **external calls** | 8 (·/3C) |  |
+| ERC-4337 wallets | [`0xf177394e…`](https://etherscan.io/tx/0xf177394e40b6e52101c309fa9be07aa66711250e6e981c996c2080324a1a9c89) | `handleOps` | 177,986 | 228,174 | -50,188 | **0** (0.00%) | 0 | **external calls** | 9 (·/4C) |  |
+| ERC-4337 wallets | [`0xe64e4eb1…`](https://etherscan.io/tx/0xe64e4eb1fc3306f4eb081b65fc8b3bdf3e2e21c7478980fa9c13aa70540e8e2b) | `handleOps` | 177,986 | 159,895 | +18,091 | **0** (0.00%) | 0 | **external calls** | 9 (·/4C) |  |
+| ERC-4337 wallets | [`0x92f6ec5b…`](https://etherscan.io/tx/0x92f6ec5bede29c44849b7bd1f12f86ff4965022525ada840029eaa676c4ceedb) | `handleOps` | 165,688 | 207,785 | -42,097 | **0** (0.00%) | 0 | **external calls** | 9 (·/4C) | EntryPoint v0.6 |
+| ERC-4337 wallets | [`0x3923cd22…`](https://etherscan.io/tx/0x3923cd2290d14e7c53073cc4422374369e77630118514ce8086bd0865b8db121) | `handleOps` | 155,664 | 142,542 | +13,122 | **0** (0.00%) | 0 | **external calls** | 9 (·/4C) | EntryPoint v0.6 |
+| ERC-4337 wallets | [`0x773e691e…`](https://etherscan.io/tx/0x773e691ea71b9e0b99e8599fa29e9ea9097c73de92e66d25bad564f17a264dad) | `handleOps` | 145,170 | 183,888 | -38,718 | **0** (0.00%) | 0 | **external calls** | 9 (·/4C) | EntryPoint v0.6 |
+| ERC-4337 wallets | [`0xf6f4f754…`](https://etherscan.io/tx/0xf6f4f754fe0c122c846a559467e388ed0241da15f4252e5a8169c0a4aaed745a) | `handleOps` | 119,160 | 112,774 | +6,386 | **0** (0.00%) | 0 | **external calls** | 8 (·/3C) | EntryPoint v0.6 |
 | Ethena | [`0xe6f15a94…`](https://etherscan.io/tx/0xe6f15a94892f1ec9a52263ba0a8869c081db57bc9c48558b31e9cc1e3609e126) | *mint* `0x96eea750` | 205,401 | 190,844 | +14,557 | **0** (0.00%) | 0 | under the floor | 8 (4S/1L4/2C) |  |
 | Ethena | [`0xba225f3e…`](https://etherscan.io/tx/0xba225f3ef9ad52f911771e967f5e81e83fc0cdebe5eb1cd996012e4aa543ef21) | *mint* `0x96eea750` | 202,207 | 187,626 | +14,581 | **0** (0.00%) | 0 | under the floor | 8 (4S/1L4/2C) |  |
 | Ethena | [`0xe67e1c84…`](https://etherscan.io/tx/0xe67e1c8420c330116b81cb6e9bd73d5016058267d390701dd8fab89e592877d0) | *mint* `0x96eea750` | 202,195 | 187,602 | +14,593 | **0** (0.00%) | 0 | under the floor | 8 (4S/1L4/2C) |  |
