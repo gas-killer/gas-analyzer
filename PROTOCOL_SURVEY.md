@@ -73,6 +73,9 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 | **Euler** | 1.31% | 0% | none — EVC router mandatory | **0 of 191 direct** |
 | **Ondo** | 2.01% | 0% | mint/redeem via manager | 52 mint/burns in 60k blocks |
 | Chainlink | 0% | 0% | none — all traffic via forwarder | 0 of 242 direct |
+| Ethena | 0% | 0% | none — mint compute is ~14.5k, floor is 27k | 0 of 8 |
+| ZeroDev / ERC-4337 | 0% | 0% | none — EntryPoint hides all work in `innerHandleOp` | 0 of 8 |
+| Panther | 0% | 0% | none — shielded pool is not on mainnet | 0 of 1 |
 
 ## What predicts a good candidate
 
@@ -309,6 +312,91 @@ Withdrawals go the other way. `queueWithdrawals` produces 24 state updates for a
 
 - **The two biggest checkpoint proofs could not be measured** — ~3.4M gas and 85 KB of calldata, and the tool produces no output on traces that size. EigenLayer's real ceiling is therefore unknown, and probably above 5.15%.
 - **129 of 136 pod transactions in the scan window came through Ether.fi's `EtherFiNodesManager` (`0x8b71140a…`) via `forwardEigenPodCall`**, not from pod owners directly. So most EigenPod traffic already has a wrapper in front of it — the same routing problem that sinks Euler, arriving from a different direction.
+## ZeroDev / ERC-4337 — the sharpest external-call case in the survey
+
+Enormous volume, zero savings, and the reason is not fixable by a partnership.
+
+EntryPoint v0.7 processed **23,336 userOps in 10,000 blocks** — the largest transaction
+pipeline measured anywhere in this survey. Eight `handleOps` transactions across
+EntryPoint v0.6 and v0.7 were measured. Every one returned **0%**, and in six of the
+eight the GasKiller base estimate *exceeded* the gas the transaction actually used.
+
+| tx | gas used | base estimate | surplus | updates | calls | Schnorr |
+|---|---:|---:|---:|---:|---:|---:|
+| `0xb752f16bd51240342af289dfffebd5276e28ec313eb12ba8bf4ad654794bd807` | 1,103,781 | 1,124,914 | −21,133 | 8 | 3 | 0% |
+| `0xc01499ee6820c815e202a36fe3f34ffa1447834e7599d2102e7f04e525d50da7` | 207,188 | 218,651 | −11,463 | 8 | 3 | 0% |
+| `0xe64e4eb1fc3306f4eb081b65fc8b3bdf3e2e21c7478980fa9c13aa70540e8e2b` | 177,986 | 159,895 | 18,091 | 9 | 4 | 0% |
+| `0xf177394e40b6e52101c309fa9be07aa66711250e6e981c996c2080324a1a9c89` | 177,986 | 228,174 | −50,188 | 9 | 4 | 0% |
+| `0x92f6ec5bede29c44849b7bd1f12f86ff4965022525ada840029eaa676c4ceedb` | 165,688 | 207,785 | −42,097 | 9 | 4 | 0% |
+| `0x3923cd2290d14e7c53073cc4422374369e77630118514ce8086bd0865b8db121` | 155,664 | 142,542 | 13,122 | 9 | 4 | 0% |
+| `0x773e691ea71b9e0b99e8599fa29e9ea9097c73de92e66d25bad564f17a264dad` | 145,170 | 183,888 | −38,718 | 9 | 4 | 0% |
+| `0xf6f4f754fe0c122c846a559467e388ed0241da15f4252e5a8169c0a4aaed745a` | 119,160 | 112,774 | 6,386 | 8 | 3 | 0% |
+
+The 1.1M-gas transaction is the clearest illustration. The whole of it reduces to eight
+state updates — three stores, one log, and three calls:
+
+1. `0x19822f7c` `validateUserOp` → into the user's smart account
+2. `0x0042dc53` `innerHandleOp` → **EntryPoint calling itself**
+3. an empty-calldata value transfer paying the bundler
+
+Every bit of the work the user paid 1.1M gas for happens inside `innerHandleOp`.
+`trace.rs:255` drops the frame, so the co-processor must replay it whole, and the base
+estimate lands *above* the original cost.
+
+This is a stronger example than anything in `CALL_BLOCKED_CANDIDATES.md`, and it belongs
+in the design conversation for a different reason than the others: EntryPoint does not
+merely call *another* protocol's contract — it calls **itself**, and that self-call is
+where 100% of the value sits. A design that follows calls into counterparties that have
+also integrated GasKiller does not automatically solve this; the recursion is internal.
+
+It is also the one case in the survey with no commercial path. EntryPoint is immutable,
+shared, unowned infrastructure. ZeroDev cannot change it, and neither can a customer.
+
+## Ethena — no hidden compute, just not enough of it
+
+Eight transactions, all **0%**, but the failure mode is the opposite of ZeroDev's and is
+worth separating.
+
+`EthenaMinting.mint` (`0x96eea750`, selector unverified) reduces to four storage writes,
+one `Log4`, and two calls — a USDT `transferFrom` (`0x23b872dd`) and a USDe `mint`
+(`0x40c10f19`). Both calls are plain ERC-20 operations. Nothing large is hiding inside
+them, which means the measured surplus really is the protocol's own compute: the EIP-712
+signature check over the signed order, plus order bookkeeping.
+
+That surplus is strikingly consistent across five mints — 14,545 / 14,557 / 14,581 /
+14,593 / 14,593 — and it is **just over half the 27,000 Schnorr floor**. Ethena is not
+blocked by external calls or by write-heaviness. It simply does not do enough work.
+
+| tx | function | gas used | base estimate | surplus | Schnorr |
+|---|---|---:|---:|---:|---:|
+| `0x1c4c1779b4b03b196c1e2891be88fb9771f33931fc356597ae5be7f54433b264` | *mint* | 200,589 | 186,044 | 14,545 | 0% |
+| `0xe67e1c8420c330116b81cb6e9bd73d5016058267d390701dd8fab89e592877d0` | *mint* | 202,195 | 187,602 | 14,593 | 0% |
+| `0xe6f15a94892f1ec9a52263ba0a8869c081db57bc9c48558b31e9cc1e3609e126` | *mint* | 205,401 | 190,844 | 14,557 | 0% |
+| `0xba225f3ef9ad52f911771e967f5e81e83fc0cdebe5eb1cd996012e4aa543ef21` | *mint* | 202,207 | 187,626 | 14,581 | 0% |
+| `0xcfea9cfa79f814a7ff93a431c56dde3b9feeb10a86e8dde41c00ce3adf6d7ec2` | *mint* | 185,047 | 170,454 | 14,593 | 0% |
+| `0x7a4241aa594bf958bdb4c5fa93ef04a12f6cc1f6b854584000349f75c809b11d` | `cooldownShares` | 72,371 | 65,909 | 6,462 | 0% |
+| `0x20437c4593fc6e80acdd78578e134c336cc0a1f827e56cb36a18e8becb5d62e0` | sUSDe | 84,342 | 83,451 | 891 | 0% |
+| `0x9786d142e2a872dda2f8af0c108635e8f638b9779b62170fd8692eb3ed633632` | sUSDe | 407,179 | 409,604 | −2,425 | 0% |
+
+`cooldownShares(uint256)` = `0x9343d9e1`, verified by keccak. The `mint` selector could not
+be matched against any candidate signature tried and is left unverified rather than guessed.
+
+## Panther — the target is not on this chain
+
+Panther's MASP runs on Polygon. On Ethereum mainnet only the ZKP token is live, and its
+traffic is overwhelmingly bridge deposits (`0xe3dec8fb` to the Polygon PoS bridge) and
+router swaps — that is, the token *leaving* for the chain where the protocol actually runs.
+
+Across 200,000 blocks (~27 days): the staking contract
+`0xf4d06d72dACdD8393FA4eA72FdcC10049711F899` saw **one** transaction and RewardMaster
+`0x347a58878D04951588741d4d16d54B742c7f60fC` saw **none**.
+
+That single transaction (`0x63338b98cb3c6bf3390a7f7dcb84e25766424b7a1c6444b4b1b3c89f9059d134`,
+selector `0x7f678334`) measured **0%** — 207,193 gas used against a 226,374 base estimate,
+from eight storage writes, one `Log3`, and two calls. Staking bookkeeping, no computation.
+
+Not a technology-fit failure. There is simply nothing on mainnet to target.
+
 ## Limitations
 
 - **Opportunistic samples.** Railgun is the largest at 15 direct transactions from one 40,000-block window; the others are 7–20 transactions each. None is a systematic survey and none should be read as a population statistic.
