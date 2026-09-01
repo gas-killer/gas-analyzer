@@ -74,7 +74,7 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 | **Ondo** | 2.01% | 0% | mint/redeem via manager | 52 mint/burns in 60k blocks |
 | Chainlink | 0% | 0% | none — all traffic via forwarder | 0 of 242 direct |
 | Ethena | 8.99% | 0% | one 900-byte mint order | **1 of 309 mints (0.3%)** |
-| ERC-4337 wallets | 0% | 0% | none — EntryPoint hides all work in `innerHandleOp` | 0 of 8 |
+| ERC-4337 EntryPoint | *86.54%?* | *60%?* | **suspect — likely estimator false positive** | 2 of 8 measured |
 | Panther | 0% | 0% | none — shielded pool is not on mainnet | 0 of 1 |
 
 ## What predicts a good candidate
@@ -312,53 +312,71 @@ Withdrawals go the other way. `queueWithdrawals` produces 24 state updates for a
 
 - **The two biggest checkpoint proofs could not be measured** — ~3.4M gas and 85 KB of calldata, and the tool produces no output on traces that size. EigenLayer's real ceiling is therefore unknown, and probably above 5.15%.
 - **129 of 136 pod transactions in the scan window came through Ether.fi's `EtherFiNodesManager` (`0x8b71140a…`) via `forwardEigenPodCall`**, not from pod owners directly. So most EigenPod traffic already has a wrapper in front of it — the same routing problem that sinks Euler, arriving from a different direction.
-## ERC-4337 smart wallets — the sharpest external-call case in the survey
+## ERC-4337 EntryPoint — a likely false-positive in the analyzer
 
-Enormous volume, zero savings, and the reason is not fixable by a partnership.
+**This section replaces an earlier conclusion that was wrong.** An initial run of eight
+`handleOps` transactions reported 0% across the board and was written up as a structural
+blocker. Most of those runs were heuristic fallbacks caused by RPC rate limiting. On clean
+re-measurement the picture inverted, and what it exposes is a probable defect in the
+estimator rather than a verdict on the protocol.
 
-**Scope caveat.** These are transactions through the shared ERC-4337 EntryPoint, not
-transactions verified to belong to ZeroDev. The wallet vendor behind each userOp was not
-identified — four of six sampled accounts use non-ERC-1967 storage and none could be
-attributed to a vendor without a contract-label source. The finding is therefore about the
-4337 category as a whole, which is the level at which it matters: every smart-wallet vendor
-routes through this same EntryPoint, so the blocker applies to all of them regardless of brand.
-ZeroDev specifically has *not* been measured.
+**Scope caveat.** These are transactions to the shared ERC-4337 EntryPoint
+(`0x0000000071727De22E5E9d8BAf0edAc6f37da032` v0.7,
+`0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789` v0.6). The wallet vendor behind each userOp
+was never identified. ZeroDev specifically has **not** been measured.
 
-EntryPoint v0.7 processed **23,336 userOps in 10,000 blocks** — the largest transaction
-pipeline measured anywhere in this survey. Eight `handleOps` transactions across
-EntryPoint v0.6 and v0.7 were measured. Every one returned **0%**, and in six of the
-eight the GasKiller base estimate *exceeded* the gas the transaction actually used.
+### The measurements
 
-| tx | gas used | base estimate | surplus | updates | calls | Schnorr |
-|---|---:|---:|---:|---:|---:|---:|
-| `0xb752f16bd51240342af289dfffebd5276e28ec313eb12ba8bf4ad654794bd807` | 1,103,781 | 1,124,914 | −21,133 | 8 | 3 | 0% |
-| `0xc01499ee6820c815e202a36fe3f34ffa1447834e7599d2102e7f04e525d50da7` | 207,188 | 218,651 | −11,463 | 8 | 3 | 0% |
-| `0xe64e4eb1fc3306f4eb081b65fc8b3bdf3e2e21c7478980fa9c13aa70540e8e2b` | 177,986 | 159,895 | 18,091 | 9 | 4 | 0% |
-| `0xf177394e40b6e52101c309fa9be07aa66711250e6e981c996c2080324a1a9c89` | 177,986 | 228,174 | −50,188 | 9 | 4 | 0% |
-| `0x92f6ec5bede29c44849b7bd1f12f86ff4965022525ada840029eaa676c4ceedb` | 165,688 | 207,785 | −42,097 | 9 | 4 | 0% |
-| `0x3923cd2290d14e7c53073cc4422374369e77630118514ce8086bd0865b8db121` | 155,664 | 142,542 | 13,122 | 9 | 4 | 0% |
-| `0x773e691ea71b9e0b99e8599fa29e9ea9097c73de92e66d25bad564f17a264dad` | 145,170 | 183,888 | −38,718 | 9 | 4 | 0% |
-| `0xf6f4f754fe0c122c846a559467e388ed0241da15f4252e5a8169c0a4aaed745a` | 119,160 | 112,774 | 6,386 | 8 | 3 | 0% |
+Cleanly measured, zero rate-limit errors:
 
-The 1.1M-gas transaction is the clearest illustration. The whole of it reduces to eight
-state updates — three stores, one log, and three calls:
+| tx | gas used | base estimate | Schnorr | updates |
+|---|---:|---:|---:|---:|
+| `0x030b4fd3776594fc57df6451e83b61e916554227a0c7208f2f6a039f9a2bc312` | 1,694,622 | **201,100** | **86.54%** | 8 (3C) |
+| `0xb752f16bd51240342af289dfffebd5276e28ec313eb12ba8bf4ad654794bd807` | 1,103,781 | **186,440** | **80.66%** | 8 (3C) |
+| `0x112f2b10d8e6fc37032a3103957c8324db6cee480bf030da56bbbcc5bec5816e` | 2,137,036 | 2,205,725 | 0% | 8 (3C) |
+| `0x989497784755fae4ffaefe945aa8309269455dc966784e3d0a8a8224cf5c27a4` | 1,141,959 | 1,208,050 | 0% | 8 (3C) |
+| `0xe64e4eb1fc3306f4eb081b65fc8b3bdf3e2e21c7478980fa9c13aa70540e8e2b` | 177,986 | 228,198 | 0% | 9 (4C) |
+| `0xf177394e40b6e52101c309fa9be07aa66711250e6e981c996c2080324a1a9c89` | 177,986 | 228,174 | 0% | 9 (4C) |
+| `0x92f6ec5bede29c44849b7bd1f12f86ff4965022525ada840029eaa676c4ceedb` | 165,688 | 207,785 | 0% | 9 (4C) |
+| `0x773e691ea71b9e0b99e8599fa29e9ea9097c73de92e66d25bad564f17a264dad` | 145,170 | 183,888 | 0% | 9 (4C) |
 
-1. `0x19822f7c` `validateUserOp` → into the user's smart account
-2. `0x0042dc53` `innerHandleOp` → **EntryPoint calling itself**
-3. an empty-calldata value transfer paying the bundler
+`0xb752f16b…` was measured twice in independent runs and returned a base of **186,440 both
+times** — the result is deterministic, not flaky.
 
-Every bit of the work the user paid 1.1M gas for happens inside `innerHandleOp`.
-`trace.rs:255` drops the frame, so the co-processor must replay it whole, and the base
-estimate lands *above* the original cost.
+### Why the two 80%+ results should not be trusted
 
-This is a stronger example than anything in `CALL_BLOCKED_CANDIDATES.md`, and it belongs
-in the design conversation for a different reason than the others: EntryPoint does not
-merely call *another* protocol's contract — it calls **itself**, and that self-call is
-where 100% of the value sits. A design that follows calls into counterparties that have
-also integrated GasKiller does not automatically solve this; the recursion is internal.
+`0x030b4fd3…` (86.54%) and `0x112f2b10…` (0%) are **structurally identical**: eight state
+updates each, same ordering, same three calls, same selectors — `0x19822f7c`
+(`validateUserOp`) into the smart account and `0x0042dc53` (`innerHandleOp`) back into
+EntryPoint. Same shape, same protocol, same code path.
 
-It is also the one case in the survey with no commercial path. EntryPoint is immutable,
-shared, unowned infrastructure. ZeroDev cannot change it, and neither can a customer.
+Yet one replays for 201,100 gas and the other for 2,205,725. A **10x divergence between
+transactions with no structural difference** is not a property of the workload. It means
+the replay is not doing the same work in both cases.
+
+The most likely explanation is EntryPoint's own error handling. EntryPoint is *designed*
+to catch a failing userOp rather than revert — it emits `UserOperationRevertReason` and
+continues. During replay the state updates are applied before `innerHandleOp` runs, so the
+userOp's inner execution can fail on already-consumed nonces or already-moved balances.
+EntryPoint swallows that failure and returns successfully and cheaply. The estimator sees a
+successful call and a small gas number, and records a large apparent saving.
+
+If that is right, the implication is general and matters well beyond 4337: **any contract
+that try/catches internally can produce a false saving under this estimator**, because a
+silently-caught failure during replay is indistinguishable from cheap success. Nothing in
+the current output flags it — no revert is reported, and the run is labelled
+`measured via StateChangeHandler`.
+
+This is unresolved. It needs someone with the estimator internals to confirm or refute,
+and it should be treated as a **known-suspect result**, not as an 86% win to take to a
+customer.
+
+### What still holds
+
+EntryPoint is immutable, shared, unowned infrastructure. Even if the savings were real,
+there is no counterparty who can integrate it — not ZeroDev, not any wallet vendor, not a
+customer. Volume is genuine (23,336 userOps in 10,000 blocks on v0.7) but unreachable
+commercially.
 
 ## Ethena — one win in 309, and a lesson about the tool
 
