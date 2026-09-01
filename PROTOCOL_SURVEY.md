@@ -70,6 +70,7 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 | Morpho | 2.60% | 0% | bundler multicall reallocation | marginal |
 | Safe | 9.99% | 0% | 5-signature execTransaction | 2 of 565 (0.4%) |
 | **Euler** | 1.31% | 0% | none — EVC router mandatory | **0 of 191 direct** |
+| **Ondo** | 2.01% | 0% | mint/redeem via manager | 52 mint/burns in 60k blocks |
 | Chainlink | 0% | 0% | none — all traffic via forwarder | 0 of 242 direct |
 
 ## What predicts a good candidate
@@ -246,6 +247,37 @@ Two further observations:
 - **Size does not help.** `0x7d1e2345…` burns 2,701,108 gas and yields a 7-update diff with +17,630 surplus. Everything is inside calls.
 
 Three transactions could not be measured: one rate-limited, two reverting reproducibly at a WETH call (`0xC02aaA39…`) during replay on all 3 attempts each.
+## Ondo — weak, and the volume is thin
+
+8 transactions measured, all trace-based. Genuine Ondo mint/redeem operations land at **1.08–2.01%**.
+
+| tx | what it is | gas used | GasKiller cost | Schnorr saved |
+|---|---|---:|---:|---:|
+| [`0x10fdab16…`](https://etherscan.io/tx/0x10fdab165e2a37d70223b9546f80e9f7a248e1a0ccacd6638bbc66d565de8c35) | mint/redeem via manager | 350,502 | 316,467 | **7,035** (2.01%) |
+| [`0x089be390…`](https://etherscan.io/tx/0x089be390aab1f47562520e714e3d96b270c279b0c2a7b2876c933ee390a264b0) | mint/redeem via manager | 447,366 | 413,235 | **7,131** (1.59%) |
+| [`0x23ac6eda…`](https://etherscan.io/tx/0x23ac6eda7ddb46309b5d61628b5f24ced1b1c1cb608470d451f6dfb869fc6242) | mint/redeem via manager | 432,419 | 400,729 | **4,690** (1.08%) |
+| [`0xd8ea9b21…`](https://etherscan.io/tx/0xd8ea9b2158d7bf3407ea618ad07e3f7debc096076e108f6c166ca9fa53e9ec37) | via CowSwap settlement | 519,037 | 542,092 | 0 |
+| [`0xfccb2eda…`](https://etherscan.io/tx/0xfccb2eda50342893f6f1e93b0fb08df57dff595d17ac74414a688d1bfe3aaa78) | third-party | 819,503 | 843,764 | 0 |
+| [`0xe16fb5bc…`](https://etherscan.io/tx/0xe16fb5bcb8d2d4d2a2a9d3c7b92d7388e8e8af784f771d3bd0f3250daeb54e42) | third-party, 153 logs | 3,611,533 | 3,660,592 | 0 |
+
+### Two results excluded as false attributions
+
+Two transactions in the sample scored higher but **are not Ondo operations** and are excluded from the protocol's figure:
+
+| tx | apparent | why excluded |
+|---|---:|---|
+| [`0x4551339c…`](https://etherscan.io/tx/0x4551339cc87aabe9c57e492856f0af4c5cc00666be7bbfbd00ee8117d6b2327c) | 13.37% | MEV/arb bot entering through a 133-byte contract; only **4 of 31 logs** are Ondo tokens, across 10 contracts |
+| [`0x197c9a14…`](https://etherscan.io/tx/0x197c9a14ed634444154e66fb75bfa167b874dfbba78b463c62f5b390063c8965) | 1.64% | aggregator; only **5 of 190 logs** are Ondo tokens, across 25 contracts |
+
+Their savings come from the bot's own routing work, not from anything Ondo does. Counting them would inflate Ondo to 13.37% on the strength of a transaction that merely touches USDY in passing. Worth noting as a general hazard when a protocol is discovered by token-log scanning: large third-party transactions incidentally touch the token and can dominate a small sample.
+
+### Why it is weak
+
+**Compliance checks are storage reads, not computation.** A tokenised-treasury mint is an allowlist lookup plus a mint — a handful of `SLOAD`s and 2–3 writes. The longlist anticipated "compliance logic" as heavy compute; it is not. This is the same reason the longlist itself correctly flags EAS as a weak fit: the write *is* the payload, with little surrounding computation to strip.
+
+**Volume is thin.** 302 USDY transactions in a 60,000-block window (~8 days), of which 52 involve a mint or burn; OUSG had **8 transactions in total**. Even at a good percentage the absolute gas is orders of magnitude below Aave or Railgun.
+
+On this evidence the RWA category looks unpromising as a whole — Midas, Centrifuge, Maple and Backed share the mint/redeem-plus-allowlist shape that produced 1–2% here.
 ## Limitations
 
 - **Opportunistic samples.** Railgun is the largest at 15 direct transactions from one 40,000-block window; the others are 7–20 transactions each. None is a systematic survey and none should be read as a population statistic.
