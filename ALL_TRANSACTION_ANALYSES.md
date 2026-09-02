@@ -1,6 +1,6 @@
 # Every transaction analysed, in one place
 
-184 Ethereum mainnet transactions across 15 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Five more could not be run at all; they are listed at the end.
+197 Ethereum mainnet transactions across 16 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Five more could not be run at all; they are listed at the end.
 
 Every number in the tables is the tool's own output. Nothing here is modelled or extrapolated.
 
@@ -51,6 +51,7 @@ Best and typical figures use only properly measured runs, and exclude the two On
 | **Ondo** | 8 | 3 | 2.01% | 1.59% | external calls (3), too many writes (1) |
 | **Euler** | 8 | 1 | 1.31% | 1.31% | external calls (7), too many writes (3), under the floor (2) |
 | **Chainlink** | 8 | 0 | 0.00% | 0.00% | external calls (8) |
+| **Lido** | 13 | 2 | 1.13% | 1.13% | too many writes (10), under the floor (1) |
 | **Ethena** | 22 | 1 | 8.99% | 8.99% | under the floor (15), external calls (6) |
 | **ERC-4337 EntryPoint** | 8 | 2 *(suspect)* | *86.54%* | *83.60%* | external calls (6); the 2 wins are likely estimator artifacts |
 | **Panther** | 1 | 0 | 0.00% | 0.00% | external calls (1), too many writes (1) |
@@ -331,6 +332,20 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | ERC-4337 EntryPoint | [`0xf177394e…`](https://etherscan.io/tx/0xf177394e40b6e52101c309fa9be07aa66711250e6e981c996c2080324a1a9c89) | `handleOps` | 177,986 | 228,174 | -50,188 | **0** (0.00%) | — | **external calls** | — |  |
 | ERC-4337 EntryPoint | [`0x92f6ec5b…`](https://etherscan.io/tx/0x92f6ec5bede29c44849b7bd1f12f86ff4965022525ada840029eaa676c4ceedb) | `handleOps` | 165,688 | 207,785 | -42,097 | **0** (0.00%) | — | **external calls** | — | EntryPoint v0.6 |
 | ERC-4337 EntryPoint | [`0x773e691e…`](https://etherscan.io/tx/0x773e691ea71b9e0b99e8599fa29e9ea9097c73de92e66d25bad564f17a264dad) | `handleOps` | 145,170 | 183,888 | -38,718 | **0** (0.00%) | — | **external calls** | — | EntryPoint v0.6 |
+
+| Lido | [`0x69d40f3d…`](https://etherscan.io/tx/0x69d40f3d0e599963cd619a61cbf60a1c3e847e9f2f87796a139561b53cec4424) | `addSigningKeysOperatorBH` ✓ `0x805911ae` | 5,887,344 | 6,739,086 | -851,742 | **0** (0.00%) | 0 | too many writes | 306 (·/1C) | largest tx in survey; 306 writes |
+| Lido | [`0x21fa690f…`](https://etherscan.io/tx/0x21fa690fbbbbefec96c3fb533b2e0b6a275e9f0bad3fa7f6c71ccec9de398461) | `addSigningKeysOperatorBH` ✓ `0x805911ae` | 5,887,248 | 6,739,014 | -851,766 | **0** (0.00%) | 0 | too many writes | 306 (·/1C) |  |
+| Lido | [`0xf9a0c484…`](https://etherscan.io/tx/0xf9a0c48463e92a01347aadfefbf9349ec72858550a8fa162e894f61e9e99a499) | *oracle report* `0x11a78d23` | 1,729,395 | 1,682,837 | +46,558 | **19,558** (1.13%) | 0 | — | 9 (·/4C) | only Lido function that pays |
+| Lido | [`0x1bad3438…`](https://etherscan.io/tx/0x1bad343834044681f393485bcf131863801ff082da4fe24a2095629a7332d517) | *oracle report* `0x11a78d23` | 1,721,688 | 1,675,339 | +46,349 | **19,349** (1.12%) | 0 | — | 9 (·/4C) |  |
+| Lido | [`0x341d60b7…`](https://etherscan.io/tx/0x341d60b7870a57c2fa6d31a6935bfa143f0cff41685fa038661fd8721e7b4a92) | *registry* `0x8f73c5ae` | 978,934 | 1,038,649 | -59,715 | **0** (0.00%) | 0 | too many writes | 73 (·/37C) |  |
+| Lido | [`0x0df2c733…`](https://etherscan.io/tx/0x0df2c7332dd34a84ee404631b5431648ecce7e791ddb93f37c3fd9a3ce7206c9) | *registry* `0x8f73c5ae` | 978,934 | 1,038,632 | -59,698 | **0** (0.00%) | 0 | too many writes | 73 (·/37C) | heuristic first claimed 25.84% |
+| Lido | [`0x6e2453d1…`](https://etherscan.io/tx/0x6e2453d1b4b55a31ffb9fd94b38a6475c6fc68727e83edbc30078829274b4446) | `claimWithdrawals` ✓ `0xacf41e4d` | 261,492 | 275,614 | -14,122 | **0** (0.00%) | 0 | too many writes | 10 (·/2C) |  |
+| Lido | [`0xdfbaead0…`](https://etherscan.io/tx/0xdfbaead0d3c07378a6265a5093d029987518e7c75ede86ceb7b41d7f6fead305) | `claimWithdrawals` ✓ `0xacf41e4d` | 261,468 | 275,626 | -14,158 | **0** (0.00%) | 0 | too many writes | 10 (·/2C) |  |
+| Lido | [`0x07dfd955…`](https://etherscan.io/tx/0x07dfd9551205d17c73cd997e2ccf76708f60eae947999636a7e96b5f45f908f2) | *wstETH withdrawal* `0x7951b76f` | 258,886 | 276,945 | -18,059 | **0** (0.00%) | 0 | too many writes | 11 (·/3C) |  |
+| Lido | [`0x8af05a00…`](https://etherscan.io/tx/0x8af05a00ef89fdbc3c3cd246e5274c935f7a45869cba96ebbfd1aaea451db50f) | `requestWithdrawals` ✓ `0xd6681042` | 215,719 | 225,836 | -10,117 | **0** (0.00%) | 0 | too many writes | 9 (·/1C) |  |
+| Lido | [`0x954e6c05…`](https://etherscan.io/tx/0x954e6c05327ab8ac475eb27d646450b600826ed279ca5c99ca3ab90e1f953177) | `requestWithdrawals` ✓ `0xd6681042` | 215,683 | 225,752 | -10,069 | **0** (0.00%) | 0 | too many writes | 9 (·/1C) |  |
+| Lido | [`0x9f518648…`](https://etherscan.io/tx/0x9f51864813f2f5744a5114d7345653ef2c1b8d87b9e479317020a14153e9b490) | `claimWithdrawals` ✓ `0xe3afe0a3` | 131,269 | 171,727 | -40,458 | **0** (0.00%) | 0 | too many writes | 26 (·/3C) |  |
+| Lido | [`0x076a9688…`](https://etherscan.io/tx/0x076a9688c14bf3e1af823eb525fe3243176492d5c246567cbe6b5680bdef7844) | `claimWithdrawals` ✓ `0xe3afe0a3` | 81,977 | 80,590 | +1,387 | **0** (0.00%) | 0 | under the floor | 8 (·/1C) |  |
 
 ## Transactions that could not be measured at all
 

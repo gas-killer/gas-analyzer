@@ -73,6 +73,7 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 | **Euler** | 1.31% | 0% | none — EVC router mandatory | **0 of 191 direct** |
 | **Ondo** | 2.01% | 0% | mint/redeem via manager | 52 mint/burns in 60k blocks |
 | Chainlink | 0% | 0% | none — all traffic via forwarder | 0 of 242 direct |
+| Lido | 1.13% | 0% | daily oracle report only | 2 of 13 |
 | Ethena | 8.99% | 0% | one 900-byte mint order | **1 of 309 mints (0.3%)** |
 | ERC-4337 EntryPoint | *86.54%?* | *60%?* | **suspect — likely estimator false positive** | 2 of 8 measured |
 | Panther | 0% | 0% | none — shielded pool is not on mainnet | 0 of 1 |
@@ -471,6 +472,72 @@ selector `0x7f678334`) measured **0%** — 207,193 gas used against a 226,374 ba
 from eight storage writes, one `Log3`, and two calls. Staking bookkeeping, no computation.
 
 Not a technology-fit failure. There is simply nothing on mainnet to target.
+
+## Lido — the biggest transactions in the survey, and almost all bookkeeping
+
+**13 transactions, all measured cleanly (zero heuristic fallbacks). Best result: 1.13%.**
+
+Lido was the last plausible source of heavy per-transaction math on the longlist, and it
+has by far the largest transactions and the highest volume measured anywhere here. It is
+still a no, and the reason is clean enough to be useful as a rule.
+
+### The 5.9M gas transaction is a write, not a computation
+
+`addSigningKeysOperatorBH(uint256,uint256,bytes,bytes)` (`0x805911ae`, keccak-verified) on
+NodeOperatorsRegistry `0x55032650b14df07b85bF18A3a3eC8E0Af2e028d5` is the single largest
+transaction in the survey — **5,887,344 gas**, run 20 times in 20,000 blocks.
+
+It produces **306 state updates**. Node operators are submitting validator signing keys in
+bulk, and storing those keys *is* the transaction. The replay costs 6,739,086 against
+5,887,344 actually used, so GasKiller would cost more than the status quo.
+
+This is the "too many writes" blocker at maximum scale, and it is worth stating plainly
+because transaction size is such a tempting proxy for opportunity: **5.9M gas of writing
+things down is worth nothing, while 200k gas of thinking is worth 60%.** Screen on the
+ratio of computation to state, never on gas used.
+
+### The oracle report is the only thing that pays, and it pays 1.13%
+
+| tx | function | gas used | base estimate | surplus | Schnorr |
+|---|---|---:|---:|---:|---:|
+| `0xf9a0c48463e92a01347aadfefbf9349ec72858550a8fa162e894f61e9e99a499` | *oracle report* `0x11a78d23` | 1,729,395 | 1,682,837 | +46,558 | **1.13%** |
+| `0x1bad343834044681f393485bcf131863801ff082da4fe24a2095629a7332d517` | *oracle report* `0x11a78d23` | 1,721,688 | 1,675,339 | +46,349 | **1.12%** |
+
+Consistent across both daily reports, and genuinely measured. For contrast, Ether.fi's
+equivalent oracle report returned 18.99% on a far smaller transaction — the difference is
+that Lido's report is dominated by writing per-operator results, not by deriving them.
+
+### Everything user-facing is zero
+
+Every withdrawal-queue entry point measures 0%, and every one has a base estimate *above*
+the gas actually used. All selectors keccak-verified.
+
+| tx | function | gas used | base estimate | Schnorr |
+|---|---|---:|---:|---:|
+| `0x6e2453d1b4b55a31ffb9fd94b38a6475c6fc68727e83edbc30078829274b4446` | `claimWithdrawals` ✓ `0xacf41e4d` | 261,492 | 275,614 | 0% |
+| `0xdfbaead0d3c07378a6265a5093d029987518e7c75ede86ceb7b41d7f6fead305` | `claimWithdrawals` ✓ `0xacf41e4d` | 261,468 | 275,626 | 0% |
+| `0x07dfd9551205d17c73cd997e2ccf76708f60eae947999636a7e96b5f45f908f2` | *wstETH withdrawal* `0x7951b76f` | 258,886 | 276,945 | 0% |
+| `0x8af05a00ef89fdbc3c3cd246e5274c935f7a45869cba96ebbfd1aaea451db50f` | `requestWithdrawals` ✓ `0xd6681042` | 215,719 | 225,836 | 0% |
+| `0x954e6c05327ab8ac475eb27d646450b600826ed279ca5c99ca3ab90e1f953177` | `requestWithdrawals` ✓ `0xd6681042` | 215,683 | 225,752 | 0% |
+| `0x9f51864813f2f5744a5114d7345653ef2c1b8d87b9e479317020a14153e9b490` | `claimWithdrawals` ✓ `0xe3afe0a3` | 131,269 | 171,727 | 0% |
+| `0x076a9688c14bf3e1af823eb525fe3243176492d5c246567cbe6b5680bdef7844` | `claimWithdrawals` ✓ `0xe3afe0a3` | 81,977 | 80,590 | 0% |
+| `0x341d60b7870a57c2fa6d31a6935bfa143f0cff41685fa038661fd8721e7b4a92` | *registry* `0x8f73c5ae` | 978,934 | 1,038,649 | 0% |
+| `0x0df2c7332dd34a84ee404631b5431648ecce7e791ddb93f37c3fd9a3ce7206c9` | *registry* `0x8f73c5ae` | 978,934 | 1,038,632 | 0% |
+| `0x69d40f3d0e599963cd619a61cbf60a1c3e847e9f2f87796a139561b53cec4424` | `addSigningKeysOperatorBH` ✓ | 5,887,344 | 6,739,086 | 0% |
+| `0x21fa690fbbbbefec96c3fb533b2e0b6a275e9f0bad3fa7f6c71ccec9de398461` | `addSigningKeysOperatorBH` ✓ | 5,887,248 | 6,739,014 | 0% |
+
+Volume is not the problem — `claimWithdrawal` alone runs 317 times per 10,000 blocks. The
+work simply is not computational.
+
+### A fifth confirmation of the heuristic trap
+
+The two `0x8f73c5ae` transactions used **identical gas — 978,934 each**. One measured
+cleanly at 0%. The other fell back to the heuristic and reported **25.84%**. Retried
+serially it measured 0%, matching its twin.
+
+That is the fifth instance in this survey of the same signature: when two runs of the same
+function disagree sharply, the heuristic one is wrong, and it is wrong in the direction of
+overstating savings.
 
 ## Limitations
 
