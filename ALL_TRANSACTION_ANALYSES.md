@@ -1,8 +1,10 @@
 # Every transaction analysed, in one place
 
-210 Ethereum mainnet transactions across 17 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Five more could not be run at all; they are listed at the end.
+208 Ethereum mainnet transactions across 17 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Five more could not be run at all; they are listed at the end.
 
-Every number in the tables is the tool's own output. Nothing here is modelled or extrapolated.
+**Read the dollar-value section first.** The percentages in this file are large and the money behind them is not: the whole opportunity across the three best protocols is roughly $2,600 a month at the gas prices measured.
+
+Every number in the transaction tables is the tool's own output. The dollar-value section is the one exception — it extrapolates measured gas prices and volumes to a month, and says so.
 
 ## What the columns mean
 
@@ -23,7 +25,14 @@ Three reasons, and they are different problems:
 | too many writes | The transaction changes so many storage slots that writing them all back costs more than the original transaction. | No. The transaction is bookkeeping, not computation. |
 | under the floor | The transaction's own work is real but smaller than the 27,000-gas signature check. | Only by making the signature check cheaper. |
 
-Across all 210 transactions, **70 save gas** (62 of them properly measured and correctly attributed) and 140 save nothing. Of those 140:
+Across all 208 transactions, **68 show a saving** and 140 show none.
+
+Of the 68 savings, **66 are properly measured and 2 are suspect** — the two ERC-4337
+EntryPoint rows at 80.66% and 86.54%, which are probably artifacts of the replay defect
+described below. **15 rows are still tagged `heur`** and are not results; re-run them
+serially before using them.
+
+Of the 140 that save nothing:
 
 - **108 are blocked by external calls**
 - 18 have too many writes
@@ -33,28 +42,69 @@ Those add up to more than the total because a transaction can hit more than one 
 
 **External calls are the single biggest blocker in this data set.** Fixing that — by getting the called contracts onto GasKiller too — unlocks more transactions than any other change.
 
+## What it's worth in dollars — read this before the percentages
+
+Every other number in this file is a percentage. Percentages turned out to be the wrong
+unit, and this is the correction.
+
+Measured 2026-09-02. Mainnet base fee was **0.15–0.35 gwei**, blocks running 11–42M gas
+against a 60M limit — abundant spare capacity, so gas is nearly free. ETH/USD $2,386, read
+from the Chainlink aggregator on-chain.
+
+| protocol | best % | qualifying txs/day | gas saved each | **savings/month** | at 20 gwei |
+|---|---:|---:|---:|---:|---:|
+| Aave V3 | 63.64% | 555 | 130,000 | **$1,691** | $103,254 |
+| Railgun | 80.84% | 106 | 877,737 | **$900** | $133,664 |
+| Pyth | 63.94% | 29 | 54,614–123,861 | **$12–25** | ~$2,245 |
+| | | | | **~$2,600** | **~$239,000** |
+
+**The ranking inverts against percentage.** Railgun has the best percentage in this file by
+a wide margin and saves *less money* than Aave, because Aave qualifies five times more
+transactions per day. Pyth — the cleanest, most reachable result here — is worth about
+twenty dollars a month.
+
+**The product's value is a leveraged bet on the fee market, not on the percentage saved.**
+Nothing about the engineering differs between the last two columns; only gas prices do.
+
+So when using this file to pick targets, rank by:
+
+1. **The fee market.** Two orders of magnitude, entirely outside anyone's control.
+2. **Qualifying transactions per day.** This is what makes Aave beat Railgun on money.
+3. **Absolute gas saved per transaction**, not the ratio.
+4. The percentage — which is only a presentation of #3 and adds no information.
+
+Caveats: sampling was one ~1.4-day window per protocol, full log enumeration plus 180
+random transactions to establish the direct-call fraction and median gas price actually
+paid, extrapolated to 30 days. **An earlier version of this calculation undercounted Aave
+by 119x** by capping the hash scan at 400 and treating the survivors as the population.
+Aave's 25% qualifying share and 130,000 gas per transaction are carried from the
+per-function work, not re-measured. A quiet window understates the average, and gas spikes
+are exactly when the product is worth most. Fees are paid by the *users* who send the
+transactions, not by the protocols — which affects who the counterparty in any deal is.
+
 ## Scoreboard
 
-Best and typical figures use only properly measured runs, and exclude the two Ondo rows that turned out to be other people's traffic.
+Best and typical figures use only properly measured runs. They exclude the two Ondo rows that turned out to be other people's traffic (a 13.37% MEV bot and a 1.64% aggregator that merely touched Ondo), and the two Morpho rows still tagged `heur`.
 
 | protocol | txs | save gas (measured) | best Schnorr | typical win | blockers on the rest |
 |---|---:|---:|---:|---:|---|
-| **Railgun** | 18 | 15 | 80.84% | 74.06% | external calls (3), under the floor (2) |
-| **Aave** | 20 | 10 | 63.64% | 44.12% | external calls (9), under the floor (8), too many writes (1) |
+| **Railgun** | 18 | 15 | **80.84%** | 74.06% | external calls (3), under the floor (2) |
+| **Pyth** | 13 | **13** | **63.94%** | 28.01% | none — every transaction saves |
+| **Aave** | 20 | 10 | **63.64%** | 44.12% | external calls (9), under the floor (8), too many writes (1) |
 | **Privacy Pools** | 11 | 2 | 23.39% | 21.96% | external calls (8), too many writes (1) |
-| **Ether.fi** | 13 | 4 | 18.99% | 7.34% | external calls (8), under the floor (3), too many writes (1) |
-| **EigenLayer** | 13 | 6 | 5.15% | 0.91% | external calls (6), too many writes (4), under the floor (3) |
+| **Ether.fi** | 13 | 3 | 18.99% | 7.34% | external calls (8), under the floor (4), too many writes (1) |
 | **Safe** | 12 | 3 | 9.99% | 8.98% | external calls (9), under the floor (8) |
+| **Ethena** | 22 | 1 | 8.99% | 8.99% | under the floor (15), external calls (6) |
+| **EigenLayer** | 13 | 6 | 5.15% | 0.91% | external calls (6), too many writes (4), under the floor (3) |
 | **Pendle** | 8 | 1 | 3.94% | 3.94% | external calls (7), under the floor (5) |
-| **Morpho** | 25 | 2 | 2.60% | 2.21% | external calls (19), too many writes (6), under the floor (2) |
 | **World ID** | 7 | 1 | 2.87% | 2.87% | external calls (6), under the floor (6) |
+| **Morpho** | 25 | 2 | 2.60% | 2.21% | external calls (20), too many writes (6), under the floor (3) |
 | **Ondo** | 8 | 3 | 2.01% | 1.59% | external calls (3), too many writes (1) |
 | **Euler** | 8 | 1 | 1.31% | 1.31% | external calls (7), too many writes (3), under the floor (2) |
-| **Chainlink** | 8 | 0 | 0.00% | 0.00% | external calls (8) |
 | **Lido** | 13 | 2 | 1.13% | 1.13% | too many writes (10), under the floor (1) |
-| **Ethena** | 22 | 1 | 8.99% | 8.99% | under the floor (15), external calls (6) |
-| **ERC-4337 EntryPoint** | 8 | 2 *(suspect)* | *86.54%* | *83.60%* | external calls (6); the 2 wins are likely estimator artifacts |
-| **Panther** | 1 | 0 | 0.00% | 0.00% | external calls (1), too many writes (1) |
+| **Chainlink** | 8 | 0 | 0.00% | — | external calls (8) |
+| **Panther** | 1 | 0 | 0.00% | — | external calls (1), too many writes (1) |
+| **ERC-4337 EntryPoint** | 8 | 2 *(suspect)* | *86.54%* | *83.60%* | external calls (6); **both wins are probably replay artifacts — do not quote** |
 
 ## What actually predicts a win
 
@@ -135,6 +185,55 @@ a time — before drawing any conclusion. The remaining `heur` rows in the table
 including those inherited from earlier protocols, were produced under the same throttling
 and should be re-run before use rather than treated as data.
 
+## The replay defect — why 11 transactions can't be measured, and one silent failure mode
+
+Separate from rate limiting, 11 runs failed with `RevertingContext CALL #n ... reverted`.
+These cluster in **Morpho (7), Euler (2) and Railgun (2)** — and not at all in Lido,
+Chainlink or Pyth.
+
+**What happens.** GasKiller records a transaction as a list of state updates and replays
+them to price it. But the recorded steps depend on each other's side effects, and the
+recording does not preserve them. A Euler liquidation
+(`0x575f2fb2224cf67a0a3a8cca18def46bbf327eb72e1ac1414771dffd6f4a67f3`, 3,036,470 gas)
+reduces to four calls:
+
+1. Morpho Blue `0xe0232b42`
+2. WETH `withdraw(uint256)` (`0x2e1a7d4d`, keccak-verified)
+3. an ETH transfer
+4. an ETH transfer to a builder
+
+On replay, step 2 reverts: `WETH.withdraw` requires the caller to already hold that WETH,
+and step 1 is what delivered it in the original transaction. The recording says only *call
+Morpho Blue with these bytes* — the balance change that call produced is not carried
+forward.
+
+This hits transactions that **chain** operations — borrow, then swap, then repay — which is
+exactly what liquidations and bundled DeFi calls do. Simple transactions never trip it,
+which is why Lido and Pyth measured first time.
+
+**The detected case is safe.** When the revert escapes, the tool notices, refuses to
+report a measurement and says why. That is correct behaviour.
+
+**The undetected case is not.** If the contract catches its own errors, the revert never
+escapes. The tool sees a call that "succeeded" very cheaply and reports a large saving.
+This is the suspected explanation for the two ERC-4337 EntryPoint rows showing 80.66% and
+86.54%: EntryPoint is designed to catch a failing userOp rather than revert. Two
+structurally identical EntryPoint transactions — same eight updates, same ordering, same
+`validateUserOp` and `innerHandleOp` calls — replay for 201,100 and 2,205,725 gas
+respectively, a 10x divergence with no structural difference.
+
+| replay fails and… | tool reports | risk |
+|---|---|---|
+| the revert escapes | "estimation failed" | none — honest |
+| the contract catches it | a large saving | **you quote it to a customer** |
+
+Nothing in the output distinguishes the second case from a real win. Both are labelled
+`measured via StateChangeHandler` with no warning.
+
+**One-sentence version:** GasKiller's replay doesn't carry forward the intermediate state
+between a transaction's recorded steps, so chained calls fail on replay — and when a
+contract swallows that failure internally, the analyzer reports it as a large false saving.
+
 ## Every transaction
 
 Sorted by protocol (best protocol first), then by savings.
@@ -173,7 +272,7 @@ A **✓** on a function name means I confirmed the 4-byte selector by hashing th
 | Aave | [`0x2cab2e0f…`](https://etherscan.io/tx/0x2cab2e0f215f22a30249a1198f6604bdcfcc131183aeaaa7c1257fb939ec239f) | `borrow` ✓ `0xa415bcad` | 346,272 | 206,699 | +139,573 | **112,573** (32.51%) | 0 | — | 12 (8S/2C/1L2/1L4) |  |
 | Aave | [`0xe65a59b9…`](https://etherscan.io/tx/0xe65a59b9f5d42dfd18018dd8c42850e6ea38c49d4a61718888c072e4f13dcc77) | `borrow` ✓ `0xa415bcad` | 316,682 | 205,592 | +111,090 | **84,090** (26.55%) | 0 | — | 12 (8S/2C/1L2/1L4) |  |
 | Aave | [`0xb33162e1…`](https://etherscan.io/tx/0xb33162e1275b4e14a4a0de3d327949fb520949cadd898d17718bb813547ca0fb) | `borrow` ✓ `0xa415bcad` | 252,529 | 164,712 | +87,817 | **60,817** (24.08%) | 0 | — | 11 (7S/2C/1L2/1L4) |  |
-| Aave | [`0xeff004bd…`](https://etherscan.io/tx/0xeff004bd1fb2851258ac5aa69997def87176f40716ecd4fe3d68904e1d6c3669) `heur` | `withdraw` ✓ `0x69328dec` | 211,120 | 160,699 | +50,421 | **23,421** (11.09%) | 0 | — | 10 (7S/1C/1L2/1L4) |  |
+| Aave | [`0xeff004bd…`](https://etherscan.io/tx/0xeff004bd1fb2851258ac5aa69997def87176f40716ecd4fe3d68904e1d6c3669) | `withdraw` ✓ `0x69328dec` | 211,120 | 194,806 | +16,314 | **0** (0.00%) | 0 | under the floor | 10 (1C) | **re-measured** — heuristic claimed 11.09% |
 | Aave | [`0x9287f808…`](https://etherscan.io/tx/0x9287f80894eeeacc8af236609401da9f14ce0e655cbb9748e0db2e405aeb2ef5) | *third-party liquidator bot* `0x7e809076` | 1,165,207 | 1,156,574 | +8,633 | 0 | 0 | **external calls** · under the floor | 6 (4C/2S) |  |
 | Aave | [`0x324633c1…`](https://etherscan.io/tx/0x324633c1f5cf10b86a58aad0d48ac39673afd6ee24e2b391488ac84e4c6baaa0) | `supplyWithPermit` ✓ `0x02c205f0` | 206,695 | 207,356 | -661 | 0 | 0 | **external calls** · too many writes | 11 (5S/3C/1L2/1L3/1L4) |  |
 | Aave | [`0x4eba5f8d…`](https://etherscan.io/tx/0x4eba5f8de29afdcac5703668d41a1f4bee734545dcdb37a129c6341b41c6ea44) | `supply` ✓ `0x617ba037` | 183,352 | 178,041 | +5,311 | 0 | 0 | **external calls** · under the floor | 11 (7S/2C/1L2/1L4) |  |
@@ -198,7 +297,7 @@ A **✓** on a function name means I confirmed the 4-byte selector by hashing th
 | Ether.fi | [`0xab780dc7…`](https://etherscan.io/tx/0xab780dc7c7c59d079462a88428b4e172c84a05eeec892195a02787a856214583) | *Ether.fi oracle-report execution* `0x2e03931e` | 259,254 | 208,906 | +50,348 | **23,348** (9.01%) | 0 | — | 6 (3C/2S/1L3) |  |
 | Ether.fi | [`0xadb81164…`](https://etherscan.io/tx/0xadb81164fb568da41e4876b7695f287df7caaec92e4fb4f11579ac6a8aa61af8) | *Ether.fi oracle-report execution* `0x2e03931e` | 250,124 | 208,906 | +41,218 | **14,218** (5.68%) | 0 | — | 6 (3C/2S/1L3) |  |
 | Ether.fi | [`0x9fe2db76…`](https://etherscan.io/tx/0x9fe2db76e575eba316f1c1133b9522b1084631a7140b9895272fb782ea65cb8d) | *Ether.fi oracle-report execution* `0x2e03931e` | 245,559 | 208,894 | +36,665 | **9,665** (3.94%) | 0 | — | 6 (3C/2S/1L3) |  |
-| Ether.fi | [`0xdce4440b…`](https://etherscan.io/tx/0xdce4440b1e1cd6ae69eaa3331085bcbe38c6ab23c8d53401f7c49c63d7ec06ce) `heur` | `batchClaimWithdraw` ✓ `0x24fccdcf` | 205,965 | 174,295 | +31,670 | **4,670** (2.27%) | 0 | — | 18 (10S/4C/2L2/2L4) |  |
+| Ether.fi | [`0xdce4440b…`](https://etherscan.io/tx/0xdce4440b1e1cd6ae69eaa3331085bcbe38c6ab23c8d53401f7c49c63d7ec06ce) | `batchClaimWithdraw` ✓ `0x24fccdcf` | 205,965 | 209,933 | -3,968 | **0** (0.00%) | 0 | **external calls** · too many writes | 18 (4C) | **re-measured** — heuristic claimed 2.27% |
 | Ether.fi | [`0xc3081e6f…`](https://etherscan.io/tx/0xc3081e6f850f214a3df7ccf069f0233a4d07fd08fede69f3e904c45e644789cf) | *third-party aggregator* `0x146ee74d` | 4,904,702 | 4,956,803 | -52,101 | 0 | 0 | **external calls** | 1 (1C) |  |
 | Ether.fi | [`0x87b26753…`](https://etherscan.io/tx/0x87b26753364ee01e9c442fbf5c2a37443f28e00d3e34591cd4a9147611fe4eb7) | `batchClaimWithdraw` ✓ `0x24fccdcf` | 679,714 | 878,853 | -199,139 | 0 | 0 | **external calls** · too many writes | 117 (65S/26C/13L2/13L4) | 13 withdrawals batched — 117 state updates |
 | Ether.fi | [`0x7ee0a346…`](https://etherscan.io/tx/0x7ee0a34642b5380eea636f02ce6ee35f109390a95bd2d19b8ff1794512829bb1) | `requestWithdraw` ✓ `0x397a1b28` | 193,099 | 198,205 | -5,106 | 0 | 0 | **external calls** | 3 (2C/1L2) |  |
@@ -240,8 +339,8 @@ A **✓** on a function name means I confirmed the 4-byte selector by hashing th
 | Pendle | [`0xa3ec8aea…`](https://etherscan.io/tx/0xa3ec8aea5dd4b01271f7dd979830a444ec2b3fa618f5e0afc550a2bd03af65a3) | *Pendle router action* `0xed48907e` | 370,167 | 359,084 | +11,083 | 0 | 0 | **external calls** · under the floor | 5 (4C/1L4) |  |
 | Pendle | [`0xec4d1fdf…`](https://etherscan.io/tx/0xec4d1fdf22d55bdde9d358e329af22a6c3345032ce969c79afb9d5dea8487556) | *Pendle router action* `0x594a88cc` | 205,329 | 213,408 | -8,079 | 0 | 0 | **external calls** | 4 (3C/1L4) |  |
 | Pendle | [`0xc503cb6f…`](https://etherscan.io/tx/0xc503cb6f653908693bc666cf764b7fbd18d25d1f2982bde550107e98c81559a0) | `swapSyForExactPt` ✓ `0x5b709f17` | 153,140 | 148,995 | +4,145 | 0 | 0 | **external calls** · under the floor | 10 (5S/3C/1L2/1L3) |  |
-| Morpho | [`0x641b76f4…`](https://etherscan.io/tx/0x641b76f483f45a02815116bb7b0213530d0f2aee019b7cc4840a2d71a2940f0e) `heur` | *liquidator bot* `0xc2df23ef` | 721,933 | 577,085 | +144,848 | **117,848** (16.32%) | 0 | — | 4 (3C/1L2) |  |
-| Morpho | [`0xcd59750e…`](https://etherscan.io/tx/0xcd59750e91859ec6af4209c588997b61962dcec2aad6c549ef35324476870bdf) `heur` | `reallocate` ✓ `0x7299aa31` | 324,608 | 253,881 | +70,727 | **43,727** (13.47%) | 0 | — | 15 (10C/5L3) |  |
+| Morpho | [`0x641b76f4…`](https://etherscan.io/tx/0x641b76f483f45a02815116bb7b0213530d0f2aee019b7cc4840a2d71a2940f0e) | *liquidator bot* `0xc2df23ef` | 721,933 | 707,735 | +14,198 | **0** (0.00%) | 0 | **external calls** · under the floor | 4 (3C) | **re-measured** — heuristic claimed 16.32% |
+| Morpho | [`0xcd59750e…`](https://etherscan.io/tx/0xcd59750e91859ec6af4209c588997b61962dcec2aad6c549ef35324476870bdf) | `reallocate` ✓ `0x7299aa31` | 324,608 | 349,625 | -25,017 | **0** (0.00%) | 0 | **external calls** | 15 (10C) | **re-measured** — heuristic claimed 13.47% |
 | Morpho | [`0x9a5fecc6…`](https://etherscan.io/tx/0x9a5fecc64422a0e8f8edb3b914eaed17cd675a09f1e2811a79d0cf0181893851) `heur` | *liquidator bot* `0x3f462f8f` | 2,661,881 | 2,335,360 | +326,521 | **299,521** (11.25%) | 76,521 | — | 8 (8C) |  |
 | Morpho | [`0x80329618…`](https://etherscan.io/tx/0x80329618f5c5261829097e2a8a079c765c6ae0ce35f6d98e09a4d246a694c8bf) | `multicall` ✓ `0xac9650d8` | 380,049 | 343,154 | +36,895 | **9,895** (2.60%) | 0 | — | 18 (10S/4C/3L3/1L1) |  |
 | Morpho | [`0x6ed1eaa3…`](https://etherscan.io/tx/0x6ed1eaa33eff8b3b992ee3fc55d5548d2072edd5f32ba437854d784dc9e62946) `heur` | *liquidator bot* `0xca8bd1f9` | 307,371 | 273,856 | +33,515 | **6,515** (2.12%) | 0 | — | 3 (3C) |  |
