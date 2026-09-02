@@ -1,6 +1,6 @@
 # Every transaction analysed, in one place
 
-197 Ethereum mainnet transactions across 16 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Five more could not be run at all; they are listed at the end.
+205 Ethereum mainnet transactions across 17 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Five more could not be run at all; they are listed at the end.
 
 Every number in the tables is the tool's own output. Nothing here is modelled or extrapolated.
 
@@ -23,7 +23,7 @@ Three reasons, and they are different problems:
 | too many writes | The transaction changes so many storage slots that writing them all back costs more than the original transaction. | No. The transaction is bookkeeping, not computation. |
 | under the floor | The transaction's own work is real but smaller than the 27,000-gas signature check. | Only by making the signature check cheaper. |
 
-Across all 182 transactions, **57 save gas** (49 of them properly measured and correctly attributed) and 125 save nothing. Of those 125:
+Across all 205 transactions, **65 save gas** (57 of them properly measured and correctly attributed) and 140 save nothing. Of those 140:
 
 - **108 are blocked by external calls**
 - 18 have too many writes
@@ -41,6 +41,7 @@ Best and typical figures use only properly measured runs, and exclude the two On
 |---|---:|---:|---:|---:|---|
 | **Railgun** | 18 | 15 | 80.84% | 74.06% | external calls (3), under the floor (2) |
 | **Aave** | 20 | 10 | 63.64% | 44.12% | external calls (9), under the floor (8), too many writes (1) |
+| **Pyth** | 8 | **8** | **28.02%** | **28.01%** | none — all 8 save |
 | **Privacy Pools** | 11 | 2 | 23.39% | 21.96% | external calls (8), too many writes (1) |
 | **Ether.fi** | 13 | 4 | 18.99% | 7.34% | external calls (8), under the floor (3), too many writes (1) |
 | **EigenLayer** | 13 | 6 | 5.15% | 0.91% | external calls (6), too many writes (4), under the floor (3) |
@@ -346,6 +347,15 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | Lido | [`0x954e6c05…`](https://etherscan.io/tx/0x954e6c05327ab8ac475eb27d646450b600826ed279ca5c99ca3ab90e1f953177) | `requestWithdrawals` ✓ `0xd6681042` | 215,683 | 225,752 | -10,069 | **0** (0.00%) | 0 | too many writes | 9 (·/1C) |  |
 | Lido | [`0x9f518648…`](https://etherscan.io/tx/0x9f51864813f2f5744a5114d7345653ef2c1b8d87b9e479317020a14153e9b490) | `claimWithdrawals` ✓ `0xe3afe0a3` | 131,269 | 171,727 | -40,458 | **0** (0.00%) | 0 | too many writes | 26 (·/3C) |  |
 | Lido | [`0x076a9688…`](https://etherscan.io/tx/0x076a9688c14bf3e1af823eb525fe3243176492d5c246567cbe6b5680bdef7844) | `claimWithdrawals` ✓ `0xe3afe0a3` | 81,977 | 80,590 | +1,387 | **0** (0.00%) | 0 | under the floor | 8 (·/1C) |  |
+
+| **Pyth** | [`0xab298442…`](https://etherscan.io/tx/0xab2984424844b5a4120660896eddea19589458b583b7a7279b8d951ddb2e90db) | `updatePriceFeedsIfNecessary` ✓ `0xb9256d28` | 195,034 | 113,393 | +81,641 | **54,641** (28.02%) | 0 | — | 12 (8S/4L2) | **no external calls** |
+| **Pyth** | [`0x32913147…`](https://etherscan.io/tx/0x329131473471b39de257f0392204b6ddc7ac7560c94e8d2407d4d33590f420f9) | `updatePriceFeedsIfNecessary` ✓ `0xb9256d28` | 194,986 | 113,357 | +81,629 | **54,629** (28.02%) | 0 | — | 12 (8S/4L2) | **no external calls** |
+| **Pyth** | [`0xfd6656e5…`](https://etherscan.io/tx/0xfd6656e58db697736c638a01a1abe0d3065a1b72627a1c9368b108e052cb03e3) | `updatePriceFeedsIfNecessary` ✓ `0xb9256d28` | 195,031 | 113,405 | +81,626 | **54,626** (28.01%) | 0 | — | 12 (8S/4L2) | **no external calls** |
+| **Pyth** | [`0xe2795d24…`](https://etherscan.io/tx/0xe2795d246d11e909653880ca648a00e2b658b4c252dcf9bfd237cd41bab1112f) | `updatePriceFeedsIfNecessary` ✓ `0xb9256d28` | 195,007 | 113,393 | +81,614 | **54,614** (28.01%) | 0 | — | 12 (8S/4L2) | **no external calls** |
+| **Pyth** | [`0xacc36012…`](https://etherscan.io/tx/0xacc36012498cc4c26e3e79d5f6ee1d0bc579e2ccf03828f34c1b60f77c5e239c) | `updatePriceFeedsIfNecessary` ✓ `0xb9256d28` | 194,992 | 113,369 | +81,623 | **54,623** (28.01%) | 0 | — | 12 (8S/4L2) | **no external calls** |
+| **Pyth** | [`0x3862ae1b…`](https://etherscan.io/tx/0x3862ae1b964adcdc8932bfd4583854ad2fb749ed85cce0ae8d0e85440f41a571) | `updatePriceFeedsIfNecessary` ✓ `0xb9256d28` | 195,004 | 113,393 | +81,611 | **54,611** (28.01%) | 0 | — | 12 (8S/4L2) | **no external calls** |
+| **Pyth** | [`0x90b34b5d…`](https://etherscan.io/tx/0x90b34b5df172d1d050f207ab34da927e4f81f7e710ae1edc1aa945e0fbc887d9) | `updatePriceFeedsIfNecessary` ✓ `0xb9256d28` | 194,995 | 113,405 | +81,590 | **54,590** (28.00%) | 0 | — | 12 (8S/4L2) | **no external calls** |
+| **Pyth** | [`0x9f3e0810…`](https://etherscan.io/tx/0x9f3e08104c3a853674bb012ae9331fccb6f00dacd90c0661bf5d3de97079c7ee) | `updatePriceFeedsIfNecessary` ✓ `0xb9256d28` | 194,989 | 113,405 | +81,584 | **54,584** (27.99%) | 0 | — | 12 (8S/4L2) | **no external calls** |
 
 ## Transactions that could not be measured at all
 

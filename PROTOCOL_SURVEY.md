@@ -63,6 +63,7 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 |---|---:|---:|---|---|
 | **Railgun** | **80.84%** | **60.30%** | direct call to smart wallet | 374 of 704 (53%) |
 | **Aave** | **63.64%** | **yes (2 txs)** | direct `borrow` (any borrower); `withdraw` if multi-asset | ~25% of txs are direct borrows |
+| **Pyth** | **28.01%** | 0% | `updatePriceFeedsIfNecessary` — no external calls | **82 of 82 direct** |
 | Privacy Pools | 23.39% | 0% | direct call to pool | 2 in 17 days |
 | Ether.fi | 18.99% | 0% | EtherFiAdmin oracle report | every ~4 hours |
 | EigenLayer | 5.15% | 0% | EigenPod checkpoint proof | 4 of 5 pod checkpoints |
@@ -538,6 +539,65 @@ serially it measured 0%, matching its twin.
 That is the fifth instance in this survey of the same signature: when two runs of the same
 function disagree sharply, the heuristic one is wrong, and it is wrong in the direction of
 overstating savings.
+
+## Pyth — the third real candidate, and the cleanest result in the survey
+
+**8 transactions, all measured cleanly, 27.99%–28.02% Schnorr. Zero heuristic fallbacks,
+zero external calls, zero variance worth mentioning.**
+
+`updatePriceFeedsIfNecessary(bytes[],bytes32[],uint64[])` (`0xb9256d28`, keccak-verified)
+on `0x4305FB66699C3B2702D4d05CF36551390A4c69C6`.
+
+| tx | gas used | base estimate | surplus | Schnorr | BLS |
+|---|---:|---:|---:|---:|---:|
+| `0xab2984424844b5a4120660896eddea19589458b583b7a7279b8d951ddb2e90db` | 195,034 | 113,393 | +81,641 | **28.02%** | 0% |
+| `0x329131473471b39de257f0392204b6ddc7ac7560c94e8d2407d4d33590f420f9` | 194,986 | 113,357 | +81,629 | **28.02%** | 0% |
+| `0xfd6656e58db697736c638a01a1abe0d3065a1b72627a1c9368b108e052cb03e3` | 195,031 | 113,405 | +81,626 | **28.01%** | 0% |
+| `0xe2795d246d11e909653880ca648a00e2b658b4c252dcf9bfd237cd41bab1112f` | 195,007 | 113,393 | +81,614 | **28.01%** | 0% |
+| `0x3862ae1b964adcdc8932bfd4583854ad2fb749ed85cce0ae8d0e85440f41a571` | 195,004 | 113,393 | +81,611 | **28.01%** | 0% |
+| `0xacc36012498cc4c26e3e79d5f6ee1d0bc579e2ccf03828f34c1b60f77c5e239c` | 194,992 | 113,369 | +81,623 | **28.01%** | 0% |
+| `0x90b34b5df172d1d050f207ab34da927e4f81f7e710ae1edc1aa945e0fbc887d9` | 194,995 | 113,405 | +81,590 | **28.00%** | 0% |
+| `0x9f3e08104c3a853674bb012ae9331fccb6f00dacd90c0661bf5d3de97079c7ee` | 194,989 | 113,405 | +81,584 | **27.99%** | 0% |
+
+BLS is 0% throughout — the 81,600 surplus is well under the 250,000 BLS floor. Schnorr only.
+
+### Why it works, and why it is unlike everything else here
+
+Pyth is the only protocol in this survey whose transactions contain **no external calls at
+all**. The state-update program is 8 `Store`s and 4 `Log2`s. Nothing else.
+
+That matters for three reasons:
+
+1. **No external-call blocker.** The dominant failure mode across the other fifteen
+   protocols (108 of 125 zero-results) simply does not apply.
+2. **No exposure to the replay defect.** With no calls to re-execute, there is no
+   intermediate state to lose and nothing that can revert or be silently swallowed. Every
+   run measured first time. This is the only protocol where that happened.
+3. **It should qualify for the net-form prestate path.** `prestate.rs` gates net form on
+   making no regular CALL, no CREATE and no SELFDESTRUCT — all satisfied here. The CLI
+   exposes no flag to force it, so 28% is the figure the default path reports; net form is
+   a possible upside that has not been measured.
+
+The workload is the right shape for the product: verify a batch of signed price updates
+(signature and merkle-proof checking, which is pure computation that writes nothing), then
+store a handful of prices. High compute, low state — the exact inverse of Lido's
+`addSigningKeysOperatorBH`.
+
+### Reachability
+
+**82 of 82 transactions in 20,000 blocks went directly to the Pyth contract**, and all 82
+were the same function. There is no router, no forwarder, no bundler in the way — the
+problem that killed Chainlink (0 of 242 direct) and Euler (0 of 191 direct).
+
+One entry point, uniform gas (194,986–195,034 across all 82), uniform savings. That makes
+the pitch unusually simple to state and the integration surface a single function.
+
+### Caveat on volume
+
+82 transactions per 20,000 blocks is roughly 1 every 4 minutes — real and steady, but two
+orders of magnitude below Chainlink's feed traffic or Lido's withdrawals. The saving per
+transaction is ~54,600 gas. Worth sizing against their actual mainnet spend before
+pitching, since this is a consistent small win rather than a large one.
 
 ## Limitations
 
