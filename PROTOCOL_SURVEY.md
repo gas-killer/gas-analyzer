@@ -63,7 +63,7 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 |---|---:|---:|---|---|
 | **Railgun** | **80.84%** | **60.30%** | direct call to smart wallet | 374 of 704 (53%) |
 | **Aave** | **63.64%** | **yes (2 txs)** | direct `borrow` (any borrower); `withdraw` if multi-asset | ~25% of txs are direct borrows |
-| **Pyth** | **28.01%** | 0% | `updatePriceFeedsIfNecessary` — no external calls | **82 of 82 direct** |
+| **Pyth** | **63.94%** | 0% | few feeds written per update; no external calls | **649 of 655 direct (99.1%)** |
 | Privacy Pools | 23.39% | 0% | direct call to pool | 2 in 17 days |
 | Ether.fi | 18.99% | 0% | EtherFiAdmin oracle report | every ~4 hours |
 | EigenLayer | 5.15% | 0% | EigenPod checkpoint proof | 4 of 5 pod checkpoints |
@@ -540,64 +540,87 @@ That is the fifth instance in this survey of the same signature: when two runs o
 function disagree sharply, the heuristic one is wrong, and it is wrong in the direction of
 overstating savings.
 
-## Pyth — the third real candidate, and the cleanest result in the survey
+## Pyth — 28% to 64%, and the driver is writes, not gas
 
-**8 transactions, all measured cleanly, 27.99%–28.02% Schnorr. Zero heuristic fallbacks,
-zero external calls, zero variance worth mentioning.**
+**13 transactions measured cleanly. Every one saves. Range 27.99%–63.94% Schnorr.**
 
 `updatePriceFeedsIfNecessary(bytes[],bytes32[],uint64[])` (`0xb9256d28`, keccak-verified)
-on `0x4305FB66699C3B2702D4d05CF36551390A4c69C6`.
+and `executeGovernanceInstruction(bytes)` (`0xb6ed701e`, keccak-verified) on
+`0x4305FB66699C3B2702D4d05CF36551390A4c69C6`.
 
-| tx | gas used | base estimate | surplus | Schnorr | BLS |
+| tx | gas used | calldata | updates | base | Schnorr |
 |---|---:|---:|---:|---:|---:|
-| `0xab2984424844b5a4120660896eddea19589458b583b7a7279b8d951ddb2e90db` | 195,034 | 113,393 | +81,641 | **28.02%** | 0% |
-| `0x329131473471b39de257f0392204b6ddc7ac7560c94e8d2407d4d33590f420f9` | 194,986 | 113,357 | +81,629 | **28.02%** | 0% |
-| `0xfd6656e58db697736c638a01a1abe0d3065a1b72627a1c9368b108e052cb03e3` | 195,031 | 113,405 | +81,626 | **28.01%** | 0% |
-| `0xe2795d246d11e909653880ca648a00e2b658b4c252dcf9bfd237cd41bab1112f` | 195,007 | 113,393 | +81,614 | **28.01%** | 0% |
-| `0x3862ae1b964adcdc8932bfd4583854ad2fb749ed85cce0ae8d0e85440f41a571` | 195,004 | 113,393 | +81,611 | **28.01%** | 0% |
-| `0xacc36012498cc4c26e3e79d5f6ee1d0bc579e2ccf03828f34c1b60f77c5e239c` | 194,992 | 113,369 | +81,623 | **28.01%** | 0% |
-| `0x90b34b5df172d1d050f207ab34da927e4f81f7e710ae1edc1aa945e0fbc887d9` | 194,995 | 113,405 | +81,590 | **28.00%** | 0% |
-| `0x9f3e08104c3a853674bb012ae9331fccb6f00dacd90c0661bf5d3de97079c7ee` | 194,989 | 113,405 | +81,584 | **27.99%** | 0% |
+| `0x8874d5a5dd22f4be257985b269f6c6ded6f28e08f0a572280d49d2db9a3a347a` | 279,375 | 2884B | 12 | 113,369 | **49.76%** |
+| `0xbf4835576f7677f4d93a6f96fe75671c0dd19362652bb1cf5c8622cec1d54fb9` | 278,401 | 2884B | 12 | 113,441 | **49.55%** |
+| `0x616ba1cd828ee4f0e63a5be3e09df5d8ef28e0661e8c396f45658cdca477fea9` | 193,725 | 1636B | **3** | 42,864 | **63.94%** |
+| `0xf8800e04ea63017f9a4ffe500a4399c72a5606f243230a351c5758828568757b` | 192,005 | 1636B | **3** | 42,864 | **63.61%** |
+| `0xa8ae70119c42ea2fb646f18a81b58f4263ae9cce624e0d44301abee3960ba7d4` | 194,705 | 1028B | 3 | 55,548 | **57.60%** *(governance)* |
+| `0xab2984424844b5a4120660896eddea19589458b583b7a7279b8d951ddb2e90db` | 195,034 | 2148B | 12 | 113,393 | 28.02% |
+| `0x329131473471b39de257f0392204b6ddc7ac7560c94e8d2407d4d33590f420f9` | 194,986 | 2148B | 12 | 113,357 | 28.02% |
+| `0xfd6656e58db697736c638a01a1abe0d3065a1b72627a1c9368b108e052cb03e3` | 195,031 | 2148B | 12 | 113,405 | 28.01% |
+| `0xacc36012498cc4c26e3e79d5f6ee1d0bc579e2ccf03828f34c1b60f77c5e239c` | 194,992 | 2148B | 12 | 113,369 | 28.01% |
+| `0xe2795d246d11e909653880ca648a00e2b658b4c252dcf9bfd237cd41bab1112f` | 195,007 | 2148B | 12 | 113,393 | 28.01% |
+| `0x3862ae1b964adcdc8932bfd4583854ad2fb749ed85cce0ae8d0e85440f41a571` | 195,004 | 2148B | 12 | 113,393 | 28.01% |
+| `0x90b34b5df172d1d050f207ab34da927e4f81f7e710ae1edc1aa945e0fbc887d9` | 194,995 | 2148B | 12 | 113,405 | 28.00% |
+| `0x9f3e08104c3a853674bb012ae9331fccb6f00dacd90c0661bf5d3de97079c7ee` | 194,989 | 2148B | 12 | 113,405 | 27.99% |
 
-BLS is 0% throughout — the 81,600 surplus is well under the 250,000 BLS floor. Schnorr only.
+BLS is 0% on every row — the surplus never approaches the 250,000 BLS floor. Schnorr only.
 
-### Why it works, and why it is unlike everything else here
+### A predictive model for Pyth
 
-Pyth is the only protocol in this survey whose transactions contain **no external calls at
-all**. The state-update program is 8 `Store`s and 4 `Log2`s. Nothing else.
+The base estimate tracks the **state-update count and nothing else**. Twelve updates cost
+113,357–113,441 across ten transactions whose gas ranged from 194,986 to 279,375. Three
+updates cost 42,864 twice, exactly.
 
-That matters for three reasons:
+Fitting the two clusters:
 
-1. **No external-call blocker.** The dominant failure mode across the other fifteen
-   protocols (108 of 125 zero-results) simply does not apply.
-2. **No exposure to the replay defect.** With no calls to re-execute, there is no
-   intermediate state to lose and nothing that can revert or be silently swallowed. Every
-   run measured first time. This is the only protocol where that happened.
-3. **It should qualify for the net-form prestate path.** `prestate.rs` gates net form on
-   making no regular CALL, no CREATE and no SELFDESTRUCT — all satisfied here. The CLI
-   exposes no flag to force it, so 28% is the figure the default path reports; net form is
-   a possible upside that has not been measured.
+```
+base ≈ 19,350 + 7,840 × (state updates)
+savings = gas_used − base − 27,000
+```
 
-The workload is the right shape for the product: verify a batch of signed price updates
-(signature and merkle-proof checking, which is pure computation that writes nothing), then
-store a handful of prices. High compute, low state — the exact inverse of Lido's
-`addSigningKeysOperatorBH`.
+`updatePriceFeedsIfNecessary` verifies the whole signed batch regardless of outcome, but
+only *writes* the feeds that are actually stale. Verification is pure computation that
+writes nothing — fully strippable. Writes are not. So:
 
-### Reachability
+**The best case is a large batch verified and few feeds written.** The 1636B transactions
+verify a decent batch and write one feed: 63.9%. The 2148B transactions verify slightly
+more and write four: 28%.
 
-**82 of 82 transactions in 20,000 blocks went directly to the Pyth contract**, and all 82
-were the same function. There is no router, no forwarder, no bundler in the way — the
-problem that killed Chainlink (0 of 242 direct) and Euler (0 of 191 direct).
+This also means gas used is a *bad* predictor here. The 192,005-gas transaction saves more
+(63.61%) than the 279,375-gas one (49.76%).
 
-One entry point, uniform gas (194,986–195,034 across all 82), uniform savings. That makes
-the pitch unusually simple to state and the integration surface a single function.
+### Correction to the earlier figure
 
-### Caveat on volume
+An earlier version of this section reported Pyth as a flat 28.01% across 8 transactions.
+That sample was drawn from a single 20,000-block window and happened to contain only the
+12-update shape. Widening to 120,000 blocks (16.7 days, 655 transactions) exposed gas
+ranging 192,005–279,375 and calldata 1028–2884B, and a second entry point.
 
-82 transactions per 20,000 blocks is roughly 1 every 4 minutes — real and steady, but two
-orders of magnitude below Chainlink's feed traffic or Lido's withdrawals. The saving per
-transaction is ~54,600 gas. Worth sizing against their actual mainnet spend before
-pitching, since this is a consistent small win rather than a large one.
+Two of the 13 rows above were also recovered from heuristic fallbacks: `0x8874d5a5dd…`
+claimed 65.79% and measures 49.76%; `0x616ba1cd82…` claimed 69.08% and measures 63.94%.
+Two further transactions could not be measured after retries and are excluded rather than
+reported.
+
+### Reachability — the best in the survey
+
+Over 16.7 days and 655 transactions touching the Pyth contract, **649 were direct calls
+(99.1%)**. Only 6 arrived via another contract, one of them Multicall3. There is no
+router, forwarder or bundler in the path — the problem that made Chainlink (0 of 242) and
+Euler (0 of 191) unreachable.
+
+Two entry points total: 645 price updates and 4 governance instructions. That is an
+unusually small integration surface.
+
+### Honest read on which figure to quote
+
+The 8-transaction random sample from one window landed entirely on the 28% shape. The 49%
+and 64% rows were found by deliberately hunting the gas extremes. So **28% is likely the
+common case and 64% the tail**, though the true distribution of write-counts across all
+645 transactions has not been measured — doing so would require tracing every one.
+
+Quote 28% as typical, cite 63.9% as demonstrated best, and do not present the mean of the
+13 rows above as an average: the sample is deliberately biased toward outliers.
 
 ## What this is actually worth in dollars
 
