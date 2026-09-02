@@ -599,6 +599,67 @@ orders of magnitude below Chainlink's feed traffic or Lido's withdrawals. The sa
 transaction is ~54,600 gas. Worth sizing against their actual mainnet spend before
 pitching, since this is a consistent small win rather than a large one.
 
+## What this is actually worth in dollars
+
+Every figure above is a percentage. Percentages were the wrong unit, and this section is
+the correction. **At the gas prices prevailing when this was measured, the entire
+opportunity across the three best protocols is roughly $2,600 per month.**
+
+Measured 2026-09-02. Mainnet base fee was **0.15–0.35 gwei**, with blocks running
+11–42M gas against a 60M limit — abundant spare capacity, so gas is nearly free.
+ETH/USD $2,386, read from the Chainlink aggregator on-chain.
+
+| protocol | best % | qualifying txs/day | gas saved each | **savings/month** | at 20 gwei |
+|---|---:|---:|---:|---:|---:|
+| Aave V3 | 63.64% | 555 | 130,000 | **$1,691** | $103,254 |
+| Railgun | 80.84% | 106 | 877,737 | **$900** | $133,664 |
+| Pyth | 28.01% | 29 | 54,614 | **$12** | $2,245 |
+| | | | | **~$2,600** | **~$239,000** |
+
+Note how the ranking inverts. Railgun has the best percentage by a wide margin and saves
+*less money* than Aave, because Aave qualifies 5x more transactions per day. And Pyth —
+the cleanest, most uniform, most reachable result in the survey — is worth twelve dollars
+a month.
+
+### The single most important sentence in this document
+
+**The product's value is a leveraged bet on gas prices, not on the percentage saved.**
+
+A 28% saving and an 80% saving are both worth approximately nothing at 0.15 gwei. The same
+integrations are worth $103k and $134k a month at 20 gwei. Nothing about the engineering
+changes between those two worlds; only the fee market does.
+
+That reframes what the survey was for. Screening protocols by percentage — which is what
+every section above does — optimises the wrong variable. The variables that actually move
+the dollar figure are, in order:
+
+1. **The fee market.** Two orders of magnitude, and entirely outside anyone's control.
+2. **Qualifying transactions per day.** Aave beats Railgun on money while losing badly on
+   percentage.
+3. **Gas saved per transaction** — the absolute number, not the ratio.
+4. The percentage, which is a *presentation* of #3 and carries no independent information.
+
+### Method and caveats
+
+Sampling: one 9,999-block window (~1.39 days) per protocol; all transaction hashes touching
+the contract enumerated from its logs, then 180 sampled at random to establish what
+fraction call the contract **directly** (the GasKiller-eligible ones) and the median
+effective gas price actually paid. Extrapolated to 30 days.
+
+- **An earlier version of this calculation undercounted Aave by 119x** by capping the hash
+  scan at 400 and treating the survivors as the whole population. The figures above use
+  full enumeration plus random sampling. Anyone re-running this should check the same trap.
+- **Aave's inputs are the softest.** The 25% qualifying share and 130,000 gas saved per
+  transaction are carried over from the earlier per-function work, not re-measured here.
+  Railgun's 53% and 877,737 are from measured runs; Pyth's 100% and 54,614 are exact.
+- A 180-transaction sample puts roughly ±7pp of uncertainty on each direct-call fraction.
+- One ~1.4-day window extrapolated to a month will miss weekly and volatility-driven
+  cycles. Gas spikes are exactly when the product is worth most, and a quiet window will
+  understate the average.
+- Gas fees are paid by whoever sends the transaction — borrowers, wallet users, price
+  submitters — not by the protocol. Even where savings are large, they are the *users'*
+  money, which affects who the counterparty in a deal actually is.
+
 ## Limitations
 
 - **Opportunistic samples.** Railgun is the largest at 15 direct transactions from one 40,000-block window; the others are 7–20 transactions each. None is a systematic survey and none should be read as a population statistic.
