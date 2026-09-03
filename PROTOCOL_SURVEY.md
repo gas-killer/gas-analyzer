@@ -61,10 +61,16 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 
 | protocol | best measured | BLS | winning shape | how common |
 |---|---:|---:|---|---|
+| **Kelp** | **85.90%** | **58.85%** | direct `depositETH` — 4 updates, 1 call | **0.36 qualifying txs/day** |
 | **Railgun** | **80.84%** | **60.30%** | direct call to smart wallet | 374 of 704 (53%) |
 | **Aave** | **63.64%** | **yes (2 txs)** | direct `borrow` (any borrower); `withdraw` if multi-asset | ~25% of txs are direct borrows |
 | **Pyth** | **63.94%** | 0% | few feeds written per update; no external calls | **649 of 655 direct (99.1%)** |
 | **Chronicle** | **50.45%** | 0% | direct feed poke; 2 updates, no external calls | **21 of 24 measured win; ~90% of traffic direct** |
+| **Symbiotic** | **62.96%** | 0% | direct ERC-4626 `withdraw`/`redeem` on a vault | 1.49/day on the one vault measured |
+| **Renzo** | **67.10%** | 0% | `claim` via the withdraw contract | 1 of 2 measured |
+| **Mellow** | **49.60%** | 0% | direct ERC-4626 `withdraw`/`redeem` on a vault | 1.61/day on steakLRT |
+| Puffer | 19.22% | 0% | direct `requestWithdrawal` | 1 of 2 measured |
+| Swell | 0% | 0% | none — withdrawal routes are call-blocked | 0 of 3 |
 | Privacy Pools | 23.39% | 0% | direct call to pool | 2 in 17 days |
 | Ether.fi | 18.99% | 0% | EtherFiAdmin oracle report | every ~4 hours |
 | EigenLayer | 5.15% | 0% | EigenPod checkpoint proof | 4 of 5 pod checkpoints |
@@ -91,6 +97,13 @@ Two conditions, both necessary. Every result above is explained by them. Aave ad
 **2. The work must actually be computation, not bookkeeping.** Pendle satisfies condition 1 on its one direct-to-market swap and still scores ~2.7% surplus, because a swap is mostly storage writes. Ether.fi's `claimWithdraw` is the clearest case: its 43,868 gas per claim decomposes as ~25,000 of storage writes + 3,768 of logs + ~15,100 of calls, leaving ~0 for computation.
 
 The winners are cryptographic: Railgun (ZK proofs + Poseidon in its own code), Privacy Pools (Poseidon over a merkle tree), Ether.fi (oracle report processing). Ordinary DeFi arithmetic — swap curves, share conversions, interest accrual — is never large enough to dominate a transaction's gas.
+
+The restaking block adds a third dimension that neither condition captures: **volume**. Kelp's
+`depositETH` satisfies both conditions better than anything else measured — 85.90%, the highest
+in the survey — and is worth $27/month, because the pool takes 0.36 qualifying deposits a day.
+Chronicle at half the percentage is worth 12x more. Across everything surveyed, percentage and
+volume have been anti-correlated; screening on the two conditions alone selects for protocols
+with no traffic.
 
 ENS is now the sharpest case of condition 2 failing on its own. It satisfies condition 1
 comfortably — resolver writes go straight to the resolver with no regular calls at all — and
@@ -950,6 +963,66 @@ removed, not just revised down.**
 
 The 6 batch sends arrive through a separate helper contract (`0xdbd0f5eb…`), not Umbra itself;
 they appear in the table below under Umbra because that is the protocol they serve.
+
+## The restaking block — best percentages in the survey, almost no money
+
+Six longlist entries measured together: Mellow, Renzo, Kelp, Puffer, Symbiotic, Swell.
+21 transactions, all trace-measured.
+
+**I predicted this block would be weak and I was wrong.** The reasoning was that EigenLayer
+(5.15%), Ether.fi (18.99%) and Lido (1.13%) had all scored low, and vault accounting is the
+bookkeeping shape. In fact **Kelp's `depositETH` is now the highest measured saving in this
+entire file at 85.90%**, ahead of Railgun's 80.84%.
+
+| protocol | function | best | n measured | winning |
+|---|---|---:|---:|---:|
+| **Kelp** | `depositETH` ✓ `0x72c51c0b` | **85.90%** | 5 | 4 |
+| **Renzo** | `claim` ✓ `0xddd5e1b2` | 67.10% | 2 | 1 |
+| **Symbiotic** | `withdraw`/`redeem` (ERC-4626) | 62.96% | 4 | 4 |
+| **Mellow** | `withdraw`/`redeem` (ERC-4626) | 49.60% | 5 | 5 |
+| **Puffer** | `requestWithdrawal` ✓ `0xef027fbf` | 19.22% | 2 | 1 |
+| **Swell** | `createWithdrawRequest` ✓ `0x74dc9d1a` | 0.00% | 3 | 0 |
+
+Kelp is remarkably consistent: 85.90%, 85.28%, 83.57%, 83.57% across four deposits. Each
+burns 843,973–881,047 gas and records **four state updates** — a reentrancy-guard write, one
+`mint` call on rsETH, one `ETHDeposit` log, and the guard reset. Replay costs 97,229–114,353.
+
+**Why it wins.** Kelp's deposit path prices the pool by iterating over node delegators and
+strategies. Those are `view` calls, so they compile to `STATICCALL`, which the tracer ignores
+— their gas lands in the surplus and none of it has to be replayed. It is the Aave `borrow`
+pattern (a per-asset loop in the contract you call directly) with an even smaller payload.
+
+**Verification.** This is the largest claim in the file, and a large win with few recorded
+updates is exactly the shape of the ERC-4337 false positive. I checked each result against its
+receipt: every Kelp deposit's receipt contains **only 2 logs**, and the trace accounts for both
+(one recorded log, plus the `mint` call that emits the other). Nothing was dropped, and no
+revert appears in any trace. The selector and the `ETHDeposit(address,uint256,uint256,string)`
+event were both confirmed by hashing locally. One Mellow row (`0x7bcd05f1…`, 22.22%) has 8 of
+10 receipt logs unaccounted for by its 2 recorded calls and is **flagged unverified** in the
+table.
+
+### And now the money
+
+| | qualifying txs/day | mean saving | **$/month** | at 20 gwei |
+|---|---:|---:|---:|---:|
+| Kelp `depositETH` | **0.36** | 728,520 gas | **$27** | $395 |
+| Symbiotic withdraw/redeem | 1.49 | 227,791 gas | **$17** | $515 |
+| Mellow withdraw/redeem | 1.61 | 110,809 gas | **$3** | $270 |
+| | | | **$47** | **$1,180** |
+
+**The best percentage in the survey is worth $27 a month.** Kelp's pool takes 6 qualifying
+deposits per 16.7 days. Chronicle, at half the percentage, is worth 12x more because it runs
+189 qualifying transactions a day instead of 0.36.
+
+This is the exact mirror of ENS — 877 txs/day and no surplus, versus 0.36 txs/day and the
+largest surplus measured. Neither is a business. **Percentage and volume have been anti-
+correlated across everything surveyed**, and the restaking block is the sharpest illustration.
+
+Caveats: Symbiotic runs many vaults and only one (`0x7a4effd8…`) was measured, so its volume
+is understated by an unknown factor — it is the one entry here that might scale. Mellow
+likewise runs many vaults; only steakLRT was measured. Three rows in the table are **other
+people's traffic** — a Paraswap route touching pufETH, and two aggregators touching ezETH and
+rswETH — flagged in the notes and excluded from the per-protocol figures above.
 
 ## What this is actually worth in dollars
 

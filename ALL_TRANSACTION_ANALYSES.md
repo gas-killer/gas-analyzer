@@ -1,6 +1,6 @@
 # Every transaction analysed, in one place
 
-258 Ethereum mainnet transactions across 20 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Five more could not be run at all; they are listed at the end.
+279 Ethereum mainnet transactions across 26 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Five more could not be run at all; they are listed at the end.
 
 **Read the dollar-value section first.** The percentages in this file are large and the money behind them is not: the whole opportunity across the three best protocols is roughly $2,600 a month at the gas prices measured.
 
@@ -56,8 +56,9 @@ from the Chainlink aggregator on-chain.
 | Aave V3 | 63.64% | 555 | 130,000 | **$1,691** | $103,254 |
 | Railgun | 80.84% | 106 | 877,737 | **$900** | $133,664 |
 | Chronicle | 50.45% | 189 | 23,650–62,031 | **$587** | $11,658 |
+| Restaking block (6 protocols) | 85.90% | 3.5 | 110,809–728,520 | **$47** | $1,180 |
 | Pyth | 63.94% | 29 | 54,614–123,861 | **$12–25** | ~$2,245 |
-| | | | | **~$3,200** | **~$251,000** |
+| | | | | **~$3,250** | **~$252,000** |
 
 **ENS is $0** and is not in the table: it is the highest-volume protocol surveyed
 (877 txs/day) and not one of its transaction shapes clears the signature floor. See the ENS
@@ -97,10 +98,15 @@ Best and typical figures use only properly measured runs. They exclude the two O
 
 | protocol | txs | save gas (measured) | best Schnorr | typical win | blockers on the rest |
 |---|---:|---:|---:|---:|---|
+| **Kelp** | 5 | 4 | **85.90%** | 83.57% | via a third-party withdrawal route (1) |
 | **Railgun** | 18 | 15 | **80.84%** | 74.06% | external calls (3), under the floor (2) |
 | **Pyth** | 13 | **13** | **63.94%** | 28.01% | none — every transaction saves |
 | **Aave** | 20 | 10 | **63.64%** | 44.12% | external calls (9), under the floor (8), too many writes (1) |
 | **Chronicle** | 24 | **21** | **50.45%** | 48.64% | external calls (3) — all Multicall3 batches |
+| **Renzo** | 2 | 1 | **67.10%** | 67.10% | 1 row is aggregator traffic, not Renzo's own |
+| **Symbiotic** | 4 | **4** | **62.96%** | 59.45% | none — every transaction saves |
+| **Mellow** | 5 | **5** | **49.60%** | 38.59% | none, but 1 row unverified |
+| **Puffer** | 2 | 1 | 19.22% | 19.22% | 1 row is Paraswap traffic, not Puffer's own |
 | **Privacy Pools** | 11 | 2 | 23.39% | 21.96% | external calls (8), too many writes (1) |
 | **Ether.fi** | 13 | 3 | 18.99% | 7.34% | external calls (8), under the floor (4), too many writes (1) |
 | **Safe** | 12 | 3 | 9.99% | 8.98% | external calls (9), under the floor (8) |
@@ -114,6 +120,7 @@ Best and typical figures use only properly measured runs. They exclude the two O
 | **Lido** | 13 | 2 | 1.13% | 1.13% | too many writes (10), under the floor (1) |
 | **Chainlink** | 8 | 0 | 0.00% | — | external calls (8) |
 | **Panther** | 1 | 0 | 0.00% | — | external calls (1), too many writes (1) |
+| **Swell** | 3 | 0 | 0.00% | — | external calls (3); 1 row is aggregator traffic |
 | **Umbra** | 8 | 0 | 0.00% | — | replay costs more (8) — negative at *any* floor |
 | **ENS** | 18 | 0 | 0.00% | — | under the floor (11), replay costs more (7) |
 | **ERC-4337 EntryPoint** | 8 | 2 *(suspect)* | *86.54%* | *83.60%* | external calls (6); **both wins are probably replay artifacts — do not quote** |
@@ -394,6 +401,66 @@ removed, not just revised down.**
 
 The 6 batch sends arrive through a separate helper contract (`0xdbd0f5eb…`), not Umbra itself;
 they appear in the table below under Umbra because that is the protocol they serve.
+
+## The restaking block — best percentages in the survey, almost no money
+
+Six longlist entries measured together: Mellow, Renzo, Kelp, Puffer, Symbiotic, Swell.
+21 transactions, all trace-measured.
+
+**I predicted this block would be weak and I was wrong.** The reasoning was that EigenLayer
+(5.15%), Ether.fi (18.99%) and Lido (1.13%) had all scored low, and vault accounting is the
+bookkeeping shape. In fact **Kelp's `depositETH` is now the highest measured saving in this
+entire file at 85.90%**, ahead of Railgun's 80.84%.
+
+| protocol | function | best | n measured | winning |
+|---|---|---:|---:|---:|
+| **Kelp** | `depositETH` ✓ `0x72c51c0b` | **85.90%** | 5 | 4 |
+| **Renzo** | `claim` ✓ `0xddd5e1b2` | 67.10% | 2 | 1 |
+| **Symbiotic** | `withdraw`/`redeem` (ERC-4626) | 62.96% | 4 | 4 |
+| **Mellow** | `withdraw`/`redeem` (ERC-4626) | 49.60% | 5 | 5 |
+| **Puffer** | `requestWithdrawal` ✓ `0xef027fbf` | 19.22% | 2 | 1 |
+| **Swell** | `createWithdrawRequest` ✓ `0x74dc9d1a` | 0.00% | 3 | 0 |
+
+Kelp is remarkably consistent: 85.90%, 85.28%, 83.57%, 83.57% across four deposits. Each
+burns 843,973–881,047 gas and records **four state updates** — a reentrancy-guard write, one
+`mint` call on rsETH, one `ETHDeposit` log, and the guard reset. Replay costs 97,229–114,353.
+
+**Why it wins.** Kelp's deposit path prices the pool by iterating over node delegators and
+strategies. Those are `view` calls, so they compile to `STATICCALL`, which the tracer ignores
+— their gas lands in the surplus and none of it has to be replayed. It is the Aave `borrow`
+pattern (a per-asset loop in the contract you call directly) with an even smaller payload.
+
+**Verification.** This is the largest claim in the file, and a large win with few recorded
+updates is exactly the shape of the ERC-4337 false positive. I checked each result against its
+receipt: every Kelp deposit's receipt contains **only 2 logs**, and the trace accounts for both
+(one recorded log, plus the `mint` call that emits the other). Nothing was dropped, and no
+revert appears in any trace. The selector and the `ETHDeposit(address,uint256,uint256,string)`
+event were both confirmed by hashing locally. One Mellow row (`0x7bcd05f1…`, 22.22%) has 8 of
+10 receipt logs unaccounted for by its 2 recorded calls and is **flagged unverified** in the
+table.
+
+### And now the money
+
+| | qualifying txs/day | mean saving | **$/month** | at 20 gwei |
+|---|---:|---:|---:|---:|
+| Kelp `depositETH` | **0.36** | 728,520 gas | **$27** | $395 |
+| Symbiotic withdraw/redeem | 1.49 | 227,791 gas | **$17** | $515 |
+| Mellow withdraw/redeem | 1.61 | 110,809 gas | **$3** | $270 |
+| | | | **$47** | **$1,180** |
+
+**The best percentage in the survey is worth $27 a month.** Kelp's pool takes 6 qualifying
+deposits per 16.7 days. Chronicle, at half the percentage, is worth 12x more because it runs
+189 qualifying transactions a day instead of 0.36.
+
+This is the exact mirror of ENS — 877 txs/day and no surplus, versus 0.36 txs/day and the
+largest surplus measured. Neither is a business. **Percentage and volume have been anti-
+correlated across everything surveyed**, and the restaking block is the sharpest illustration.
+
+Caveats: Symbiotic runs many vaults and only one (`0x7a4effd8…`) was measured, so its volume
+is understated by an unknown factor — it is the one entry here that might scale. Mellow
+likewise runs many vaults; only steakLRT was measured. Three rows in the table are **other
+people's traffic** — a Paraswap route touching pufETH, and two aggregators touching ezETH and
+rswETH — flagged in the notes and excluded from the per-protocol figures above.
 
 ## What actually predicts a win
 
@@ -834,6 +901,28 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | Umbra | [`0x19d8496e…`](https://etherscan.io/tx/0x19d8496ec02910a6092679e948e5814e288bb799b2fccc7c7e45e52bba3efca5) | `sendToken` ✓ `0xb9bfabe1` | 83,724 | 93,380 | -9,656 | **0** (0.00%) | 0 | replay costs more | 3 (1C/1L3/1S) |  |
 | Umbra | [`0x03d44b4b…`](https://etherscan.io/tx/0x03d44b4b02585abf604b803e381863fd2d71659fe9e1db94fe25be978cb2fe38) | `sendToken` ✓ `0xb9bfabe1` | 75,873 | 85,673 | -9,800 | **0** (0.00%) | 0 | replay costs more | 3 (1C/1L3/1S) |  |
 | Umbra | [`0x2bfe5664…`](https://etherscan.io/tx/0x2bfe566409f498dbfaac1f42fb6a93e28773ab90165036f8cccd41276aa4ba2f) | *batch send (11 Announcements)* `0x7d703ead` | 505,078 | 531,727 | -26,649 | **0** (0.00%) | 0 | replay costs more | 11 (10C/1L2) |  |
+
+| Kelp | [`0x5927773e…`](https://etherscan.io/tx/0x5927773e7bf28ca0228333c07d5913192569982502caa320d594616403ac8581) | `depositETH` ✓ `0x72c51c0b` | 881,047 | 97,229 | +783,818 | **756,818** (85.90%) | 533,818 | — | 4 (1C/1L2/2S) |  |
+| Kelp | [`0x3d793f5e…`](https://etherscan.io/tx/0x3d793f5e6caf4cca5325c0a08586f09ea802e7155537c6268cae62a0d9b2fb90) | `depositETH` ✓ `0x72c51c0b` | 843,973 | 97,253 | +746,720 | **719,720** (85.28%) | 496,720 | — | 4 (1C/1L2/2S) |  |
+| Kelp | [`0xed07bc6d…`](https://etherscan.io/tx/0xed07bc6df666ead240eee3539cf2fbe198222bd5e77373dee853ed66799b8356) | `depositETH` ✓ `0x72c51c0b` | 860,124 | 114,353 | +745,771 | **718,771** (83.57%) | 495,771 | — | 4 (1C/1L2/2S) |  |
+| Kelp | [`0x1de5a43e…`](https://etherscan.io/tx/0x1de5a43e5be3c8909ee49f2b31d7da4fb6e5ae2820db7dcab45c7b54cd975db1) | `depositETH` ✓ `0x72c51c0b` | 860,124 | 114,353 | +745,771 | **718,771** (83.57%) | 495,771 | — | 4 (1C/1L2/2S) |  |
+| Renzo | [`0x0164c9ec…`](https://etherscan.io/tx/0x0164c9ec2a2aca0002fb6c83b026baf02ae79657118116d659cc1607306e732d) | `claim` ✓ `0xddd5e1b2` | 556,985 | 156,250 | +400,735 | **373,735** (67.10%) | 150,735 | — | 17 (2C/1L1/14S) |  |
+| Symbiotic | [`0xf9907340…`](https://etherscan.io/tx/0xf99073406b04143cb575fd593f4acce362cc6dedd1dbc7dc121f7b741d266974) | `withdraw` ✓ `0xb460af94` | 388,545 | 116,909 | +271,636 | **244,636** (62.96%) | 21,636 | — | 7 (1C/1L3/1L4/4S) |  |
+| Symbiotic | [`0x222b1607…`](https://etherscan.io/tx/0x222b16076f8654a56941e68b760ce77a76837708f34a778ac9c0c448aa1e74a8) | `withdraw` ✓ `0xb460af94` | 393,345 | 121,781 | +271,564 | **244,564** (62.18%) | 21,564 | — | 7 (1C/1L3/1L4/4S) |  |
+| Symbiotic | [`0x52cc4627…`](https://etherscan.io/tx/0x52cc462709e07ca5cd17b03456a405d420552051f717a39e058ce3531eee0ad6) | `redeem` ✓ `0xba087652` | 354,891 | 116,909 | +237,982 | **210,982** (59.45%) | 0 | — | 7 (1C/1L3/1L4/4S) |  |
+| Symbiotic | [`0x42aa444d…`](https://etherscan.io/tx/0x42aa444d7ee88138c5b8d1466996ee1e1fbc54a45837dad954528751b2d046e9) | `redeem` ✓ `0xba087652` | 354,891 | 116,909 | +237,982 | **210,982** (59.45%) | 0 | — | 7 (1C/1L3/1L4/4S) |  |
+| Mellow | [`0xf6e00504…`](https://etherscan.io/tx/0xf6e005046649586bebc607e52b1a599be30fa5298a675c7bd47cb65910d4b0e9) | `withdraw` ✓ `0xb460af94` | 285,541 | 116,909 | +168,632 | **141,632** (49.60%) | 0 | — | 7 (1C/1L3/1L4/4S) |  |
+| Mellow | [`0xfe087bdd…`](https://etherscan.io/tx/0xfe087bdd2929c1ffa4b9cfd6ced03e510015b91bfd4d2e46630d45782bea7733) | `redeem` ✓ `0xba087652` | 257,579 | 116,909 | +140,670 | **113,670** (44.13%) | 0 | — | 7 (1C/1L3/1L4/4S) |  |
+| Mellow | [`0x7492f30f…`](https://etherscan.io/tx/0x7492f30ffc86ee6112332404b2d566b7ac69892b929a8b1269e83b02ec002739) | `withdraw` ✓ `0xb460af94` | 267,866 | 137,503 | +130,363 | **103,363** (38.59%) | 0 | — | 7 (1C/1L3/1L4/4S) |  |
+| Mellow | [`0x8cab3ca8…`](https://etherscan.io/tx/0x8cab3ca8f227eea89b600c21d9946246c1d3b934ec4fa0866b75bf06c2c4fd64) | `redeem` ✓ `0xba087652` | 244,274 | 132,703 | +111,571 | **84,571** (34.62%) | 0 | — | 7 (1C/1L3/1L4/4S) |  |
+| Mellow | [`0x7bcd05f1…`](https://etherscan.io/tx/0x7bcd05f137e612ed18a05b8ae6a3d69098e49478bd08f3f1fdc503125e7660a6) | `redeem` ✓ `0xba087652` | 362,727 | 255,112 | +107,615 | **80,615** (22.22%) | 0 | — | 8 (2C/1L3/1L4/4S) | **unverified** — 8 of 10 receipt logs unaccounted for by the 2 recorded calls |
+| Puffer | [`0x4138ef12…`](https://etherscan.io/tx/0x4138ef12a8ff9af26a8a3e2215ece5d3d89a7def48d0d15014b0ac1c5b766233) | `requestWithdrawal` ✓ `0xef027fbf` | 189,094 | 125,747 | +63,347 | **36,347** (19.22%) | 0 | — | 7 (1C/1L4/5S) |  |
+| Swell | [`0xde520139…`](https://etherscan.io/tx/0xde520139bb8c7e72bc8f00f44e5f5acc1836e277dd2ca6c383ec2cb85fdf07a4) | *withdrawal route* `0x64370336` | 506,140 | 500,723 | +5,417 | **0** (0.00%) | 0 | external calls | 18 (2C/3L2/13S) |  |
+| Swell | [`0x5fa9fc3e…`](https://etherscan.io/tx/0x5fa9fc3e86cd5eca4d1cea80f43cdc4deda42654347dc2d9f96f1d3861c747c9) | `swap` ✓ `0xe21fd0e9` | 1,429,886 | 1,434,239 | -4,353 | **0** (0.00%) | 0 | external calls | 7 (3C/4L1) | **not Swell's own** — aggregator touching rswETH |
+| Swell | [`0x007900f8…`](https://etherscan.io/tx/0x007900f86481e523c1e73a76908b3ae1af44fd4978f798298305f98c300461dd) | `createWithdrawRequest` ✓ `0x74dc9d1a` | 310,597 | 317,086 | -6,489 | **0** (0.00%) | 0 | external calls | 16 (2C/1L3/1L4/12S) |  |
+| Renzo | [`0xbec0bce9…`](https://etherscan.io/tx/0xbec0bce9263ce0eafb97a9516080b2ffb8fbbac17bec59bd6de8314cf755107d) | `transferAndMulticall` ✓ `0xf9e4bab4` | 836,980 | 843,164 | -6,184 | **0** (0.00%) | 0 | external calls | 3 (2C/1L1) | **not Renzo's own** — aggregator that touches ezETH |
+| Puffer | [`0x98eacd62…`](https://etherscan.io/tx/0x98eacd62af71a709fa00814c8e065c2865e5e90432d97147dacea56fbcffba60) | `swapExactAmountInOnCurveV1` ✓ `0x1a01c532` | 239,072 | 252,170 | -13,098 | **0** (0.00%) | 0 | external calls | 5 (5C) | **not Puffer's own** — Paraswap route touching pufETH |
+| Kelp | [`0xe0901586…`](https://etherscan.io/tx/0xe090158643e1c7bf676c2e373ca98e3d37d95affb69ca257b2ee598bbc03310a) | *withdrawal route* `0x6d7b7040` | 508,968 | 515,629 | -6,661 | **0** (0.00%) | 0 | external calls | 1 (1C) | via third-party contract |
 
 ## Transactions that could not be measured at all
 
