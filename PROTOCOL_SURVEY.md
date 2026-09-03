@@ -832,8 +832,12 @@ begins with three zero bytes, saving calldata gas. They optimise aggressively.
 Every direct poke records exactly **two state updates — one storage write and one log** — and
 **zero external calls**. Replay therefore costs about 37,000 gas regardless of feed or
 transaction: across 13 Scribe measurements the base estimate varies by 96 gas. Everything
-above it, roughly 88,000 gas, is signature verification and validator bookkeeping, and all of
-it is removable.
+above it — mean **89,031 gas** — is removable work.
+
+The analyzer reports the size of that surplus, not what it consists of. Attributing it to
+signature verification is an inference from Scribe's `poke` path (decode, staleness check,
+Schnorr verify, signer-registry lookup, write), where verification is by far the largest item
+and the 260-byte calldata is mostly signature. **Not decomposed, not verified.**
 
 This is the precise inverse of ENS, measured in the same session. ENS is a large payload with
 nothing around it (best surplus 16,058 gas, never clears the floor). Chronicle is a tiny
@@ -861,8 +865,10 @@ inclusion. Gas *price paid* is a ranking input, not just gas used.
 aggregated off-chain and one signature is verified on-chain. GasKiller would replace one
 aggregate-signature check with another, and its 27,000-gas floor is charged against a contract
 built specifically to minimise that cost. The argument has to be narrow and quantitative —
-*the on-chain verification path costs ~88,000 gas, GasKiller's costs 27,000* — not "we remove
-your computation."
+*the measured removable surplus averages 89,031 gas; GasKiller's own signature check costs
+27,000* — not "we remove your computation." Both should be quoted for what they are: 27,000 is
+a constant in this repo (`crates/core/src/encoding.rs:21`), 89,031 is gas used minus the
+measured replay cost.
 
 **2. Optimistic settlement changes the security model for a price feed.** GasKiller writes the
 result and permits a challenge afterwards. A lending market reading that price to trigger

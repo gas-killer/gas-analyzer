@@ -214,8 +214,13 @@ do not are Multicall3 batches.**
 A Chronicle feed update burns 121,000–129,000 gas and writes one storage slot plus one log.
 Replaying that costs about 37,000 gas no matter which feed or which transaction — the base
 estimate varies by only 96 gas across all 13 Scribe measurements. Everything above that,
-roughly 88,000 gas, is signature verification and validator bookkeeping, and all of it is
-removable.
+mean **89,031 gas** — is removable work.
+
+*What* that work is, the analyzer does not say: it reports the amount of removable work, not
+its composition. Reading it as signature verification is an inference from Scribe's `poke`
+path (decode, staleness check, Schnorr verify, signer-registry lookup, write), where the
+verification is much the largest item and the 260-byte calldata is mostly signature. **Not
+decomposed, not verified.**
 
 This is the exact inverse of ENS, measured in the same session: ENS is a large payload with
 no computation around it, Chronicle is a tiny payload with a lot. Same floor, opposite result.
@@ -242,9 +247,11 @@ ranking.
 **1. Scribe is already a Schnorr multi-signature oracle.** Its own repository describes it as
 "an efficient Schnorr multi-signature based Oracle." So GasKiller would be replacing one
 aggregate-signature check with another, and the 27,000-gas floor is charged against a contract
-whose entire design goal is minimising exactly that cost. The pitch is narrow and quantitative
-— *your on-chain verification path costs ~88,000 gas, ours costs 27,000* — rather than "we
-remove your computation."
+whose entire design goal is minimising exactly that cost. The pitch is narrow and quantitative —
+*the measured removable surplus averages 89,031 gas; GasKiller's own signature check costs
+27,000* — rather than "we remove your computation." Quote both for what they are: 27,000 is a
+constant in this repo (`crates/core/src/encoding.rs:21`), 89,031 is gas used minus the
+measured replay cost.
 
 **2. Optimistic settlement changes what an oracle is.** GasKiller writes the result first and
 allows a challenge later. For a lending protocol reading that price to decide liquidations,
