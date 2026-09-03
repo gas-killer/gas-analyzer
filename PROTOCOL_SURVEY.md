@@ -2,7 +2,7 @@
 
 Measured with this repository's analyzer (`cargo run -- t <hash>`, EvmSketch backend) against Ethereum mainnet. Companion to `MORPHO_CANDIDATES.md` (Morpho) and `CALL_BLOCKED_CANDIDATES.md` (transactions that score zero because of external calls).
 
-Every number in the results tables is analyzer output. Where a figure is my own arithmetic it says so. The appendix at the end indexes all 114 measured transactions by their 4-byte selector, separating keccak-verified function names from labels inferred only from emitted events.
+Every number in the results tables is analyzer output. Where a figure is my own arithmetic it says so. The appendix at the end indexes the measured transactions by their 4-byte selector, separating keccak-verified function names from labels inferred only from emitted events.
 
 ## Headline: Railgun
 
@@ -78,6 +78,7 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 | Ethena | 8.99% | 0% | one 900-byte mint order | **1 of 309 mints (0.3%)** |
 | ERC-4337 EntryPoint | *86.54%?* | *60%?* | **suspect — likely estimator false positive** | 2 of 8 measured |
 | Panther | 0% | 0% | none — shielded pool is not on mainnet | 0 of 1 |
+| **ENS** | **0%** | 0% | **none — 18 of 18 measured, best is 40% short of the floor** | 877 txs/day, all shapes zero |
 
 ## What predicts a good candidate
 
@@ -88,6 +89,11 @@ Two conditions, both necessary. Every result above is explained by them. Aave ad
 **2. The work must actually be computation, not bookkeeping.** Pendle satisfies condition 1 on its one direct-to-market swap and still scores ~2.7% surplus, because a swap is mostly storage writes. Ether.fi's `claimWithdraw` is the clearest case: its 43,868 gas per claim decomposes as ~25,000 of storage writes + 3,768 of logs + ~15,100 of calls, leaving ~0 for computation.
 
 The winners are cryptographic: Railgun (ZK proofs + Poseidon in its own code), Privacy Pools (Poseidon over a merkle tree), Ether.fi (oracle report processing). Ordinary DeFi arithmetic — swap curves, share conversions, interest accrual — is never large enough to dominate a transaction's gas.
+
+ENS is now the sharpest case of condition 2 failing on its own. It satisfies condition 1
+comfortably — resolver writes go straight to the resolver with no regular calls at all — and
+still scores zero on all 18 transactions, because a naming record *is* a storage write. There
+is nothing wrapped around it to remove.
 
 ## Aave — `borrow` is a reliable candidate
 
@@ -621,6 +627,117 @@ common case and 64% the tail**, though the true distribution of write-counts acr
 
 Quote 28% as typical, cite 63.9% as demonstrated best, and do not present the mean of the
 13 rows above as an average: the sample is deliberately biased toward outliers.
+
+## ENS — the write is the payload, and there is nothing around it
+
+Picked as the highest-volume protocol left on the longlist. The longlist rates it a good
+candidate ("high-volume registrations, renewals, and resolver writes at predictable,
+repeated cost: a good candidate for rebate-style savings passed to users"). That rating is
+wrong, and this is the cleanest negative result in the survey.
+
+**18 transactions, 9 functions, 5 contracts, all trace-measured, all 0.00%.**
+
+### Volume, for context
+
+Enumerated by `eth_getLogs` across 7 ENS contracts over blocks 25,796,435–25,896,434
+(13.94 days): **12,227 distinct ENS-touching transactions = 877/day.** That is the highest
+transaction rate of anything surveyed. The dominant contract is the current
+`ETHRegistrarController` at `0x59e16fcc…` — 6,203 txs over the window (445/day), and it
+handles exactly two entry points:
+
+| selector | function | share of 213 sampled | gas | calldata |
+|---|---|---:|---|---|
+| `0xef9c8805` | `register((string,address,uint256,bytes32,address,bytes[],uint8,bytes32))` | 108 | 140,288–524,112 (med 218,814) | 388–2564B |
+| `0x18026ad1` | `renew(string,uint256,bytes32)` | 105 | 80,866–88,200 (med 83,013) | 164B fixed |
+
+Both selectors keccak-verified locally. Note this is *not* the controller at
+`0x253553366D…` that most ENS documentation still lists; that one took 2 of 220 sampled
+transactions. The current one adds a `bytes32 referrer` argument to both entry points.
+
+### Results
+
+| contract | function | gas used | replay cost | surplus | Schnorr |
+|---|---|---:|---:|---:|---:|
+| Controller | `renew` | 88,200 | 72,142 | **+16,058** | 0% |
+| Controller | `register` | 140,288 | 124,344 | +15,944 | 0% |
+| Controller | `register` | 455,003 | 440,380 | +14,623 | 0% |
+| Controller | `renew` | 83,013 | 69,415 | +13,598 | 0% |
+| Controller | `register` | 524,112 | 511,783 | +12,329 | 0% |
+| Controller | `renew` | 80,866 | 69,331 | +11,535 | 0% |
+| Controller | `register` | 207,083 | 195,854 | +11,229 | 0% |
+| PublicResolver | `setText` | 63,971 | 57,713 | +6,258 | 0% |
+| PublicResolver | `setAddr` | 66,214 | 61,851 | +4,363 | 0% |
+| PublicResolver | `multicall` | 95,617 | 92,644 | +2,973 | 0% |
+| PublicResolver | `setText` | 110,303 | 108,030 | +2,273 | 0% |
+| PublicResolver | `setContenthash` | 48,536 | 51,625 | −3,089 | 0% |
+| PublicResolver | `multicall` | 86,903 | 92,644 | −5,741 | 0% |
+| NameWrapper | `setSubnodeRecord` | 142,491 | 150,080 | −7,589 | 0% |
+| PublicResolver | `multicall` | 171,817 | 181,469 | −9,652 | 0% |
+| Registry | `setSubnodeRecord` | 76,480 | 86,787 | −10,307 | 0% |
+| BaseRegistrar | `safeTransferFrom` | 128,799 | 146,761 | −17,962 | 0% |
+| NameWrapper | `setRecord` | 53,596 | 74,883 | −21,287 | 0% |
+
+**Best surplus: 16,058 gas against a 27,000-gas floor — 40% short. Mean surplus across all
+18: 1,975 gas. Seven of the 18 are negative**, meaning replaying the recorded state changes
+costs more than the original transaction did.
+
+### Why it fails, and why more volume cannot fix it
+
+An ENS transaction's gas is storage writes plus logs, and almost nothing else. GasKiller must
+perform the identical writes and emit the identical logs, so none of that cost is removed. All
+it strips is the surrounding compute — namehash, string handling, the USD price lookup, the
+commitment check — and that is worth 11,000–16,000 gas, every time, regardless of the
+transaction.
+
+The decisive observation is that **surplus does not scale with transaction size**:
+
+- 524,112-gas `register` → 12,329 gas surplus
+- 88,200-gas `renew` → 16,058 gas surplus
+
+A transaction six times smaller yields *more* surplus. The large registrations spend their gas
+in sub-calls to the registry, the NFT and the resolver — 6 of their 8 recorded updates are
+`Call`s — and every one of those is re-executed on replay (`crates/core/src/trace.rs:255`).
+So the usual route to clearing the floor, "find a bigger transaction," is closed here: bigger
+ENS transactions are bigger because they make more sub-calls, which adds to replay cost as
+fast as it adds to gas used.
+
+`PublicResolver.multicall` looked like the exception before measurement — it uses
+`DELEGATECALL` internally, which the tracer follows transparently, and all its authorisation
+checks are `view` (so `STATICCALL`, ignored). It therefore records **zero** external calls.
+It still scores zero, and two of the three measured are negative. Batching more records into
+one multicall makes the transaction more expensive to replay, not less.
+
+This is precisely the objection the longlist itself raises about EAS — "a plain `attest()`
+call is mostly a single storage write plus one keccak256 hash, and the write is the payload,
+so there's little surrounding compute to strip out." ENS is the same shape. **Its longlist
+rating should be revised down to match EAS's.**
+
+### Ceiling if the signature were free
+
+26,319 transactions/month × 1,975 gas mean surplus, at the 0.107 gwei median effective gas
+price these transactions actually paid, ETH at $2,396.31 (Chainlink aggregator, read
+on-chain): **$13/month.** At 20 gwei, $2,491/month. With the real 27,000-gas floor it is $0
+at any gas price.
+
+For comparison, Pyth clears the floor on every transaction and is worth $12–25/month at the
+same fee levels. ENS has 30× Pyth's transaction volume and is worth nothing — which is the
+single best illustration in this survey that volume is necessary but not sufficient.
+
+### One methodological finding worth carrying forward
+
+8 of the 18 first-pass runs hit `HTTP 429` and fell back to the heuristic estimator. Retrying
+serially recovered all 8, though `0x707689e3…` took four separate retry rounds. **All 8 collapsed to 0%**, and the largest
+error was 125,611 gas — the heuristic reported 51.78% on a transaction whose replay is
+actually *more expensive* than the original.
+
+Crucially, four of those eight had **zero external calls**. The known failure mode — the
+heuristic prices `Call` at zero — cannot explain them. The cause is a second one:
+`crates/core/src/heuristic.rs:40` charges `WARM_SSTORE_COST` 5,000 per storage write, while a
+write to a previously empty slot really costs about 20,000. ENS resolver records are mostly
+fresh slots, so the heuristic underpriced replay by roughly 15,000 gas per write.
+
+So "this row has no external calls" is **not** a reason to trust a `heur` figure. Only
+re-measurement is.
 
 ## What this is actually worth in dollars
 

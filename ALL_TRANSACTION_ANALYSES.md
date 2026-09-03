@@ -1,6 +1,6 @@
 # Every transaction analysed, in one place
 
-208 Ethereum mainnet transactions across 17 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Five more could not be run at all; they are listed at the end.
+226 Ethereum mainnet transactions across 18 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Five more could not be run at all; they are listed at the end.
 
 **Read the dollar-value section first.** The percentages in this file are large and the money behind them is not: the whole opportunity across the three best protocols is roughly $2,600 a month at the gas prices measured.
 
@@ -58,6 +58,10 @@ from the Chainlink aggregator on-chain.
 | Pyth | 63.94% | 29 | 54,614–123,861 | **$12–25** | ~$2,245 |
 | | | | | **~$2,600** | **~$239,000** |
 
+**ENS is $0** and is not in the table: it is the highest-volume protocol surveyed
+(877 txs/day) and not one of its transaction shapes clears the signature floor. See the ENS
+section below — volume without surplus is worth nothing.
+
 **The ranking inverts against percentage.** Railgun has the best percentage in this file by
 a wide margin and saves *less money* than Aave, because Aave qualifies five times more
 transactions per day. Pyth — the cleanest, most reachable result here — is worth about
@@ -104,7 +108,55 @@ Best and typical figures use only properly measured runs. They exclude the two O
 | **Lido** | 13 | 2 | 1.13% | 1.13% | too many writes (10), under the floor (1) |
 | **Chainlink** | 8 | 0 | 0.00% | — | external calls (8) |
 | **Panther** | 1 | 0 | 0.00% | — | external calls (1), too many writes (1) |
+| **ENS** | 18 | 0 | 0.00% | — | under the floor (11), replay costs more (7) |
 | **ERC-4337 EntryPoint** | 8 | 2 *(suspect)* | *86.54%* | *83.60%* | external calls (6); **both wins are probably replay artifacts — do not quote** |
+
+## ENS: 18 transactions, 18 measured, nothing saved
+
+ENS was the highest-volume protocol left unchecked on the longlist, and the longlist called
+it a good candidate for "rebate-style savings passed to users." It is the clearest negative
+result in this file, and the reason is structural rather than incidental.
+
+**All 18 transactions measured 0.00%, and 7 of them have negative surplus** — replaying the
+recorded state changes costs *more* than the original transaction did.
+
+| | |
+|---|---:|
+| transactions measured | 18 / 18 — no `heur` rows left |
+| coverage | 9 functions across 5 ENS contracts |
+| best surplus of any transaction | **16,058 gas** (`renew`) |
+| Schnorr floor it must clear | 27,000 gas |
+| shortfall of the best case | **10,942 gas** |
+| mean surplus across all 18 | 1,975 gas |
+| transactions with negative surplus | 7 of 18 |
+
+**Why.** An ENS transaction's gas is almost entirely storage writes and logs. GasKiller has
+to write those same slots and emit those same logs, so that cost does not go away — it is
+the payload, not the computation. What GasKiller removes is only the surrounding compute:
+string parsing, namehash, the price lookup, the commitment check. That is worth 11,000–16,000
+gas and never more.
+
+**Surplus does not grow with transaction size.** A 524,112-gas registration yields 12,329 gas
+of surplus; an 88,200-gas renewal yields 16,058 — more, from a transaction six times smaller.
+The large registrations spend their gas in sub-calls to the registry, the NFT and the resolver
+(6 of their 8 recorded updates are `Call`s), and those must be re-executed on replay. Making
+ENS transactions bigger does not move them toward the floor.
+
+This is the same objection the longlist itself raises against EAS — "the write is the payload,
+so there's little surrounding compute to strip out." It applies to ENS with full force, and
+**the longlist's assessment of ENS should be revised down.**
+
+**What it would be worth if the signature were free.** ENS-wide: 26,319 transactions/month ×
+1,975 gas mean surplus, at the 0.107 gwei median effective gas price actually paid and ETH at
+$2,396.31 (Chainlink, read on-chain) = **$13/month**. At 20 gwei, $2,491/month. With the real
+27,000-gas floor it is **$0 at any gas price**, because none of the nine functions measured
+clears the floor — the best is 40% short.
+
+Volume for reference: 12,227 distinct ENS-touching transactions in a 13.94-day window across
+7 contracts, i.e. 877/day. The dominant one is the current `ETHRegistrarController`
+(`0x59e16fcc…`, 445/day), which handles only `register` and `renew`. Caveat: 18 transactions
+over nine functions is a sample, not the population — but the shortfall is 11,000 gas wide,
+not a rounding error, and it is negative for 7 of the 18.
 
 ## What actually predicts a win
 
@@ -184,6 +236,38 @@ On `0xaf1a2df7…` the heuristic was wrong by 86,378 gas.
 a time — before drawing any conclusion. The remaining `heur` rows in the table below,
 including those inherited from earlier protocols, were produced under the same throttling
 and should be re-run before use rather than treated as data.
+
+
+### The heuristic also underprices fresh storage writes, not just calls
+
+ENS exposed a second, independent way the fallback lies. `crates/core/src/heuristic.rs:40`
+charges `WARM_SSTORE_COST` 5,000 per storage write. A write to a slot that was previously
+empty actually costs about 20,000. ENS resolver records are mostly new slots, so the
+heuristic underestimated the replay cost by roughly 15,000 gas per write — and it did this
+on transactions with **zero external calls**, where the `Call`-priced-at-zero explanation
+does not apply at all.
+
+8 of the 18 ENS runs fell back to the heuristic, all of them on `HTTP 429`. Retrying
+(up to 10 attempts each) recovered real measurements for all 8, and **all 8 collapsed to 0%**:
+
+| tx | function | calls | heuristic claimed | true measured | heuristic underpriced base by |
+|---|---|---:|---:|---:|---:|
+| `0x707689e3…` | `multicall` | 0 | 51.78% | 0% | 125,611 gas |
+| `0xd49a8171…` | `multicall` | 0 | 34.21% | 0% | 56,733 gas |
+| `0x063bce87…` | `multicall` | 0 | 27.61% | 0% | 56,733 gas |
+| `0x3b10d318…` | `renew` | 2 | 21.42% | 0% | 31,180 gas |
+| `0xacbe2f4e…` | `register` | 5 | 15.57% | 0% | 48,014 gas |
+| `0x4fce8ead…` | `setAddr` | 0 | 14.63% | 0% | 32,321 gas |
+| `0x15e84300…` | `setText` | 0 | 12.40% | 0% | 28,677 gas |
+| `0xfe33d0ff…` | `setContenthash` | 0 | 0% | 0% | 13,476 gas |
+
+The worst case, `0x707689e3…`, was wrong by 125,611 gas: the heuristic reported a 51.78%
+saving on a transaction whose replay actually costs *more* than the original.
+
+**So "zero external calls" is not a safety check on a `heur` row.** Three of the four largest
+overstatements above have no calls at all. The only safe treatment is re-measurement.
+Retrying does work, but it can take persistence: `0x707689e3…` needed four separate retry
+rounds before the replay went through.
 
 ## The replay defect — why 11 transactions can't be measured, and one silent failure mode
 
@@ -461,6 +545,25 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | **Pyth** | [`0x90b34b5d…`](https://etherscan.io/tx/0x90b34b5df172d1d050f207ab34da927e4f81f7e710ae1edc1aa945e0fbc887d9) | `updatePriceFeedsIfNecessary` ✓ `0xb9256d28` | 194,995 | 113,405 | +81,590 | **54,590** (28.00%) | 0 | — | 12 | 2148B calldata.  |
 | **Pyth** | [`0x9f3e0810…`](https://etherscan.io/tx/0x9f3e08104c3a853674bb012ae9331fccb6f00dacd90c0661bf5d3de97079c7ee) | `updatePriceFeedsIfNecessary` ✓ `0xb9256d28` | 194,989 | 113,405 | +81,584 | **54,584** (27.99%) | 0 | — | 12 | 2148B calldata.  |
 
+| ENS | [`0x00061980…`](https://etherscan.io/tx/0x000619805359c5bbf89fd109825f18f9e6ef602ee010df1482c4444107131b98) | Controller `renew` ✓ `0x18026ad1` | 88,200 | 72,142 | +16,058 | **0** (0.00%) | 0 | under the floor | 3 (2C/1L2) |  |
+| ENS | [`0x27b47957…`](https://etherscan.io/tx/0x27b479573f4bfa7ab2ae841aeb979d7e415d8cdf00d5533d9f1d3e9bfd8289f7) | Controller `register` ✓ `0xef9c8805` | 140,288 | 124,344 | +15,944 | **0** (0.00%) | 0 | under the floor | 5 (3C/1L3/1S) |  |
+| ENS | [`0x518c3dc9…`](https://etherscan.io/tx/0x518c3dc964d3794cbc21a1f5f5f39c218ef77b741418b24b7cfbe7aecb053a4a) | Controller `register` ✓ `0xef9c8805` | 455,003 | 440,380 | +14,623 | **0** (0.00%) | 0 | under the floor | 8 (6C/1L3/1S) |  |
+| ENS | [`0x3b10d318…`](https://etherscan.io/tx/0x3b10d318e95285570651ca3662a40c592873e9ef55309eb64e5eeb2a182e9747) | Controller `renew` ✓ `0x18026ad1` | 83,013 | 69,415 | +13,598 | **0** (0.00%) | 0 | under the floor | 3 (2C/1L2) |  |
+| ENS | [`0xe6c6ae69…`](https://etherscan.io/tx/0xe6c6ae69a80283612cc07a48e3f4f65bf19d2ccafb247136ec98d4b1ee937346) | Controller `register` ✓ `0xef9c8805` | 524,112 | 511,783 | +12,329 | **0** (0.00%) | 0 | under the floor | 8 (6C/1L3/1S) |  |
+| ENS | [`0x3d046fd6…`](https://etherscan.io/tx/0x3d046fd6792e7306571e45a22eea26744796b46dba0522209504e12f657efdea) | Controller `renew` ✓ `0x18026ad1` | 80,866 | 69,331 | +11,535 | **0** (0.00%) | 0 | under the floor | 3 (2C/1L2) |  |
+| ENS | [`0xacbe2f4e…`](https://etherscan.io/tx/0xacbe2f4e73a952fb2ed80b6d2d44628e57c20446707aba2916dce1cb35580bec) | Controller `register` ✓ `0xef9c8805` | 207,083 | 195,854 | +11,229 | **0** (0.00%) | 0 | under the floor | 7 (5C/1L3/1S) |  |
+| ENS | [`0x15e84300…`](https://etherscan.io/tx/0x15e8430076c4d227e82b143d875c27fb6989ef5e761a1a6948a16d746998ceb6) | PublicResolver `setText` ✓ `0x10f13a8c` | 63,971 | 57,713 | +6,258 | **0** (0.00%) | 0 | under the floor | 2 (1L3/1S) |  |
+| ENS | [`0x4fce8ead…`](https://etherscan.io/tx/0x4fce8ead701079e2eedf6e422305741ca541cbb3daf5d4ddf589e1a98a2630fa) | PublicResolver `setAddr` ✓ `0xd5fa2b00` | 66,214 | 61,851 | +4,363 | **0** (0.00%) | 0 | under the floor | 3 (2L2/1S) |  |
+| ENS | [`0xd49a8171…`](https://etherscan.io/tx/0xd49a8171d37b5fd4a3b2a20104378746771ce302c4f75ab08416b6255f133068) | PublicResolver `multicall` ✓ `0xac9650d8` | 95,617 | 92,644 | +2,973 | **0** (0.00%) | 0 | under the floor | 5 (3L2/2S) |  |
+| ENS | [`0x56b75bb9…`](https://etherscan.io/tx/0x56b75bb9a6edfd8f1e154aa50d77826298dda3ce9b8ff7a38bd2550c04964cb9) | PublicResolver `setText` ✓ `0x10f13a8c` | 110,303 | 108,030 | +2,273 | **0** (0.00%) | 0 | under the floor | 4 (1L3/3S) |  |
+| ENS | [`0xfe33d0ff…`](https://etherscan.io/tx/0xfe33d0ffec57cf666aab00eab3e93c7db5bb19e2c1d6a1c1b364539e1a318a0c) | PublicResolver `setContenthash` ✓ `0x304e6ade` | 48,536 | 51,625 | -3,089 | **0** (0.00%) | 0 | replay costs more | 4 (1L2/3S) |  |
+| ENS | [`0x063bce87…`](https://etherscan.io/tx/0x063bce8758b202c3130502edbb56e57b49200da873751ba911ae2dc1f3d35347) | PublicResolver `multicall` ✓ `0xac9650d8` | 86,903 | 92,644 | -5,741 | **0** (0.00%) | 0 | replay costs more | 5 (3L2/2S) |  |
+| ENS | [`0x24718216…`](https://etherscan.io/tx/0x24718216634b3849236fed508cce84aa1cd40b65a0030e2dd0e384c8466fb297) | NameWrapper `setSubnodeRecord` ✓ `0x24c1af44` | 142,491 | 150,080 | -7,589 | **0** (0.00%) | 0 | replay costs more | 5 (1C/1L2/1L4/2S) |  |
+| ENS | [`0x707689e3…`](https://etherscan.io/tx/0x707689e32396134bcfe3fcee826a3bbbdd9b668dae5f438404449696027896b1) | PublicResolver `multicall` ✓ `0xac9650d8` | 171,817 | 181,469 | -9,652 | **0** (0.00%) | 0 | replay costs more | 9 (2L2/2L3/5S) |  |
+| ENS | [`0x8beab91b…`](https://etherscan.io/tx/0x8beab91bab4d5bbf770c63071eeff6faca54dbf3c2a399f38507fb9a989ccc9f) | Registry `setSubnodeRecord` ✓ `0x5ef2c7f0` | 76,480 | 86,787 | -10,307 | **0** (0.00%) | 0 | replay costs more | 4 (1L2/1L3/2S) |  |
+| ENS | [`0x7e8f6cf9…`](https://etherscan.io/tx/0x7e8f6cf9bd7ff68bcbbe6181362379868086438492a79d55f57a72c851b182a6) | BaseRegistrar `safeTransferFrom` ✓ `0xb88d4fde` | 128,799 | 146,761 | -17,962 | **0** (0.00%) | 0 | replay costs more | 5 (1C/1L4/3S) |  |
+| ENS | [`0x2a918a42…`](https://etherscan.io/tx/0x2a918a425728e529f0c9889da1fff462ba34aa62e7386c3868565f060d99696f) | NameWrapper `setRecord` ✓ `0xcf408823` | 53,596 | 74,883 | -21,287 | **0** (0.00%) | 0 | replay costs more | 6 (2C/1L2/1L4/2S) |  |
+
 ## Transactions that could not be measured at all
 
 The tool produced no output and exited cleanly. Every one is a very large trace, so the surveys here systematically miss the biggest and most interesting transactions.
@@ -477,9 +580,11 @@ Four Morpho liquidations failed the real replay for other reasons and appear in 
 
 ## What to be careful about
 
-- **16 of the results are `heur` fallbacks.** Ignore their savings figures. The three biggest apparent Morpho wins in this file (16.32%, 13.47%, 11.25%) are all fallbacks, and the one that was later re-measured properly dropped from 13.47% to 0%.
+- **15 of the results are `heur` fallbacks** (Morpho 7, Euler 3, Ethena 3, Railgun 2). Ignore their savings figures. The three biggest apparent Morpho wins in this file (16.32%, 13.47%, 11.25%) are all fallbacks. Of the 18 fallbacks re-measured properly so far, **16 collapsed to 0%** (6 in Ethena, 4 corrected in place across Morpho/Aave/Ether.fi, all 8 in ENS). The two exceptions are both Pyth, where a real saving survived but shrank — `0x8874d5a5…` from 65.79% to 49.76%, and `0x616ba1cd…` down to 63.94%. So a fallback is not automatically fictional; it is automatically *overstated*, and on this evidence it is fictional about 90% of the time.
 - **The five unmeasurable transactions are all large.** EigenLayer's real ceiling is unknown for this reason.
 - **Two Ondo rows are mislabelled traffic**, flagged in the notes column — an MEV bot and an aggregator that happen to touch Ondo tokens. Ondo's own mint and redeem transactions save 1–2%.
+- **A `heur` row with zero external calls is still not trustworthy.** ENS produced four such rows and the biggest was wrong by 125,611 gas. The fallback underprices fresh storage writes as well as calls.
+- **ENS is fully measured (18/18) and uniformly zero.** It is the one protocol here where the negative result is structural rather than a sampling artefact.
 - **Sample sizes are small per protocol** (7–26 transactions, drawn from a few thousand recent blocks). The direction of each result is solid; the exact percentages are not a population average.
 
 Deeper write-ups: `PROTOCOL_SURVEY.md` (per protocol), `MORPHO_CANDIDATES.md` (Morpho and liquidations), `CALL_BLOCKED_CANDIDATES.md` (the external-call group).
