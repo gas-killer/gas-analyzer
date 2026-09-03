@@ -79,7 +79,7 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 | Ethena | 8.99% | 0% | one 900-byte mint order | **1 of 309 mints (0.3%)** |
 | ERC-4337 EntryPoint | *86.54%?* | *60%?* | **suspect — likely estimator false positive** | 2 of 8 measured |
 | Panther | 0% | 0% | none — shielded pool is not on mainnet | 0 of 1 |
-| **Umbra** | **0%** | 0% | **none — all 8 txs have negative surplus** | 10.4 txs/day (lowest surveyed) |
+| **Umbra** | **0%** | 0% | **none — all 8 txs have negative surplus** | 1.4 txs/day (lowest surveyed) |
 | **ENS** | **0%** | 0% | **none — 18 of 18 measured, best is 40% short of the floor** | 877 txs/day, all shapes zero |
 
 ## What predicts a good candidate
@@ -921,11 +921,35 @@ the *only* protocol surveyed where every single transaction is negative.
 verifies an ECDSA signature. It measures −8,966 and −9,248. One `ecrecover` is ~3,000 gas —
 nowhere near enough to matter against a 27,000-gas floor.
 
-**And the frequency claim is wrong.** 291 distinct Umbra transactions in a 27.88-day window
-(200,000 blocks) = **10.4/day**, the lowest of anything surveyed with a live deployment. There
-is no volume-based rebate pitch to make: even at a hypothetical 100% saving, 10 transactions a
-day at 2.079 gwei is a rounding error. **Umbra's longlist entry should be removed, not just
-revised down.**
+**There is no shield transaction, by design.** Every `PUSH4` constant in the contract's 7,110
+bytes of bytecode resolves to one of: `sendEth`/`sendToken`, four `withdrawToken*` variants,
+seven toll/fee admin functions, `tokenPayments`, and Ownable's three. Three selectors are
+unresolved. Nothing resembles a shield, deposit, commitment, nullifier or proof verifier.
+Umbra is a stealth-address scheme, not a shielded pool: funds go straight to a fresh one-time
+address derived from the recipient's published keys, and the `Announcement` event exists only
+so the recipient can scan for it. Privacy comes from address unlinkability, not from hiding
+amounts in a pool — so there is no merkle tree to update and no proof to verify. That is why a
+payment costs 62,000 gas and why there is nothing to remove. The longlist says as much
+("smaller compute footprint than shielded pools"); the measurement confirms it.
+
+**And the frequency claim is wrong.** Enumerating *every* transaction that touches the Umbra
+contract in a 27.88-day window (200,000 blocks, filtered on address **and** topic): **38
+transactions = 1.36/day** — 15 `sendToken`, 15 `withdrawTokenOnBehalf`, 6 batch sends,
+2 `sendEth`. That is the lowest of anything surveyed with a live deployment, and the
+highest-gas Umbra transaction among all 38 is the 505,078-gas batch send already measured at
+−26,649 surplus, so no heavier shape exists outside the sample.
+
+> **Correction.** An earlier version of this section reported 291 transactions / 10.4 per day.
+> That came from filtering the `Announcement` topic *without* an address filter, which swept in
+> dozens of unrelated contracts emitting the same event signature. The real figure is 7.6x
+> lower. The conclusion is unchanged and strengthened.
+
+There is no volume-based rebate pitch to make: even at a hypothetical 100% saving, 1.4
+transactions a day at 2.079 gwei is a rounding error. **Umbra's longlist entry should be
+removed, not just revised down.**
+
+The 6 batch sends arrive through a separate helper contract (`0xdbd0f5eb…`), not Umbra itself;
+they appear in the table below under Umbra because that is the protocol they serve.
 
 ## What this is actually worth in dollars
 
