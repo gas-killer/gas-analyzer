@@ -64,6 +64,7 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 | **Railgun** | **80.84%** | **60.30%** | direct call to smart wallet | 374 of 704 (53%) |
 | **Aave** | **63.64%** | **yes (2 txs)** | direct `borrow` (any borrower); `withdraw` if multi-asset | ~25% of txs are direct borrows |
 | **Pyth** | **63.94%** | 0% | few feeds written per update; no external calls | **649 of 655 direct (99.1%)** |
+| **Chronicle** | **50.45%** | 0% | direct feed poke; 2 updates, no external calls | **21 of 24 measured win; ~90% of traffic direct** |
 | Privacy Pools | 23.39% | 0% | direct call to pool | 2 in 17 days |
 | Ether.fi | 18.99% | 0% | EtherFiAdmin oracle report | every ~4 hours |
 | EigenLayer | 5.15% | 0% | EigenPod checkpoint proof | 4 of 5 pod checkpoints |
@@ -712,6 +713,32 @@ call is mostly a single storage write plus one keccak256 hash, and the write is 
 so there's little surrounding compute to strip out." ENS is the same shape. **Its longlist
 rating should be revised down to match EAS's.**
 
+### It is not the external calls — the relationship is inverted
+
+The usual reason a transaction scores zero in this file is external calls. That is **not**
+what happens with ENS — the relationship runs backwards:
+
+| | zero external calls | has external calls |
+|---|---:|---:|
+| transactions | 8 | 10 |
+| best surplus | **+6,258** gas | **+16,058** gas |
+| mean surplus | **−1,615** gas | **+4,848** gas |
+
+The eight transactions with no external calls at all have a *negative* mean surplus, and
+their best case is four times short of the floor. Removing every external call from ENS
+would not produce a single win.
+
+The clean ones are resolver writes — `setAddr`, `setText`, `multicall` — which are a storage
+write plus a log and nothing else. `register` and `renew` score higher *despite* having 2–6
+calls each, because they are the only ENS functions doing real computation: namehash, string
+validation, the commitment check, and the USD price lookup (a `STATICCALL`, so the tracer
+ignores it and its gas lands in the surplus). Even so they top out at 16,058.
+
+So ENS fails the second screening condition, not the first. That distinction matters for how
+you would treat it: Euler scores zero because of a mandatory router, which is a fixable no.
+ENS is an unfixable no — a naming record *is* a storage write, and there is nothing wrapped
+around it to remove.
+
 ### Ceiling if the signature were free
 
 26,319 transactions/month × 1,975 gas mean surplus, at the 0.107 gwei median effective gas
@@ -738,6 +765,115 @@ fresh slots, so the heuristic underpriced replay by roughly 15,000 gas per write
 
 So "this row has no external calls" is **not** a reason to trust a `heur` figure. Only
 re-measurement is.
+
+## Chronicle — heavy verification, two-update payload, every direct poke wins
+
+Chronicle runs Sky/Maker's oracle network. Selected as the last unchecked protocol on the
+longlist whose on-chain work is cryptographic verification rather than bookkeeping. The
+prediction held: it is the strongest new candidate in this survey.
+
+**24 transactions, all trace-measured, no heuristic fallbacks. 21 of 24 save.**
+
+### How the contracts were found
+
+No address list was needed. Chronicle's Scribe emits `Poked(address,uint128,uint32)` and the
+legacy Maker medians emit `LogMedianPrice(uint256,uint256)`; filtering `eth_getLogs` on those
+two topics with no address filter enumerates every live feed contract on mainnet. Over blocks
+25,846,619–25,896,618 (6.97 days):
+
+| event | txs | rate | direct-to-contract |
+|---|---:|---:|---:|
+| `Poked` (Scribe) | 718 | 103/day | 81 of 90 sampled (90%) |
+| `LogMedianPrice` (legacy Median/OSM) | 672 | 96/day | 90 of 90 (100%) |
+
+Four entry points, all keccak-verified locally:
+
+| selector | function | gas | calldata |
+|---|---|---|---|
+| `0x00000082` | `poke_optimized_7136211((uint128,uint32),(bytes32,address,bytes))` | 121,309–129,099 | 260B |
+| `0x2f529d73` | `poke((uint128,uint32),(bytes32,address,bytes))` | 127,899–128,819 | 260B |
+| `0x89bbb8b2` | `poke(uint256[],uint256[],uint8[],bytes32[],bytes32[])` | 73,493–89,949 | 1124–1444B |
+| `0x18178358` | `poke()` | 80,034–103,090 | 4B |
+
+`poke_optimized_7136211` is a mined function name: Chronicle brute-forced it so the selector
+begins with three zero bytes, saving calldata gas. They optimise aggressively.
+
+### Results
+
+| contract | function | gas used | replay cost | surplus | Schnorr |
+|---|---|---:|---:|---:|---:|
+| Scribe | `poke_optimized` | 129,099 | 36,964 | +92,135 | **50.45%** |
+| Scribe | `poke` | 128,819 | 36,964 | +91,855 | **50.35%** |
+| Scribe | `poke` | 127,899 | 36,940 | +90,959 | **50.01%** |
+| Scribe | `poke_optimized` | 127,643 | 36,964 | +90,679 | **49.89%** |
+| Scribe | `poke_optimized` | 127,655 | 37,036 | +90,619 | **49.84%** |
+| Scribe | `poke_optimized` | 126,087 | 36,988 | +89,099 | **49.25%** |
+| Scribe | `poke_optimized` | 125,951 | 36,940 | +89,011 | **49.23%** |
+| Scribe | `poke_optimized` | 125,663 | 37,036 | +88,627 | **49.04%** |
+| Scribe | `poke_optimized` | 124,495 | 36,940 | +87,555 | **48.64%** |
+| Scribe | `poke_optimized` | 124,507 | 36,988 | +87,519 | **48.61%** |
+| Scribe | `poke_optimized` | 124,507 | 36,988 | +87,519 | **48.61%** |
+| Scribe | `poke_optimized` | 124,519 | 37,012 | +87,507 | **48.59%** |
+| Scribe | `poke_optimized` | 121,309 | 36,988 | +84,321 | **47.25%** |
+| OSM | `poke()` | 103,090 | 36,022 | +67,068 | **38.87%** |
+| OSM | `poke()` | 103,080 | 36,022 | +67,058 | **38.86%** |
+| Median | `poke(...sigs)` | 89,949 | 35,974 | +53,975 | **29.99%** |
+| Median | `poke(...sigs)` | 89,937 | 35,974 | +53,963 | **29.98%** |
+| OSM | `poke()` | 80,034 | 35,974 | +44,060 | **21.32%** |
+| OSM | `poke()` | 80,034 | 35,974 | +44,060 | **21.32%** |
+| Median | `poke(...sigs)` | 73,567 | 36,022 | +37,545 | **14.33%** |
+| Median | `poke(...sigs)` | 73,493 | 36,022 | +37,471 | **14.25%** |
+| Multicall3 | `aggregate3` | 897,296 | 911,985 | −14,689 | 0% |
+| Multicall3 | `aggregate3` | 569,896 | 579,405 | −9,509 | 0% |
+| Multicall3 | `aggregate3` | 243,479 | 247,819 | −4,340 | 0% |
+
+### Why the shape is close to ideal
+
+Every direct poke records exactly **two state updates — one storage write and one log** — and
+**zero external calls**. Replay therefore costs about 37,000 gas regardless of feed or
+transaction: across 13 Scribe measurements the base estimate varies by 96 gas. Everything
+above it, roughly 88,000 gas, is signature verification and validator bookkeeping, and all of
+it is removable.
+
+This is the precise inverse of ENS, measured in the same session. ENS is a large payload with
+nothing around it (best surplus 16,058 gas, never clears the floor). Chronicle is a tiny
+payload with a lot around it (surplus 37,471–92,135 gas, always clears it). Same floor,
+opposite outcome — the cleanest illustration in this survey of what condition 2 actually
+measures.
+
+### Worth in dollars
+
+189 qualifying transactions/day (92.7 Scribe direct + 96.4 legacy Median/OSM), mean saving
+62,031 gas for Scribe and 23,650 for Median/OSM = **240.9M gas/month**. At the **1.007 gwei**
+median effective gas price these transactions actually paid, ETH $2,419.40 (Chronicle
+aggregator, on-chain): **$587/month.** At 20 gwei, $11,658/month.
+
+Third by money behind Aave ($1,691) and Railgun ($900), and **25x Pyth** despite a lower
+headline percentage than Pyth's best. Two reasons, both worth carrying into the ranking
+method: Chronicle has ~6x Pyth's qualifying volume, and its transactions pay roughly **10x
+the gas price** ENS and Pyth pay, because an oracle update must land promptly and bids for
+inclusion. Gas *price paid* is a ranking input, not just gas used.
+
+### Two objections that belong in any pitch
+
+**1. Scribe is already a Schnorr multi-signature oracle.** Its repository describes it as
+"an efficient Schnorr multi-signature based Oracle": validator signatures are already
+aggregated off-chain and one signature is verified on-chain. GasKiller would replace one
+aggregate-signature check with another, and its 27,000-gas floor is charged against a contract
+built specifically to minimise that cost. The argument has to be narrow and quantitative —
+*the on-chain verification path costs ~88,000 gas, GasKiller's costs 27,000* — not "we remove
+your computation."
+
+**2. Optimistic settlement changes the security model for a price feed.** GasKiller writes the
+result and permits a challenge afterwards. A lending market reading that price to trigger
+liquidations treats "verified now" and "challengeable later" very differently. This is not a
+gas question and I have not evaluated it, but it is the strongest counter to the largest win
+measured here, and Chronicle will raise it before anything else.
+
+**Batching is the one technical blocker.** About 10% of Scribe traffic arrives via Multicall3
+`aggregate3`, a keeper poking several feeds at once. All three measured score 0% with negative
+surplus: each inner poke becomes an external call that must be re-executed. An integration
+should keep pokes as separate direct transactions.
 
 ## What this is actually worth in dollars
 

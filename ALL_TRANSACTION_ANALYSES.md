@@ -1,6 +1,6 @@
 # Every transaction analysed, in one place
 
-226 Ethereum mainnet transactions across 18 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Five more could not be run at all; they are listed at the end.
+250 Ethereum mainnet transactions across 19 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Five more could not be run at all; they are listed at the end.
 
 **Read the dollar-value section first.** The percentages in this file are large and the money behind them is not: the whole opportunity across the three best protocols is roughly $2,600 a month at the gas prices measured.
 
@@ -55,8 +55,9 @@ from the Chainlink aggregator on-chain.
 |---|---:|---:|---:|---:|---:|
 | Aave V3 | 63.64% | 555 | 130,000 | **$1,691** | $103,254 |
 | Railgun | 80.84% | 106 | 877,737 | **$900** | $133,664 |
+| Chronicle | 50.45% | 189 | 23,650–62,031 | **$587** | $11,658 |
 | Pyth | 63.94% | 29 | 54,614–123,861 | **$12–25** | ~$2,245 |
-| | | | | **~$2,600** | **~$239,000** |
+| | | | | **~$3,200** | **~$251,000** |
 
 **ENS is $0** and is not in the table: it is the highest-volume protocol surveyed
 (877 txs/day) and not one of its transaction shapes clears the signature floor. See the ENS
@@ -72,7 +73,11 @@ Nothing about the engineering differs between the last two columns; only gas pri
 
 So when using this file to pick targets, rank by:
 
-1. **The fee market.** Two orders of magnitude, entirely outside anyone's control.
+1. **The fee market.** Two orders of magnitude, entirely outside anyone's control. Note it
+   also varies *between* protocols at the same moment: Chronicle's transactions paid 1.007
+   gwei while ENS and Pyth paid 0.107, because an oracle update has to land promptly and bids
+   for inclusion. A 10x difference in gas price paid is worth as much as a 10x difference in
+   volume, and I initially overlooked it by using one price for everything.
 2. **Qualifying transactions per day.** This is what makes Aave beat Railgun on money.
 3. **Absolute gas saved per transaction**, not the ratio.
 4. The percentage — which is only a presentation of #3 and adds no information.
@@ -95,6 +100,7 @@ Best and typical figures use only properly measured runs. They exclude the two O
 | **Railgun** | 18 | 15 | **80.84%** | 74.06% | external calls (3), under the floor (2) |
 | **Pyth** | 13 | **13** | **63.94%** | 28.01% | none — every transaction saves |
 | **Aave** | 20 | 10 | **63.64%** | 44.12% | external calls (9), under the floor (8), too many writes (1) |
+| **Chronicle** | 24 | **21** | **50.45%** | 48.64% | external calls (3) — all Multicall3 batches |
 | **Privacy Pools** | 11 | 2 | 23.39% | 21.96% | external calls (8), too many writes (1) |
 | **Ether.fi** | 13 | 3 | 18.99% | 7.34% | external calls (8), under the floor (4), too many writes (1) |
 | **Safe** | 12 | 3 | 9.99% | 8.98% | external calls (9), under the floor (8) |
@@ -146,6 +152,32 @@ This is the same objection the longlist itself raises against EAS — "the write
 so there's little surrounding compute to strip out." It applies to ENS with full force, and
 **the longlist's assessment of ENS should be revised down.**
 
+### It is not the external calls
+
+The usual reason a transaction scores zero in this file is external calls. That is **not**
+what happens with ENS — the relationship runs backwards:
+
+| | zero external calls | has external calls |
+|---|---:|---:|
+| transactions | 8 | 10 |
+| best surplus | **+6,258** gas | **+16,058** gas |
+| mean surplus | **−1,615** gas | **+4,848** gas |
+
+The eight transactions with no external calls at all have a *negative* mean surplus, and
+their best case is four times short of the floor. Removing every external call from ENS
+would not produce a single win.
+
+The clean ones are resolver writes — `setAddr`, `setText`, `multicall` — which are a storage
+write plus a log and nothing else. `register` and `renew` score higher *despite* having 2–6
+calls each, because they are the only ENS functions doing real computation: namehash, string
+validation, the commitment check, and the USD price lookup (a `STATICCALL`, so the tracer
+ignores it and its gas lands in the surplus). Even so they top out at 16,058.
+
+So ENS fails the second screening condition, not the first. That distinction matters for how
+you would treat it: Euler scores zero because of a mandatory router, which is a fixable no.
+ENS is an unfixable no — a naming record *is* a storage write, and there is nothing wrapped
+around it to remove.
+
 **What it would be worth if the signature were free.** ENS-wide: 26,319 transactions/month ×
 1,975 gas mean surplus, at the 0.107 gwei median effective gas price actually paid and ETH at
 $2,396.31 (Chainlink, read on-chain) = **$13/month**. At 20 gwei, $2,491/month. With the real
@@ -157,6 +189,74 @@ Volume for reference: 12,227 distinct ENS-touching transactions in a 13.94-day w
 (`0x59e16fcc…`, 445/day), which handles only `register` and `renew`. Caveat: 18 transactions
 over nine functions is a sample, not the population — but the shortfall is 11,000 gas wide,
 not a rounding error, and it is negative for 7 of the 18.
+
+## Chronicle — the best new candidate found, and every direct transaction wins
+
+Chronicle runs Sky/Maker's oracle network. It was picked because it is the last unchecked
+protocol on the longlist whose on-chain work is *verification* rather than accounting, and
+that prediction held.
+
+**24 transactions, all trace-measured, no `heur` rows. 21 of 24 save. The only three that
+do not are Multicall3 batches.**
+
+| | |
+|---|---:|
+| direct pokes measured | 21, **all winning** |
+| Scribe `poke` range | **47.25% – 50.45%** (median 48.64%) |
+| legacy Median / OSM range | 14.25% – 38.87% |
+| gas saved per Scribe poke | 57,321 – 65,135 |
+| state updates per transaction | **2** — one storage write, one log |
+| external calls | **0** on every direct poke |
+| replay cost (base) | **~37,000, essentially constant** |
+
+### Why the shape is close to ideal
+
+A Chronicle feed update burns 121,000–129,000 gas and writes one storage slot plus one log.
+Replaying that costs about 37,000 gas no matter which feed or which transaction — the base
+estimate varies by only 96 gas across all 13 Scribe measurements. Everything above that,
+roughly 88,000 gas, is signature verification and validator bookkeeping, and all of it is
+removable.
+
+This is the exact inverse of ENS, measured in the same session: ENS is a large payload with
+no computation around it, Chronicle is a tiny payload with a lot. Same floor, opposite result.
+
+Note Chronicle already optimises hard — the dominant entry point is
+`poke_optimized_7136211`, a function name mined so its selector is `0x00000082`, three zero
+bytes to shave calldata cost. A team doing that is likely receptive to a gas argument, and
+also unlikely to have left easy wins lying around.
+
+### What it is worth
+
+189 qualifying transactions/day (92.7 Scribe direct + 96.4 legacy Median/OSM), 240.9M gas
+saved per month. **At the 1.007 gwei these transactions actually paid and ETH at $2,419:
+$587/month.** At 20 gwei, $11,658.
+
+That places it third by money behind Aave and Railgun, and **25x Pyth** — despite Pyth
+having a higher headline percentage. Two reasons: Chronicle has 6x the qualifying volume,
+and its transactions pay **~10x the gas price** ENS and Pyth pay, because an oracle update
+has to land promptly and bids accordingly. Gas price paid, not just gas used, belongs in the
+ranking.
+
+### Two honest objections
+
+**1. Scribe is already a Schnorr multi-signature oracle.** Its own repository describes it as
+"an efficient Schnorr multi-signature based Oracle." So GasKiller would be replacing one
+aggregate-signature check with another, and the 27,000-gas floor is charged against a contract
+whose entire design goal is minimising exactly that cost. The pitch is narrow and quantitative
+— *your on-chain verification path costs ~88,000 gas, ours costs 27,000* — rather than "we
+remove your computation."
+
+**2. Optimistic settlement changes what an oracle is.** GasKiller writes the result first and
+allows a challenge later. For a lending protocol reading that price to decide liquidations,
+"verified now" and "verifiable later" are not the same guarantee. This is a security-model
+conversation, not a gas conversation, and Chronicle will raise it first. It is the strongest
+counter-argument to the largest measured win in this section, and I have not evaluated it.
+
+**Batching is the one technical blocker.** Roughly 10% of Scribe traffic arrives through
+Multicall3 (`aggregate3`), where a keeper pokes several feeds in one transaction. All three
+measured that way score 0% with negative surplus, because each inner poke becomes an external
+call that has to be re-executed. Any integration should keep pokes as separate direct
+transactions.
 
 ## What actually predicts a win
 
@@ -563,6 +663,31 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | ENS | [`0x8beab91b…`](https://etherscan.io/tx/0x8beab91bab4d5bbf770c63071eeff6faca54dbf3c2a399f38507fb9a989ccc9f) | Registry `setSubnodeRecord` ✓ `0x5ef2c7f0` | 76,480 | 86,787 | -10,307 | **0** (0.00%) | 0 | replay costs more | 4 (1L2/1L3/2S) |  |
 | ENS | [`0x7e8f6cf9…`](https://etherscan.io/tx/0x7e8f6cf9bd7ff68bcbbe6181362379868086438492a79d55f57a72c851b182a6) | BaseRegistrar `safeTransferFrom` ✓ `0xb88d4fde` | 128,799 | 146,761 | -17,962 | **0** (0.00%) | 0 | replay costs more | 5 (1C/1L4/3S) |  |
 | ENS | [`0x2a918a42…`](https://etherscan.io/tx/0x2a918a425728e529f0c9889da1fff462ba34aa62e7386c3868565f060d99696f) | NameWrapper `setRecord` ✓ `0xcf408823` | 53,596 | 74,883 | -21,287 | **0** (0.00%) | 0 | replay costs more | 6 (2C/1L2/1L4/2S) |  |
+
+| Chronicle | [`0x33fc0276…`](https://etherscan.io/tx/0x33fc0276a8d7ed1948aac0130dad3adb5c285cfbdb65880d647fcda76d9a90c8) | Scribe `poke_optimized_7136211` ✓ `0x00000082` | 129,099 | 36,964 | +92,135 | **65,135** (50.45%) | 0 | — | 2 (1L2/1S) |  |
+| Chronicle | [`0x0bb84b09…`](https://etherscan.io/tx/0x0bb84b092ba588fb16ff105e7c13957841facfaea7e1dce09918b8e6ddec9906) | Scribe `poke` ✓ `0x2f529d73` | 128,819 | 36,964 | +91,855 | **64,855** (50.35%) | 0 | — | 2 (1L2/1S) |  |
+| Chronicle | [`0xd4ccdc11…`](https://etherscan.io/tx/0xd4ccdc1185f1269709d962e9ec8becf18ffeb40a048016cd877bd57f8c56a395) | Scribe `poke` ✓ `0x2f529d73` | 127,899 | 36,940 | +90,959 | **63,959** (50.01%) | 0 | — | 2 (1L2/1S) |  |
+| Chronicle | [`0xc2ff01f2…`](https://etherscan.io/tx/0xc2ff01f2e2b32d3a92441742ad8ef44ac7645a2a12b3a0a0595d5803e95b3314) | Scribe `poke_optimized_7136211` ✓ `0x00000082` | 127,643 | 36,964 | +90,679 | **63,679** (49.89%) | 0 | — | 2 (1L2/1S) |  |
+| Chronicle | [`0x18beefef…`](https://etherscan.io/tx/0x18beefef56141767a0e4c4d6aebaab6f4e042ba2fd73063b325590fedd954559) | Scribe `poke_optimized_7136211` ✓ `0x00000082` | 127,655 | 37,036 | +90,619 | **63,619** (49.84%) | 0 | — | 2 (1L2/1S) |  |
+| Chronicle | [`0xa5043652…`](https://etherscan.io/tx/0xa50436526fc8a0e8c94781fd8cec6c2e782e81588ec069525419903a685b5586) | Scribe `poke_optimized_7136211` ✓ `0x00000082` | 126,087 | 36,988 | +89,099 | **62,099** (49.25%) | 0 | — | 2 (1L2/1S) |  |
+| Chronicle | [`0xa43037be…`](https://etherscan.io/tx/0xa43037be59fafae9223f0ba1342c3eeaae408da11080b1b9e0d80c7545a8e9f9) | Scribe `poke_optimized_7136211` ✓ `0x00000082` | 125,951 | 36,940 | +89,011 | **62,011** (49.23%) | 0 | — | 2 (1L2/1S) |  |
+| Chronicle | [`0xbf98a993…`](https://etherscan.io/tx/0xbf98a993b605a94c01605b92d14f08d5cf6a019c1f89dbe3654a8b70abda7780) | Scribe `poke_optimized_7136211` ✓ `0x00000082` | 125,663 | 37,036 | +88,627 | **61,627** (49.04%) | 0 | — | 2 (1L2/1S) |  |
+| Chronicle | [`0xfd9968d1…`](https://etherscan.io/tx/0xfd9968d1b696a78ade14ce04b7c2368cab2350b5e521e0b41d1a8ac5c07bfedb) | Scribe `poke_optimized_7136211` ✓ `0x00000082` | 124,495 | 36,940 | +87,555 | **60,555** (48.64%) | 0 | — | 2 (1L2/1S) |  |
+| Chronicle | [`0xd3fa91b6…`](https://etherscan.io/tx/0xd3fa91b65de811df53dcb9827df0ac660675ba0f6cebd2a1c53b2c2d59ab2dc0) | Scribe `poke_optimized_7136211` ✓ `0x00000082` | 124,507 | 36,988 | +87,519 | **60,519** (48.61%) | 0 | — | 2 (1L2/1S) |  |
+| Chronicle | [`0x85ff84f4…`](https://etherscan.io/tx/0x85ff84f45a7383338660b54e3cb4763d462c5781a78a631141fd783f05ae8aed) | Scribe `poke_optimized_7136211` ✓ `0x00000082` | 124,507 | 36,988 | +87,519 | **60,519** (48.61%) | 0 | — | 2 (1L2/1S) |  |
+| Chronicle | [`0x1a8e1999…`](https://etherscan.io/tx/0x1a8e1999e69bb4f2996e716a0e740b9b492f0f1458106d5412a92573d69a319d) | Scribe `poke_optimized_7136211` ✓ `0x00000082` | 124,519 | 37,012 | +87,507 | **60,507** (48.59%) | 0 | — | 2 (1L2/1S) |  |
+| Chronicle | [`0xc504a4dc…`](https://etherscan.io/tx/0xc504a4dcbdb2f1a547c8e85a3aa10e301fb47b7618636f74d582110275a3dfda) | Scribe `poke_optimized_7136211` ✓ `0x00000082` | 121,309 | 36,988 | +84,321 | **57,321** (47.25%) | 0 | — | 2 (1L2/1S) |  |
+| Chronicle | [`0xfaffd0ec…`](https://etherscan.io/tx/0xfaffd0ecd5ad094bc14a1f7d1474a38c6c200235298119e39e77f13b5fb955fa) | OSM `poke()` ✓ `0x18178358` | 103,090 | 36,022 | +67,068 | **40,068** (38.87%) | 0 | — | 2 (1L1/1S) |  |
+| Chronicle | [`0x11df7756…`](https://etherscan.io/tx/0x11df7756226128459aff94e29187d1ec9501dccc2d905bba2136ea531a7e76e2) | OSM `poke()` ✓ `0x18178358` | 103,080 | 36,022 | +67,058 | **40,058** (38.86%) | 0 | — | 2 (1L1/1S) |  |
+| Chronicle | [`0xf4e4f0f1…`](https://etherscan.io/tx/0xf4e4f0f17ed73f459a59ff95f17a8496e03d65a70cfd7208de79ccb87bc56f56) | Median `poke(uint256[],uint256[],uint8[],bytes32[],bytes32[])` ✓ `0x89bbb8b2` | 89,949 | 35,974 | +53,975 | **26,975** (29.99%) | 0 | — | 2 (1L1/1S) |  |
+| Chronicle | [`0x1a400408…`](https://etherscan.io/tx/0x1a40040807a503ec6538bfeffaa4fa3458ed9566af8aa83a94a5ace150e65dca) | Median `poke(uint256[],uint256[],uint8[],bytes32[],bytes32[])` ✓ `0x89bbb8b2` | 89,937 | 35,974 | +53,963 | **26,963** (29.98%) | 0 | — | 2 (1L1/1S) |  |
+| Chronicle | [`0x2ed22cf0…`](https://etherscan.io/tx/0x2ed22cf0d3276cefb494e31647f280b844ce618e67a8326ba2fe9fc43d720ee9) | OSM `poke()` ✓ `0x18178358` | 80,034 | 35,974 | +44,060 | **17,060** (21.32%) | 0 | — | 2 (1L1/1S) |  |
+| Chronicle | [`0x2b1cdec4…`](https://etherscan.io/tx/0x2b1cdec4cc43ebcde9112c9d92256ca344eda19dfee70457882a23e9e6cfc386) | OSM `poke()` ✓ `0x18178358` | 80,034 | 35,974 | +44,060 | **17,060** (21.32%) | 0 | — | 2 (1L1/1S) |  |
+| Chronicle | [`0x07668874…`](https://etherscan.io/tx/0x0766887492c81242e9346d58c8630dac26a1c6f4307dc62a987e2d79c4668f82) | Median `poke(uint256[],uint256[],uint8[],bytes32[],bytes32[])` ✓ `0x89bbb8b2` | 73,567 | 36,022 | +37,545 | **10,545** (14.33%) | 0 | — | 2 (1L1/1S) |  |
+| Chronicle | [`0x96b59d20…`](https://etherscan.io/tx/0x96b59d20ce9611707d365c3df5b33b2d1468c68dba4dc6a2f0ecbf055fd448a8) | Median `poke(uint256[],uint256[],uint8[],bytes32[],bytes32[])` ✓ `0x89bbb8b2` | 73,493 | 36,022 | +37,471 | **10,471** (14.25%) | 0 | — | 2 (1L1/1S) |  |
+| Chronicle | [`0xcd7e52d7…`](https://etherscan.io/tx/0xcd7e52d764d8cc8d810a33e5d156b74837cad5b74688126b8a21ed5494413d15) | Multicall3 `aggregate3` ✓ `0x82ad56cb` | 897,296 | 911,985 | -14,689 | **0** (0.00%) | 0 | external calls | 8 (8C) |  |
+| Chronicle | [`0x640f1093…`](https://etherscan.io/tx/0x640f1093965977576f6f631e09c267391b3a213d2fef75c74cd83a25d5825f22) | Multicall3 `aggregate3` ✓ `0x82ad56cb` | 569,896 | 579,405 | -9,509 | **0** (0.00%) | 0 | external calls | 5 (5C) |  |
+| Chronicle | [`0x3aa6909a…`](https://etherscan.io/tx/0x3aa6909a86a92ae55183b4fe13961dc1972a1d670a450418179ac5b4395fabe7) | Multicall3 `aggregate3` ✓ `0x82ad56cb` | 243,479 | 247,819 | -4,340 | **0** (0.00%) | 0 | external calls | 2 (2C) |  |
 
 ## Transactions that could not be measured at all
 
