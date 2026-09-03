@@ -1,6 +1,6 @@
 # Every transaction analysed, in one place
 
-250 Ethereum mainnet transactions across 19 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Five more could not be run at all; they are listed at the end.
+258 Ethereum mainnet transactions across 20 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Five more could not be run at all; they are listed at the end.
 
 **Read the dollar-value section first.** The percentages in this file are large and the money behind them is not: the whole opportunity across the three best protocols is roughly $2,600 a month at the gas prices measured.
 
@@ -114,6 +114,7 @@ Best and typical figures use only properly measured runs. They exclude the two O
 | **Lido** | 13 | 2 | 1.13% | 1.13% | too many writes (10), under the floor (1) |
 | **Chainlink** | 8 | 0 | 0.00% | — | external calls (8) |
 | **Panther** | 1 | 0 | 0.00% | — | external calls (1), too many writes (1) |
+| **Umbra** | 8 | 0 | 0.00% | — | replay costs more (8) — negative at *any* floor |
 | **ENS** | 18 | 0 | 0.00% | — | under the floor (11), replay costs more (7) |
 | **ERC-4337 EntryPoint** | 8 | 2 *(suspect)* | *86.54%* | *83.60%* | external calls (6); **both wins are probably replay artifacts — do not quote** |
 
@@ -316,13 +317,59 @@ own product is a Schnorr multi-signature oracle, they are also the counterparty 
 have a precise view of what on-chain Schnorr verification really costs. **Establish the
 provenance of 27,000 before pitching them.**
 
-Chainlink and Panther score zero at *any* floor, including zero — their surplus is negative,
-so replaying costs more than the original transaction regardless of signature scheme.
+Chainlink, Panther and Umbra score zero at *any* floor, including zero — their surplus is
+negative, so replaying costs more than the original transaction regardless of signature
+scheme. Umbra is the starkest: all 8 of its transactions are negative, best case −7,488 gas.
 
 Caveats: the 15 `heur` rows are excluded, since their base estimates are unreliable for
 reasons unrelated to the floor. The 5 unmeasurable transactions have no base estimate at all
 and cannot be re-evaluated at any floor. The BLS row uses the same mechanism with its 250,000
 constant, which has the same lack of provenance.
+
+## Umbra — zero at any floor, and the volume premise is wrong too
+
+Next entry on the longlist after the other three privacy protocols. The longlist rates it
+"smaller compute footprint than shielded pools but high transaction frequency, useful
+reference for volume-based rebate pitch." Both halves of that turn out to be wrong in the
+same direction.
+
+Found by event topic, no address guessing: `Announcement(address,uint256,address,bytes32,bytes32)`
+resolves to a single live contract, `0xfb2dc580…`.
+
+**8 transactions, 4 functions, all trace-measured. All 0.00% — and every one has negative
+surplus.**
+
+| function | gas used | replay cost | surplus |
+|---|---:|---:|---:|
+| `sendEth` ✓ `0xbeb9addf` | 62,261 | 69,749 | **−7,488** |
+| `sendEth` ✓ `0xbeb9addf` | 62,261 | 69,773 | −7,512 |
+| `withdrawTokenOnBehalf` ✓ `0x81ab0fcd` | 70,497 | 79,463 | −8,966 |
+| `withdrawTokenOnBehalf` ✓ `0x81ab0fcd` | 70,613 | 79,861 | −9,248 |
+| `sendToken` ✓ `0xb9bfabe1` | 83,712 | 93,356 | −9,644 |
+| `sendToken` ✓ `0xb9bfabe1` | 83,724 | 93,380 | −9,656 |
+| `sendToken` ✓ `0xb9bfabe1` | 75,873 | 85,673 | −9,800 |
+| *batch send* `0x7d703ead` | 505,078 | 531,727 | −26,649 |
+
+The best case is **−7,488 gas**. Umbra therefore joins Chainlink and Panther in the group that
+scores zero **at any floor, including a floor of zero** — the floor-sensitivity table above
+cannot rescue it, because there is no surplus to recover.
+
+**Why.** A stealth payment is a value transfer plus an event. The transfer is recorded as a
+`Call` update, which GasKiller has to re-execute verbatim; the event has to be re-emitted.
+Both are irreducible payload, and neither is computation. The recorded state changes are 1–3
+updates of which 1–2 are always `Call`s, so replay reproduces essentially the whole
+transaction and then adds wrapper overhead on top — hence the negative surplus. Note this is
+the *only* protocol surveyed where every single transaction is negative.
+
+`withdrawTokenOnBehalf` was the one plausible candidate: a relayer-sponsored withdrawal that
+verifies an ECDSA signature. It measures −8,966 and −9,248. One `ecrecover` is ~3,000 gas —
+nowhere near enough to matter against a 27,000-gas floor.
+
+**And the frequency claim is wrong.** 291 distinct Umbra transactions in a 27.88-day window
+(200,000 blocks) = **10.4/day**, the lowest of anything surveyed with a live deployment. There
+is no volume-based rebate pitch to make: even at a hypothetical 100% saving, 10 transactions a
+day at 2.079 gwei is a rounding error. **Umbra's longlist entry should be removed, not just
+revised down.**
 
 ## What actually predicts a win
 
@@ -754,6 +801,15 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | Chronicle | [`0xcd7e52d7…`](https://etherscan.io/tx/0xcd7e52d764d8cc8d810a33e5d156b74837cad5b74688126b8a21ed5494413d15) | Multicall3 `aggregate3` ✓ `0x82ad56cb` | 897,296 | 911,985 | -14,689 | **0** (0.00%) | 0 | external calls | 8 (8C) |  |
 | Chronicle | [`0x640f1093…`](https://etherscan.io/tx/0x640f1093965977576f6f631e09c267391b3a213d2fef75c74cd83a25d5825f22) | Multicall3 `aggregate3` ✓ `0x82ad56cb` | 569,896 | 579,405 | -9,509 | **0** (0.00%) | 0 | external calls | 5 (5C) |  |
 | Chronicle | [`0x3aa6909a…`](https://etherscan.io/tx/0x3aa6909a86a92ae55183b4fe13961dc1972a1d670a450418179ac5b4395fabe7) | Multicall3 `aggregate3` ✓ `0x82ad56cb` | 243,479 | 247,819 | -4,340 | **0** (0.00%) | 0 | external calls | 2 (2C) |  |
+
+| Umbra | [`0x281842ba…`](https://etherscan.io/tx/0x281842ba2fd455a6e0e832ed95a04aa3c872451d3189ed956b4af673242be149) | `sendEth` ✓ `0xbeb9addf` | 62,261 | 69,749 | -7,488 | **0** (0.00%) | 0 | replay costs more | 2 (1C/1L3) |  |
+| Umbra | [`0x292bfbc8…`](https://etherscan.io/tx/0x292bfbc8b76c06254cfb83e2980b8100410e8ac1e367609e5936020c59a292e5) | `sendEth` ✓ `0xbeb9addf` | 62,261 | 69,773 | -7,512 | **0** (0.00%) | 0 | replay costs more | 2 (1C/1L3) |  |
+| Umbra | [`0x13ad4804…`](https://etherscan.io/tx/0x13ad4804e62a9d15b2bd7bb521bc86214dd787d89dc90d380404850ffb299f6c) | `withdrawTokenOnBehalf` ✓ `0x81ab0fcd` | 70,497 | 79,463 | -8,966 | **0** (0.00%) | 0 | replay costs more | 4 (2C/1L4/1S) |  |
+| Umbra | [`0x15272613…`](https://etherscan.io/tx/0x15272613ac2388a2b9a2e71f3f47c807387c8524e067b9b8adf3306ec674766f) | `withdrawTokenOnBehalf` ✓ `0x81ab0fcd` | 70,613 | 79,861 | -9,248 | **0** (0.00%) | 0 | replay costs more | 4 (2C/1L4/1S) |  |
+| Umbra | [`0x1ab89fac…`](https://etherscan.io/tx/0x1ab89fac7fc4f93a41671563e0a739ef53b85eebf49b6e08ddee46356899908a) | `sendToken` ✓ `0xb9bfabe1` | 83,712 | 93,356 | -9,644 | **0** (0.00%) | 0 | replay costs more | 3 (1C/1L3/1S) |  |
+| Umbra | [`0x19d8496e…`](https://etherscan.io/tx/0x19d8496ec02910a6092679e948e5814e288bb799b2fccc7c7e45e52bba3efca5) | `sendToken` ✓ `0xb9bfabe1` | 83,724 | 93,380 | -9,656 | **0** (0.00%) | 0 | replay costs more | 3 (1C/1L3/1S) |  |
+| Umbra | [`0x03d44b4b…`](https://etherscan.io/tx/0x03d44b4b02585abf604b803e381863fd2d71659fe9e1db94fe25be978cb2fe38) | `sendToken` ✓ `0xb9bfabe1` | 75,873 | 85,673 | -9,800 | **0** (0.00%) | 0 | replay costs more | 3 (1C/1L3/1S) |  |
+| Umbra | [`0x2bfe5664…`](https://etherscan.io/tx/0x2bfe566409f498dbfaac1f42fb6a93e28773ab90165036f8cccd41276aa4ba2f) | *batch send (11 Announcements)* `0x7d703ead` | 505,078 | 531,727 | -26,649 | **0** (0.00%) | 0 | replay costs more | 11 (10C/1L2) |  |
 
 ## Transactions that could not be measured at all
 

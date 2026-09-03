@@ -79,6 +79,7 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 | Ethena | 8.99% | 0% | one 900-byte mint order | **1 of 309 mints (0.3%)** |
 | ERC-4337 EntryPoint | *86.54%?* | *60%?* | **suspect — likely estimator false positive** | 2 of 8 measured |
 | Panther | 0% | 0% | none — shielded pool is not on mainnet | 0 of 1 |
+| **Umbra** | **0%** | 0% | **none — all 8 txs have negative surplus** | 10.4 txs/day (lowest surveyed) |
 | **ENS** | **0%** | 0% | **none — 18 of 18 measured, best is 40% short of the floor** | 877 txs/day, all shapes zero |
 
 ## What predicts a good candidate
@@ -880,6 +881,51 @@ measured here, and Chronicle will raise it before anything else.
 `aggregate3`, a keeper poking several feeds at once. All three measured score 0% with negative
 surplus: each inner poke becomes an external call that must be re-executed. An integration
 should keep pokes as separate direct transactions.
+
+## Umbra — a value transfer plus an event, and nothing else
+
+Next entry on the longlist after the other three privacy protocols. The longlist rates it
+"smaller compute footprint than shielded pools but high transaction frequency, useful
+reference for volume-based rebate pitch." Both halves of that turn out to be wrong in the
+same direction.
+
+Found by event topic, no address guessing: `Announcement(address,uint256,address,bytes32,bytes32)`
+resolves to a single live contract, `0xfb2dc580…`.
+
+**8 transactions, 4 functions, all trace-measured. All 0.00% — and every one has negative
+surplus.**
+
+| function | gas used | replay cost | surplus |
+|---|---:|---:|---:|
+| `sendEth` ✓ `0xbeb9addf` | 62,261 | 69,749 | **−7,488** |
+| `sendEth` ✓ `0xbeb9addf` | 62,261 | 69,773 | −7,512 |
+| `withdrawTokenOnBehalf` ✓ `0x81ab0fcd` | 70,497 | 79,463 | −8,966 |
+| `withdrawTokenOnBehalf` ✓ `0x81ab0fcd` | 70,613 | 79,861 | −9,248 |
+| `sendToken` ✓ `0xb9bfabe1` | 83,712 | 93,356 | −9,644 |
+| `sendToken` ✓ `0xb9bfabe1` | 83,724 | 93,380 | −9,656 |
+| `sendToken` ✓ `0xb9bfabe1` | 75,873 | 85,673 | −9,800 |
+| *batch send* `0x7d703ead` | 505,078 | 531,727 | −26,649 |
+
+The best case is **−7,488 gas**. Umbra therefore joins Chainlink and Panther in the group that
+scores zero **at any floor, including a floor of zero** — a lower signature floor
+cannot rescue it, because there is no surplus to recover.
+
+**Why.** A stealth payment is a value transfer plus an event. The transfer is recorded as a
+`Call` update, which GasKiller has to re-execute verbatim; the event has to be re-emitted.
+Both are irreducible payload, and neither is computation. The recorded state changes are 1–3
+updates of which 1–2 are always `Call`s, so replay reproduces essentially the whole
+transaction and then adds wrapper overhead on top — hence the negative surplus. Note this is
+the *only* protocol surveyed where every single transaction is negative.
+
+`withdrawTokenOnBehalf` was the one plausible candidate: a relayer-sponsored withdrawal that
+verifies an ECDSA signature. It measures −8,966 and −9,248. One `ecrecover` is ~3,000 gas —
+nowhere near enough to matter against a 27,000-gas floor.
+
+**And the frequency claim is wrong.** 291 distinct Umbra transactions in a 27.88-day window
+(200,000 blocks) = **10.4/day**, the lowest of anything surveyed with a live deployment. There
+is no volume-based rebate pitch to make: even at a hypothetical 100% saving, 10 transactions a
+day at 2.079 gwei is a rounding error. **Umbra's longlist entry should be removed, not just
+revised down.**
 
 ## What this is actually worth in dollars
 
