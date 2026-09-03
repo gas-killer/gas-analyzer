@@ -265,6 +265,65 @@ measured that way score 0% with negative surplus, because each inner poke become
 call that has to be re-executed. Any integration should keep pokes as separate direct
 transactions.
 
+## If the 27,000 floor is wrong — re-evaluating without re-running anything
+
+The signature floor is a hardcoded constant (`TURETZKY_UPPER_GAS_LIMIT_SCHNORR`,
+`crates/core/src/encoding.rs:21`), applied flat: `estimate = base + 27,000`, then
+`savings = gas_used − estimate`. Nothing about it is derived from the transaction. There is no
+derivation, citation or benchmark for the number anywhere in this repository.
+
+**Every conclusion in this file is therefore conditional on that one constant** — and can be
+revised with no new measurement. `surplus = gas_used − base_estimate` is floor-independent,
+and both columns are recorded here for all 235 properly measured transactions. Changing the
+floor is arithmetic on this table, not a re-run of the analyzer.
+
+| floor | winning txs | protocols with ≥1 win | most wins |
+|---:|---:|---:|---|
+| 0 | 153 | 17 | Chronicle 21, Aave 19, Railgun 15, Ethena 15, Pyth 13 |
+| 10,000 | 129 | 17 | Chronicle 21, Railgun 15, Ethena 14, Pyth 13, Aave 12 |
+| **27,000** *(current)* | **89** | **16** | Chronicle 21, Railgun 15, Pyth 13, Aave 10 |
+| 40,000 | 71 | 12 | Chronicle 19, Railgun 15, Pyth 13, Aave 10 |
+| 60,000 | 61 | 9 | Railgun 15, Chronicle 15, Pyth 13, Aave 10 |
+| 80,000 | 59 | 9 | Railgun 15, Pyth 13, Chronicle 13, Aave 10 |
+| 100,000 | 34 | 6 | Railgun 15, Aave 9, Pyth 5 |
+| 150,000 | 29 | 6 | Railgun 15, Aave 7, Pyth 3 |
+| 250,000 *(BLS)* | 20 | 4 | Railgun 15, Aave 2, Ondo 1 |
+
+**64 transactions are killed by the floor alone** — they have positive surplus but under
+27,000. If the true floor is lower, they come back; if higher, more die.
+
+### The floor each protocol can tolerate
+
+A protocol keeps at least one win at any floor below its best surplus:
+
+| protocol | best surplus | protocol | best surplus |
+|---|---:|---|---:|
+| ERC-4337 *(suspect row — see warning above)* | 1,493,522 | Ethena | 48,699 |
+| Railgun | 1,297,915 | Lido | 46,558 |
+| Aave | 390,592 | EigenLayer | 38,841 |
+| Ondo | 267,495 | Safe | 37,454 |
+| Pyth | 166,006 | World ID | 35,578 |
+| Privacy Pools | 164,301 | Euler | 34,191 |
+| Pendle | 94,736 | ENS | 16,058 |
+| **Chronicle** | **92,135** | Chainlink | 0 |
+| Ether.fi | 82,310 | Panther | 0 |
+| Morpho | 59,150 | | |
+
+**Railgun, Aave and Pyth are robust** — they survive a floor 4–48x higher than the current
+one. **Chronicle is the most floor-sensitive of the strong candidates:** all 21 of its wins
+hold at 27,000, but only 15 at 60,000, 13 at 80,000, and none above 92,135. Since Chronicle's
+own product is a Schnorr multi-signature oracle, they are also the counterparty most likely to
+have a precise view of what on-chain Schnorr verification really costs. **Establish the
+provenance of 27,000 before pitching them.**
+
+Chainlink and Panther score zero at *any* floor, including zero — their surplus is negative,
+so replaying costs more than the original transaction regardless of signature scheme.
+
+Caveats: the 15 `heur` rows are excluded, since their base estimates are unreliable for
+reasons unrelated to the floor. The 5 unmeasurable transactions have no base estimate at all
+and cannot be re-evaluated at any floor. The BLS row uses the same mechanism with its 250,000
+constant, which has the same lack of provenance.
+
 ## What actually predicts a win
 
 Three rules. Every result in this file follows them.
