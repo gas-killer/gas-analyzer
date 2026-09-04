@@ -4,9 +4,21 @@ Measured with this repository's analyzer (`cargo run -- t <hash>`, EvmSketch bac
 
 Every number in the results tables is analyzer output. Where a figure is my own arithmetic it says so. The appendix at the end indexes the measured transactions by their 4-byte selector, separating keccak-verified function names from labels inferred only from emitted events.
 
+> ### Revised for the new signature floor — 2026-09-04
+>
+> The Schnorr floor was raised from **27,000 to 50,000 gas** on `main` (`87aaf1c`), derived from a
+> Sepolia measurement of a 3-operator 2-of-3 `SchnorrStakeRegistry` (32,066 full participation,
+> 45,417 with one non-signer). Gas used and replay cost are unchanged — verified by re-running
+> three reference transactions on the rebuilt binary — so all revisions here are arithmetic.
+>
+> **Six protocols lost every win at the new floor: EigenLayer, Ethena, Euler, Lido, Safe and
+> World ID.** Sections below that predate the change are corrected inline where the conclusion
+> moved, but treat any percentage in this file as provisional against
+> `ALL_TRANSACTION_ANALYSES.md`, which was regenerated wholesale.
+
 ## Headline: Railgun
 
-**15 direct calls to the Railgun smart wallet, all trace-measured, all clearing both signature floors.** Schnorr savings range **65.57%–80.84%** (median 74.06%). BLS savings range 19.53%–64.86%.
+**15 direct calls to the Railgun smart wallet, all trace-measured, all clearing both signature floors.** Schnorr savings range **60.83%–78.72%** (median 72.02%). BLS savings range 19.53%–64.86%.
 
 In aggregate: 15,174,097 gas used on chain becomes 3,765,439 under GasKiller with Schnorr — a saving of **11,408,658 gas (75.2%)**.
 
@@ -32,28 +44,28 @@ All 3 RelayAdapt transactions analyzed scored zero.
 
 | tx | gas used | GasKiller cost | Schnorr saved | BLS saved | state updates |
 |---|---:|---:|---:|---:|---|
-| [`0xaa357a48…`](https://etherscan.io/tx/0xaa357a4824001aed7173b3bc7d976f997fc7839def4c56ec070db97ec2121bc4) | 1,085,832 | 181,095 | **877,737** (80.84%) | 654,737 (60.30%) | `Store`×11, `Log1`×3 |
-| [`0x32daef80…`](https://etherscan.io/tx/0x32daef80a0c5180dcf45b15130e10ecced485242f0d3305b30942ebeb5aec364) | 1,056,246 | 197,859 | **831,387** (78.71%) | 608,387 (57.60%) | `Store`×12, `Log1`×3 |
-| [`0xe7e605b6…`](https://etherscan.io/tx/0xe7e605b6520aaf757f4531a88af4966866d86fee61ec06e93b3423b30a934adc) | 1,615,755 | 317,840 | **1,270,915** (78.66%) | 1,047,915 (64.86%) | `Store`×15, `Log1`×5, `Call`×2 |
-| [`0xa2177825…`](https://etherscan.io/tx/0xa21778257ba78ce1354a4ff25a48ee07854e5e858f4facfe3e3c3893d9a1945f) | 1,561,573 | 312,286 | **1,222,287** (78.27%) | 999,287 (63.99%) | `Store`×16, `Log1`×5, `Call`×2 |
-| [`0x73a1d71e…`](https://etherscan.io/tx/0x73a1d71e2cfa678b63c934c8c04eb6b6069de89c85faf16d0376241ecabfb0ec) | 1,097,058 | 213,396 | **856,662** (78.09%) | 633,662 (57.76%) | `Store`×14, `Log1`×3 |
-| [`0xa3a010fa…`](https://etherscan.io/tx/0xa3a010fa890d910e669fba1ea7b681a4c1f464b754c5b7bff7d62ae15ae25e71) | 1,113,545 | 241,625 | **844,920** (75.88%) | 621,920 (55.85%) | `Store`×12, `Log1`×4, `Call`×2 |
-| [`0x04736806…`](https://etherscan.io/tx/0x04736806756593b664eb29591a2ea046b2261c5a4fa1bdd1707a6dc5abf54f07) | 1,136,044 | 266,554 | **842,490** (74.16%) | 619,490 (54.53%) | `Store`×13, `Log1`×4, `Call`×2 |
-| [`0x39a67a29…`](https://etherscan.io/tx/0x39a67a2964b675ccd1be1939c513b46f62cae71c3f320bece6acdaf71934b3ae) | 1,131,080 | 266,430 | **837,650** (74.06%) | 614,650 (54.34%) | `Store`×14, `Log1`×4, `Call`×2 |
-| [`0xaf36e218…`](https://etherscan.io/tx/0xaf36e2187e095fa88299a8859632963594414b716f36aae541318d4ce71740e6) | 1,177,014 | 282,477 | **867,537** (73.71%) | 644,537 (54.76%) | `Store`×15, `Log1`×4, `Call`×2 |
-| [`0x0376edd3…`](https://etherscan.io/tx/0x0376edd36b0c9211b1a38f41e5f1c04233478ca4dcf7d4852ef313deb1c57ade) | 724,515 | 168,652 | **528,863** (73.00%) | 305,863 (42.22%) | `Store`×10, `Log1`×2, `Call`×2 |
-| [`0xab44777b…`](https://etherscan.io/tx/0xab44777b4e3a37169ea03163ec5d14dbf668bcb18219c3a95cc2313c2be55a3d) | 736,786 | 177,753 | **532,033** (72.21%) | 309,033 (41.94%) | `Store`×9, `Log1`×2, `Call`×2 |
-| [`0x27ce0220…`](https://etherscan.io/tx/0x27ce022039ef027d473c61f3140da32c8e58f0a8daaee826e6f04a58744db447) | 742,727 | 185,294 | **530,433** (71.42%) | 307,433 (41.39%) | `Store`×10, `Log1`×2, `Call`×2 |
-| [`0x3d54cfc3…`](https://etherscan.io/tx/0x3d54cfc375e626acd71432b2ab59a94bde2f6ee2490528ca8259417091e3ab97) | 752,878 | 197,812 | **528,066** (70.14%) | 305,066 (40.52%) | `Store`×11, `Log1`×2, `Call`×2 |
-| [`0x6837bb8d…`](https://etherscan.io/tx/0x6837bb8d629ee0dce5f045acfc6c1e296df4abe1907897820bf621462dc23425) | 758,741 | 211,644 | **520,097** (68.55%) | 297,097 (39.16%) | `Store`×14, `Log1`×2, `Call`×2 |
-| [`0x792a8e57…`](https://etherscan.io/tx/0x792a8e5783cec82cc456d83f0f1703a2bf71eafa05984a17896809bd952567cc) | 484,303 | 139,722 | **317,581** (65.57%) | 94,581 (19.53%) | `Log1`×3, `Store`×2, `Call`×2 |
+| [`0xaa357a48…`](https://etherscan.io/tx/0xaa357a4824001aed7173b3bc7d976f997fc7839def4c56ec070db97ec2121bc4) | 1,085,832 | 181,095 | **854,737** (78.72%) | 654,737 (60.30%) | `Store`×11, `Log1`×3 |
+| [`0x32daef80…`](https://etherscan.io/tx/0x32daef80a0c5180dcf45b15130e10ecced485242f0d3305b30942ebeb5aec364) | 1,056,246 | 197,859 | **808,387** (76.53%) | 608,387 (57.60%) | `Store`×12, `Log1`×3 |
+| [`0xe7e605b6…`](https://etherscan.io/tx/0xe7e605b6520aaf757f4531a88af4966866d86fee61ec06e93b3423b30a934adc) | 1,615,755 | 317,840 | **1,247,915** (77.23%) | 1,047,915 (64.86%) | `Store`×15, `Log1`×5, `Call`×2 |
+| [`0xa2177825…`](https://etherscan.io/tx/0xa21778257ba78ce1354a4ff25a48ee07854e5e858f4facfe3e3c3893d9a1945f) | 1,561,573 | 312,286 | **1,199,287** (76.80%) | 999,287 (63.99%) | `Store`×16, `Log1`×5, `Call`×2 |
+| [`0x73a1d71e…`](https://etherscan.io/tx/0x73a1d71e2cfa678b63c934c8c04eb6b6069de89c85faf16d0376241ecabfb0ec) | 1,097,058 | 213,396 | **833,662** (75.99%) | 633,662 (57.76%) | `Store`×14, `Log1`×3 |
+| [`0xa3a010fa…`](https://etherscan.io/tx/0xa3a010fa890d910e669fba1ea7b681a4c1f464b754c5b7bff7d62ae15ae25e71) | 1,113,545 | 241,625 | **821,920** (73.81%) | 621,920 (55.85%) | `Store`×12, `Log1`×4, `Call`×2 |
+| [`0x04736806…`](https://etherscan.io/tx/0x04736806756593b664eb29591a2ea046b2261c5a4fa1bdd1707a6dc5abf54f07) | 1,136,044 | 266,554 | **819,490** (72.14%) | 619,490 (54.53%) | `Store`×13, `Log1`×4, `Call`×2 |
+| [`0x39a67a29…`](https://etherscan.io/tx/0x39a67a2964b675ccd1be1939c513b46f62cae71c3f320bece6acdaf71934b3ae) | 1,131,080 | 266,430 | **814,650** (72.02%) | 614,650 (54.34%) | `Store`×14, `Log1`×4, `Call`×2 |
+| [`0xaf36e218…`](https://etherscan.io/tx/0xaf36e2187e095fa88299a8859632963594414b716f36aae541318d4ce71740e6) | 1,177,014 | 282,477 | **844,537** (71.75%) | 644,537 (54.76%) | `Store`×15, `Log1`×4, `Call`×2 |
+| [`0x0376edd3…`](https://etherscan.io/tx/0x0376edd36b0c9211b1a38f41e5f1c04233478ca4dcf7d4852ef313deb1c57ade) | 724,515 | 168,652 | **505,863** (69.82%) | 305,863 (42.22%) | `Store`×10, `Log1`×2, `Call`×2 |
+| [`0xab44777b…`](https://etherscan.io/tx/0xab44777b4e3a37169ea03163ec5d14dbf668bcb18219c3a95cc2313c2be55a3d) | 736,786 | 177,753 | **509,033** (69.09%) | 309,033 (41.94%) | `Store`×9, `Log1`×2, `Call`×2 |
+| [`0x27ce0220…`](https://etherscan.io/tx/0x27ce022039ef027d473c61f3140da32c8e58f0a8daaee826e6f04a58744db447) | 742,727 | 185,294 | **507,433** (68.32%) | 307,433 (41.39%) | `Store`×10, `Log1`×2, `Call`×2 |
+| [`0x3d54cfc3…`](https://etherscan.io/tx/0x3d54cfc375e626acd71432b2ab59a94bde2f6ee2490528ca8259417091e3ab97) | 752,878 | 197,812 | **505,066** (67.08%) | 305,066 (40.52%) | `Store`×11, `Log1`×2, `Call`×2 |
+| [`0x6837bb8d…`](https://etherscan.io/tx/0x6837bb8d629ee0dce5f045acfc6c1e296df4abe1907897820bf621462dc23425) | 758,741 | 211,644 | **497,097** (65.52%) | 297,097 (39.16%) | `Store`×14, `Log1`×2, `Call`×2 |
+| [`0x792a8e57…`](https://etherscan.io/tx/0x792a8e5783cec82cc456d83f0f1703a2bf71eafa05984a17896809bd952567cc) | 484,303 | 139,722 | **294,581** (60.83%) | 94,581 (19.53%) | `Log1`×3, `Store`×2, `Call`×2 |
 
 By function:
 
 - **private transfer / unshield** (`0xd8ae136a`) — 10 txs, 65.6–80.8% Schnorr, gas 484,303–1,615,755. **This selector was not verified**: no signature I constructed matched it, so the name is inferred from the `Nullified` and `Unshield` events it emits, not from the selector.
 - **`shield`** (`0x044a40c3`, `shield(((bytes32,(uint8,address,uint256),uint120),(bytes32[3],bytes32))[])`) — 5 txs, 68.5–73.0% Schnorr, gas 724,515–758,741
 
-On the RelayAdapt side, only 1 of the 3 completed a real replay (`0x2d754e6f…`, surplus −10,281). The other two fell back to heuristic — one of them reverted mid-replay against the smart wallet on all 3 attempts. All three scored zero either way, and their heuristic surpluses (+4,121 and +10,372) are well under the 27,000 floor, so the fallbacks do not change the conclusion.
+On the RelayAdapt side, only 1 of the 3 completed a real replay (`0x2d754e6f…`, surplus −10,281). The other two fell back to heuristic — one of them reverted mid-replay against the smart wallet on all 3 attempts. All three scored zero either way, and their heuristic surpluses (+4,121 and +10,372) are well under the floor, so the fallbacks do not change the conclusion.
 
 ## All protocols surveyed
 
@@ -61,15 +73,15 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 
 | protocol | best measured | BLS | winning shape | how common |
 |---|---:|---:|---|---|
-| **Kelp** | **85.90%** | **58.85%** | direct `depositETH` — 4 updates, 1 call | **0.36 qualifying txs/day** |
-| **Railgun** | **80.84%** | **60.30%** | direct call to smart wallet | 374 of 704 (53%) |
-| **Aave** | **63.64%** | **yes (2 txs)** | direct `borrow` (any borrower); `withdraw` if multi-asset | ~25% of txs are direct borrows |
-| **Pyth** | **63.94%** | 0% | few feeds written per update; no external calls | **649 of 655 direct (99.1%)** |
-| **Chronicle** | **50.45%** | 0% | direct feed poke; 2 updates, no external calls | **21 of 24 measured win; ~90% of traffic direct** |
-| **Symbiotic** | **62.96%** | 0% | direct ERC-4626 `withdraw`/`redeem` on a vault | 1.49/day on the one vault measured |
-| **Renzo** | **67.10%** | 0% | `claim` via the withdraw contract | 1 of 2 measured |
-| **Mellow** | **49.60%** | 0% | direct ERC-4626 `withdraw`/`redeem` on a vault | 1.61/day on steakLRT |
-| Puffer | 19.22% | 0% | direct `requestWithdrawal` | 1 of 2 measured |
+| **Kelp** | **83.29%** | **58.85%** | direct `depositETH` — 4 updates, 1 call | **0.36 qualifying txs/day** |
+| **Railgun** | **78.72%** | **60.30%** | direct call to smart wallet | 374 of 704 (53%) |
+| **Aave** | **59.61%** | **yes (2 txs)** | direct `borrow` (any borrower); `withdraw` if multi-asset | ~25% of txs are direct borrows |
+| **Pyth** | **52.06%** | 0% | few feeds written per update; no external calls | **649 of 655 direct (99.1%)** |
+| **Chronicle** | **32.64%** | 0% | direct feed poke; 2 updates, no external calls | **17 of 24 measured win; ~90% of traffic direct** |
+| **Symbiotic** | **57.04%** | 0% | direct ERC-4626 `withdraw`/`redeem` on a vault | 1.49/day on the one vault measured |
+| **Renzo** | *62.97%* | 0% | `claim` via the withdraw contract (**label inferred**) | 1 of 2 measured |
+| **Mellow** | **41.55%** | 0% | direct ERC-4626 `withdraw`/`redeem` on a vault | 1.61/day on steakLRT |
+| Puffer | *7.06%* | 0% | direct `requestWithdrawal` (**label inferred**) | 1 of 2 measured |
 | Swell | 0% | 0% | none — withdrawal routes are call-blocked | 0 of 3 |
 | Privacy Pools | 23.39% | 0% | direct call to pool | 2 in 17 days |
 | Ether.fi | 18.99% | 0% | EtherFiAdmin oracle report | every ~4 hours |
@@ -94,15 +106,15 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 
 Two conditions, both necessary. Every result above is explained by them. Aave adds a third dimension: the two conditions can hold for one *function* of a protocol and fail for another — `borrow` clears the floor 9 times out of 9 while `supply` and `repay` never do, because only the former runs a per-reserve health-factor loop. Screen per entry point, not per protocol.
 
-**1. The expensive work must happen in the contract the transaction is sent to.** The sharpest evidence is Aave vs Euler: identical per-asset risk math, 63.64% vs 1.31%, because Aave permits direct `Pool` calls and Euler mandates the EVC router. The analyzer keeps a regular `CALL` as one instruction and re-executes it on replay, so anything inside it is never stripped (`crates/core/src/trace.rs:255`; `crates/core/src/prestate.rs` documents the same constraint for the net form). Railgun direct vs Railgun RelayAdapt is the same operation on the same contract scoring 80% vs 0% on this alone.
+**1. The expensive work must happen in the contract the transaction is sent to.** The sharpest evidence is Aave vs Euler: identical per-asset risk math, 59.61% vs **0%** (Euler's best surplus, 34,191 gas, no longer clears the floor), because Aave permits direct `Pool` calls and Euler mandates the EVC router. The analyzer keeps a regular `CALL` as one instruction and re-executes it on replay, so anything inside it is never stripped (`crates/core/src/trace.rs:255`; `crates/core/src/prestate.rs` documents the same constraint for the net form). Railgun direct vs Railgun RelayAdapt is the same operation on the same contract scoring 80% vs 0% on this alone.
 
 **2. The work must actually be computation, not bookkeeping.** Pendle satisfies condition 1 on its one direct-to-market swap and still scores ~2.7% surplus, because a swap is mostly storage writes. Ether.fi's `claimWithdraw` is the clearest case: its 43,868 gas per claim decomposes as ~25,000 of storage writes + 3,768 of logs + ~15,100 of calls, leaving ~0 for computation.
 
 The winners are cryptographic: Railgun (ZK proofs + Poseidon in its own code), Privacy Pools (Poseidon over a merkle tree), Ether.fi (oracle report processing). Ordinary DeFi arithmetic — swap curves, share conversions, interest accrual — is never large enough to dominate a transaction's gas.
 
 The restaking block adds a third dimension that neither condition captures: **volume**. Kelp's
-`depositETH` satisfies both conditions better than anything else measured — 85.90%, the highest
-in the survey — and is worth $27/month, because the pool takes 0.36 qualifying deposits a day.
+`depositETH` satisfies both conditions better than anything else measured — 83.29%, the highest
+in the survey — and is worth $25/month, because the pool takes 0.36 qualifying deposits a day.
 Chronicle at half the percentage is worth 12x more. Across everything surveyed, percentage and
 volume have been anti-correlated; screening on the two conditions alone selects for protocols
 with no traffic.
@@ -118,7 +130,7 @@ is nothing wrapped around it to remove.
 
 | operation | measured | clear the floor | Schnorr range |
 |---|---:|---:|---|
-| **`borrow`** | 9 | **9** | **24.08% – 63.64%** (median 42.93%) |
+| **`borrow`** | 9 | **9** | **14.98% – 59.61%** (median 37.77%) |
 | `withdraw` | 4 | 2 | 0% – 49.14% |
 | `supply` / `supplyWithPermit` / `repay` | 6 | **0** | 0% |
 | `liquidationCall` (via 3rd party) | 1 | 0 | 0% |
@@ -127,15 +139,15 @@ is nothing wrapped around it to remove.
 
 | reserves held | gas used | GasKiller cost | Schnorr saved |
 |---:|---:|---:|---:|
-| 8 | 571,333 | 180,741 | **363,592** (63.64%) |
-| 6 | 450,205 | 163,828 | **259,377** (57.61%) |
-| 3 | 371,912 | 173,408 | **171,504** (46.11%) |
-| 4 | 360,781 | 170,263 | **163,518** (45.32%) |
-| 3 | 345,794 | 170,335 | **148,459** (42.93%) |
-| 4 | 365,438 | 181,716 | **156,722** (42.89%) |
-| 2 | 346,272 | 206,699 | **112,573** (32.51%) |
-| 1 | 316,682 | 205,592 | **84,090** (26.55%) |
-| 2 | 252,529 | 164,712 | **60,817** (24.08%) |
+| 8 | 571,333 | 180,741 | **340,592** (59.61%) |
+| 6 | 450,205 | 163,828 | **236,377** (52.50%) |
+| 3 | 371,912 | 173,408 | **148,504** (39.93%) |
+| 4 | 360,781 | 170,263 | **140,518** (38.95%) |
+| 3 | 345,794 | 170,335 | **125,459** (36.28%) |
+| 4 | 365,438 | 181,716 | **133,722** (36.59%) |
+| 2 | 346,272 | 206,699 | **89,573** (25.87%) |
+| 1 | 316,682 | 205,592 | **61,090** (19.29%) |
+| 2 | 252,529 | 164,712 | **37,817** (14.98%) |
 
 **GasKiller's cost barely moves: 163,828–206,699, while gas used runs 252,529–571,333.** The diff is effectively fixed and the computation on top varies — the same fixed-diff/variable-workload signature seen in Ether.fi's oracle report and World ID's identity registration.
 
@@ -185,9 +197,9 @@ The one liquidation in range (1,165,207 gas) went through a third-party liquidat
 
 | tx | sigs | gas used | GasKiller cost | surplus | Schnorr saved |
 |---|---:|---:|---:|---:|---:|
-| [`0xa9eca9f1…`](https://etherscan.io/tx/0xa9eca9f1a7075c8eb971e7ee2a1a3ee514cf3cf6b1077d6ddcc4f60f8ebf4eaa) | 5 | 104,612 | 67,158 | +37,454 | **10,454** (9.99%) |
-| [`0x5c559278…`](https://etherscan.io/tx/0x5c5592787da61ec8c46326d93089c14e667276fab45703077168e72dcbbee99e) | 5 | 115,958 | 78,540 | +37,418 | **10,418** (8.98%) |
-| [`0x8951b058…`](https://etherscan.io/tx/0x8951b058f41486ff7d9c5806d187af52f7d969ae69ddbb85c1e1be04171dae04) | — | 3,251,629 | 3,220,361 | +31,268 | **4,268** (0.13%) |
+| [`0xa9eca9f1…`](https://etherscan.io/tx/0xa9eca9f1a7075c8eb971e7ee2a1a3ee514cf3cf6b1077d6ddcc4f60f8ebf4eaa) | 5 | 104,612 | 67,158 | +37,454 | **0** (0.00%) |
+| [`0x5c559278…`](https://etherscan.io/tx/0x5c5592787da61ec8c46326d93089c14e667276fab45703077168e72dcbbee99e) | 5 | 115,958 | 78,540 | +37,418 | **0** (0.00%) |
+| [`0x8951b058…`](https://etherscan.io/tx/0x8951b058f41486ff7d9c5806d187af52f7d969ae69ddbb85c1e1be04171dae04) | — | 3,251,629 | 3,220,361 | +31,268 | **0** (0.00%) |
 | [`0x5688590b…`](https://etherscan.io/tx/0x5688590bc26e704d720d7bb2185b195aabb310ba67dddd944f64509b1cf70513) | 3 | 322,338 | 297,128 | +25,210 | 0 |
 | [`0x2666f99a…`](https://etherscan.io/tx/0x2666f99a3b1ad225cf8dcc40fbafb1959a6efb5bb3c561b3d2d5a3b242ca4a29) | 3 | 96,660 | 73,351 | +23,309 | 0 |
 | [`0xb286eeb1…`](https://etherscan.io/tx/0xb286eeb15c4cb3445a73e275e89336f7563eb46c2e9ec97a82aeefb5a4485430) | 4 | 463,470 | 442,944 | +20,526 | 0 |
@@ -210,7 +222,7 @@ A Safe changes **one slot** — its nonce. Everything else it does is verify sig
 | 2 | 13,307 |
 | 1 | 5,407 |
 
-Against a 27,000 floor, **5 signatures is roughly break-even**. Signature counts across 565 sampled transactions (read from the `signatures` field length in the `execTransaction` calldata):
+**At the 50,000 floor Safe scores zero on all 12 transactions** — its best surplus is 37,454 gas. The analysis below was written against the old 27,000 floor, where 5 signatures was roughly break-even; it is kept because the signature-count relationship is still the right lens, but the break-even no longer exists at any observed signature count. Signature counts across 565 sampled transactions (read from the `signatures` field length in the `execTransaction` calldata):
 
 | signatures | txs | share |
 |---:|---:|---:|
@@ -239,7 +251,7 @@ Safe is therefore not a blocked candidate but a thin wrapper in front of other c
 
 | tx | gas used | GasKiller cost | surplus | Schnorr saved | state updates |
 |---|---:|---:|---:|---:|---:|
-| [`0x0a06e978…`](https://etherscan.io/tx/0x0a06e9783d4bc563d8b4674112b2dd427597c80a1095c377e6b88e307b31927c) | 548,011 | 513,820 | +34,191 | **7,191** (1.31%) | 29 |
+| [`0x0a06e978…`](https://etherscan.io/tx/0x0a06e9783d4bc563d8b4674112b2dd427597c80a1095c377e6b88e307b31927c) | 548,011 | 513,820 | +34,191 | **0** (0.00%) | 29 |
 | [`0x7d1e2345…`](https://etherscan.io/tx/0x7d1e2345c39b884a16eb6b2e06c1c4a4177c5639fe1c91474a356c3eef04fd87) | 2,701,108 | 2,683,478 | +17,630 | 0 | 7 |
 | [`0xa32effd3…`](https://etherscan.io/tx/0xa32effd3b31a02343d8cf4362c4fee2e806ea9dcf00fdea5eb1a2b054ae0ea4a) | 499,524 | 482,833 | +16,691 | 0 | 29 |
 | [`0x10c755ee…`](https://etherscan.io/tx/0x10c755eea1865f9761e49f2e52dd700d8ecc4e0037057bb2ea05df24bb946095) | 203,620 | 244,538 | −40,918 | 0 | 14 |
@@ -266,7 +278,7 @@ The two protocols side by side:
 | per-asset risk math on borrow | yes | yes |
 | direct calls to the lending contract | **52% of txs** | **0 of 191** |
 | borrows clearing the Schnorr floor | 9 of 9 | 1 of 5 |
-| best measured | **63.64%** | **1.31%** |
+| best measured | **59.61%** | **0%** |
 
 Same category, same computation, ~49× difference in outcome — decided by whether the protocol lets users call the contract that does the work. Euler belongs in `CALL_BLOCKED_CANDIDATES.md` rather than being written off: the compressible work exists, it is simply unreachable through the current encoder.
 
@@ -282,9 +294,9 @@ Three transactions could not be measured: one rate-limited, two reverting reprod
 
 | tx | what it is | gas used | GasKiller cost | Schnorr saved |
 |---|---|---:|---:|---:|
-| [`0x10fdab16…`](https://etherscan.io/tx/0x10fdab165e2a37d70223b9546f80e9f7a248e1a0ccacd6638bbc66d565de8c35) | mint/redeem via manager | 350,502 | 316,467 | **7,035** (2.01%) |
-| [`0x089be390…`](https://etherscan.io/tx/0x089be390aab1f47562520e714e3d96b270c279b0c2a7b2876c933ee390a264b0) | mint/redeem via manager | 447,366 | 413,235 | **7,131** (1.59%) |
-| [`0x23ac6eda…`](https://etherscan.io/tx/0x23ac6eda7ddb46309b5d61628b5f24ced1b1c1cb608470d451f6dfb869fc6242) | mint/redeem via manager | 432,419 | 400,729 | **4,690** (1.08%) |
+| [`0x10fdab16…`](https://etherscan.io/tx/0x10fdab165e2a37d70223b9546f80e9f7a248e1a0ccacd6638bbc66d565de8c35) | mint/redeem via manager | 350,502 | 316,467 | **0** (0.00%) |
+| [`0x089be390…`](https://etherscan.io/tx/0x089be390aab1f47562520e714e3d96b270c279b0c2a7b2876c933ee390a264b0) | mint/redeem via manager | 447,366 | 413,235 | **0** (0.00%) |
+| [`0x23ac6eda…`](https://etherscan.io/tx/0x23ac6eda7ddb46309b5d61628b5f24ced1b1c1cb608470d451f6dfb869fc6242) | mint/redeem via manager | 432,419 | 400,729 | **0** (0.00%) |
 | [`0xd8ea9b21…`](https://etherscan.io/tx/0xd8ea9b2158d7bf3407ea618ad07e3f7debc096076e108f6c166ca9fa53e9ec37) | via CowSwap settlement | 519,037 | 542,092 | 0 |
 | [`0xfccb2eda…`](https://etherscan.io/tx/0xfccb2eda50342893f6f1e93b0fb08df57dff595d17ac74414a688d1bfe3aaa78) | third-party | 819,503 | 843,764 | 0 |
 | [`0xe16fb5bc…`](https://etherscan.io/tx/0xe16fb5bcb8d2d4d2a2a9d3c7b92d7388e8e8af784f771d3bd0f3250daeb54e42) | third-party, 153 logs | 3,611,533 | 3,660,592 | 0 |
@@ -313,12 +325,12 @@ On this evidence the RWA category looks unpromising as a whole — Midas, Centri
 
 | tx | function | gas used | GasKiller cost | surplus | Schnorr saved | updates |
 |---|---|---:|---:|---:|---:|---:|
-| [`0x4ce09132…`](https://etherscan.io/tx/0x4ce0913231fcb4ac1351f81c6632f53165a5a80dc1f44fc7ea9c31021e5c7b04) | *checkpoint-proof verification* | 229,856 | 191,015 | +38,841 | **11,841** (5.15%) | 11 |
-| [`0x03d50d7f…`](https://etherscan.io/tx/0x03d50d7f761256ff7ddcab530c0535f352ad8101d5d2912d67339e65e3c61b5d) | `forwardEigenPodCall` ✓ | 134,366 | 103,398 | +30,968 | **3,968** (2.95%) | 1 |
-| [`0xbbc8abcb…`](https://etherscan.io/tx/0xbbc8abcb0eeb0f311b36ab4274e8629bd2b8c1395ffe79ffdebbcbf4536fbe29) | `forwardEigenPodCall` ✓ | 417,028 | 386,243 | +30,785 | **3,785** (0.91%) | 1 |
-| [`0xc770332c…`](https://etherscan.io/tx/0xc770332c7e516902481cc309756988fbe452f58f89a1144713150fe083c1105e) | `forwardEigenPodCall` ✓ | 417,090 | 386,305 | +30,785 | **3,785** (0.91%) | 1 |
-| [`0x95fa2d07…`](https://etherscan.io/tx/0x95fa2d07b579aaac9fa7e0fbd3545bcdb408c197956e0b4e34b9b29fa0f1cd9c) | *rewards claim* | 108,528 | 81,086 | +27,442 | **442** (0.41%) | 5 |
-| [`0x6fa0fbbf…`](https://etherscan.io/tx/0x6fa0fbbf87072c3315c4801db2ac55a1e6c58b009d9ff07234e9c84b7a84801e) | *rewards claim* | 125,638 | 98,174 | +27,464 | **464** (0.37%) | 5 |
+| [`0x4ce09132…`](https://etherscan.io/tx/0x4ce0913231fcb4ac1351f81c6632f53165a5a80dc1f44fc7ea9c31021e5c7b04) | *checkpoint-proof verification* | 229,856 | 191,015 | +38,841 | **0** (0.00%) | 11 |
+| [`0x03d50d7f…`](https://etherscan.io/tx/0x03d50d7f761256ff7ddcab530c0535f352ad8101d5d2912d67339e65e3c61b5d) | `forwardEigenPodCall` ✓ | 134,366 | 103,398 | +30,968 | **0** (0.00%) | 1 |
+| [`0xbbc8abcb…`](https://etherscan.io/tx/0xbbc8abcb0eeb0f311b36ab4274e8629bd2b8c1395ffe79ffdebbcbf4536fbe29) | `forwardEigenPodCall` ✓ | 417,028 | 386,243 | +30,785 | **0** (0.00%) | 1 |
+| [`0xc770332c…`](https://etherscan.io/tx/0xc770332c7e516902481cc309756988fbe452f58f89a1144713150fe083c1105e) | `forwardEigenPodCall` ✓ | 417,090 | 386,305 | +30,785 | **0** (0.00%) | 1 |
+| [`0x95fa2d07…`](https://etherscan.io/tx/0x95fa2d07b579aaac9fa7e0fbd3545bcdb408c197956e0b4e34b9b29fa0f1cd9c) | *rewards claim* | 108,528 | 81,086 | +27,442 | **0** (0.00%) | 5 |
+| [`0x6fa0fbbf…`](https://etherscan.io/tx/0x6fa0fbbf87072c3315c4801db2ac55a1e6c58b009d9ff07234e9c84b7a84801e) | *rewards claim* | 125,638 | 98,174 | +27,464 | **0** (0.00%) | 5 |
 | [`0x065a18a2…`](https://etherscan.io/tx/0x065a18a2af1e2d80514ad79067794b7c34e92ba2c2754c5cb7ddb5157eb111b8) | `queueWithdrawals` ✓ | 439,868 | 469,142 | -29,274 | 0 | 24 |
 | [`0x22b2c58c…`](https://etherscan.io/tx/0x22b2c58ced9f209d9ec2d21415436e9395067b377764d600927c8b54625f6d4f) | `startCheckpoint` ✓ | 76,444 | 52,517 | +23,927 | 0 | 4 |
 | [`0x5ce19358…`](https://etherscan.io/tx/0x5ce19358229301efda44bc79908632dfc69c1609477d52438c3cd9add6950792) | `completeQueuedWithdrawal` ✓ | 190,728 | 190,504 | +224 | 0 | 17 |
@@ -329,7 +341,7 @@ On this evidence the RWA category looks unpromising as a whole — Midas, Centri
 
 ### The proof work is real but it sits on a fixed ceiling
 
-The five EigenPod checkpoint transactions have surpluses of **23,927 / 30,785 / 30,785 / 30,968 / 38,841** regardless of how much gas they burn (76,444 up to 417,090). That is a fixed cost — verifying beacon-chain Merkle proofs and BLS-adjacent balance checks — sitting just above the 27,000 floor. Four of five clear it, but only by 4,000–12,000 gas.
+The five EigenPod checkpoint transactions have surpluses of **23,927 / 30,785 / 30,785 / 30,968 / 38,841** regardless of how much gas they burn (76,444 up to 417,090). That is a fixed cost — verifying beacon-chain Merkle proofs and BLS-adjacent balance checks. Against the old 27,000 floor four of five cleared it by 4,000–12,000 gas. **Against the 50,000 floor none of them clear it, and EigenLayer scores zero across all 13 transactions.** The fixed-cost observation is what matters: the surplus does not scale with gas burned, so a higher floor removes the protocol entirely rather than reducing it.
 
 Withdrawals go the other way. `queueWithdrawals` produces 24 state updates for a 440,000-gas transaction, so GasKiller costs **31,569 more** than the transaction did. Share accounting again: many writes, little compute.
 
@@ -356,8 +368,8 @@ Cleanly measured, zero rate-limit errors:
 
 | tx | gas used | base estimate | Schnorr | updates |
 |---|---:|---:|---:|---:|
-| `0x030b4fd3776594fc57df6451e83b61e916554227a0c7208f2f6a039f9a2bc312` | 1,694,622 | **201,100** | **86.54%** | 8 (3C) |
-| `0xb752f16bd51240342af289dfffebd5276e28ec313eb12ba8bf4ad654794bd807` | 1,103,781 | **186,440** | **80.66%** | 8 (3C) |
+| `0x030b4fd3776594fc57df6451e83b61e916554227a0c7208f2f6a039f9a2bc312` | 1,694,622 | **201,100** | **85.18%** | 8 (3C) |
+| `0xb752f16bd51240342af289dfffebd5276e28ec313eb12ba8bf4ad654794bd807` | 1,103,781 | **186,440** | **78.58%** | 8 (3C) |
 | `0x112f2b10d8e6fc37032a3103957c8324db6cee480bf030da56bbbcc5bec5816e` | 2,137,036 | 2,205,725 | 0% | 8 (3C) |
 | `0x989497784755fae4ffaefe945aa8309269455dc966784e3d0a8a8224cf5c27a4` | 1,141,959 | 1,208,050 | 0% | 8 (3C) |
 | `0xe64e4eb1fc3306f4eb081b65fc8b3bdf3e2e21c7478980fa9c13aa70540e8e2b` | 177,986 | 228,198 | 0% | 9 (4C) |
@@ -413,12 +425,12 @@ ERC-20 operations, so nothing large is hiding inside them. The measured surplus 
 Ethena's own compute: the EIP-712 check over the signed order, plus order bookkeeping.
 
 Across 11 cleanly measured mints that surplus sits in a tight band of **10,565–18,063**,
-against a 27,000 Schnorr floor. Ethena is not blocked by external calls and not blocked by
+against the Schnorr floor. **At 50,000 Ethena's single win disappears** — its best surplus is 48,699 gas, 1,301 short. Ethena is not blocked by external calls and not blocked by
 write-heaviness. It simply does not do enough work.
 
 | tx | gas used | base estimate | surplus | Schnorr |
 |---|---:|---:|---:|---:|
-| `0x5055ea7ff088407138215ddbe45b9cedfc334cda7e791d0eba4061aea819015c` | 241,268 | 192,569 | **+48,699** | **8.99%** |
+| `0x5055ea7ff088407138215ddbe45b9cedfc334cda7e791d0eba4061aea819015c` | 241,268 | 192,569 | **+48,699** | **0.00%** |
 | `0xb3a29f2bdcb1573d2f3b7d613a08415854df6ea60d356c9611248856474a8a21` | 219,295 | 204,750 | +14,545 | 0% |
 | `0xae6a3e25f711d88ab06a1729ec60acf771c33e83877b2ac7885661cfe0d4d253` | 210,560 | 192,497 | +18,063 | 0% |
 | `0xd2475759c71f278896ea7ff15ca213bb17dc9c3e0b29ddfdc8e1e01424995ae0` | 208,058 | 190,820 | +17,238 | 0% |
@@ -524,8 +536,8 @@ ratio of computation to state, never on gas used.
 
 | tx | function | gas used | base estimate | surplus | Schnorr |
 |---|---|---:|---:|---:|---:|
-| `0xf9a0c48463e92a01347aadfefbf9349ec72858550a8fa162e894f61e9e99a499` | *oracle report* `0x11a78d23` | 1,729,395 | 1,682,837 | +46,558 | **1.13%** |
-| `0x1bad343834044681f393485bcf131863801ff082da4fe24a2095629a7332d517` | *oracle report* `0x11a78d23` | 1,721,688 | 1,675,339 | +46,349 | **1.12%** |
+| `0xf9a0c48463e92a01347aadfefbf9349ec72858550a8fa162e894f61e9e99a499` | *oracle report* `0x11a78d23` | 1,729,395 | 1,682,837 | +46,558 | **0.00%** |
+| `0x1bad343834044681f393485bcf131863801ff082da4fe24a2095629a7332d517` | *oracle report* `0x11a78d23` | 1,721,688 | 1,675,339 | +46,349 | **0.00%** |
 
 Consistent across both daily reports, and genuinely measured. For contrast, Ether.fi's
 equivalent oracle report returned 18.99% on a far smaller transaction — the difference is
@@ -565,7 +577,7 @@ overstating savings.
 
 ## Pyth — 28% to 64%, and the driver is writes, not gas
 
-**13 transactions measured cleanly. Every one saves. Range 27.99%–63.94% Schnorr.**
+**13 transactions measured cleanly. Every one still saves at the 50,000 floor. Range 16.20%–52.06% Schnorr.**
 
 `updatePriceFeedsIfNecessary(bytes[],bytes32[],uint64[])` (`0xb9256d28`, keccak-verified)
 and `executeGovernanceInstruction(bytes)` (`0xb6ed701e`, keccak-verified) on
@@ -573,11 +585,11 @@ and `executeGovernanceInstruction(bytes)` (`0xb6ed701e`, keccak-verified) on
 
 | tx | gas used | calldata | updates | base | Schnorr |
 |---|---:|---:|---:|---:|---:|
-| `0x8874d5a5dd22f4be257985b269f6c6ded6f28e08f0a572280d49d2db9a3a347a` | 279,375 | 2884B | 12 | 113,369 | **49.76%** |
-| `0xbf4835576f7677f4d93a6f96fe75671c0dd19362652bb1cf5c8622cec1d54fb9` | 278,401 | 2884B | 12 | 113,441 | **49.55%** |
-| `0x616ba1cd828ee4f0e63a5be3e09df5d8ef28e0661e8c396f45658cdca477fea9` | 193,725 | 1636B | **3** | 42,864 | **63.94%** |
-| `0xf8800e04ea63017f9a4ffe500a4399c72a5606f243230a351c5758828568757b` | 192,005 | 1636B | **3** | 42,864 | **63.61%** |
-| `0xa8ae70119c42ea2fb646f18a81b58f4263ae9cce624e0d44301abee3960ba7d4` | 194,705 | 1028B | 3 | 55,548 | **57.60%** *(governance)* |
+| `0x8874d5a5dd22f4be257985b269f6c6ded6f28e08f0a572280d49d2db9a3a347a` | 279,375 | 2884B | 12 | 113,369 | **41.52%** |
+| `0xbf4835576f7677f4d93a6f96fe75671c0dd19362652bb1cf5c8622cec1d54fb9` | 278,401 | 2884B | 12 | 113,441 | **41.29%** |
+| `0x616ba1cd828ee4f0e63a5be3e09df5d8ef28e0661e8c396f45658cdca477fea9` | 193,725 | 1636B | **3** | 42,864 | **52.06%** |
+| `0xf8800e04ea63017f9a4ffe500a4399c72a5606f243230a351c5758828568757b` | 192,005 | 1636B | **3** | 42,864 | **51.63%** |
+| `0xa8ae70119c42ea2fb646f18a81b58f4263ae9cce624e0d44301abee3960ba7d4` | 194,705 | 1028B | 3 | 55,548 | **45.79%** *(governance)* |
 | `0xab2984424844b5a4120660896eddea19589458b583b7a7279b8d951ddb2e90db` | 195,034 | 2148B | 12 | 113,393 | 28.02% |
 | `0x329131473471b39de257f0392204b6ddc7ac7560c94e8d2407d4d33590f420f9` | 194,986 | 2148B | 12 | 113,357 | 28.02% |
 | `0xfd6656e58db697736c638a01a1abe0d3065a1b72627a1c9368b108e052cb03e3` | 195,031 | 2148B | 12 | 113,405 | 28.01% |
@@ -599,7 +611,7 @@ Fitting the two clusters:
 
 ```
 base ≈ 19,350 + 7,840 × (state updates)
-savings = gas_used − base − 27,000
+savings = gas_used − base − 50,000
 ```
 
 `updatePriceFeedsIfNecessary` verifies the whole signed batch regardless of outcome, but
@@ -621,7 +633,7 @@ That sample was drawn from a single 20,000-block window and happened to contain 
 ranging 192,005–279,375 and calldata 1028–2884B, and a second entry point.
 
 Two of the 13 rows above were also recovered from heuristic fallbacks: `0x8874d5a5dd…`
-claimed 65.79% and measures 49.76%; `0x616ba1cd82…` claimed 69.08% and measures 63.94%.
+claimed 65.79% and measured 49.76% at the old floor (41.53% at 50,000); `0x616ba1cd82…` claimed 69.08% and measured 63.94% (52.06% at 50,000).
 Two further transactions could not be measured after retries and are excluded rather than
 reported.
 
@@ -694,7 +706,7 @@ transactions. The current one adds a `bytes32 referrer` argument to both entry p
 | BaseRegistrar | `safeTransferFrom` | 128,799 | 146,761 | −17,962 | 0% |
 | NameWrapper | `setRecord` | 53,596 | 74,883 | −21,287 | 0% |
 
-**Best surplus: 16,058 gas against a 27,000-gas floor — 40% short. Mean surplus across all
+**Best surplus: 16,058 gas against a 50,000-gas floor — 68% short. Mean surplus across all
 18: 1,975 gas. Seven of the 18 are negative**, meaning replaying the recorded state changes
 costs more than the original transaction did.
 
@@ -759,7 +771,7 @@ around it to remove.
 
 26,319 transactions/month × 1,975 gas mean surplus, at the 0.107 gwei median effective gas
 price these transactions actually paid, ETH at $2,396.31 (Chainlink aggregator, read
-on-chain): **$13/month.** At 20 gwei, $2,491/month. With the real 27,000-gas floor it is $0
+on-chain): **$13/month.** At 20 gwei, $2,491/month. With the real 50,000-gas floor it is $0
 at any gas price.
 
 For comparison, Pyth clears the floor on every transaction and is worth $12–25/month at the
@@ -818,27 +830,27 @@ begins with three zero bytes, saving calldata gas. They optimise aggressively.
 
 | contract | function | gas used | replay cost | surplus | Schnorr |
 |---|---|---:|---:|---:|---:|
-| Scribe | `poke_optimized` | 129,099 | 36,964 | +92,135 | **50.45%** |
-| Scribe | `poke` | 128,819 | 36,964 | +91,855 | **50.35%** |
-| Scribe | `poke` | 127,899 | 36,940 | +90,959 | **50.01%** |
-| Scribe | `poke_optimized` | 127,643 | 36,964 | +90,679 | **49.89%** |
-| Scribe | `poke_optimized` | 127,655 | 37,036 | +90,619 | **49.84%** |
-| Scribe | `poke_optimized` | 126,087 | 36,988 | +89,099 | **49.25%** |
-| Scribe | `poke_optimized` | 125,951 | 36,940 | +89,011 | **49.23%** |
-| Scribe | `poke_optimized` | 125,663 | 37,036 | +88,627 | **49.04%** |
-| Scribe | `poke_optimized` | 124,495 | 36,940 | +87,555 | **48.64%** |
-| Scribe | `poke_optimized` | 124,507 | 36,988 | +87,519 | **48.61%** |
-| Scribe | `poke_optimized` | 124,507 | 36,988 | +87,519 | **48.61%** |
-| Scribe | `poke_optimized` | 124,519 | 37,012 | +87,507 | **48.59%** |
-| Scribe | `poke_optimized` | 121,309 | 36,988 | +84,321 | **47.25%** |
-| OSM | `poke()` | 103,090 | 36,022 | +67,068 | **38.87%** |
-| OSM | `poke()` | 103,080 | 36,022 | +67,058 | **38.86%** |
-| Median | `poke(...sigs)` | 89,949 | 35,974 | +53,975 | **29.99%** |
-| Median | `poke(...sigs)` | 89,937 | 35,974 | +53,963 | **29.98%** |
-| OSM | `poke()` | 80,034 | 35,974 | +44,060 | **21.32%** |
-| OSM | `poke()` | 80,034 | 35,974 | +44,060 | **21.32%** |
-| Median | `poke(...sigs)` | 73,567 | 36,022 | +37,545 | **14.33%** |
-| Median | `poke(...sigs)` | 73,493 | 36,022 | +37,471 | **14.25%** |
+| Scribe | `poke_optimized` | 129,099 | 36,964 | +92,135 | **32.64%** |
+| Scribe | `poke` | 128,819 | 36,964 | +91,855 | **32.49%** |
+| Scribe | `poke` | 127,899 | 36,940 | +90,959 | **32.02%** |
+| Scribe | `poke_optimized` | 127,643 | 36,964 | +90,679 | **31.87%** |
+| Scribe | `poke_optimized` | 127,655 | 37,036 | +90,619 | **31.82%** |
+| Scribe | `poke_optimized` | 126,087 | 36,988 | +89,099 | **31.01%** |
+| Scribe | `poke_optimized` | 125,951 | 36,940 | +89,011 | **30.97%** |
+| Scribe | `poke_optimized` | 125,663 | 37,036 | +88,627 | **30.74%** |
+| Scribe | `poke_optimized` | 124,495 | 36,940 | +87,555 | **30.17%** |
+| Scribe | `poke_optimized` | 124,507 | 36,988 | +87,519 | **30.13%** |
+| Scribe | `poke_optimized` | 124,507 | 36,988 | +87,519 | **30.13%** |
+| Scribe | `poke_optimized` | 124,519 | 37,012 | +87,507 | **30.12%** |
+| Scribe | `poke_optimized` | 121,309 | 36,988 | +84,321 | **28.29%** |
+| OSM | `poke()` | 103,090 | 36,022 | +67,068 | **16.56%** |
+| OSM | `poke()` | 103,080 | 36,022 | +67,058 | **16.55%** |
+| Median | `poke(...sigs)` | 89,949 | 35,974 | +53,975 | **4.42%** |
+| Median | `poke(...sigs)` | 89,937 | 35,974 | +53,963 | **4.41%** |
+| OSM | `poke()` | 80,034 | 35,974 | +44,060 | **0.00%** |
+| OSM | `poke()` | 80,034 | 35,974 | +44,060 | **0.00%** |
+| Median | `poke(...sigs)` | 73,567 | 36,022 | +37,545 | **0.00%** |
+| Median | `poke(...sigs)` | 73,493 | 36,022 | +37,471 | **0.00%** |
 | Multicall3 | `aggregate3` | 897,296 | 911,985 | −14,689 | 0% |
 | Multicall3 | `aggregate3` | 569,896 | 579,405 | −9,509 | 0% |
 | Multicall3 | `aggregate3` | 243,479 | 247,819 | −4,340 | 0% |
@@ -866,9 +878,9 @@ measures.
 189 qualifying transactions/day (92.7 Scribe direct + 96.4 legacy Median/OSM), mean saving
 62,031 gas for Scribe and 23,650 for Median/OSM = **240.9M gas/month**. At the **1.007 gwei**
 median effective gas price these transactions actually paid, ETH $2,419.40 (Chronicle
-aggregator, on-chain): **$587/month.** At 20 gwei, $11,658/month.
+aggregator, on-chain): **$304/month.** At 20 gwei, $6,041/month.
 
-Third by money behind Aave ($1,691) and Railgun ($900), and **25x Pyth** despite a lower
+Third by money behind Aave ($1,392) and Railgun ($876), and **~25x Pyth** despite a lower
 headline percentage than Pyth's best. Two reasons, both worth carrying into the ranking
 method: Chronicle has ~6x Pyth's qualifying volume, and its transactions pay roughly **10x
 the gas price** ENS and Pyth pay, because an oracle update must land promptly and bids for
@@ -879,10 +891,10 @@ inclusion. Gas *price paid* is a ranking input, not just gas used.
 **1. Scribe is already a Schnorr multi-signature oracle.** Its repository describes it as
 "an efficient Schnorr multi-signature based Oracle": validator signatures are already
 aggregated off-chain and one signature is verified on-chain. GasKiller would replace one
-aggregate-signature check with another, and its 27,000-gas floor is charged against a contract
+aggregate-signature check with another, and its 50,000-gas floor is charged against a contract
 built specifically to minimise that cost. The argument has to be narrow and quantitative —
 *the measured removable surplus averages 89,031 gas; GasKiller's own signature check costs
-27,000* — not "we remove your computation." Both should be quoted for what they are: 27,000 is
+50,000* — not "we remove your computation." Both should be quoted for what they are: 50,000 is
 a constant in this repo (`crates/core/src/encoding.rs:21`), 89,031 is gas used minus the
 measured replay cost.
 
@@ -934,7 +946,7 @@ the *only* protocol surveyed where every single transaction is negative.
 
 `withdrawTokenOnBehalf` was the one plausible candidate: a relayer-sponsored withdrawal that
 verifies an ECDSA signature. It measures −8,966 and −9,248. One `ecrecover` is ~3,000 gas —
-nowhere near enough to matter against a 27,000-gas floor.
+nowhere near enough to matter against a 50,000-gas floor.
 
 **There is no shield transaction, by design.** Every `PUSH4` constant in the contract's 7,110
 bytes of bytecode resolves to one of: `sendEth`/`sendToken`, four `withdrawToken*` variants,
@@ -973,19 +985,19 @@ Six longlist entries measured together: Mellow, Renzo, Kelp, Puffer, Symbiotic, 
 
 **I predicted this block would be weak and I was wrong.** The reasoning was that EigenLayer
 (5.15%), Ether.fi (18.99%) and Lido (1.13%) had all scored low, and vault accounting is the
-bookkeeping shape. In fact **Kelp's `depositETH` is now the highest measured saving in this
-entire file at 85.90%**, ahead of Railgun's 80.84%.
+bookkeeping shape. In fact **Kelp's `depositETH` is the highest measured saving in this
+entire file at 83.29%**, ahead of Railgun's 78.72%.
 
 | protocol | function | best | n measured | winning |
 |---|---|---:|---:|---:|
-| **Kelp** | `depositETH` ✓ `0x72c51c0b` | **85.90%** | 5 | 4 |
-| **Renzo** | `claim` ✓ `0xddd5e1b2` | 67.10% | 2 | 1 |
-| **Symbiotic** | `withdraw`/`redeem` (ERC-4626) | 62.96% | 4 | 4 |
-| **Mellow** | `withdraw`/`redeem` (ERC-4626) | 49.60% | 5 | 5 |
-| **Puffer** | `requestWithdrawal` ✓ `0xef027fbf` | 19.22% | 2 | 1 |
+| **Kelp** | `depositETH` ✓ `0x72c51c0b` | **83.29%** | 5 | 4 |
+| **Renzo** | `claim` ✓ `0xddd5e1b2` | *62.97%* | 2 | 1 |
+| **Symbiotic** | `withdraw`/`redeem` (ERC-4626) | 57.04% | 4 | 4 |
+| **Mellow** | `withdraw`/`redeem` (ERC-4626) | 41.55% | 5 | 5 |
+| **Puffer** | `requestWithdrawal` ✓ `0xef027fbf` | *7.06%* | 2 | 1 |
 | **Swell** | `createWithdrawRequest` ✓ `0x74dc9d1a` | 0.00% | 3 | 0 |
 
-Kelp is remarkably consistent: 85.90%, 85.28%, 83.57%, 83.57% across four deposits. Each
+Kelp is remarkably consistent: 83.29%, 82.55%, 80.90%, 80.90% across four deposits. Each
 burns 843,973–881,047 gas and records **four state updates** — a reentrancy-guard write, one
 `mint` call on rsETH, one `ETHDeposit` log, and the guard reset. Replay costs 97,229–114,353.
 
@@ -1012,15 +1024,15 @@ against which tokens the receipt actually moved:
 
 | label | `to` | status |
 |---|---|---|
-| **Kelp** (4 rows incl. the 85.90%) | `0x036676389e…` LRTDepositPool | **verified** — own deposit pool, mints rsETH |
+| **Kelp** (4 rows incl. the 83.29%) | `0x036676389e…` LRTDepositPool | **verified** — own deposit pool, mints rsETH |
 | **Mellow** (5 rows) | `0xbeef69ac78…` steakLRT vault | **verified** — the vault itself |
 | **Symbiotic** (4 rows) | `0x7a4effd87c…` vault | **verified by association** — interacts with Symbiotic's wstETH default collateral |
-| **Renzo** (the 67.10% row) | `0x5efc9d10e4…` | **inferred only** — contract unidentified; moves ezETH |
-| **Puffer** (the 19.22% row) | `0xdda0483184…` | **inferred only** — contract unidentified; moves pufETH |
+| **Renzo** (the 62.97% row) | `0x5efc9d10e4…` | **inferred only** — contract unidentified; moves ezETH |
+| **Puffer** (the 7.06% row) | `0xdda0483184…` | **inferred only** — contract unidentified; moves pufETH |
 | **Swell** (2 rows) | `0x58749c46ff…`, `0x289d600447…` | inferred only; both score 0%, so nothing rests on them |
 
-**The headline is safe** — Kelp's 85.90% goes directly to Kelp's own pool. **Renzo's 67.10% and
-Puffer's 19.22% should not be quoted as those protocols' own numbers** until someone confirms
+**The headline is safe** — Kelp's 83.29% goes directly to Kelp's own pool. **Renzo's 62.97% and
+Puffer's 7.06% should not be quoted as those protocols' own numbers** until someone confirms
 what those two contracts are. They are ezETH- and pufETH-related, which is not the same as
 being Renzo's or Puffer's own entry point. This is the same failure mode as the earlier
 mislabelling of the ERC-4337 EntryPoint as "ZeroDev", caught earlier this time.
@@ -1033,13 +1045,13 @@ volumes together double-counts, which makes the $47/month figure above slightly 
 
 | | qualifying txs/day | mean saving | **$/month** | at 20 gwei |
 |---|---:|---:|---:|---:|
-| Kelp `depositETH` | **0.36** | 728,520 gas | **$27** | $395 |
-| Symbiotic withdraw/redeem | 1.49 | 227,791 gas | **$17** | $515 |
-| Mellow withdraw/redeem | 1.61 | 110,809 gas | **$3** | $270 |
-| | | | **$47** | **$1,180** |
+| Kelp `depositETH` | **0.36** | 705,520 gas | **$25** | $372 |
+| Symbiotic withdraw/redeem | 1.49 | 198,041 gas | **$14** | $432 |
+| Mellow withdraw/redeem | 1.61 | 93,559 gas | **$3** | $221 |
+| | | | **$42** | **$1,025** |
 
-**The best percentage in the survey is worth $27 a month.** Kelp's pool takes 6 qualifying
-deposits per 16.7 days. Chronicle, at half the percentage, is worth 12x more because it runs
+**The best percentage in the survey is worth $25 a month.** Kelp's pool takes 6 qualifying
+deposits per 16.7 days. Chronicle, at a lower percentage, is worth about 12x more because it runs
 189 qualifying transactions a day instead of 0.36.
 
 This is the exact mirror of ENS — 877 txs/day and no surplus, versus 0.36 txs/day and the
@@ -1141,7 +1153,7 @@ belongs to the *arbitrage bot's* transaction, not to Sky. Each individual Sky ca
 12,000–48,000 gas, so Sky's own share of one of those transactions is under 10% of it.
 
 That makes the negative stronger, not weaker. Even if the routing problem were solved and
-`buyGem` were directly callable, 48,418 gas has to clear a 27,000-gas floor from a base that
+`buyGem` were directly callable, 48,418 gas has to clear a 50,000-gas floor from a base that
 already contains its own storage writes and logs — there is no room. The supporting evidence is
 `daiToUsds`, the largest single Sky function in the census at 130,551 gas: it *was* measured
 directly, and came out at **−19,430 surplus**.
@@ -1189,8 +1201,8 @@ ETH/USD $2,386, read from the Chainlink aggregator on-chain.
 
 | protocol | best % | qualifying txs/day | gas saved each | **savings/month** | at 20 gwei |
 |---|---:|---:|---:|---:|---:|
-| Aave V3 | 63.64% | 555 | 130,000 | **$1,691** | $103,254 |
-| Railgun | 80.84% | 106 | 877,737 | **$900** | $133,664 |
+| Aave V3 | 59.61% | 555 | 107,000 | **$1,392** | $84,986 |
+| Railgun | 78.72% | 106 | 854,737 | **$876** | $130,162 |
 | Pyth | 28.01% | 29 | 54,614 | **$12** | $2,245 |
 | | | | | **~$2,600** | **~$239,000** |
 
@@ -1258,35 +1270,35 @@ A **✓** means the selector was confirmed by matching a locally computed keccak
 
 | protocol | tx | function (4-byte) | gas used | GasKiller cost | Schnorr saved |
 |---|---|---|---:|---:|---:|
-| Railgun | [`0xaa357a48…`](https://etherscan.io/tx/0xaa357a4824001aed7173b3bc7d976f997fc7839def4c56ec070db97ec2121bc4) | `0xd8ae136a` *Railgun private transfer / unshield* | 1,085,832 | 181,095 | **877,737** (80.84%) |
-| Railgun | [`0x32daef80…`](https://etherscan.io/tx/0x32daef80a0c5180dcf45b15130e10ecced485242f0d3305b30942ebeb5aec364) | `0xd8ae136a` *Railgun private transfer / unshield* | 1,056,246 | 197,859 | **831,387** (78.71%) |
-| Railgun | [`0xe7e605b6…`](https://etherscan.io/tx/0xe7e605b6520aaf757f4531a88af4966866d86fee61ec06e93b3423b30a934adc) | `0xd8ae136a` *Railgun private transfer / unshield* | 1,615,755 | 317,840 | **1,270,915** (78.66%) |
-| Railgun | [`0xa2177825…`](https://etherscan.io/tx/0xa21778257ba78ce1354a4ff25a48ee07854e5e858f4facfe3e3c3893d9a1945f) | `0xd8ae136a` *Railgun private transfer / unshield* | 1,561,573 | 312,286 | **1,222,287** (78.27%) |
-| Railgun | [`0x73a1d71e…`](https://etherscan.io/tx/0x73a1d71e2cfa678b63c934c8c04eb6b6069de89c85faf16d0376241ecabfb0ec) | `0xd8ae136a` *Railgun private transfer / unshield* | 1,097,058 | 213,396 | **856,662** (78.09%) |
-| Railgun | [`0xa3a010fa…`](https://etherscan.io/tx/0xa3a010fa890d910e669fba1ea7b681a4c1f464b754c5b7bff7d62ae15ae25e71) | `0xd8ae136a` *Railgun private transfer / unshield* | 1,113,545 | 241,625 | **844,920** (75.88%) |
-| Railgun | [`0x04736806…`](https://etherscan.io/tx/0x04736806756593b664eb29591a2ea046b2261c5a4fa1bdd1707a6dc5abf54f07) | `0xd8ae136a` *Railgun private transfer / unshield* | 1,136,044 | 266,554 | **842,490** (74.16%) |
-| Railgun | [`0x39a67a29…`](https://etherscan.io/tx/0x39a67a2964b675ccd1be1939c513b46f62cae71c3f320bece6acdaf71934b3ae) | `0xd8ae136a` *Railgun private transfer / unshield* | 1,131,080 | 266,430 | **837,650** (74.06%) |
-| Railgun | [`0xaf36e218…`](https://etherscan.io/tx/0xaf36e2187e095fa88299a8859632963594414b716f36aae541318d4ce71740e6) | `0xd8ae136a` *Railgun private transfer / unshield* | 1,177,014 | 282,477 | **867,537** (73.71%) |
-| Railgun | [`0x0376edd3…`](https://etherscan.io/tx/0x0376edd36b0c9211b1a38f41e5f1c04233478ca4dcf7d4852ef313deb1c57ade) | `0x044a40c3` `shield` ✓ | 724,515 | 168,652 | **528,863** (73.00%) |
-| Railgun | [`0xab44777b…`](https://etherscan.io/tx/0xab44777b4e3a37169ea03163ec5d14dbf668bcb18219c3a95cc2313c2be55a3d) | `0x044a40c3` `shield` ✓ | 736,786 | 177,753 | **532,033** (72.21%) |
-| Railgun | [`0x27ce0220…`](https://etherscan.io/tx/0x27ce022039ef027d473c61f3140da32c8e58f0a8daaee826e6f04a58744db447) | `0x044a40c3` `shield` ✓ | 742,727 | 185,294 | **530,433** (71.42%) |
-| Railgun | [`0x3d54cfc3…`](https://etherscan.io/tx/0x3d54cfc375e626acd71432b2ab59a94bde2f6ee2490528ca8259417091e3ab97) | `0x044a40c3` `shield` ✓ | 752,878 | 197,812 | **528,066** (70.14%) |
-| Railgun | [`0x6837bb8d…`](https://etherscan.io/tx/0x6837bb8d629ee0dce5f045acfc6c1e296df4abe1907897820bf621462dc23425) | `0x044a40c3` `shield` ✓ | 758,741 | 211,644 | **520,097** (68.55%) |
-| Railgun | [`0x792a8e57…`](https://etherscan.io/tx/0x792a8e5783cec82cc456d83f0f1703a2bf71eafa05984a17896809bd952567cc) | `0xd8ae136a` *Railgun private transfer / unshield* | 484,303 | 139,722 | **317,581** (65.57%) |
+| Railgun | [`0xaa357a48…`](https://etherscan.io/tx/0xaa357a4824001aed7173b3bc7d976f997fc7839def4c56ec070db97ec2121bc4) | `0xd8ae136a` *Railgun private transfer / unshield* | 1,085,832 | 181,095 | **854,737** (78.72%) |
+| Railgun | [`0x32daef80…`](https://etherscan.io/tx/0x32daef80a0c5180dcf45b15130e10ecced485242f0d3305b30942ebeb5aec364) | `0xd8ae136a` *Railgun private transfer / unshield* | 1,056,246 | 197,859 | **808,387** (76.53%) |
+| Railgun | [`0xe7e605b6…`](https://etherscan.io/tx/0xe7e605b6520aaf757f4531a88af4966866d86fee61ec06e93b3423b30a934adc) | `0xd8ae136a` *Railgun private transfer / unshield* | 1,615,755 | 317,840 | **1,247,915** (77.23%) |
+| Railgun | [`0xa2177825…`](https://etherscan.io/tx/0xa21778257ba78ce1354a4ff25a48ee07854e5e858f4facfe3e3c3893d9a1945f) | `0xd8ae136a` *Railgun private transfer / unshield* | 1,561,573 | 312,286 | **1,199,287** (76.80%) |
+| Railgun | [`0x73a1d71e…`](https://etherscan.io/tx/0x73a1d71e2cfa678b63c934c8c04eb6b6069de89c85faf16d0376241ecabfb0ec) | `0xd8ae136a` *Railgun private transfer / unshield* | 1,097,058 | 213,396 | **833,662** (75.99%) |
+| Railgun | [`0xa3a010fa…`](https://etherscan.io/tx/0xa3a010fa890d910e669fba1ea7b681a4c1f464b754c5b7bff7d62ae15ae25e71) | `0xd8ae136a` *Railgun private transfer / unshield* | 1,113,545 | 241,625 | **821,920** (73.81%) |
+| Railgun | [`0x04736806…`](https://etherscan.io/tx/0x04736806756593b664eb29591a2ea046b2261c5a4fa1bdd1707a6dc5abf54f07) | `0xd8ae136a` *Railgun private transfer / unshield* | 1,136,044 | 266,554 | **819,490** (72.14%) |
+| Railgun | [`0x39a67a29…`](https://etherscan.io/tx/0x39a67a2964b675ccd1be1939c513b46f62cae71c3f320bece6acdaf71934b3ae) | `0xd8ae136a` *Railgun private transfer / unshield* | 1,131,080 | 266,430 | **814,650** (72.02%) |
+| Railgun | [`0xaf36e218…`](https://etherscan.io/tx/0xaf36e2187e095fa88299a8859632963594414b716f36aae541318d4ce71740e6) | `0xd8ae136a` *Railgun private transfer / unshield* | 1,177,014 | 282,477 | **844,537** (71.75%) |
+| Railgun | [`0x0376edd3…`](https://etherscan.io/tx/0x0376edd36b0c9211b1a38f41e5f1c04233478ca4dcf7d4852ef313deb1c57ade) | `0x044a40c3` `shield` ✓ | 724,515 | 168,652 | **505,863** (69.82%) |
+| Railgun | [`0xab44777b…`](https://etherscan.io/tx/0xab44777b4e3a37169ea03163ec5d14dbf668bcb18219c3a95cc2313c2be55a3d) | `0x044a40c3` `shield` ✓ | 736,786 | 177,753 | **509,033** (69.09%) |
+| Railgun | [`0x27ce0220…`](https://etherscan.io/tx/0x27ce022039ef027d473c61f3140da32c8e58f0a8daaee826e6f04a58744db447) | `0x044a40c3` `shield` ✓ | 742,727 | 185,294 | **507,433** (68.32%) |
+| Railgun | [`0x3d54cfc3…`](https://etherscan.io/tx/0x3d54cfc375e626acd71432b2ab59a94bde2f6ee2490528ca8259417091e3ab97) | `0x044a40c3` `shield` ✓ | 752,878 | 197,812 | **505,066** (67.08%) |
+| Railgun | [`0x6837bb8d…`](https://etherscan.io/tx/0x6837bb8d629ee0dce5f045acfc6c1e296df4abe1907897820bf621462dc23425) | `0x044a40c3` `shield` ✓ | 758,741 | 211,644 | **497,097** (65.52%) |
+| Railgun | [`0x792a8e57…`](https://etherscan.io/tx/0x792a8e5783cec82cc456d83f0f1703a2bf71eafa05984a17896809bd952567cc) | `0xd8ae136a` *Railgun private transfer / unshield* | 484,303 | 139,722 | **294,581** (60.83%) |
 | Railgun | [`0x6f534f5a…`](https://etherscan.io/tx/0x6f534f5af7fa26b66e0c6a5f49505f7125665e88b0d1af23efca86da88109f27) `heur` | `0x28223a77` *unidentified* | 1,297,603 | 1,287,231 | 0 |
 | Railgun | [`0x7c731150…`](https://etherscan.io/tx/0x7c731150234add278ecae3ee9b6bcd35ee50435cc69bc47cce1a008e54c1f2ce) `heur` | `0x28223a77` *unidentified* | 1,120,780 | 1,116,659 | 0 |
 | Railgun | [`0x2d754e6f…`](https://etherscan.io/tx/0x2d754e6f8a34058e5d07596e627cbc70e0c704279e9f745a4c0baef80389cca7) | `0x28223a77` *unidentified* | 523,496 | 533,777 | 0 |
-| Aave | [`0xa7a8c34f…`](https://etherscan.io/tx/0xa7a8c34fee3795db241bcdf3e5c0b8b279dcb78f62ceee2f3530c9f38dd1ebec) | `0xa415bcad` `borrow` ✓ | 571,333 | 180,741 | **363,592** (63.64%) |
-| Aave | [`0xa36db142…`](https://etherscan.io/tx/0xa36db1427faa3a36a7461bf00e80bc12bd07d9d7c87fbab54ee49bec92b9fec7) | `0xa415bcad` `borrow` ✓ | 450,205 | 163,828 | **259,377** (57.61%) |
-| Aave | [`0x1b708eba…`](https://etherscan.io/tx/0x1b708eba95e753a84558374c488f1557907935272fabc2ffe91f6d8844c06370) | `0x69328dec` `withdraw` ✓ | 408,792 | 180,921 | **200,871** (49.14%) |
-| Aave | [`0xa70a6bbd…`](https://etherscan.io/tx/0xa70a6bbd833f973defbcc4a0b1ad281f4708fa1960a39635d784a855a8fac9e1) | `0xa415bcad` `borrow` ✓ | 371,912 | 173,408 | **171,504** (46.11%) |
-| Aave | [`0xc62d052c…`](https://etherscan.io/tx/0xc62d052c8385a546ab9f2f4d6a9fc194e45c3c9c7bf69e22454e38d9c55cb0cb) | `0xa415bcad` `borrow` ✓ | 360,781 | 170,263 | **163,518** (45.32%) |
-| Aave | [`0xe73dcebf…`](https://etherscan.io/tx/0xe73dcebf75429339193a24c45a37e377948bf6f69fa77b8f50931d1e26ebeeea) | `0xa415bcad` `borrow` ✓ | 345,794 | 170,335 | **148,459** (42.93%) |
-| Aave | [`0x000d4a32…`](https://etherscan.io/tx/0x000d4a32a076758c9ca1271e2909e2c4e1acaf988ff36ac8e8dc513f5fa64332) | `0xa415bcad` `borrow` ✓ | 365,438 | 181,716 | **156,722** (42.89%) |
-| Aave | [`0x2cab2e0f…`](https://etherscan.io/tx/0x2cab2e0f215f22a30249a1198f6604bdcfcc131183aeaaa7c1257fb939ec239f) | `0xa415bcad` `borrow` ✓ | 346,272 | 206,699 | **112,573** (32.51%) |
-| Aave | [`0xe65a59b9…`](https://etherscan.io/tx/0xe65a59b9f5d42dfd18018dd8c42850e6ea38c49d4a61718888c072e4f13dcc77) | `0xa415bcad` `borrow` ✓ | 316,682 | 205,592 | **84,090** (26.55%) |
-| Aave | [`0xb33162e1…`](https://etherscan.io/tx/0xb33162e1275b4e14a4a0de3d327949fb520949cadd898d17718bb813547ca0fb) | `0xa415bcad` `borrow` ✓ | 252,529 | 164,712 | **60,817** (24.08%) |
-| Aave | [`0xeff004bd…`](https://etherscan.io/tx/0xeff004bd1fb2851258ac5aa69997def87176f40716ecd4fe3d68904e1d6c3669) `heur` | `0x69328dec` `withdraw` ✓ | 211,120 | 160,699 | **23,421** (11.09%) |
+| Aave | [`0xa7a8c34f…`](https://etherscan.io/tx/0xa7a8c34fee3795db241bcdf3e5c0b8b279dcb78f62ceee2f3530c9f38dd1ebec) | `0xa415bcad` `borrow` ✓ | 571,333 | 180,741 | **340,592** (59.61%) |
+| Aave | [`0xa36db142…`](https://etherscan.io/tx/0xa36db1427faa3a36a7461bf00e80bc12bd07d9d7c87fbab54ee49bec92b9fec7) | `0xa415bcad` `borrow` ✓ | 450,205 | 163,828 | **236,377** (52.50%) |
+| Aave | [`0x1b708eba…`](https://etherscan.io/tx/0x1b708eba95e753a84558374c488f1557907935272fabc2ffe91f6d8844c06370) | `0x69328dec` `withdraw` ✓ | 408,792 | 180,921 | **177,871** (43.51%) |
+| Aave | [`0xa70a6bbd…`](https://etherscan.io/tx/0xa70a6bbd833f973defbcc4a0b1ad281f4708fa1960a39635d784a855a8fac9e1) | `0xa415bcad` `borrow` ✓ | 371,912 | 173,408 | **148,504** (39.93%) |
+| Aave | [`0xc62d052c…`](https://etherscan.io/tx/0xc62d052c8385a546ab9f2f4d6a9fc194e45c3c9c7bf69e22454e38d9c55cb0cb) | `0xa415bcad` `borrow` ✓ | 360,781 | 170,263 | **140,518** (38.95%) |
+| Aave | [`0xe73dcebf…`](https://etherscan.io/tx/0xe73dcebf75429339193a24c45a37e377948bf6f69fa77b8f50931d1e26ebeeea) | `0xa415bcad` `borrow` ✓ | 345,794 | 170,335 | **125,459** (36.28%) |
+| Aave | [`0x000d4a32…`](https://etherscan.io/tx/0x000d4a32a076758c9ca1271e2909e2c4e1acaf988ff36ac8e8dc513f5fa64332) | `0xa415bcad` `borrow` ✓ | 365,438 | 181,716 | **133,722** (36.59%) |
+| Aave | [`0x2cab2e0f…`](https://etherscan.io/tx/0x2cab2e0f215f22a30249a1198f6604bdcfcc131183aeaaa7c1257fb939ec239f) | `0xa415bcad` `borrow` ✓ | 346,272 | 206,699 | **89,573** (25.87%) |
+| Aave | [`0xe65a59b9…`](https://etherscan.io/tx/0xe65a59b9f5d42dfd18018dd8c42850e6ea38c49d4a61718888c072e4f13dcc77) | `0xa415bcad` `borrow` ✓ | 316,682 | 205,592 | **61,090** (19.29%) |
+| Aave | [`0xb33162e1…`](https://etherscan.io/tx/0xb33162e1275b4e14a4a0de3d327949fb520949cadd898d17718bb813547ca0fb) | `0xa415bcad` `borrow` ✓ | 252,529 | 164,712 | **37,817** (14.98%) |
+| Aave | [`0xeff004bd…`](https://etherscan.io/tx/0xeff004bd1fb2851258ac5aa69997def87176f40716ecd4fe3d68904e1d6c3669) `heur` | `0x69328dec` `withdraw` ✓ | 211,120 | 160,699 | **421** (0.20%) |
 | Aave | [`0x9287f808…`](https://etherscan.io/tx/0x9287f80894eeeacc8af236609401da9f14ce0e655cbb9748e0db2e405aeb2ef5) | `0x7e809076` *third-party liquidator bot* | 1,165,207 | 1,156,574 | 0 |
 | Aave | [`0x324633c1…`](https://etherscan.io/tx/0x324633c1f5cf10b86a58aad0d48ac39673afd6ee24e2b391488ac84e4c6baaa0) | `0x02c205f0` `supplyWithPermit` ✓ | 206,695 | 207,356 | 0 |
 | Aave | [`0x4eba5f8d…`](https://etherscan.io/tx/0x4eba5f8de29afdcac5703668d41a1f4bee734545dcdb37a129c6341b41c6ea44) | `0x617ba037` `supply` ✓ | 183,352 | 178,041 | 0 |
@@ -1296,8 +1308,8 @@ A **✓** means the selector was confirmed by matching a locally computed keccak
 | Aave | [`0x7f281bd6…`](https://etherscan.io/tx/0x7f281bd663289348bccaeb5c1616459ab424f557a65eaebfb603a1d445267ad4) | `0x617ba037` `supply` ✓ | 155,576 | 150,490 | 0 |
 | Aave | [`0x055c232c…`](https://etherscan.io/tx/0x055c232ce489f003f64d5f05a5f77706c8a282f921d60a4264b5eeb21a6c6736) | `0x617ba037` `supply` ✓ | 147,675 | 142,925 | 0 |
 | Aave | [`0x6b7563d1…`](https://etherscan.io/tx/0x6b7563d1e117aa90cc1e65b19b10ee525da3bdc89a26d0498a2a7084ab7867b1) | `0x573ade81` `repay` ✓ | 144,130 | 142,631 | 0 |
-| Privacy Pools | [`0xe894abc7…`](https://etherscan.io/tx/0xe894abc79ca19fae8e3ef2a98b9570da0037d6f47ce531351002770d16ffe11f) | `0x30c0766d` `withdraw` ✓ | 587,069 | 422,768 | **137,301** (23.39%) |
-| Privacy Pools | [`0x67deaa0e…`](https://etherscan.io/tx/0x67deaa0e50f0db65925f464c05168927db7ce336079334100aba5cdbeb701e64) | `0x30c0766d` `withdraw` ✓ | 576,177 | 430,907 | **118,270** (20.53%) |
+| Privacy Pools | [`0xe894abc7…`](https://etherscan.io/tx/0xe894abc79ca19fae8e3ef2a98b9570da0037d6f47ce531351002770d16ffe11f) | `0x30c0766d` `withdraw` ✓ | 587,069 | 422,768 | **114,301** (19.47%) |
+| Privacy Pools | [`0x67deaa0e…`](https://etherscan.io/tx/0x67deaa0e50f0db65925f464c05168927db7ce336079334100aba5cdbeb701e64) | `0x30c0766d` `withdraw` ✓ | 576,177 | 430,907 | **95,270** (16.53%) |
 | Privacy Pools | [`0x15082298…`](https://etherscan.io/tx/0x150822981204592e4cfa340ba2e63e607a1c6ded490b988f9a8bd37c1f2b46d0) | `0x8a44121e` `relay` ✓ | 620,208 | 632,053 | 0 |
 | Privacy Pools | [`0x03ebad9a…`](https://etherscan.io/tx/0x03ebad9a10bc3dc5ad36613de80975b7ee8061d7fa74367f1a9aa04e77cc1524) | `0x8a44121e` `relay` ✓ | 604,245 | 616,114 | 0 |
 | Privacy Pools | [`0xad4ac41d…`](https://etherscan.io/tx/0xad4ac41d7ad3ba9792d7c426631dba0d46a31e271f5105dbb6aa6df349c891a5) | `0x8a44121e` `relay` ✓ | 604,233 | 616,066 | 0 |
@@ -1317,9 +1329,9 @@ A **✓** means the selector was confirmed by matching a locally computed keccak
 | Ether.fi | [`0xd14eb830…`](https://etherscan.io/tx/0xd14eb830b3308feb3dee287e11752e9400d4aaf8b1c85cacb04d1ef9321a2a84) | `0xea598cb0` `wrap` ✓ | 134,730 | 130,194 | **157,194** (0.00%) |
 | Ether.fi | [`0x2cc9a112…`](https://etherscan.io/tx/0x2cc9a112936e0cfda1b4e9afd88ac5a861f2392cb9e20d2598f255a509b6d929) | `0xde0e9a3e` `unwrap` ✓ | 122,474 | 117,487 | **144,487** (0.00%) |
 | Ether.fi | [`0xbe33787e…`](https://etherscan.io/tx/0xbe33787eb89c203cacaee0fb05da574bfef9c0aef4b80bcd8eed779a57f86222) | `0xd0e30db0` `deposit` ✓ | 120,178 | 128,056 | **155,056** (0.00%) |
-| Safe | [`0xa9eca9f1…`](https://etherscan.io/tx/0xa9eca9f1a7075c8eb971e7ee2a1a3ee514cf3cf6b1077d6ddcc4f60f8ebf4eaa) | `0x6a761202` `execTransaction` ✓ | 104,612 | 67,158 | **10,454** (9.99%) |
-| Safe | [`0x5c559278…`](https://etherscan.io/tx/0x5c5592787da61ec8c46326d93089c14e667276fab45703077168e72dcbbee99e) | `0x6a761202` `execTransaction` ✓ | 115,958 | 78,540 | **10,418** (8.98%) |
-| Safe | [`0x8951b058…`](https://etherscan.io/tx/0x8951b058f41486ff7d9c5806d187af52f7d969ae69ddbb85c1e1be04171dae04) | `0x6a761202` `execTransaction` ✓ | 3,251,629 | 3,220,361 | **4,268** (0.13%) |
+| Safe | [`0xa9eca9f1…`](https://etherscan.io/tx/0xa9eca9f1a7075c8eb971e7ee2a1a3ee514cf3cf6b1077d6ddcc4f60f8ebf4eaa) | `0x6a761202` `execTransaction` ✓ | 104,612 | 67,158 | **0** (0.00%) |
+| Safe | [`0x5c559278…`](https://etherscan.io/tx/0x5c5592787da61ec8c46326d93089c14e667276fab45703077168e72dcbbee99e) | `0x6a761202` `execTransaction` ✓ | 115,958 | 78,540 | **0** (0.00%) |
+| Safe | [`0x8951b058…`](https://etherscan.io/tx/0x8951b058f41486ff7d9c5806d187af52f7d969ae69ddbb85c1e1be04171dae04) | `0x6a761202` `execTransaction` ✓ | 3,251,629 | 3,220,361 | **0** (0.00%) |
 | Safe | [`0xf20b6df4…`](https://etherscan.io/tx/0xf20b6df4702b6537ba520316a35552b6d1da7b696e3c69e34986ed901402bd56) | `0x6a761202` `execTransaction` ✓ | 11,414,223 | 11,400,916 | 0 |
 | Safe | [`0xdcc894ec…`](https://etherscan.io/tx/0xdcc894ec22dc799bd1cd8c24caa4bcd2a2d7f35ae2ba8ab7c431a07f76e5ba21) | `0x6a761202` `execTransaction` ✓ | 1,004,511 | 1,005,210 | 0 |
 | Safe | [`0xb286eeb1…`](https://etherscan.io/tx/0xb286eeb15c4cb3445a73e275e89336f7563eb46c2e9ec97a82aeefb5a4485430) | `0x6a761202` `execTransaction` ✓ | 463,470 | 442,944 | 0 |
@@ -1329,7 +1341,7 @@ A **✓** means the selector was confirmed by matching a locally computed keccak
 | Safe | [`0x909681b5…`](https://etherscan.io/tx/0x909681b5131c5ccc56e6f6791f152efe41cf270172c5a4645fc0067567bd8651) | `0x6a761202` `execTransaction` ✓ | 103,575 | 85,519 | 0 |
 | Safe | [`0x2666f99a…`](https://etherscan.io/tx/0x2666f99a3b1ad225cf8dcc40fbafb1959a6efb5bb3c561b3d2d5a3b242ca4a29) | `0x6a761202` `execTransaction` ✓ | 96,660 | 73,351 | 0 |
 | Safe | [`0xb2b17e51…`](https://etherscan.io/tx/0xb2b17e51681c60f3d66aa112fa13f070c5ea76c466e794e3ba360c8b833b5a55) | `0x6a761202` `execTransaction` ✓ | 75,536 | 70,129 | 0 |
-| Pendle | [`0x75aceefb…`](https://etherscan.io/tx/0x75aceefb54f607c4de446308146e0b84ff405ec56a6e5bc24ccb88b3b5397991) | `0xc685f647` *third-party aggregator* | 1,719,271 | 1,624,535 | **67,736** (3.94%) |
+| Pendle | [`0x75aceefb…`](https://etherscan.io/tx/0x75aceefb54f607c4de446308146e0b84ff405ec56a6e5bc24ccb88b3b5397991) | `0xc685f647` *third-party aggregator* | 1,719,271 | 1,624,535 | **44,736** (2.60%) |
 | Pendle | [`0xa2c6de73…`](https://etherscan.io/tx/0xa2c6de73e89c7bd707a9fe308d09c54eb16d2ddf9e3ff09f866d8a68e3948afd) | `0xc685f647` *third-party aggregator* | 1,183,159 | 1,157,967 | 0 |
 | Pendle | [`0x8bd2985a…`](https://etherscan.io/tx/0x8bd2985af25143dbf0d3aa60f0e36bc50195d2702e4beeaf1576f8f4464200d7) | `0x60fc8466` *Pendle router action* | 1,018,948 | 1,020,097 | 0 |
 | Pendle | [`0xa01ba5b6…`](https://etherscan.io/tx/0xa01ba5b6e8c9f78e7d4d324bd2b03da78a7d02cdf9fa852aa82b60dc400a586c) | `0xed48907e` *Pendle router action* | 768,674 | 762,631 | 0 |
@@ -1337,15 +1349,15 @@ A **✓** means the selector was confirmed by matching a locally computed keccak
 | Pendle | [`0xa3ec8aea…`](https://etherscan.io/tx/0xa3ec8aea5dd4b01271f7dd979830a444ec2b3fa618f5e0afc550a2bd03af65a3) | `0xed48907e` *Pendle router action* | 370,167 | 359,084 | 0 |
 | Pendle | [`0xec4d1fdf…`](https://etherscan.io/tx/0xec4d1fdf22d55bdde9d358e329af22a6c3345032ce969c79afb9d5dea8487556) | `0x594a88cc` *Pendle router action* | 205,329 | 213,408 | 0 |
 | Pendle | [`0xc503cb6f…`](https://etherscan.io/tx/0xc503cb6f653908693bc666cf764b7fbd18d25d1f2982bde550107e98c81559a0) | `0x5b709f17` `swapSyForExactPt` ✓ | 153,140 | 148,995 | 0 |
-| World ID | [`0xa447c2d3…`](https://etherscan.io/tx/0xa447c2d3d0786a32f8b23c0f571e714e91d4d812b575d7bee27864c7c3e8c556) | `0x2217b211` `registerIdentities` ✓ | 298,629 | 263,051 | **8,578** (2.87%) |
+| World ID | [`0xa447c2d3…`](https://etherscan.io/tx/0xa447c2d3d0786a32f8b23c0f571e714e91d4d812b575d7bee27864c7c3e8c556) | `0x2217b211` `registerIdentities` ✓ | 298,629 | 263,051 | **0** (0.00%) |
 | World ID | [`0x36c09544…`](https://etherscan.io/tx/0x36c095445eb96f2ccaa2a2ec9544ac2cf72aa524c36c0ce23c0aecc2cf36b8b7) | `0x2217b211` `registerIdentities` ✓ | 285,261 | 263,075 | 0 |
 | World ID | [`0x6b2fb8d3…`](https://etherscan.io/tx/0x6b2fb8d32c1fc927e5c37ae0ca52d17cb122b949ec0140f75a8212164911f494) | `0x2217b211` `registerIdentities` ✓ | 282,573 | 263,039 | 0 |
 | World ID | [`0xb2f5ba58…`](https://etherscan.io/tx/0xb2f5ba588077025662acd44f62ead62c4dc6da4faa30890d658542aedcaef3c5) | `0x2217b211` `registerIdentities` ✓ | 281,457 | 263,051 | 0 |
 | World ID | [`0xcd404a27…`](https://etherscan.io/tx/0xcd404a27462a9e60fdd5a17c024d758d809f860ad2da9f1709882d497276375a) | `0x2217b211` `registerIdentities` ✓ | 281,445 | 263,051 | 0 |
 | World ID | [`0x04ca8194…`](https://etherscan.io/tx/0x04ca81943592e11ddbce6e4fac96c0f84debb12c8d972bd3f910dc8bf77274de) | `0xea10fbbe` `deleteIdentities` ✓ | 271,876 | 263,087 | 0 |
 | World ID | [`0x2fee0848…`](https://etherscan.io/tx/0x2fee084888a10a8cf80c30b36bf511e8ba499e517d49dbc0ca2a97d4c4e160e6) | `0xea10fbbe` `deleteIdentities` ✓ | 271,816 | 263,075 | 0 |
-| Morpho | [`0x80329618…`](https://etherscan.io/tx/0x80329618f5c5261829097e2a8a079c765c6ae0ce35f6d98e09a4d246a694c8bf) | `0xac9650d8` `multicall` ✓ | 380,049 | 343,154 | **9,895** (2.60%) |
-| Morpho | [`0x4e547494…`](https://etherscan.io/tx/0x4e547494fcf332b50465117a6467c8cb097787e4b54fd5b97ff6ff5cfec96ceb) | `0x642ba7a7` *flash-loan leverage* | 1,779,190 | 1,720,040 | **32,150** (1.81%) |
+| Morpho | [`0x80329618…`](https://etherscan.io/tx/0x80329618f5c5261829097e2a8a079c765c6ae0ce35f6d98e09a4d246a694c8bf) | `0xac9650d8` `multicall` ✓ | 380,049 | 343,154 | **0** (0.00%) |
+| Morpho | [`0x4e547494…`](https://etherscan.io/tx/0x4e547494fcf332b50465117a6467c8cb097787e4b54fd5b97ff6ff5cfec96ceb) | `0x642ba7a7` *flash-loan leverage* | 1,779,190 | 1,720,040 | **9,150** (0.51%) |
 | Morpho | [`0x16a0a31c…`](https://etherscan.io/tx/0x16a0a31c0547f2f35018c38f0c2fa3bdcf1320e6a75f998caaa957747e9dc568) `heur` | `0x2f5066dd` *flash-loan deleverage* | 1,312,558 | 1,577,595 | 0 |
 | Morpho | [`0xb1bf36be…`](https://etherscan.io/tx/0xb1bf36beaf1aeeb69e575a1230468d917ef4646c6416ab465201bca70d8c7a72) | `0xac9650d8` `multicall` ✓ | 1,278,050 | 1,457,568 | 0 |
 | Morpho | [`0x1c71eb76…`](https://etherscan.io/tx/0x1c71eb76549cc6a80467e06e8bc938b7fc1e67e9575c2aece8d98345243bb218) | `0xeb7499cf` *9-market reallocation* | 725,295 | 699,768 | 0 |
