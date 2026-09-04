@@ -1,5 +1,10 @@
 # Call-blocked candidates — transactions worth revisiting
 
+> **Revised for the 50,000-gas Schnorr floor (2026-09-04).** The floor was raised from
+> 27,000 on `main` (`87aaf1c`). Savings cells here were recomputed arithmetically from the
+> recorded gas and replay-cost columns; gas used and replay cost are unchanged. See
+> `ALL_TRANSACTION_ANALYSES.md` for the derivation and the full revision.
+
 Transactions that **score at or near zero today** because the expensive work sits behind an external call the analyzer re-executes rather than strips out. Measured results live in `MORPHO_CANDIDATES.md` and `PROTOCOL_SURVEY.md`; this is the watchlist of what is currently unreachable.
 
 > **Correction (this revision).** An earlier version of this file implied the "unlocked" figures were achievable through the repo's prestate/net-form encoder. They are not. `crates/core/src/prestate.rs` states that a net form exists only when a transaction *"makes no regular `CALL`"* — every row here contains one, so all of them fall back to the struct-log encoder. These estimates describe a **call-aware encoder that does not exist yet**, not a mode that can be switched on today.
@@ -20,8 +25,8 @@ A transaction's score therefore depends on **which address it was sent to**. Two
 
 | | direct | via wrapper | measured saving |
 |---|---|---|---:|
-| **Railgun** `transact` | smart wallet | RelayAdapt (calls `0xd8ae136a`, the same function) | **80.84%** vs **0%** |
-| **Privacy Pools** withdraw | pool | Entrypoint `relay` | **23.39%** vs **0%** |
+| **Railgun** `transact` | smart wallet | RelayAdapt (calls `0xd8ae136a`, the same function) | **78.72%** vs **0%** |
+| **Privacy Pools** withdraw | pool | Entrypoint `relay` | **19.47%** vs **0%** |
 
 ## Three cases, needing different fixes
 
@@ -35,7 +40,7 @@ A transaction's score therefore depends on **which address it was sent to**. Two
 
 ## The watchlist
 
-Sorted by the pessimistic bound. `slots` = storage slots that actually changed on chain (measured, `debug_traceTransaction` / `prestateTracer` diffMode). `contracts` = how many contracts they span, which is the real integration cost. `unlocked` prices writes at the warm rate (5,000) and the cold rate (22,100), plus exact log costs, plus the 27,000 Schnorr floor.
+Sorted by the pessimistic bound. `slots` = storage slots that actually changed on chain (measured, `debug_traceTransaction` / `prestateTracer` diffMode). `contracts` = how many contracts they span, which is the real integration cost. `unlocked` prices writes at the warm rate (5,000) and the cold rate (22,100), plus exact log costs, plus the 50,000 Schnorr floor.
 
 | tx | protocol | what | gas used | today | slots | ctrs | logs | unlocked (pessimistic → optimistic) |
 |---|---|---|---:|---:|---:|---:|---:|---:|

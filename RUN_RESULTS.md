@@ -1,5 +1,10 @@
 # GasKiller gas-analyzer run — tx `0x2dcd16b5645202184d37532d00f4e34dff1c61332ca325f830ab580f45b0c78a`
 
+> **Revised for the 50,000-gas Schnorr floor (2026-09-04).** The floor was raised from
+> 27,000 on `main` (`87aaf1c`). Savings cells here were recomputed arithmetically from the
+> recorded gas and replay-cost columns; gas used and replay cost are unchanged. See
+> `ALL_TRANSACTION_ANALYSES.md` for the derivation and the full revision.
+
 Recorded 2026-08-17. Backend: **EvmSketch** (default). Toolchain: Rust 1.97.0.
 The run itself **succeeded** (exit 0) using the **real trace**.
 
@@ -85,7 +90,7 @@ Per signature scheme, base estimate + Turetzky upper gas limit
 | Scheme | Turetzky upper gas limit | GasKiller gas estimate | Gas savings | Percent savings |
 |---|---|---|---|---|
 | **BLS** | 250,000 | **2,984,965** | **0** | **0.00%** |
-| **Schnorr** | 27,000 | **2,761,965** | **0** | **0.00%** |
+| **Schnorr** | 50,000 | **2,784,965** | **0** | **0.00%** |
 
 ### Reading these numbers
 
@@ -97,7 +102,7 @@ usage. `SignatureType::savings` computes savings as
 difference saturates to 0 and the percentage follows.
 
 Schnorr remains the cheaper scheme by exactly the floor difference —
-2,984,965 − 2,761,965 = **223,000 gas** (250,000 − 27,000). That simply isn't enough to
+2,984,965 − 2,784,965 = **200,000 gas** (250,000 − 50,000). That simply isn't enough to
 close the **194,501 gas** deficit already present in the base estimate
 (2,734,965 − 2,540,464), which is why Schnorr's much lower floor still yields 0%.
 
@@ -186,7 +191,7 @@ GasKiller base estimate (before signature floor): 2734965 (measured via StateCha
   GasKiller gas estimate: 2984965
   Gas savings: 0 (0.00%)
 
-[Schnorr] (Turetzky upper gas limit: 27000)
+[Schnorr] (Turetzky upper gas limit: 50000)
   GasKiller gas estimate: 2761965
   Gas savings: 0 (0.00%)
 EXIT=0

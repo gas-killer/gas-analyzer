@@ -1,5 +1,10 @@
 # Morpho transactions as GasKiller candidates under Schnorr
 
+> **Revised for the 50,000-gas Schnorr floor (2026-09-04).** The floor was raised from
+> 27,000 on `main` (`87aaf1c`). Savings cells here were recomputed arithmetically from the
+> recorded gas and replay-cost columns; gas used and replay cost are unchanged. See
+> `ALL_TRANSACTION_ANALYSES.md` for the derivation and the full revision.
+
 Produced by running this repository's own analyzer (`cargo run -- t <hash>`, EvmSketch backend) against Morpho Blue transactions discovered on Ethereum mainnet. Every number below is analyzer output, not an estimate of mine.
 
 > **Revision note.** The first pass of this document reported three Schnorr-only candidates. The top one was a heuristic fallback; it has since been re-measured through the real replay path and **no longer qualifies** — see *"Follow-up: the top result was re-measured and it collapsed"* below. Two trace-based candidates remain. Separately, the one liquidation from the first pass has been double-checked against 5 more liquidations from a much wider window: 2 of the 6 could be measured through the real replay path, and both show zero savings — see *"Second follow-up: liquidations, double-checked"* below. The other 4, including the original, could not be measured at all for reproducible, non-network reasons.
@@ -57,12 +62,12 @@ Two code-size families dominate: **19,340 B** and **19,730 B** vault-like contra
 
 ## Results
 
-All 20 analyzed transactions, sorted by Schnorr savings descending. `surplus` = `gas_used − base_estimate`; savings are `gas_used − (base_estimate + floor)`, saturating at 0, with floor = 27,000 (Schnorr) or 250,000 (BLS).
+All 20 analyzed transactions, sorted by Schnorr savings descending. `surplus` = `gas_used − base_estimate`; savings are `gas_used − (base_estimate + floor)`, saturating at 0, with floor = 50,000 (Schnorr) or 250,000 (BLS).
 
 | # | tx | block | `to` | what it does | gas_used | base_estimate | surplus | Schnorr est. | Schnorr saved | BLS saved | est. source | state updates |
 |---:|---|---:|---|---|---:|---:|---:|---:|---:|---:|---|---|
-| 1 | [`0x4e547494…`](https://etherscan.io/tx/0x4e547494fcf332b50465117a6467c8cb097787e4b54fd5b97ff6ff5cfec96ceb) | 25774052 | `0x5af8b1e9…` | Flash-loan leverage open: `FlashLoan`+`SupplyCollateral`+`Borrow`, 12,324 B calldata (label from events; selector `0x642ba7a7` not identified) 🟢 **SCHNORR-ONLY** | 1,779,190 | 1,720,040 | 59,150 | 1,747,040 | **32,150** (1.81%) | 0 (0.00%) | trace | 6: Store×3, Call×2, Log1×1 |
-| 2 | [`0x80329618…`](https://etherscan.io/tx/0x80329618f5c5261829097e2a8a079c765c6ae0ce35f6d98e09a4d246a694c8bf) | 25774472 | `0x3a618e9d…` | Bundler `multicall(bytes[])` (selector verified): 2-market `Supply`+`Withdraw` reallocation 🟢 **SCHNORR-ONLY** | 380,049 | 343,154 | 36,895 | 370,154 | **9,895** (2.60%) | 0 (0.00%) | trace | 18: Store×10, Call×4, Log3×3, Log1×1 |
+| 1 | [`0x4e547494…`](https://etherscan.io/tx/0x4e547494fcf332b50465117a6467c8cb097787e4b54fd5b97ff6ff5cfec96ceb) | 25774052 | `0x5af8b1e9…` | Flash-loan leverage open: `FlashLoan`+`SupplyCollateral`+`Borrow`, 12,324 B calldata (label from events; selector `0x642ba7a7` not identified) 🟢 **SCHNORR-ONLY** | 1,779,190 | 1,720,040 | 59,150 | 1,747,040 | **9,150** (0.51%) | 0 (0.00%) | trace | 6: Store×3, Call×2, Log1×1 |
+| 2 | [`0x80329618…`](https://etherscan.io/tx/0x80329618f5c5261829097e2a8a079c765c6ae0ce35f6d98e09a4d246a694c8bf) | 25774472 | `0x3a618e9d…` | Bundler `multicall(bytes[])` (selector verified): 2-market `Supply`+`Withdraw` reallocation 🟢 **SCHNORR-ONLY** | 380,049 | 343,154 | 36,895 | 370,154 | **0** (0.00%) | 0 (0.00%) | trace | 18: Store×10, Call×4, Log3×3, Log1×1 |
 | 3 | [`0x1c71eb76…`](https://etherscan.io/tx/0x1c71eb76549cc6a80467e06e8bc938b7fc1e67e9575c2aece8d98345243bb218) | 25774086 | `0x9e9110cf…` | 9-market reallocation: `Supply`+`Withdraw`+`AccrueInterest` across 9 market ids (label from events; selector `0xeb7499cf` not identified)  | 725,295 | 699,768 | 25,527 | 726,768 | **0** (0.00%) | 0 (0.00%) | trace | 1: Call×1 |
 | 4 | [`0x9a08a526…`](https://etherscan.io/tx/0x9a08a526e05f5fe827840f0ec4e3d1ce31906fa5a7a9bda7677098e4d78903df) | 25774239 | `0x00000f91…` | Flash-loan-only MEV/arb bot: single `FlashLoan` event (label from event; selector `0x03f00196` not identified)  | 420,293 | 414,721 | 5,572 | 441,721 | **0** (0.00%) | 0 (0.00%) | ⚠️ **heuristic** | 5: Call×5 |
 | 5 | [`0x8e4616ac…`](https://etherscan.io/tx/0x8e4616acfaf812a41b471e139924a1bc906e03e8e1203760ae6117113682b760) | 25774072 | `0x64c18dcc…` | Bundler `multicall(bytes[])` (selector verified): 2-market `Supply`+`Withdraw` reallocation  | 312,814 | 314,184 | -1,370 | 341,184 | **0** (0.00%) | 0 (0.00%) | trace | 18: Store×10, Call×4, Log3×3, Log1×1 |
@@ -107,15 +112,15 @@ Full hashes, in the same order:
 
 ## ⭐ Transactions where Schnorr saves but BLS does not
 
-These are the headline result: the surplus (`gas_used − base_estimate`) lands inside the 27,000–250,000 band, so Schnorr's cheaper floor turns a non-candidate into a candidate.
+These are the headline result: the surplus (`gas_used − base_estimate`) lands inside the 50,000–250,000 band, so Schnorr's cheaper floor turns a non-candidate into a candidate.
 
 | tx | what it does | gas_used | base_estimate | **surplus** | Schnorr saved | BLS saved | est. source |
 |---|---|---:|---:|---:|---:|---:|---|
-| `0x4e547494fcf332b5…` | Flash-loan leverage open: `FlashLoan`+`SupplyCollateral`+`Borrow`, 12,324 B calldata (label from events; selector `0x642ba7a7` not identified) | 1,779,190 | 1,720,040 | **59,150** | **32,150** (1.81%) | 0 | trace |
-| `0x80329618f5c52618…` | Bundler `multicall(bytes[])` (selector verified): 2-market `Supply`+`Withdraw` reallocation | 380,049 | 343,154 | **36,895** | **9,895** (2.60%) | 0 | trace |
+| `0x4e547494fcf332b5…` | Flash-loan leverage open: `FlashLoan`+`SupplyCollateral`+`Borrow`, 12,324 B calldata (label from events; selector `0x642ba7a7` not identified) | 1,779,190 | 1,720,040 | **59,150** | **9,150** (0.51%) | 0 | trace |
+| `0x80329618f5c52618…` | Bundler `multicall(bytes[])` (selector verified): 2-market `Supply`+`Withdraw` reallocation | 380,049 | 343,154 | **36,895** | **0** (0.00%) | 0 | trace |
 
 - `0x4e547494fcf332b50465117a6467c8cb097787e4b54fd5b97ff6ff5cfec96ceb` — surplus **59,150**, i.e. 32,150 gas above the Schnorr floor and 190,850 gas below the BLS floor.
-- `0x80329618f5c5261829097e2a8a079c765c6ae0ce35f6d98e09a4d246a694c8bf` — surplus **36,895**, i.e. 9,895 gas above the Schnorr floor and 213,105 gas below the BLS floor.
+- `0x80329618f5c5261829097e2a8a079c765c6ae0ce35f6d98e09a4d246a694c8bf` — surplus **36,895**, i.e. **13,105 gas BELOW the 50,000 Schnorr floor** (it cleared the old 27,000 floor by 9,895) and 213,105 gas below the BLS floor.
 
 ## Follow-up: the top result was re-measured and it collapsed
 
@@ -128,7 +133,7 @@ The highest-scoring transaction in the first pass was a heuristic fallback. It h
 | gas_used | 324,608 | 324,608 |
 | base_estimate | 253,881 | **349,625** |
 | surplus | 70,727 | **-25,017** |
-| Schnorr savings | 43,727 (13.47%) | **0 (0.00%)** |
+| Schnorr savings | 43,727 (13.47%) *— heuristic, old 27,000 floor* | **0 (0.00%)** |
 | BLS savings | 0 | 0 |
 
 The heuristic understated the replay cost by **95,744 gas** (27% of the true `base_estimate`). An apparent 13.47% win is in fact a **25,017 gas loss** — not a candidate under either scheme.
@@ -176,9 +181,9 @@ So it charges what the ten Morpho calls cost *inside the original transaction* a
 - `0x2d7cebfe726192fe…` — 3 updates (`Call`×3), heuristic surplus -3,986. Same bias applies.
 
 None of them currently show savings, so the bias does not create false positives in the table as it stands — but it does mean the liquidation's apparent −114,334 surplus is not trustworthy either, in *either* direction. It remains unmeasured.
-### Near misses — positive surplus, but under the 27,000 Schnorr floor
+### Near misses — positive surplus, but under the 50,000 Schnorr floor
 
-Two transactions had a genuinely positive surplus yet still scored zero, because the surplus did not clear Schnorr's 27,000 floor. One of them missed by a rounding error:
+Two transactions had a genuinely positive surplus yet still scored zero, because the surplus did not clear Schnorr's 50,000 floor. One of them missed by a rounding error:
 
 | tx | what it does | gas_used | base_estimate | surplus | short of Schnorr floor by | est. source |
 |---|---|---:|---:|---:|---:|---|
@@ -197,9 +202,9 @@ All 6 were successful liquidations with **zero bad debt realized** (`badDebtAsse
 |---|---:|---:|---:|---:|---:|---:|---:|---|
 | [`0x584c52d9…`](https://etherscan.io/tx/0x584c52d957c165432f32e42e0ebacc4683d0e6f9cb251d926060701f8f71322b) | 25766097 | 11 | 362,143 | 382,655 | −20,512 | 0 | 0 | ✅ **trace** |
 | [`0x482fb3b2…`](https://etherscan.io/tx/0x482fb3b2dfb2d336237a0112285a14d7847af91006e64e6fd442f11864360e9c) | 25774008 | 625 | 457,129 | 462,926 | −5,797 | 0 | 0 | ✅ **trace** |
-| [`0x9a5fecc6…`](https://etherscan.io/tx/0x9a5fecc64422a0e8f8edb3b914eaed17cd675a09f1e2811a79d0cf0181893851) | 25767442 | 0 | 2,661,881 | 2,335,360 | 326,521 | 299,521 (11.25%) | 76,521 (2.87%) | ⚠️ heuristic — **could not be measured**, see below |
-| [`0x641b76f4…`](https://etherscan.io/tx/0x641b76f483f45a02815116bb7b0213530d0f2aee019b7cc4840a2d71a2940f0e) | 25764980 | 242 | 721,933 | 577,085 | 144,848 | 117,848 (16.32%) | 0 | ⚠️ heuristic — **could not be measured**, see below |
-| [`0x6ed1eaa3…`](https://etherscan.io/tx/0x6ed1eaa33eff8b3b992ee3fc55d5548d2072edd5f32ba437854d784dc9e62946) | 25770383 | 292 | 307,371 | 273,856 | 33,515 | 6,515 (2.12%) | 0 | ⚠️ heuristic — **could not be measured**, see below |
+| [`0x9a5fecc6…`](https://etherscan.io/tx/0x9a5fecc64422a0e8f8edb3b914eaed17cd675a09f1e2811a79d0cf0181893851) | 25767442 | 0 | 2,661,881 | 2,335,360 | 326,521 | 276,521 (10.39%) | 76,521 (2.87%) | ⚠️ heuristic — **could not be measured**, see below |
+| [`0x641b76f4…`](https://etherscan.io/tx/0x641b76f483f45a02815116bb7b0213530d0f2aee019b7cc4840a2d71a2940f0e) | 25764980 | 242 | 721,933 | 577,085 | 144,848 | 94,848 (13.14%) | 0 | ⚠️ heuristic — **could not be measured**, see below |
+| [`0x6ed1eaa3…`](https://etherscan.io/tx/0x6ed1eaa33eff8b3b992ee3fc55d5548d2072edd5f32ba437854d784dc9e62946) | 25770383 | 292 | 307,371 | 273,856 | 33,515 | 0 (0.00%) | 0 | ⚠️ heuristic — **could not be measured**, see below |
 | [`0x09fd0f6e…`](https://etherscan.io/tx/0x09fd0f6eb66388ce7cdc484b2020d300b5c6d519df89c5bddc73307d9e68bd80) | 25774216 | 76 | 619,024 | 733,358 | −114,334 | 0 | 0 | ⚠️ heuristic — **the original tx, re-run in isolation, still cannot be measured** |
 
 ### The two that could actually be measured both show zero savings
@@ -233,7 +238,7 @@ None of this proves the true numbers are zero — the per-call correction is not
 
 ### Headline: no transaction in this sample saved anything under BLS
 
-**0 of 20** transactions cleared the 250,000 BLS floor. **2 of 20** cleared the 27,000 Schnorr floor. Every single win in this sample is a Schnorr-only win — the 223,000-gas band is doing all of the work here. On this evidence, Morpho is a protocol GasKiller can only address with the cheaper signature scheme.
+**0 of 20** transactions cleared the 250,000 BLS floor. **2 of 20** cleared the 50,000 Schnorr floor. Every single win in this sample is a Schnorr-only win — the 223,000-gas band is doing all of the work here. On this evidence, Morpho is a protocol GasKiller can only address with the cheaper signature scheme.
 
 ### The controlling variable is surplus, and surplus is usually negative
 
@@ -259,7 +264,7 @@ Two of the analyzed transactions are near-twins — both bundler `multicall(byte
 | base_estimate | 343,154 | 314,184 |
 | gas_used | 380,049 | 312,814 |
 | **surplus** | **36,895** | **-1,370** |
-| Schnorr saved | **9,895** (2.60%) | 0 |
+| Schnorr saved | **0** (0.00%) *— was 9,895 (2.60%) at the old 27,000 floor* | 0 |
 
 The diffs cost almost the same to replay (343,154 vs 314,184, a 28,970 gas difference), but the winner *burned 67,235 more gas doing it*. That extra gas went into computation that left no additional trace in the final state — and it is precisely that gap that Schnorr's floor converts into savings. **Structurally, this is the whole thesis in one comparison: for a fixed diff, savings are a function of how much invisible computation the transaction did.**
 

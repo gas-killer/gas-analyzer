@@ -671,24 +671,24 @@ Avoid protocols whose transactions are mostly transfers, share-balance updates, 
 
 ## Near misses — blocked by calls but already close
 
-These transactions have real compressible work left over and still lost. If the contract behind the call also ran GasKiller, these are the ones that flip first.
+These transactions have real compressible work left over and still lost. If the contract behind the call also ran GasKiller, these are the ones that flip first. **Shortfalls are against the 50,000-gas floor** — at the old 27,000 floor they were 23,000 gas smaller, and several of these rows were wins.
 
 | protocol | tx | function | gas used | surplus | short of the floor by | calls in the result |
 |---|---|---|---:|---:|---:|---:|
-| Morpho | [`0x1c71eb76…`](https://etherscan.io/tx/0x1c71eb76549cc6a80467e06e8bc938b7fc1e67e9575c2aece8d98345243bb218) | *9-market reallocation* `0xeb7499cf` | 725,295 | +25,527 | 1,473 | 1 |
-| Safe | [`0x5688590b…`](https://etherscan.io/tx/0x5688590bc26e704d720d7bb2185b195aabb310ba67dddd944f64509b1cf70513) | `execTransaction` ✓ `0x6a761202` | 322,338 | +25,210 | 1,790 | 2 |
-| Pendle | [`0xa2c6de73…`](https://etherscan.io/tx/0xa2c6de73e89c7bd707a9fe308d09c54eb16d2ddf9e3ff09f866d8a68e3948afd) | *third-party aggregator* `0xc685f647` | 1,183,159 | +25,192 | 1,808 | 5 |
-| Safe | [`0x2666f99a…`](https://etherscan.io/tx/0x2666f99a3b1ad225cf8dcc40fbafb1959a6efb5bb3c561b3d2d5a3b242ca4a29) | `execTransaction` ✓ `0x6a761202` | 96,660 | +23,309 | 3,691 | 1 |
-| World ID | [`0x36c09544…`](https://etherscan.io/tx/0x36c095445eb96f2ccaa2a2ec9544ac2cf72aa524c36c0ce23c0aecc2cf36b8b7) | `registerIdentities` ✓ `0x2217b211` | 285,261 | +22,186 | 4,814 | 1 |
-| EigenLayer | [`0xaa858fcd…`](https://etherscan.io/tx/0xaa858fcd781a6a5afa142ccd9a802d0df1e2f68292f0abf8546426cda3fe6644) | *EigenLayer rewards claim* `0x3ccc861d` | 156,150 | +20,985 | 6,015 | 2 |
-| Safe | [`0xb286eeb1…`](https://etherscan.io/tx/0xb286eeb15c4cb3445a73e275e89336f7563eb46c2e9ec97a82aeefb5a4485430) | `execTransaction` ✓ `0x6a761202` | 463,470 | +20,526 | 6,474 | 6 |
-| World ID | [`0x6b2fb8d3…`](https://etherscan.io/tx/0x6b2fb8d32c1fc927e5c37ae0ca52d17cb122b949ec0140f75a8212164911f494) | `registerIdentities` ✓ `0x2217b211` | 282,573 | +19,534 | 7,466 | 1 |
-| World ID | [`0xb2f5ba58…`](https://etherscan.io/tx/0xb2f5ba588077025662acd44f62ead62c4dc6da4faa30890d658542aedcaef3c5) | `registerIdentities` ✓ `0x2217b211` | 281,457 | +18,406 | 8,594 | 1 |
-| World ID | [`0xcd404a27…`](https://etherscan.io/tx/0xcd404a27462a9e60fdd5a17c024d758d809f860ad2da9f1709882d497276375a) | `registerIdentities` ✓ `0x2217b211` | 281,445 | +18,394 | 8,606 | 1 |
-| Safe | [`0x909681b5…`](https://etherscan.io/tx/0x909681b5131c5ccc56e6f6791f152efe41cf270172c5a4645fc0067567bd8651) | `execTransaction` ✓ `0x6a761202` | 103,575 | +18,056 | 8,944 | 1 |
-| Euler | [`0x7d1e2345…`](https://etherscan.io/tx/0x7d1e2345c39b884a16eb6b2e06c1c4a4177c5639fe1c91474a356c3eef04fd87) | *third-party contract* `0x3271ba8d` | 2,701,108 | +17,630 | 9,370 | 3 |
-| Euler | [`0xa32effd3…`](https://etherscan.io/tx/0xa32effd3b31a02343d8cf4362c4fee2e806ea9dcf00fdea5eb1a2b054ae0ea4a) | `batch` ✓ `0xc16ae7a4` | 499,524 | +16,691 | 10,309 | 5 |
-| Aave | [`0x9905c35e…`](https://etherscan.io/tx/0x9905c35e963d0c36e66b33d6f2319085daebf2920a8572ce26c01e201d0bbc16) | `withdraw` ✓ `0x69328dec` | 183,126 | +16,416 | 10,584 | 1 |
+| Morpho | [`0x1c71eb76…`](https://etherscan.io/tx/0x1c71eb76549cc6a80467e06e8bc938b7fc1e67e9575c2aece8d98345243bb218) | *9-market reallocation* `0xeb7499cf` | 725,295 | +25,527 | 24,473 | 1 |
+| Safe | [`0x5688590b…`](https://etherscan.io/tx/0x5688590bc26e704d720d7bb2185b195aabb310ba67dddd944f64509b1cf70513) | `execTransaction` ✓ `0x6a761202` | 322,338 | +25,210 | 24,790 | 2 |
+| Pendle | [`0xa2c6de73…`](https://etherscan.io/tx/0xa2c6de73e89c7bd707a9fe308d09c54eb16d2ddf9e3ff09f866d8a68e3948afd) | *third-party aggregator* `0xc685f647` | 1,183,159 | +25,192 | 24,808 | 5 |
+| Safe | [`0x2666f99a…`](https://etherscan.io/tx/0x2666f99a3b1ad225cf8dcc40fbafb1959a6efb5bb3c561b3d2d5a3b242ca4a29) | `execTransaction` ✓ `0x6a761202` | 96,660 | +23,309 | 26,691 | 1 |
+| World ID | [`0x36c09544…`](https://etherscan.io/tx/0x36c095445eb96f2ccaa2a2ec9544ac2cf72aa524c36c0ce23c0aecc2cf36b8b7) | `registerIdentities` ✓ `0x2217b211` | 285,261 | +22,186 | 27,814 | 1 |
+| EigenLayer | [`0xaa858fcd…`](https://etherscan.io/tx/0xaa858fcd781a6a5afa142ccd9a802d0df1e2f68292f0abf8546426cda3fe6644) | *EigenLayer rewards claim* `0x3ccc861d` | 156,150 | +20,985 | 29,015 | 2 |
+| Safe | [`0xb286eeb1…`](https://etherscan.io/tx/0xb286eeb15c4cb3445a73e275e89336f7563eb46c2e9ec97a82aeefb5a4485430) | `execTransaction` ✓ `0x6a761202` | 463,470 | +20,526 | 29,474 | 6 |
+| World ID | [`0x6b2fb8d3…`](https://etherscan.io/tx/0x6b2fb8d32c1fc927e5c37ae0ca52d17cb122b949ec0140f75a8212164911f494) | `registerIdentities` ✓ `0x2217b211` | 282,573 | +19,534 | 30,466 | 1 |
+| World ID | [`0xb2f5ba58…`](https://etherscan.io/tx/0xb2f5ba588077025662acd44f62ead62c4dc6da4faa30890d658542aedcaef3c5) | `registerIdentities` ✓ `0x2217b211` | 281,457 | +18,406 | 31,594 | 1 |
+| World ID | [`0xcd404a27…`](https://etherscan.io/tx/0xcd404a27462a9e60fdd5a17c024d758d809f860ad2da9f1709882d497276375a) | `registerIdentities` ✓ `0x2217b211` | 281,445 | +18,394 | 31,606 | 1 |
+| Safe | [`0x909681b5…`](https://etherscan.io/tx/0x909681b5131c5ccc56e6f6791f152efe41cf270172c5a4645fc0067567bd8651) | `execTransaction` ✓ `0x6a761202` | 103,575 | +18,056 | 31,944 | 1 |
+| Euler | [`0x7d1e2345…`](https://etherscan.io/tx/0x7d1e2345c39b884a16eb6b2e06c1c4a4177c5639fe1c91474a356c3eef04fd87) | *third-party contract* `0x3271ba8d` | 2,701,108 | +17,630 | 32,370 | 3 |
+| Euler | [`0xa32effd3…`](https://etherscan.io/tx/0xa32effd3b31a02343d8cf4362c4fee2e806ea9dcf00fdea5eb1a2b054ae0ea4a) | `batch` ✓ `0xc16ae7a4` | 499,524 | +16,691 | 33,309 | 5 |
+| Aave | [`0x9905c35e…`](https://etherscan.io/tx/0x9905c35e963d0c36e66b33d6f2319085daebf2920a8572ce26c01e201d0bbc16) | `withdraw` ✓ `0x69328dec` | 183,126 | +16,416 | 33,584 | 1 |
 
 **One caveat on the Safe rows.** A Safe's own work is verifying owner signatures — about 3,000 gas each — and it writes one slot, its nonce. So its surplus is capped by owner count no matter what the transaction does. The gas inside the call belongs to whatever the Safe called, and those protocols would get that saving with or without a Safe in front. Safe is a thin wrapper over other candidates, not a candidate itself.
 

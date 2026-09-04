@@ -83,24 +83,24 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 | **Mellow** | **41.55%** | 0% | direct ERC-4626 `withdraw`/`redeem` on a vault | 1.61/day on steakLRT |
 | Puffer | *7.06%* | 0% | direct `requestWithdrawal` (**label inferred**) | 1 of 2 measured |
 | Swell | 0% | 0% | none — withdrawal routes are call-blocked | 0 of 3 |
-| Privacy Pools | 23.39% | 0% | direct call to pool | 2 in 17 days |
-| Ether.fi | 18.99% | 0% | EtherFiAdmin oracle report | every ~4 hours |
-| EigenLayer | 5.15% | 0% | EigenPod checkpoint proof | 4 of 5 pod checkpoints |
-| Pendle | 3.94% | 0% | one large aggregator tx | marginal |
-| World ID | 2.87% | 0% | direct, but verifier call dominates | all txs direct |
-| Morpho | 2.60% | 0% | bundler multicall reallocation | marginal |
-| Safe | 9.99% | 0% | 5-signature execTransaction | 2 of 565 (0.4%) |
-| **Euler** | 1.31% | 0% | none — EVC router mandatory | **0 of 191 direct** |
-| **Ondo** | 2.01% | 0% | mint/redeem via manager | 52 mint/burns in 60k blocks |
+| Privacy Pools | 19.47% | 0% | direct call to pool | 2 in 17 days |
+| Ether.fi | 11.09% | 0% | EtherFiAdmin oracle report | every ~4 hours |
+| EigenLayer | **0%** | 0% | none — checkpoint surplus (23,927–38,841) is under the 50,000 floor | 0 of 13 at the new floor |
+| Pendle | 2.60% *(aggregator tx, not Pendle's own)* | 0% | none of Pendle's own entry points clear the floor | 1 of 8 |
+| World ID | **0%** | 0% | none — best surplus 35,578, under the floor | 0 of 7 at the new floor |
+| Morpho | 0.51% | 0% | bundler multicall reallocation | 1 of 25 |
+| Safe | **0%** | 0% | none — best surplus 37,454, under the floor | 0 of 12 at the new floor |
+| **Euler** | **0%** | 0% | none — EVC router mandatory | **0 of 191 direct** |
+| **Ondo** | **0%** own *(12.09% is an MEV bot that merely touches Ondo)* | 0% | none of Ondo's own mint/redeem clear the floor | 52 mint/burns in 60k blocks |
 | Chainlink | 0% | 0% | none — all traffic via forwarder | 0 of 242 direct |
-| Lido | 1.13% | 0% | daily oracle report only | 2 of 13 |
-| Ethena | 8.99% | 0% | one 900-byte mint order | **1 of 309 mints (0.3%)** |
-| ERC-4337 EntryPoint | *86.54%?* | *60%?* | **suspect — likely estimator false positive** | 2 of 8 measured |
+| Lido | **0%** | 0% | none — best surplus 46,558, under the floor | 0 of 13 at the new floor |
+| Ethena | **0%** | 0% | none — best surplus 48,699, 1,301 short of the floor | 0 of 22 at the new floor |
+| ERC-4337 EntryPoint | *85.18%?* | *60%?* | **suspect — likely estimator false positive** | 2 of 8 measured |
 | Panther | 0% | 0% | none — shielded pool is not on mainnet | 0 of 1 |
 | **Umbra** | **0%** | 0% | **none — all 8 txs have negative surplus** | 1.4 txs/day (lowest surveyed) |
 | **Sky (Maker)** | **0%** | 0% | **none — 0 direct calls to Vat/PSM/Jug in 3h** | ~6,500/day core txs, all indirect |
 | Notional | — | — | **nothing to measure — not active on mainnet** | 0 protocol events in 8 days |
-| **ENS** | **0%** | 0% | **none — 18 of 18 measured, best is 40% short of the floor** | 877 txs/day, all shapes zero |
+| **ENS** | **0%** | 0% | **none — 18 of 18 measured, best is 68% short of the floor** | 877 txs/day, all shapes zero |
 
 ## What predicts a good candidate
 
@@ -131,7 +131,7 @@ is nothing wrapped around it to remove.
 | operation | measured | clear the floor | Schnorr range |
 |---|---:|---:|---|
 | **`borrow`** | 9 | **9** | **14.98% – 59.61%** (median 37.77%) |
-| `withdraw` | 4 | 2 | 0% – 49.14% |
+| `withdraw` | 4 | 1 | 0% – 43.51% |
 | `supply` / `supplyWithPermit` / `repay` | 6 | **0** | 0% |
 | `liquidationCall` (via 3rd party) | 1 | 0 | 0% |
 
@@ -166,7 +166,7 @@ Median gas by operation and reserve count, across 471 direct-to-Pool transaction
 | `supply` | 184,880 | 150,987 | 160,388 |
 | `repay` | — | 152,022 | 154,444 |
 
-Three `withdraw` calls with **identical diff shapes** (8 stores, 1 call, 3 logs) scored 49.14%, 0% and 0%. Their opcode profiles isolate the mechanism:
+Three `withdraw` calls with **identical diff shapes** (8 stores, 1 call, 3 logs) scored 43.51%, 0% and 0%. Their opcode profiles isolate the mechanism:
 
 | | winner | zero | zero |
 |---|---:|---:|---:|
@@ -176,7 +176,7 @@ Three `withdraw` calls with **identical diff shapes** (8 stores, 1 call, 3 logs)
 | `SLOAD` | 129 | 47 | 47 |
 | total opcodes | 17,929 | 7,038 | 6,980 |
 | user's active reserves | **5** | 1 | 0 |
-| **Schnorr saved** | **49.14%** | 0 | 0 |
+| **Schnorr saved** | **43.51%** | 0 | 0 |
 
 Six times the oracle reads, ~2.5× the opcodes, and the same 12 state updates at the end.
 
