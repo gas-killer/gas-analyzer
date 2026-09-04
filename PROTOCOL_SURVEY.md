@@ -86,6 +86,7 @@ Best trace-measured Schnorr saving per protocol, and whether the winning shape i
 | ERC-4337 EntryPoint | *86.54%?* | *60%?* | **suspect — likely estimator false positive** | 2 of 8 measured |
 | Panther | 0% | 0% | none — shielded pool is not on mainnet | 0 of 1 |
 | **Umbra** | **0%** | 0% | **none — all 8 txs have negative surplus** | 1.4 txs/day (lowest surveyed) |
+| **Sky (Maker)** | **0%** | 0% | **none — 0 direct calls to Vat/PSM/Jug in 3h** | ~6,500/day core txs, all indirect |
 | **ENS** | **0%** | 0% | **none — 18 of 18 measured, best is 40% short of the floor** | 877 txs/day, all shapes zero |
 
 ## What predicts a good candidate
@@ -1049,6 +1050,65 @@ is understated by an unknown factor — it is the one entry here that might scal
 likewise runs many vaults; only steakLRT was measured. Three rows in the table are **other
 people's traffic** — a Paraswap route touching pufETH, and two aggregators touching ezETH and
 rswETH — flagged in the notes and excluded from the per-protocol figures above.
+
+## Sky (Maker) — thousands of transactions a day, none of them reachable
+
+The last remaining longlist entry with Aave-scale mainnet volume, and the reason it was worth
+checking. **9 transactions measured, all 0.00%, every one with negative surplus.** Sky joins
+Chainlink, Panther and Umbra in scoring zero at any floor including zero.
+
+The result is not about gas efficiency. It is about routing.
+
+### The volume is real and it is all indirect
+
+Scanned 899 consecutive blocks (3.0 hours) of full block receipts — Maker's `Vat` emits no
+events, so a log-based scan misses the core entirely and I had to walk receipts instead.
+
+| contract | txs/day | direct calls | median gas |
+|---|---:|---:|---:|
+| **LitePSM (USDC)** | **3,836** | **0** | 670,471 |
+| **Vat** (the core ledger) | **2,531** | **0** | 679,968 |
+| Jug (stability fees) | 200 | **0** | 735,969 |
+| sUSDS | 296 indirect | **96 direct** | 826,081 / 135,872 |
+
+**Not one direct call to the Vat, the PSM or the Jug in three hours.** Every PSM swap and every
+CDP operation arrives inside someone else's contract — arbitrage bots, aggregators, and in the
+two cases measured here a market maker's Gnosis Safe (`execTransaction`, verified by hashing).
+The analyzer keeps a regular `CALL` as one instruction and re-executes it on replay
+(`crates/core/src/trace.rs:255`), so none of that work is ever removable.
+
+This is the Euler result at ten times the scale. Euler scored 1.31% with 0 of 191 direct calls
+because the EVC router is mandatory; Sky scores 0.00% with 0 of ~6,500 daily core transactions
+direct, because the PSM and the Vat are plumbing that only other contracts call.
+
+### What is directly callable measures negative
+
+| function | gas used | replay cost | surplus |
+|---|---:|---:|---:|
+| Safe `execTransaction` *(third-party)* | 902,223 | 902,671 | **−448** |
+| Safe `execTransaction` *(third-party)* | 982,548 | 985,574 | −3,026 |
+| sUSDS `transfer` | 56,380 | 62,836 | −6,456 |
+| USDS `transfer` | 56,336 | 62,836 | −6,500 |
+| DaiUsds `daiToUsds` | 132,007 | 151,437 | −19,430 |
+| sUSDS `redeem` | 148,203 | 174,502 | −26,299 |
+| sUSDS `withdraw` | 148,058 | 174,490 | −26,432 |
+| sUSDS `deposit` | 145,878 | 177,107 | −31,229 |
+| sUSDS `deposit` | 145,585 | 177,095 | −31,510 |
+
+The only Sky-native operations users call directly are sUSDS deposits and redemptions (96/day)
+and token transfers. Every one is negative: an sUSDS deposit records 9–10 updates of which 3
+are `Call`s, so replay reproduces the transaction and adds overhead. Interesting detail — the
+two third-party Safe executions come *closest* to breaking even (−448) despite being the
+largest transactions here, because almost all their gas sits in calls that replay at the same
+price.
+
+**Note this is the opposite failure from ENS.** ENS was directly callable with nothing to
+remove. Sky has plenty to remove — the median indirect transaction burns 670,000 gas — and no
+way to reach it. Of the two, Sky's is the more interesting problem, because a routing change
+is at least conceivable where a missing computation is not.
+
+**One transaction could not be measured**: an sUSDS `deposit` (`0x2f6a9995…`, 110,061 gas, 0
+logs) failed after 6 attempts and is listed with the other unmeasurable transactions.
 
 ## What this is actually worth in dollars
 

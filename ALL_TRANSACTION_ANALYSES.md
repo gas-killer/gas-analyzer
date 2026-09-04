@@ -1,6 +1,6 @@
 # Every transaction analysed, in one place
 
-279 Ethereum mainnet transactions across 26 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Five more could not be run at all; they are listed at the end.
+288 Ethereum mainnet transactions across 27 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Six more could not be run at all; they are listed at the end.
 
 **Read the dollar-value section first.** The percentages in this file are large and the money behind them is not: the whole opportunity across the three best protocols is roughly $2,600 a month at the gas prices measured.
 
@@ -121,6 +121,7 @@ Best and typical figures use only properly measured runs. They exclude the two O
 | **Chainlink** | 8 | 0 | 0.00% | — | external calls (8) |
 | **Panther** | 1 | 0 | 0.00% | — | external calls (1), too many writes (1) |
 | **Swell** | 3 | 0 | 0.00% | — | external calls (3); 1 row is aggregator traffic |
+| **Sky (Maker)** | 9 | 0 | 0.00% | — | replay costs more (9) — negative at *any* floor |
 | **Umbra** | 8 | 0 | 0.00% | — | replay costs more (8) — negative at *any* floor |
 | **ENS** | 18 | 0 | 0.00% | — | under the floor (11), replay costs more (7) |
 | **ERC-4337 EntryPoint** | 8 | 2 *(suspect)* | *86.54%* | *83.60%* | external calls (6); **both wins are probably replay artifacts — do not quote** |
@@ -324,7 +325,7 @@ own product is a Schnorr multi-signature oracle, they are also the counterparty 
 have a precise view of what on-chain Schnorr verification really costs. **Establish the
 provenance of 27,000 before pitching them.**
 
-Chainlink, Panther and Umbra score zero at *any* floor, including zero — their surplus is
+Chainlink, Panther, Umbra and Sky score zero at *any* floor, including zero — their surplus is
 negative, so replaying costs more than the original transaction regardless of signature
 scheme. Umbra is the starkest: all 8 of its transactions are negative, best case −7,488 gas.
 
@@ -487,6 +488,65 @@ is understated by an unknown factor — it is the one entry here that might scal
 likewise runs many vaults; only steakLRT was measured. Three rows in the table are **other
 people's traffic** — a Paraswap route touching pufETH, and two aggregators touching ezETH and
 rswETH — flagged in the notes and excluded from the per-protocol figures above.
+
+## Sky (Maker) — thousands of transactions a day, none of them reachable
+
+The last remaining longlist entry with Aave-scale mainnet volume, and the reason it was worth
+checking. **9 transactions measured, all 0.00%, every one with negative surplus.** Sky joins
+Chainlink, Panther and Umbra in scoring zero at any floor including zero.
+
+The result is not about gas efficiency. It is about routing.
+
+### The volume is real and it is all indirect
+
+Scanned 899 consecutive blocks (3.0 hours) of full block receipts — Maker's `Vat` emits no
+events, so a log-based scan misses the core entirely and I had to walk receipts instead.
+
+| contract | txs/day | direct calls | median gas |
+|---|---:|---:|---:|
+| **LitePSM (USDC)** | **3,836** | **0** | 670,471 |
+| **Vat** (the core ledger) | **2,531** | **0** | 679,968 |
+| Jug (stability fees) | 200 | **0** | 735,969 |
+| sUSDS | 296 indirect | **96 direct** | 826,081 / 135,872 |
+
+**Not one direct call to the Vat, the PSM or the Jug in three hours.** Every PSM swap and every
+CDP operation arrives inside someone else's contract — arbitrage bots, aggregators, and in the
+two cases measured here a market maker's Gnosis Safe (`execTransaction`, verified by hashing).
+The analyzer keeps a regular `CALL` as one instruction and re-executes it on replay
+(`crates/core/src/trace.rs:255`), so none of that work is ever removable.
+
+This is the Euler result at ten times the scale. Euler scored 1.31% with 0 of 191 direct calls
+because the EVC router is mandatory; Sky scores 0.00% with 0 of ~6,500 daily core transactions
+direct, because the PSM and the Vat are plumbing that only other contracts call.
+
+### What is directly callable measures negative
+
+| function | gas used | replay cost | surplus |
+|---|---:|---:|---:|
+| Safe `execTransaction` *(third-party)* | 902,223 | 902,671 | **−448** |
+| Safe `execTransaction` *(third-party)* | 982,548 | 985,574 | −3,026 |
+| sUSDS `transfer` | 56,380 | 62,836 | −6,456 |
+| USDS `transfer` | 56,336 | 62,836 | −6,500 |
+| DaiUsds `daiToUsds` | 132,007 | 151,437 | −19,430 |
+| sUSDS `redeem` | 148,203 | 174,502 | −26,299 |
+| sUSDS `withdraw` | 148,058 | 174,490 | −26,432 |
+| sUSDS `deposit` | 145,878 | 177,107 | −31,229 |
+| sUSDS `deposit` | 145,585 | 177,095 | −31,510 |
+
+The only Sky-native operations users call directly are sUSDS deposits and redemptions (96/day)
+and token transfers. Every one is negative: an sUSDS deposit records 9–10 updates of which 3
+are `Call`s, so replay reproduces the transaction and adds overhead. Interesting detail — the
+two third-party Safe executions come *closest* to breaking even (−448) despite being the
+largest transactions here, because almost all their gas sits in calls that replay at the same
+price.
+
+**Note this is the opposite failure from ENS.** ENS was directly callable with nothing to
+remove. Sky has plenty to remove — the median indirect transaction burns 670,000 gas — and no
+way to reach it. Of the two, Sky's is the more interesting problem, because a routing change
+is at least conceivable where a missing computation is not.
+
+**One transaction could not be measured**: an sUSDS `deposit` (`0x2f6a9995…`, 110,061 gas, 0
+logs) failed after 6 attempts and is listed with the other unmeasurable transactions.
 
 ## What actually predicts a win
 
@@ -950,6 +1010,16 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | Puffer | [`0x98eacd62…`](https://etherscan.io/tx/0x98eacd62af71a709fa00814c8e065c2865e5e90432d97147dacea56fbcffba60) | `swapExactAmountInOnCurveV1` ✓ `0x1a01c532` | 239,072 | 252,170 | -13,098 | **0** (0.00%) | 0 | external calls | 5 (5C) | **not Puffer's own** — Paraswap route touching pufETH |
 | Kelp | [`0xe0901586…`](https://etherscan.io/tx/0xe090158643e1c7bf676c2e373ca98e3d37d95affb69ca257b2ee598bbc03310a) | *withdrawal route* `0x6d7b7040` | 508,968 | 515,629 | -6,661 | **0** (0.00%) | 0 | external calls | 1 (1C) | via third-party contract |
 
+| Sky | [`0xea36a77d…`](https://etherscan.io/tx/0xea36a77deb266334389af73a95ad7dd7769253612695af1aa83e12cf4b0b6362) | Safe `execTransaction` ✓ `0x6a761202` | 902,223 | 902,671 | -448 | **0** (0.00%) | 0 | replay costs more | 8 (6C/1L2/1S) | **not Sky's own** — a market maker's multisig touching Jug/Vat/PSM |
+| Sky | [`0x8468cfac…`](https://etherscan.io/tx/0x8468cfacae12d76e813dd9fba6f224d5671a39b2e96b7f50dfd0da3ccb57d898) | Safe `execTransaction` ✓ `0x6a761202` | 982,548 | 985,574 | -3,026 | **0** (0.00%) | 0 | replay costs more | 9 (7C/1L2/1S) | **not Sky's own** — same multisig |
+| Sky | [`0x1c77d8ed…`](https://etherscan.io/tx/0x1c77d8edef60f73522dfe4b551680d7f3ed0d12e53b146fae31a3af0f5539fe6) | sUSDS `transfer` ✓ `0xa9059cbb` | 56,380 | 62,836 | -6,456 | **0** (0.00%) | 0 | replay costs more | 3 (1L3/2S) |  |
+| Sky | [`0x765e023f…`](https://etherscan.io/tx/0x765e023f53a0822981195b2c5711f9a1c973c951a3488856ecdfb01ac6b48f7c) | USDS `transfer` ✓ `0xa9059cbb` | 56,336 | 62,836 | -6,500 | **0** (0.00%) | 0 | replay costs more | 3 (1L3/2S) |  |
+| Sky | [`0xd1ddae6d…`](https://etherscan.io/tx/0xd1ddae6dade88620d7be1aea762b7881998f1040dea2900a71e7126b6ea23a6e) | DaiUsds `daiToUsds` ✓ `0xf2c07aae` | 132,007 | 151,437 | -19,430 | **0** (0.00%) | 0 | replay costs more | 4 (3C/1L3) |  |
+| Sky | [`0x77b86295…`](https://etherscan.io/tx/0x77b862956888e2596c3488b625eb227d0ac7da838e711e0dd702c1fea2a60ea2) | sUSDS `redeem` ✓ `0xba087652` | 148,203 | 174,502 | -26,299 | **0** (0.00%) | 0 | replay costs more | 9 (3C/1L1/1L3/1L4/3S) |  |
+| Sky | [`0xd13aa7d3…`](https://etherscan.io/tx/0xd13aa7d3a3b423b3f705b6a42f0dc8960c97b3bdafcae23bb69b3a37edd7fb73) | sUSDS `withdraw` ✓ `0xb460af94` | 148,058 | 174,490 | -26,432 | **0** (0.00%) | 0 | replay costs more | 9 (3C/1L1/1L3/1L4/3S) |  |
+| Sky | [`0x72447406…`](https://etherscan.io/tx/0x72447406351431526cc15cc615b0ea33e721af225347728bacb95a974705b0ea) | sUSDS `deposit` ✓ `0x9b8d6d38` | 145,878 | 177,107 | -31,229 | **0** (0.00%) | 0 | replay costs more | 10 (3C/1L1/3L3/3S) |  |
+| Sky | [`0x49581560…`](https://etherscan.io/tx/0x495815608a04d20d2c25565c0d11081f78db2e6252f5edaa2781cafe94cf2071) | sUSDS `deposit` ✓ `0x9b8d6d38` | 145,585 | 177,095 | -31,510 | **0** (0.00%) | 0 | replay costs more | 10 (3C/1L1/3L3/3S) |  |
+
 ## Transactions that could not be measured at all
 
 The tool produced no output and exited cleanly. Every one is a very large trace, so the surveys here systematically miss the biggest and most interesting transactions.
@@ -961,6 +1031,7 @@ The tool produced no output and exited cleanly. Every one is a very large trace,
 | Safe | [`0xfde7c414…`](https://etherscan.io/tx/0xfde7c414c1bd53ec908140e72afe5eb34f717e5d8188a8231fcd6b55f4c280e9) | ~6.5M gas |
 | EigenLayer | [`0x6508d5bf…`](https://etherscan.io/tx/0x6508d5bfc34439a4005d3c0e8967fe62cf65df140eae5171cb9faa35b8ccc4ac) | checkpoint proof, ~3.4M gas, 85 KB calldata |
 | EigenLayer | [`0xe92e3dad…`](https://etherscan.io/tx/0xe92e3dadee2f12722936bb8fc0bf19527e305e4c51a6e63e9f10d481d067e23d) | checkpoint proof, oversized trace |
+| Sky | [`0x2f6a9995…`](https://etherscan.io/tx/0x2f6a99957e3f04443c6fb474108c0e26a026bd162317ca2964a48e2fc981c7be) | sUSDS `deposit`, 110,061 gas, 0 logs; replay failed 6 attempts |
 
 Four Morpho liquidations failed the real replay for other reasons and appear in the table above with `heur` numbers you should not trust: one sender is an EIP-7702 smart EOA the simulator rejects outright, two revert reproducibly part-way through the replay, and one was rate-limited. `MORPHO_CANDIDATES.md` has the detail.
 
