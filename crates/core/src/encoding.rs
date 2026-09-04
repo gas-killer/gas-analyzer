@@ -18,7 +18,17 @@ pub const TURETZKY_UPPER_GAS_LIMIT_BLS: u64 = 250000u64;
 /// The Turetzky upper gas limit for Schnorr-verified attestations. See
 /// [`TURETZKY_UPPER_GAS_LIMIT_BLS`]; Schnorr verification is cheaper on-chain and so
 /// yields a lower floor.
-pub const TURETZKY_UPPER_GAS_LIMIT_SCHNORR: u64 = 27000u64;
+///
+/// Measured on Sepolia against a 3-operator 2-of-3 `SchnorrStakeRegistry`: 32,066 with
+/// full participation, 45,417 with one non-signer. One non-signer is the most a 2-of-3
+/// quorum admits, and it costs that operator's record SLOADs plus one modexp point
+/// subtraction, so the limit covers that case rather than full participation.
+///
+/// The settlements those figures come from, on verified contracts:
+/// target <https://sepolia.etherscan.io/address/0xff7d6cdeeb44a357a936c8eb939fe8282d6da2e7>
+/// verifying against
+/// <https://sepolia.etherscan.io/address/0x69534bc676c60c0846736a5652b0779127b341a9>.
+pub const TURETZKY_UPPER_GAS_LIMIT_SCHNORR: u64 = 50000u64;
 
 /// Signature scheme used to verify the aggregated operator attestation on-chain.
 ///
