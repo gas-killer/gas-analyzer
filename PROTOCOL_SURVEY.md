@@ -1103,9 +1103,52 @@ largest transactions here, because almost all their gas sits in calls that repla
 price.
 
 **Note this is the opposite failure from ENS.** ENS was directly callable with nothing to
-remove. Sky has plenty to remove — the median indirect transaction burns 670,000 gas — and no
-way to reach it. Of the two, Sky's is the more interesting problem, because a routing change
+remove; Sky's core is not directly callable at all. But see the census below before reading that
+as untapped value — Sky's own share of those large indirect transactions is only 12,000–48,000
+gas per call. Of the two, Sky's is the more interesting problem, because a routing change
 is at least conceivable where a missing computation is not.
+
+### Function-level census — what "no savings" actually covers
+
+9 transactions across 6 functions is thin for a system Maker's size, so the claim was checked
+against a full function-level census. `debug_traceTransaction` with `callTracer` is available on
+this endpoint, so every call *into* a Sky contract can be enumerated, including nested ones.
+70 Sky-touching transactions traced (of 473 found in 260 blocks), yielding **32 distinct
+contract/function pairs**, all selectors resolved by local hashing.
+
+**Every core Maker function is nested-only — never once invoked at top level:**
+
+| contract | function | calls | at top level | gas of that call |
+|---|---|---:|---:|---:|
+| Vat | `move(address,address,uint256)` | 19 | **0** | 12,843 |
+| Vat | `frob(bytes32,address,address,address,int256,int256)` | 2 | **0** | 33,803 |
+| Vat | `suck(address,address,uint256)` | 1 | **0** | 44,764 |
+| Vat | `fold(bytes32,address,int256)` | 1 | **0** | 14,632 |
+| LitePSM | `buyGem(address,uint256)` | 6 | **0** | 48,418 |
+| LitePSM | `sellGem(address,uint256)` | 5 | **0** | 39,036 |
+| LitePSM | `sellGemNoFee(address,uint256)` | 1 | **0** | 49,021 |
+| Jug | `drip(bytes32)` | 1 | **0** | 47,347 |
+| DaiUsds | `daiToUsds` / `usdsToDai` | 2 | **0** | 130,551 / 89,372 |
+| DAI/USDS | `mint` / `burn` | 19 | **0** | 10,346–28,157 |
+
+The only functions ever called at top level are token operations — `transfer`, `transferFrom`,
+`approve` on DAI, USDS and SKY — plus `sUSDS.deposit`. Nothing else.
+
+**This corrects a claim made earlier in this section.** An earlier version said Sky has "a median
+670,000 gas of removable work and no way to reach it". That was wrong: the 670,000-gas median
+belongs to the *arbitrage bot's* transaction, not to Sky. Each individual Sky call consumes
+12,000–48,000 gas, so Sky's own share of one of those transactions is under 10% of it.
+
+That makes the negative stronger, not weaker. Even if the routing problem were solved and
+`buyGem` were directly callable, 48,418 gas has to clear a 27,000-gas floor from a base that
+already contains its own storage writes and logs — there is no room. The supporting evidence is
+`daiToUsds`, the largest single Sky function in the census at 130,551 gas: it *was* measured
+directly, and came out at **−19,430 surplus**.
+
+Coverage of the 32 pairs: 8 are `view` functions and cannot be transactions at all
+(`balanceOf`, `allowance`, `ilks`, `urns`, `tout`, `to18ConversionFactor`); 6 were measured;
+the remaining 18 are either token operations nearly identical to ones measured, or the
+nested-only core functions above, none of which exceeds 49,021 gas per call.
 
 **One transaction could not be measured**: an sUSDS `deposit` (`0x2f6a9995…`, 110,061 gas, 0
 logs) failed after 6 attempts and is listed with the other unmeasurable transactions.
