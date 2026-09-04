@@ -439,6 +439,32 @@ event were both confirmed by hashing locally. One Mellow row (`0x7bcd05f1…`, 2
 10 receipt logs unaccounted for by its 2 recorded calls and is **flagged unverified** in the
 table.
 
+### Attribution check — which labels are verified
+
+Because these six were measured in one batch off entry points discovered from each protocol's
+token logs, the protocol labels are worth auditing separately from the numbers. For each of the
+21 transactions I checked the `to` address against a list of verified protocol contracts and
+against which tokens the receipt actually moved:
+
+| label | `to` | status |
+|---|---|---|
+| **Kelp** (4 rows incl. the 85.90%) | `0x036676389e…` LRTDepositPool | **verified** — own deposit pool, mints rsETH |
+| **Mellow** (5 rows) | `0xbeef69ac78…` steakLRT vault | **verified** — the vault itself |
+| **Symbiotic** (4 rows) | `0x7a4effd87c…` vault | **verified by association** — interacts with Symbiotic's wstETH default collateral |
+| **Renzo** (the 67.10% row) | `0x5efc9d10e4…` | **inferred only** — contract unidentified; moves ezETH |
+| **Puffer** (the 19.22% row) | `0xdda0483184…` | **inferred only** — contract unidentified; moves pufETH |
+| **Swell** (2 rows) | `0x58749c46ff…`, `0x289d600447…` | inferred only; both score 0%, so nothing rests on them |
+
+**The headline is safe** — Kelp's 85.90% goes directly to Kelp's own pool. **Renzo's 67.10% and
+Puffer's 19.22% should not be quoted as those protocols' own numbers** until someone confirms
+what those two contracts are. They are ezETH- and pufETH-related, which is not the same as
+being Renzo's or Puffer's own entry point. This is the same failure mode as the earlier
+mislabelling of the ERC-4337 EntryPoint as "ZeroDev", caught earlier this time.
+
+**Mellow and Symbiotic are not independent.** The steakLRT vault deposits into Symbiotic's
+wstETH default collateral, so a Mellow withdrawal is partly Symbiotic activity. Adding their
+volumes together double-counts, which makes the $47/month figure above slightly optimistic.
+
 ### And now the money
 
 | | qualifying txs/day | mean saving | **$/month** | at 20 gwei |
@@ -906,7 +932,7 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | Kelp | [`0x3d793f5e…`](https://etherscan.io/tx/0x3d793f5e6caf4cca5325c0a08586f09ea802e7155537c6268cae62a0d9b2fb90) | `depositETH` ✓ `0x72c51c0b` | 843,973 | 97,253 | +746,720 | **719,720** (85.28%) | 496,720 | — | 4 (1C/1L2/2S) |  |
 | Kelp | [`0xed07bc6d…`](https://etherscan.io/tx/0xed07bc6df666ead240eee3539cf2fbe198222bd5e77373dee853ed66799b8356) | `depositETH` ✓ `0x72c51c0b` | 860,124 | 114,353 | +745,771 | **718,771** (83.57%) | 495,771 | — | 4 (1C/1L2/2S) |  |
 | Kelp | [`0x1de5a43e…`](https://etherscan.io/tx/0x1de5a43e5be3c8909ee49f2b31d7da4fb6e5ae2820db7dcab45c7b54cd975db1) | `depositETH` ✓ `0x72c51c0b` | 860,124 | 114,353 | +745,771 | **718,771** (83.57%) | 495,771 | — | 4 (1C/1L2/2S) |  |
-| Renzo | [`0x0164c9ec…`](https://etherscan.io/tx/0x0164c9ec2a2aca0002fb6c83b026baf02ae79657118116d659cc1607306e732d) | `claim` ✓ `0xddd5e1b2` | 556,985 | 156,250 | +400,735 | **373,735** (67.10%) | 150,735 | — | 17 (2C/1L1/14S) |  |
+| Renzo | [`0x0164c9ec…`](https://etherscan.io/tx/0x0164c9ec2a2aca0002fb6c83b026baf02ae79657118116d659cc1607306e732d) | `claim` ✓ `0xddd5e1b2` | 556,985 | 156,250 | +400,735 | **373,735** (67.10%) | 150,735 | — | 17 (2C/1L1/14S) | **label inferred** — `to` `0x5efc9d10…` unidentified; moves ezETH but not confirmed as Renzo's own contract |
 | Symbiotic | [`0xf9907340…`](https://etherscan.io/tx/0xf99073406b04143cb575fd593f4acce362cc6dedd1dbc7dc121f7b741d266974) | `withdraw` ✓ `0xb460af94` | 388,545 | 116,909 | +271,636 | **244,636** (62.96%) | 21,636 | — | 7 (1C/1L3/1L4/4S) |  |
 | Symbiotic | [`0x222b1607…`](https://etherscan.io/tx/0x222b16076f8654a56941e68b760ce77a76837708f34a778ac9c0c448aa1e74a8) | `withdraw` ✓ `0xb460af94` | 393,345 | 121,781 | +271,564 | **244,564** (62.18%) | 21,564 | — | 7 (1C/1L3/1L4/4S) |  |
 | Symbiotic | [`0x52cc4627…`](https://etherscan.io/tx/0x52cc462709e07ca5cd17b03456a405d420552051f717a39e058ce3531eee0ad6) | `redeem` ✓ `0xba087652` | 354,891 | 116,909 | +237,982 | **210,982** (59.45%) | 0 | — | 7 (1C/1L3/1L4/4S) |  |
@@ -916,7 +942,7 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | Mellow | [`0x7492f30f…`](https://etherscan.io/tx/0x7492f30ffc86ee6112332404b2d566b7ac69892b929a8b1269e83b02ec002739) | `withdraw` ✓ `0xb460af94` | 267,866 | 137,503 | +130,363 | **103,363** (38.59%) | 0 | — | 7 (1C/1L3/1L4/4S) |  |
 | Mellow | [`0x8cab3ca8…`](https://etherscan.io/tx/0x8cab3ca8f227eea89b600c21d9946246c1d3b934ec4fa0866b75bf06c2c4fd64) | `redeem` ✓ `0xba087652` | 244,274 | 132,703 | +111,571 | **84,571** (34.62%) | 0 | — | 7 (1C/1L3/1L4/4S) |  |
 | Mellow | [`0x7bcd05f1…`](https://etherscan.io/tx/0x7bcd05f137e612ed18a05b8ae6a3d69098e49478bd08f3f1fdc503125e7660a6) | `redeem` ✓ `0xba087652` | 362,727 | 255,112 | +107,615 | **80,615** (22.22%) | 0 | — | 8 (2C/1L3/1L4/4S) | **unverified** — 8 of 10 receipt logs unaccounted for by the 2 recorded calls |
-| Puffer | [`0x4138ef12…`](https://etherscan.io/tx/0x4138ef12a8ff9af26a8a3e2215ece5d3d89a7def48d0d15014b0ac1c5b766233) | `requestWithdrawal` ✓ `0xef027fbf` | 189,094 | 125,747 | +63,347 | **36,347** (19.22%) | 0 | — | 7 (1C/1L4/5S) |  |
+| Puffer | [`0x4138ef12…`](https://etherscan.io/tx/0x4138ef12a8ff9af26a8a3e2215ece5d3d89a7def48d0d15014b0ac1c5b766233) | `requestWithdrawal` ✓ `0xef027fbf` | 189,094 | 125,747 | +63,347 | **36,347** (19.22%) | 0 | — | 7 (1C/1L4/5S) | **label inferred** — `to` `0xdda04831…` unidentified; moves pufETH but not confirmed as Puffer's own contract |
 | Swell | [`0xde520139…`](https://etherscan.io/tx/0xde520139bb8c7e72bc8f00f44e5f5acc1836e277dd2ca6c383ec2cb85fdf07a4) | *withdrawal route* `0x64370336` | 506,140 | 500,723 | +5,417 | **0** (0.00%) | 0 | external calls | 18 (2C/3L2/13S) |  |
 | Swell | [`0x5fa9fc3e…`](https://etherscan.io/tx/0x5fa9fc3e86cd5eca4d1cea80f43cdc4deda42654347dc2d9f96f1d3861c747c9) | `swap` ✓ `0xe21fd0e9` | 1,429,886 | 1,434,239 | -4,353 | **0** (0.00%) | 0 | external calls | 7 (3C/4L1) | **not Swell's own** — aggregator touching rswETH |
 | Swell | [`0x007900f8…`](https://etherscan.io/tx/0x007900f86481e523c1e73a76908b3ae1af44fd4978f798298305f98c300461dd) | `createWithdrawRequest` ✓ `0x74dc9d1a` | 310,597 | 317,086 | -6,489 | **0** (0.00%) | 0 | external calls | 16 (2C/1L3/1L4/12S) |  |

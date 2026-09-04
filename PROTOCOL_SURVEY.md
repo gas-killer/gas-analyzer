@@ -1001,6 +1001,32 @@ event were both confirmed by hashing locally. One Mellow row (`0x7bcd05f1…`, 2
 10 receipt logs unaccounted for by its 2 recorded calls and is **flagged unverified** in the
 table.
 
+### Attribution check — which labels are verified
+
+Because these six were measured in one batch off entry points discovered from each protocol's
+token logs, the protocol labels are worth auditing separately from the numbers. For each of the
+21 transactions I checked the `to` address against a list of verified protocol contracts and
+against which tokens the receipt actually moved:
+
+| label | `to` | status |
+|---|---|---|
+| **Kelp** (4 rows incl. the 85.90%) | `0x036676389e…` LRTDepositPool | **verified** — own deposit pool, mints rsETH |
+| **Mellow** (5 rows) | `0xbeef69ac78…` steakLRT vault | **verified** — the vault itself |
+| **Symbiotic** (4 rows) | `0x7a4effd87c…` vault | **verified by association** — interacts with Symbiotic's wstETH default collateral |
+| **Renzo** (the 67.10% row) | `0x5efc9d10e4…` | **inferred only** — contract unidentified; moves ezETH |
+| **Puffer** (the 19.22% row) | `0xdda0483184…` | **inferred only** — contract unidentified; moves pufETH |
+| **Swell** (2 rows) | `0x58749c46ff…`, `0x289d600447…` | inferred only; both score 0%, so nothing rests on them |
+
+**The headline is safe** — Kelp's 85.90% goes directly to Kelp's own pool. **Renzo's 67.10% and
+Puffer's 19.22% should not be quoted as those protocols' own numbers** until someone confirms
+what those two contracts are. They are ezETH- and pufETH-related, which is not the same as
+being Renzo's or Puffer's own entry point. This is the same failure mode as the earlier
+mislabelling of the ERC-4337 EntryPoint as "ZeroDev", caught earlier this time.
+
+**Mellow and Symbiotic are not independent.** The steakLRT vault deposits into Symbiotic's
+wstETH default collateral, so a Mellow withdrawal is partly Symbiotic activity. Adding their
+volumes together double-counts, which makes the $47/month figure above slightly optimistic.
+
 ### And now the money
 
 | | qualifying txs/day | mean saving | **$/month** | at 20 gwei |
