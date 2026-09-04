@@ -122,6 +122,7 @@ Best and typical figures use only properly measured runs. They exclude the two O
 | **Panther** | 1 | 0 | 0.00% | — | external calls (1), too many writes (1) |
 | **Swell** | 3 | 0 | 0.00% | — | external calls (3); 1 row is aggregator traffic |
 | **Sky (Maker)** | 9 | 0 | 0.00% | — | replay costs more (9) — negative at *any* floor |
+| **Notional** | 0 | — | — | — | no measurable mainnet activity — see below |
 | **Umbra** | 8 | 0 | 0.00% | — | replay costs more (8) — negative at *any* floor |
 | **ENS** | 18 | 0 | 0.00% | — | under the floor (11), replay costs more (7) |
 | **ERC-4337 EntryPoint** | 8 | 2 *(suspect)* | *86.54%* | *83.60%* | external calls (6); **both wins are probably replay artifacts — do not quote** |
@@ -590,6 +591,29 @@ nested-only core functions above, none of which exceeds 49,021 gas per call.
 
 **One transaction could not be measured**: an sUSDS `deposit` (`0x2f6a9995…`, 110,061 gas, 0
 logs) failed after 6 attempts and is listed with the other unmeasurable transactions.
+
+## Notional — no measurable activity on Ethereum mainnet
+
+Nothing was measured, because nothing was found to measure. Recorded here so the entry is
+closed rather than skipped.
+
+Three independent checks agree:
+
+| check | result |
+|---|---|
+| 8 Notional protocol event signatures, scanned **topic-only** (no address filter) over 60,000 blocks (~8 days) | **0 logs anywhere on mainnet** |
+| NOTE token transfers over the same window — contract verified as genuine (`name()` = "Notional", `symbol()` = "NOTE", 8 decimals) | **4 transfers, all DEX routers** (MetaMask Swap, 1inch v6, CoW Protocol, one other) |
+| Candidate V3 router `0x1344A36A…` | **not Notional** — a live proxy with an owner and implementation, but every Notional view function reverts, and zero logs in probes going back 3.6M blocks |
+
+Notional V3 is deployed primarily on Arbitrum. This is the same situation as Panther: the
+protocol is real and the mainnet target is not there. NOTE exists on mainnet as a tradeable
+token only.
+
+**Stated limitation:** I could not locate a live Notional V3 entry point on mainnet, so the
+honest claim is "no measurable activity found", not "definitively zero". If someone supplies a
+confirmed mainnet address the census takes about ten minutes to run against it. The event-topic
+scan is the stronger of the three checks because it needs no address at all — but it does rely
+on my event signatures being right, and those were reconstructed rather than taken from an ABI.
 
 ## What actually predicts a win
 
