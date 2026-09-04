@@ -118,8 +118,8 @@ fn bench_extraction_paths(c: &mut Criterion) {
     // with a single trailing log — not as a property of the encoders. Asserting vector equality here
     // would pass for the same narrow reason and read as proof of a general equivalence that does not
     // hold; see the `core` test named in the module docs for where they actually diverge.
-    let n_struct = compute_state_updates(trace.clone())
-        .map(|(u, _, _)| u.len())
+    let n_struct = compute_state_updates(trace.clone(), None)
+        .map(|e| e.state_updates.len())
         .unwrap_or(0);
     let n_pre = build_state_updates_from_prestate(CONSUMER, &diff, &frame).len();
     eprintln!(
@@ -136,7 +136,7 @@ fn bench_extraction_paths(c: &mut Criterion) {
     group.bench_function("compute_state_updates_heavy", |b| {
         b.iter_batched(
             || trace.clone(),
-            |t| black_box(compute_state_updates(black_box(t))),
+            |t| black_box(compute_state_updates(black_box(t), None)),
             BatchSize::PerIteration,
         )
     });

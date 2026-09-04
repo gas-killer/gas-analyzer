@@ -4,9 +4,7 @@
 //! (alloy-provider, DebugApi). These are separated from the core crate
 //! because they are not WASM-compatible.
 
-use std::collections::HashSet;
-
-use alloy::primitives::FixedBytes;
+use alloy::primitives::{Address, FixedBytes};
 use alloy::rpc::types::BlockOverrides;
 use alloy::rpc::types::trace::geth::{
     CallConfig, CallFrame, DefaultFrame, DiffMode, GethDebugTracingCallOptions,
@@ -19,8 +17,7 @@ use alloy_rpc_types::TransactionTrait;
 use anyhow::{Result, anyhow, bail};
 
 use gas_analyzer_core::SimProfile;
-use gas_analyzer_core::trace::compute_state_updates;
-use gas_analyzer_core::types::{Opcode, StateUpdate};
+use gas_analyzer_core::trace::{TraceExtract, compute_state_updates};
 use gas_analyzer_estimator::PrecedingTx;
 
 /// Apply a [`SimProfile`]'s environment overrides to a `debug_traceCall`
@@ -243,17 +240,19 @@ where
 /// `status` must be `receipt.status()` for `tx_hash`. Pass the already-fetched
 /// receipt's status to avoid an extra `eth_getTransactionReceipt` round-trip.
 ///
-/// Returns: (state_updates, skipped_opcodes, call_gas_total)
+/// `origin` is the traced transaction's target contract, used for re-entry
+/// detection (see [`TraceExtract::reentered`]); pass `None` to skip it.
 pub async fn compute_state_updates_from_tx<P: Provider + DebugApi>(
     provider: &P,
     tx_hash: FixedBytes<32>,
     status: bool,
-) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64)> {
+    origin: Option<Address>,
+) -> Result<TraceExtract> {
     // Primary path: use the historical trace via debug_traceTransaction.
     let trace = get_tx_trace(provider, tx_hash, status).await?;
     let struct_logs_len = trace.struct_logs.len();
     if struct_logs_len > 0 {
-        return compute_state_updates(trace);
+        return compute_state_updates(trace, origin);
     }
 
     bail!(

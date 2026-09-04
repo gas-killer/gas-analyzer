@@ -18,7 +18,17 @@ pub const TURETZKY_UPPER_GAS_LIMIT_BLS: u64 = 250000u64;
 /// The Turetzky upper gas limit for Schnorr-verified attestations. See
 /// [`TURETZKY_UPPER_GAS_LIMIT_BLS`]; Schnorr verification is cheaper on-chain and so
 /// yields a lower floor.
-pub const TURETZKY_UPPER_GAS_LIMIT_SCHNORR: u64 = 27000u64;
+///
+/// Measured on Sepolia against a 3-operator 2-of-3 `SchnorrStakeRegistry`: 32,066 with
+/// full participation, 45,417 with one non-signer. One non-signer is the most a 2-of-3
+/// quorum admits, and it costs that operator's record SLOADs plus one modexp point
+/// subtraction, so the limit covers that case rather than full participation.
+///
+/// The settlements those figures come from, on verified contracts:
+/// target <https://sepolia.etherscan.io/address/0xff7d6cdeeb44a357a936c8eb939fe8282d6da2e7>
+/// verifying against
+/// <https://sepolia.etherscan.io/address/0x69534bc676c60c0846736a5652b0779127b341a9>.
+pub const TURETZKY_UPPER_GAS_LIMIT_SCHNORR: u64 = 50000u64;
 
 /// Signature scheme used to verify the aggregated operator attestation on-chain.
 ///
@@ -190,6 +200,32 @@ pub fn encode_state_updates_to_abi(state_updates: &[StateUpdate]) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{IStateUpdateTypes, StateUpdate};
+    use alloy_primitives::B256;
+
+    /// A program with no operations still encodes to a full tuple: two offsets and two
+    /// zero-length arrays. Nothing about the byte string says "empty" except its content, which
+    /// is why [`encode_state_updates_to_abi`]'s callers are given the operation count rather than
+    /// left to infer it from the payload.
+    #[test]
+    fn no_updates_encode_to_two_empty_arrays() {
+        let encoded = encode_state_updates_to_abi(&[]);
+        assert_eq!(encoded.len(), 128);
+        assert_eq!(&encoded[31..32], &[0x40]); // offset: types
+        assert_eq!(&encoded[63..64], &[0x60]); // offset: datas
+        assert!(encoded[64..].iter().all(|&b| b == 0)); // both lengths zero
+    }
+
+    #[test]
+    fn one_store_encodes_past_the_empty_form() {
+        let store = StateUpdate::Store(IStateUpdateTypes::Store {
+            slot: B256::ZERO,
+            value: B256::with_last_byte(1),
+        });
+        let encoded = encode_state_updates_to_abi(&[store]);
+        assert!(encoded.len() > 128);
+        assert_ne!(encoded, encode_state_updates_to_abi(&[]));
+    }
 
     #[test]
     fn turetzky_upper_gas_limit_matches_scheme() {

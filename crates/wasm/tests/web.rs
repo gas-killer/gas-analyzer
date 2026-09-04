@@ -16,6 +16,7 @@ fn test_wasm_analyze_trace_returns_jsvalue() {
         &test_estimator_address(),
         &test_caller_address(),
         None,
+        None,
     );
     assert!(
         result.is_ok(),
@@ -34,6 +35,7 @@ fn test_wasm_analyze_trace_invalid_json_returns_error() {
         &test_estimator_address(),
         &test_caller_address(),
         None,
+        None,
     );
     assert!(result.is_err());
 }
@@ -45,13 +47,14 @@ fn test_wasm_analyze_trace_invalid_address_returns_error() {
         "not-an-address",
         &test_caller_address(),
         None,
+        None,
     );
     assert!(result.is_err());
 }
 
 #[wasm_bindgen_test]
 fn test_wasm_estimate_gas_heuristic_returns_jsvalue() {
-    let result = estimate_gas_heuristic(&valid_sstore_trace());
+    let result = estimate_gas_heuristic(&valid_sstore_trace(), None);
     assert!(
         result.is_ok(),
         "estimate_gas_heuristic should succeed: {:?}",
@@ -75,7 +78,7 @@ fn test_wasm_encode_trace_returns_jsvalue() {
 
 #[wasm_bindgen_test]
 fn test_wasm_estimate_gas_heuristic_invalid_json_returns_error() {
-    let result = estimate_gas_heuristic("bad json");
+    let result = estimate_gas_heuristic("bad json", None);
     assert!(result.is_err());
 }
 
@@ -91,6 +94,7 @@ fn test_wasm_analyze_trace_response_fields() {
         &valid_sstore_trace(),
         &test_estimator_address(),
         &test_caller_address(),
+        None,
         None,
     )
     .unwrap();

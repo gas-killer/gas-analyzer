@@ -23,4 +23,15 @@ pub mod state {
     /// TTL on `LAST_HEAD_KEY`. Must comfortably exceed the head-tracker's
     /// poll interval; 60s is well over the 4s default.
     pub const LAST_HEAD_TTL_SECS: u64 = 60;
+
+    /// Running count of blocks the head-tracker skipped past to honour
+    /// `MAX_BLOCKS_BEHIND` — i.e. blocks that were never fanned out at all.
+    /// Un-TTL'd, unlike [`LAST_HEAD_KEY`]: that one is a liveness signal that
+    /// should vanish when stale, this one measures a permanent hole in the
+    /// data and has to outlive the staleness bound that made it.
+    pub const SKIPPED_BLOCKS_KEY: &str = "indexer:state:skipped_blocks";
+    /// Running count of jobs workers dropped at claim time for exceeding
+    /// `QUEUE_JOB_TTL_SECS`. Un-TTL'd for the same reason as
+    /// [`SKIPPED_BLOCKS_KEY`].
+    pub const EXPIRED_JOBS_KEY: &str = "indexer:state:expired_jobs";
 }

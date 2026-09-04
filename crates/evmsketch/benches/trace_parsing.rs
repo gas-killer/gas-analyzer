@@ -73,7 +73,7 @@ fn bench_trace_parsing(c: &mut Criterion) {
     let region = Region::new(GLOBAL);
     for _ in 0..ALLOC_ITERS {
         let t = trace.clone();
-        let _ = black_box(gas_analyzer_core::compute_state_updates(black_box(t)));
+        let _ = black_box(gas_analyzer_core::compute_state_updates(black_box(t), None));
     }
     let total_stats = region.change();
     eprintln!(
@@ -93,7 +93,7 @@ fn bench_trace_parsing(c: &mut Criterion) {
     group.bench_function("compute_state_updates", |b| {
         b.iter_batched(
             || trace.clone(),
-            |t| black_box(gas_analyzer_core::compute_state_updates(black_box(t))),
+            |t| black_box(gas_analyzer_core::compute_state_updates(black_box(t), None)),
             BatchSize::PerIteration,
         )
     });
