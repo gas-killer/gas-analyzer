@@ -1284,6 +1284,42 @@ own L2, so mainnet was expected to be thin. It is — but the result does not re
 at high volume the router saves nothing, because replaying three external calls costs more than
 making them.
 
+## Aragon — real savings, but they are the plugin's bookkeeping around a replayed call
+
+Aragon OSx is live on mainnet and it does save gas: five of eight measured transactions clear
+the 50,000 floor, the best at **21.59%** (182,847 gas) and the largest at 468,738 gas absolute.
+That is the first non-zero result since Chronicle. It is still not a candidate, for two reasons
+that are worth separating.
+
+**Discovery.** No address was assumed. Scanning 200,000 blocks (~28 days) for OSx event topics
+found the registry (`0x7a62da7b…`, 4 `DAORegistered`), the plugin repo registry
+(`0x5b3b36bd…`) and 93 `Executed` logs across a handful of DAOs. Of 81 distinct executing
+transactions, **0 were sent directly to a DAO** — every one enters through a plugin. Three of
+those plugins answer `dao()` and use `execute(uint256)` (`0xfe0d94c1`); the rest of the `to`
+addresses were Safe multisigs and unrelated contracts and were excluded rather than counted as
+Aragon.
+
+**The wins are call-dominated.** Every winning row has the identical recorded program —
+**1 `Store`, 1 `Call`, 1 `Log2`** — while the receipt carries 14 to 124 logs. The base estimate
+is 94% of gas used because replaying that single `CALL` re-executes the entire proposal at full
+price. What GasKiller removes is only the plugin's own proposal bookkeeping sitting outside the
+call: marking the proposal executed, emitting `ProposalExecuted`. The percentage therefore
+falls as the proposal grows — 21.59% on an 846k-gas execution, 5.60% on an 8.4M-gas one. It is
+a real saving under the tool's model, not a replay artifact (the inner call reproduces the rest
+of the state), but it does not scale with the work being done.
+
+The three zero rows are the opposite shape: a plugin that writes **38 `Store`s** of its own,
+where replay costs more than execution.
+
+**The volume is negligible.** 81 executions in 28 days = **2.89/day**. At 189,327 gas mean
+saving across the eight measured, that is 16.4M gas/month — **$18/month** at the 0.453 gwei
+median these transactions actually paid, or $813/month at 20 gwei. Governance execution is
+inherently low-frequency; this is a rounding error next to Aave's $1,392/month.
+
+| | qualifying txs/day | mean saving | **$/month** | at 20 gwei |
+|---|---:|---:|---:|---:|
+| Aragon | 2.89 | 189,327 gas | **$18** | $813 |
+
 ## What this is actually worth in dollars
 
 Every figure above is a percentage. Percentages were the wrong unit, and this section is
