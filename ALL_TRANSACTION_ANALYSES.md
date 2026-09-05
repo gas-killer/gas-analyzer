@@ -153,7 +153,7 @@ Best and typical figures use only properly measured runs. They exclude the two O
 | **Umbra** | 8 | 0 | **0.00%** | — | replay costs more (8) |
 | **Swell** | 3 | 0 | **0.00%** | — | replay costs more (2), under the floor (1) |
 | **Sky** | 9 | 0 | **0.00%** | — | replay costs more (9) |
-| **Frax** | 10 | 0 | **0.00%** | — | replay costs more (10) |
+| **Frax** | 10 | 0 | **0.00%** | — | replay costs more (10); router rows are **call-blocked**, not empty — see `CALL_BLOCKED_CANDIDATES.md` |
 
 ## ENS: 18 transactions, 18 measured, nothing saved
 

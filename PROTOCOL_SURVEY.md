@@ -1233,9 +1233,38 @@ same three external calls, so it costs *more* than the original transaction. The
 identical to the gas across all five (-4,243), confirming these are one bot on one code path —
 one observation, not five.
 
-This is the same shape as Pendle (2.60%, aggregator) and the Ondo MEV-bot row. **A pure router
-is structurally disqualified from this scheme**, and no floor change affects that: the surplus
-is negative before the floor is applied. Frax would score 0.00% at a floor of zero.
+This is the same shape as Pendle (2.60%, aggregator) and the Ondo MEV-bot row. No floor change
+affects it: the surplus is negative before the floor is applied, so Frax scores 0.00% at a floor
+of zero.
+
+> **Correction.** The first version of this section concluded from the above that "a pure router
+> is structurally disqualified from this scheme." That over-claims. A wider census (below) found
+> that the work is not absent — it is one `CALL` deeper, in the pair contract, and the current
+> encoder cannot see it. The router rows belong on the call-blocked watchlist, not in the
+> written-off pile. See `CALL_BLOCKED_CANDIDATES.md`.
+
+**The wider census — 38 more contracts, and the reason the router number is misleading.**
+The first pass tested six contracts. Frax's live surface is much larger, so all of it was
+censused: veFXS, sFRAX, the frxETH redemption queue, FraxFerry, the AMO minter, the unified
+farm, the Fraxlend deployer, the Fraxswap factory and all **29 Fraxswap pairs** enumerated from
+that factory. Over 2,500 blocks (8.33 hours):
+
+```
+scanned 2500 blocks (8.33h): 35 touching txs = 101/day  (direct 0)
+```
+
+**Zero** direct top-level calls to any of the 38. Every selector came back `TOP=0`. But the
+pairs are busy when reached through the router, and what they are doing matters:
+`executeVirtualOrders(uint256)` (`0x2e0ae375`) — TWAMM long-term order grinding — runs at a
+**123,468-gas median**, with one observed pair call at **802,548 gas**. That is genuine
+computation of exactly the kind this scheme exists to remove, and the router's -4,243 surplus
+is measuring its own inability to reach it, not its absence.
+
+Priced properly against the real state diff (13 slots, of which only 3 are fresh; 3 contracts;
+7 logs; 13,626 of log cost; 50,000 floor) a call-aware encoder would unlock **+37,748 (17%)**
+on the largest swap and +28,734 (14%) on the typical one. Real, but roughly a fifth of what the
+Railgun and Morpho entries on that watchlist would unlock — and behind a direct rate of ~59/day
+that is mostly `approve` spam.
 
 **The token and vault operations fail the other way.** sfrxETH `redeem` (78,365 gas, base
 97,929), FXS `transfer` (128,870 / 152,949), frxETH `approve` (46,619 / 55,564) — all

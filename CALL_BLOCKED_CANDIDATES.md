@@ -58,11 +58,44 @@ Sorted by the pessimistic bound. `slots` = storage slots that actually changed o
 | [`0xdcc894ec…`](https://etherscan.io/tx/0xdcc894ec22dc799bd1cd8c24caa4bcd2a2d7f35ae2ba8ab7c431a07f76e5ba21) | Safe | execTransaction -> 13 third-party contracts | 1,004,511 | +0 | 34 | 13 | 57 | +97,942 → +679,342 (10–68%) |
 | [`0xf6ebba6b…`](https://etherscan.io/tx/0xf6ebba6ba0e5e5f003598b5e05efbb737fb5e00e6a1818e58d1e565316f96b74) | Safe | execTransaction -> 5 third-party contracts | 214,221 | +0 | 5 | 5 | 5 | +68,316 → +153,816 (32–72%) |
 | [`0xa676c243…`](https://etherscan.io/tx/0xa676c24374af6324558937b595e3a94fca0fb817823fd22a24ea0f783ebffc6c) | Chainlink | price update, typical (1 Call) | 136,046 | -2,319 | 2 | 1 | 3 | +53,297 → +87,497 (39–64%) |
+| [`0x90708b44…`](https://etherscan.io/tx/0x90708b4454d6d7e5dc8dcc44b44034a7fa9967ebef463de6eb21b3f12c9d763b) | Frax | Fraxswap router → TWAMM pair (3 Calls) | 217,674 | -4,243 | 13 | 3 | 7 | -133,252 → +89,048 (-61–41%) |
+| [`0x334d2c7e…`](https://etherscan.io/tx/0x334d2c7ee4103f7f46cf6be9cc6bbe34e73ff83e6caf0440a29f9119b3c512e9) | Frax | Fraxswap router → TWAMM pair (3 Calls) | 208,660 | -4,243 | 13 | 3 | 7 | -142,266 → +80,034 (-68–38%) |
 | [`0x09fd0f6e…`](https://etherscan.io/tx/0x09fd0f6eb66388ce7cdc484b2020d300b5c6d519df89c5bddc73307d9e68bd80) | Morpho | liquidation | 619,024 | *unmeasurable* | 32 | 11 | 34 | -185,495 → +361,705 (-30–58%) |
 | [`0x1338ba16…`](https://etherscan.io/tx/0x1338ba16b0a7f61988caf43896fde0e32edac97cd7dab32bb6136bf9e77f0302) | Morpho | flash-loan MEV bot (1 Call) | 405,201 | -18,088 | 24 | 6 | 21 | -194,945 → +215,455 (-48–53%) |
 | [`0x1c71eb76…`](https://etherscan.io/tx/0x1c71eb76549cc6a80467e06e8bc938b7fc1e67e9575c2aece8d98345243bb218) | Morpho | 9-market reallocation (1 Call) | 725,295 | +25,527 | 44 | 3 | 48 | -368,705 → +383,695 (-51–53%) |
 | [`0xc3081e6f…`](https://etherscan.io/tx/0xc3081e6f850f214a3df7ccf069f0233a4d07fd08fede69f3e904c45e644789cf) | Ether.fi | third-party aggregator (1 Call) | 4,904,702 | -52,101 | 235 | 16 | 378 | -1,041,056 → +2,977,444 (-21–61%) |
 | [`0x8951b058…`](https://etherscan.io/tx/0x8951b058f41486ff7d9c5806d187af52f7d969ae69ddbb85c1e1be04171dae04) | Safe | execTransaction, 251 logs (log-cost bound) | 3,251,629 | +4,268 | 252 | 2 | 251 | -2,784,952 → +1,524,248 (-86–47%) |
+
+### Frax — added after the wider census (2026-09-05)
+
+The Fraxswap rows above are the clearest small-scale illustration of the blocking rule, and
+they correct an over-claim made when Frax was first written up.
+
+A Fraxswap router swap records **three `Call`s and nothing else** — no `Store`s, no `Log`s —
+so its replay cost (221,917) exceeds its gas used (217,674) and it scores 0.00%. The first
+write-up read that as "a pure router is structurally disqualified." That is too strong. The
+work has not vanished; it is one `CALL` deeper, in the pair contract, where a function-level
+census found `executeVirtualOrders(uint256)` (`0x2e0ae375`) running at a **123,468-gas median
+and one observed call at 802,548 gas**. TWAMM order grinding is exactly the computation this
+scheme is meant to remove — it is simply invisible to the current encoder.
+
+Two caveats keep this off the priority list:
+
+1. **The realistic unlock is modest.** The bounds above price all 13 slots cold, which is
+   wrong: only **3 are fresh**. Pricing 3 at 22,100 and 10 at 5,000, plus 13,626 of logs and
+   the 50,000 floor, gives a replacement cost of 179,926 and an unlock of **+37,748 (17%)** on
+   the largest swap, +28,734 (14%) on the typical one. Real, but an order of magnitude below
+   the Railgun and Morpho entries.
+2. **There is almost no volume behind it.** A 2,500-block census (8.33h) over 38 Frax
+   contracts — 29 Fraxswap pairs, veFXS, sFRAX, the frxETH redemption queue, FraxFerry and the
+   unified farms — found **zero** direct top-level calls to any of them. The pairs are reached
+   only through the router or third-party aggregators. Frax's whole direct rate is ~59/day and
+   most of that is `approve` traffic from a single bot.
+
+So Frax is call-blocked rather than worthless, but unlocking it would buy ~15% on a handful of
+swaps a day. The token rows are a separate and genuine negative: FXS `transfer` and frxETH
+`approve` contain **zero external calls** and still replay above cost, because 6 `Store`s and
+3 logs *are* the transaction.
 
 ### Priority — robust and cheap to integrate
 
