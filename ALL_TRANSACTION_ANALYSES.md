@@ -1,6 +1,6 @@
 # Every transaction analysed, in one place
 
-306 Ethereum mainnet transactions across 29 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Six more could not be run at all; they are listed at the end.
+316 Ethereum mainnet transactions across 29 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Six more could not be run at all; they are listed at the end.
 
 > ### Revised for the new signature floor — 2026-09-04
 >
@@ -136,7 +136,7 @@ Best and typical figures use only properly measured runs. They exclude the two O
 | **Mellow** | 5 | 5 | **41.55%** | 30.00% | — |
 | **Chronicle** | 24 | 17 | **32.64%** | 30.17% | under the floor (4), replay costs more (3) |
 | **Privacy Pools** | 11 | 2 | **19.47%** | 18.00% | replay costs more (9) |
-| **Aragon** | 8 | 5 | **21.59%** | 8.00% | replay costs more (3); all wins **call-dominated** — see notes |
+| **Aragon** | 18 | 5 | **21.59%** | 3.56% | replay costs more (11), under the floor (2); all wins **call-dominated**, and only `execute` ever saves |
 | **Ondo** | 8 | 2 | **12.09%** | 6.51% | under the floor (3), replay costs more (3) |
 | **Ether.fi** | 13 | 2 | **11.09%** | 5.61% | replay costs more (6), under the floor (5) |
 | **Puffer** | 2 | 1 | *7.06%* | *7.06%* | replay costs more (1); **label inferred — entry point unidentified, do not quote** |
@@ -1120,6 +1120,16 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | Aragon | [`0x59aaf7ea…`](https://etherscan.io/tx/0x59aaf7eaaea44ff4a6af66c3617d8040c9e78c09ddab45c2952d55ad869cee60) | Multisig `createProposal` ✓ `0xfbd56e41` | 779,933 | 839,488 | -59,555 | **0** (0.00%) | 0 | replay costs more | 42 (38S/2L3/1C/1L2) | **call-dominated** — 4 of 7 receipt logs produced inside the replayed `CALL` |
 | Aragon | [`0x415e03e4…`](https://etherscan.io/tx/0x415e03e4c2ac8554ec2a5d6baa93c6c4f8c4d1a10d729029b448ad81df5e7d72) | Multisig `createProposal` ✓ `0xfbd56e41` | 779,885 | 839,440 | -59,555 | **0** (0.00%) | 0 | replay costs more | 42 (38S/2L3/1C/1L2) | **call-dominated** — 4 of 7 receipt logs produced inside the replayed `CALL` |
 | Aragon | [`0x2a5b4f66…`](https://etherscan.io/tx/0x2a5b4f66df51696c39c40c0ee26a01934e67011872b44c4e9dea7d07a0fbb397) | Multisig `createProposal` ✓ `0xfbd56e41` | 779,885 | 839,344 | -59,459 | **0** (0.00%) | 0 | replay costs more | 42 (38S/2L3/1C/1L2) | **call-dominated** — 4 of 7 receipt logs produced inside the replayed `CALL` |
+| Aragon | [`0xf52bf2b8…`](https://etherscan.io/tx/0xf52bf2b899889c76e0d30d1d3ccef2897cf4cf53b48ba6e4f09c2edaf5d7fc67) | Multisig `createProposal` ✓ `0xfbd56e41` | 4,933,009 | 5,583,640 | -650,631 | **0** (0.00%) | 0 | replay costs more | 266 (265S/1L3) |  |
+| Aragon | [`0x5ea007bf…`](https://etherscan.io/tx/0x5ea007bfa09947742aa3708156203975cf306d3b021036a82834560af032825a) | Multisig `createProposal` ✓ `0xfbd56e41` | 3,600,315 | 4,041,397 | -441,082 | **0** (0.00%) | 0 | replay costs more | 187 (186S/1L3) |  |
+| Aragon | [`0x55333434…`](https://etherscan.io/tx/0x55333434ae82aa133ebee6a31d4fac9c251c881394776f7ba28fe4a02cd24165) | Multisig `createProposal` ✓ `0xfbd56e41` | 2,120,898 | 2,382,001 | -261,103 | **0** (0.00%) | 0 | replay costs more | 117 (116S/1L3) |  |
+| Aragon | [`0xd7e6f307…`](https://etherscan.io/tx/0xd7e6f3078f6a145567e5c63540c21b369a826f95059d2a9b5504dd9a7e71d9ca) | Multisig `createProposal` ✓ `0xfbd56e41` | 1,797,514 | 2,002,150 | -204,636 | **0** (0.00%) | 0 | replay costs more | 95 (94S/1L3) |  |
+| Aragon | [`0xbe13a890…`](https://etherscan.io/tx/0xbe13a890f1d42d1f805b8c1ba37c425b33cf5d1f1cacd7e75dc50e36a41832c2) | Multisig `createProposal` ✓ `0xfbd56e41` | 1,704,722 | 1,938,462 | -233,740 | **0** (0.00%) | 0 | replay costs more | 113 (112S/1L3) |  |
+| Aragon | [`0x5a277db6…`](https://etherscan.io/tx/0x5a277db6cc2dc98ca29b75ce3a65c9f94cb11c6a74e32ebd684c3cae811a34d5) | Multisig `createProposal` ✓ `0xfbd56e41` | 1,527,109 | 1,721,110 | -194,001 | **0** (0.00%) | 0 | replay costs more | 92 (91S/1L3) |  |
+| Aragon | [`0x70a709c7…`](https://etherscan.io/tx/0x70a709c7cc559ae789324a97a4274430a9c8f36248f8389f6e5554747214e3b8) | Multisig `createProposal` ✓ `0xfbd56e41` | 674,728 | 726,034 | -51,306 | **0** (0.00%) | 0 | replay costs more | 34 (33S/1L3) |  |
+| Aragon | [`0x6d7811d9…`](https://etherscan.io/tx/0x6d7811d9cd76deb1b93a64ed71489ac568a966fce11b8a75c6ff6170d2bb6877) | *unidentified* `0xe978afe5` | 413,213 | 491,468 | -78,255 | **0** (0.00%) | 0 | replay costs more | 28 (14S/14L4) |  |
+| Aragon | [`0xf0f7520f…`](https://etherscan.io/tx/0xf0f7520f273464f42bbedd0f0460548290ea4c674a8978a41e7b90013911e5ee) | Multisig `approve` ✓ `0x747442d3` | 81,408 | 79,384 | +2,024 | **0** (0.00%) | 0 | under the floor | 3 (2S/1L3) |  |
+| Aragon | [`0xccdc5f46…`](https://etherscan.io/tx/0xccdc5f4692cc057e07474e7c3d6eb1826bc8aaddd2cebe756349c6fc35288df2) | Multisig `approve` ✓ `0x747442d3` | 81,408 | 79,372 | +2,036 | **0** (0.00%) | 0 | under the floor | 3 (2S/1L3) |  |
 | Frax | [`0x90708b44…`](https://etherscan.io/tx/0x90708b4454d6d7e5dc8dcc44b44034a7fa9967ebef463de6eb21b3f12c9d763b) | FraxswapRouter `swapExactTokensForTokens` ✓ `0x38ed1739` | 217,674 | 221,917 | -4,243 | **0** (0.00%) | 0 | replay costs more | 3 (3C) | router — all work nested in pair contracts, dropped at `trace.rs:255` |
 | Frax | [`0x23b0a5dc…`](https://etherscan.io/tx/0x23b0a5dc6f12e48f79b97f0e8f4c7240e3e93c16ce4b46373f79d9735fbd0694) | FraxswapRouter `swapExactTokensForTokens` ✓ `0x38ed1739` | 213,167 | 217,410 | -4,243 | **0** (0.00%) | 0 | replay costs more | 3 (3C) | router — all work nested in pair contracts, dropped at `trace.rs:255` |
 | Frax | [`0x4108ebf1…`](https://etherscan.io/tx/0x4108ebf139950b48bc09542acc14974874cfc1cc25c80d503b5becca60d43841) | FraxswapRouter `swapExactTokensForTokens` ✓ `0x38ed1739` | 208,660 | 212,903 | -4,243 | **0** (0.00%) | 0 | replay costs more | 3 (3C) | router — all work nested in pair contracts, dropped at `trace.rs:255` |

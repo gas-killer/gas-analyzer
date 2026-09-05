@@ -1309,7 +1309,33 @@ a real saving under the tool's model, not a replay artifact (the inner call repr
 of the state), but it does not scale with the work being done.
 
 The three zero rows are the opposite shape: a plugin that writes **38 `Store`s** of its own,
-where replay costs more than execution.
+where replay costs more than execution. (Those three were first recorded as `execute`; they are
+in fact `createProposal` — `0xfbd56e41`, verified locally. The label is corrected in
+`ALL_TRANSACTION_ANALYSES.md`.)
+
+**Every other Aragon transaction type was then measured, and none of them saves anything.**
+The first pass covered only `execute(uint256)`. An address-filtered log scan across 18 Aragon
+addresses over 200,000 blocks found 98 transactions, 50 of them direct, spanning three more
+entry points — and `execute` is not even the common one:
+
+| type | selector | n | median gas | result |
+|---|---|---:|---:|---|
+| `approve(uint256,bool)` | `0x747442d3` | 25 | 81,408 | +2,024 surplus, **under the floor** |
+| `createProposal(...)` | `0xfbd56e41` | 14 | up to 4,933,009 | **replay costs more**, every one |
+| `execute(uint256)` | `0xfe0d94c1` | 10 | 1,419,945 | the only type that saves |
+| *unidentified* | `0xe978afe5` | 1 | 413,213 | **replay costs more** |
+
+`createProposal` is the interesting negative. At 4.9M gas it is the largest Aragon transaction
+on mainnet, and its recorded program is **265 `Store`s and a single `Log3`** — writing the
+proposal's actions into storage and nothing else. There is no computation to remove; the
+transaction *is* its state change, so replaying it costs 5,583,640 against 4,933,009 used. The
+pattern holds across all seven measured, from 34 stores at 674,728 gas to 265 at 4.9M.
+
+`approve` — the most common Aragon transaction at 25 of 50 direct — is 2 `Store`s and a log,
+with a surplus of ~2,000 gas against a 50,000 floor. It would need the floor to fall by 25×.
+
+So across 18 measured transactions and four entry points, savings exist only in `execute`, only
+because a `CALL` hides the real work, and only at 2.89 executions/day.
 
 **The volume is negligible.** 81 executions in 28 days = **2.89/day**. At 189,327 gas mean
 saving across the eight measured, that is 16.4M gas/month — **$18/month** at the 0.453 gwei
@@ -1318,7 +1344,7 @@ inherently low-frequency; this is a rounding error next to Aave's $1,392/month.
 
 | | qualifying txs/day | mean saving | **$/month** | at 20 gwei |
 |---|---:|---:|---:|---:|
-| Aragon | 2.89 | 189,327 gas | **$18** | $813 |
+| Aragon | 2.89 (`execute` only) | 189,327 gas | **$18** | $813 |
 
 ## What this is actually worth in dollars
 
