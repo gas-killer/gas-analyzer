@@ -1189,6 +1189,72 @@ confirmed mainnet address the census takes about ten minutes to run against it. 
 scan is the stronger of the three checks because it needs no address at all — but it does rely
 on my event signatures being right, and those were reconstructed rather than taken from an ABI.
 
+## Frax — a router saves nothing, and the tokens are never called directly
+
+Frax was the next name on the longlist. It is a negative, and unlike most of the negatives in
+this file it fails on *both* screening conditions at once, for two different sets of
+transactions. Ten transactions measured, none saved anything.
+
+**Addresses verified before any volume claim.** Six of seven candidate addresses returned
+non-zero codesize; the FPI address carried in the longlist returned codesize 0 and was dropped
+rather than counted. This check exists because Notional's first pass reported "0 txs in 27.9
+days" from an address that turned out not to be Notional.
+
+**The volume figure is smaller than it first looks.** A 600-block census found 58 transactions
+touching a Frax contract — 696/day — but only 4 of them called one directly. A wider 4,000-block
+scan (13.3 hours) put the direct rate at **59.4/day**. The gap is the whole point: the other
+~640/day are other protocols' transactions that happen to move a Frax token, and
+`crates/core/src/trace.rs:255` drops everything nested inside a regular `CALL`. That work is
+invisible to the analyzer and is credited to whichever contract was actually called. "Touching"
+and "directly called" are different numbers and only the second one can be replaced.
+
+(This distinction is recorded because getting it wrong is easy: the Umbra volume in an earlier
+draft of this file was overstated 7.6× by matching an event signature without an address filter.)
+
+**Composition kills most of what remains.** Of the 33 direct transactions found, 22 were
+`approve` — 16 of them byte-identical at 46,619 gas, which reads as a single bot looping. An
+`approve` is one `SSTORE` and one log: the state change *is* the transaction, so there is no
+surplus to remove. That is screening condition (2) — the work must be computation, not
+bookkeeping.
+
+**The router fails structurally, not marginally.** The Fraxswap swaps were the one genuinely
+promising candidate: top-level, 208,660 gas, and a swap is computation. The measurement:
+
+| | gas used | base estimate | surplus |
+|---|---|---|---|
+| `swapExactTokensForTokens` | 217,674 | 221,917 | **-4,243** |
+| `swapExactTokensForTokens` | 213,167 | 217,410 | **-4,243** |
+| `swapExactTokensForTokens` | 208,660 | 212,903 | **-4,243** (×3) |
+
+The recorded state-update program for a Fraxswap swap is **three `Call`s and nothing else** — no
+`Store`s, no `Log`s. A router does no work of its own; it calls the pair contracts, and
+everything inside those calls is dropped. GasKiller's replacement program still has to make the
+same three external calls, so it costs *more* than the original transaction. The surplus is
+identical to the gas across all five (-4,243), confirming these are one bot on one code path —
+one observation, not five.
+
+This is the same shape as Pendle (2.60%, aggregator) and the Ondo MEV-bot row. **A pure router
+is structurally disqualified from this scheme**, and no floor change affects that: the surplus
+is negative before the floor is applied. Frax would score 0.00% at a floor of zero.
+
+**The token and vault operations fail the other way.** sfrxETH `redeem` (78,365 gas, base
+97,929), FXS `transfer` (128,870 / 152,949), frxETH `approve` (46,619 / 55,564) — all
+bookkeeping, all with `base_estimate` above `gas_used`.
+
+The `approve` was run as a control, expected to return 0%. It did. That is what licenses
+trusting the rest of the column.
+
+**Two transactions are excluded, not counted as zeros.** `0xace12218…` and `0xefa82f36…` would
+not come off the heuristic estimator after four attempts each. A `heur` row is not evidence —
+16 of 18 heuristic fallbacks re-measured elsewhere in this survey collapsed to 0%. They are
+excluded from the ten. Separately, `0xefa82f36…` carries 0 logs on a nominally successful
+208k-gas swap, which usually means it reverted; it is not counted either way.
+
+**Prior stated before measurement, and it held:** Frax migrated most activity to Fraxtal, its
+own L2, so mainnet was expected to be thin. It is — but the result does not rest on that. Even
+at high volume the router saves nothing, because replaying three external calls costs more than
+making them.
+
 ## What this is actually worth in dollars
 
 Every figure above is a percentage. Percentages were the wrong unit, and this section is

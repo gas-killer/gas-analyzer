@@ -1,6 +1,6 @@
 # Every transaction analysed, in one place
 
-288 Ethereum mainnet transactions across 27 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Six more could not be run at all; they are listed at the end.
+298 Ethereum mainnet transactions across 28 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Six more could not be run at all; they are listed at the end.
 
 > ### Revised for the new signature floor — 2026-09-04
 >
@@ -153,6 +153,7 @@ Best and typical figures use only properly measured runs. They exclude the two O
 | **Umbra** | 8 | 0 | **0.00%** | — | replay costs more (8) |
 | **Swell** | 3 | 0 | **0.00%** | — | replay costs more (2), under the floor (1) |
 | **Sky** | 9 | 0 | **0.00%** | — | replay costs more (9) |
+| **Frax** | 10 | 0 | **0.00%** | — | replay costs more (10) |
 
 ## ENS: 18 transactions, 18 measured, nothing saved
 
@@ -1110,6 +1111,16 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | Sky | [`0x1c77d8ed…`](https://etherscan.io/tx/0x1c77d8edef60f73522dfe4b551680d7f3ed0d12e53b146fae31a3af0f5539fe6) | sUSDS `transfer` ✓ `0xa9059cbb` | 56,380 | 62,836 | -6,456 | **0** (0.00%) | 0 | replay costs more | 3 (1L3/2S) |  |
 | Sky | [`0x765e023f…`](https://etherscan.io/tx/0x765e023f53a0822981195b2c5711f9a1c973c951a3488856ecdfb01ac6b48f7c) | USDS `transfer` ✓ `0xa9059cbb` | 56,336 | 62,836 | -6,500 | **0** (0.00%) | 0 | replay costs more | 3 (1L3/2S) |  |
 | Sky | [`0xd1ddae6d…`](https://etherscan.io/tx/0xd1ddae6dade88620d7be1aea762b7881998f1040dea2900a71e7126b6ea23a6e) | DaiUsds `daiToUsds` ✓ `0xf2c07aae` | 132,007 | 151,437 | -19,430 | **0** (0.00%) | 0 | replay costs more | 4 (3C/1L3) |  |
+| Frax | [`0x90708b44…`](https://etherscan.io/tx/0x90708b4454d6d7e5dc8dcc44b44034a7fa9967ebef463de6eb21b3f12c9d763b) | FraxswapRouter `swapExactTokensForTokens` ✓ `0x38ed1739` | 217,674 | 221,917 | -4,243 | **0** (0.00%) | 0 | replay costs more | 3 (3C) | router — all work nested in pair contracts, dropped at `trace.rs:255` |
+| Frax | [`0x23b0a5dc…`](https://etherscan.io/tx/0x23b0a5dc6f12e48f79b97f0e8f4c7240e3e93c16ce4b46373f79d9735fbd0694) | FraxswapRouter `swapExactTokensForTokens` ✓ `0x38ed1739` | 213,167 | 217,410 | -4,243 | **0** (0.00%) | 0 | replay costs more | 3 (3C) | router — all work nested in pair contracts, dropped at `trace.rs:255` |
+| Frax | [`0x4108ebf1…`](https://etherscan.io/tx/0x4108ebf139950b48bc09542acc14974874cfc1cc25c80d503b5becca60d43841) | FraxswapRouter `swapExactTokensForTokens` ✓ `0x38ed1739` | 208,660 | 212,903 | -4,243 | **0** (0.00%) | 0 | replay costs more | 3 (3C) | router — all work nested in pair contracts, dropped at `trace.rs:255` |
+| Frax | [`0x334d2c7e…`](https://etherscan.io/tx/0x334d2c7ee4103f7f46cf6be9cc6bbe34e73ff83e6caf0440a29f9119b3c512e9) | FraxswapRouter `swapExactTokensForTokens` ✓ `0x38ed1739` | 208,660 | 212,903 | -4,243 | **0** (0.00%) | 0 | replay costs more | 3 (3C) | router — all work nested in pair contracts, dropped at `trace.rs:255` |
+| Frax | [`0x2fbe40e2…`](https://etherscan.io/tx/0x2fbe40e2de7a3e1c2f8683e6e930a9a0590f978ae2307ee557a02eec2b000ef1) | FraxswapRouter `swapExactTokensForTokens` ✓ `0x38ed1739` | 208,660 | 212,903 | -4,243 | **0** (0.00%) | 0 | replay costs more | 3 (3C) | router — all work nested in pair contracts, dropped at `trace.rs:255` |
+| Frax | [`0x462742b2…`](https://etherscan.io/tx/0x462742b2df4366d41e94270be3f1bf23529c4ec3a78e637692b5a11930733fb3) | FXS `transfer` ✓ `0xa9059cbb` | 128,870 | 152,949 | -24,079 | **0** (0.00%) | 0 | replay costs more | 9 (6S/2L2/1L3) |  |
+| Frax | [`0xcbe7ff8b…`](https://etherscan.io/tx/0xcbe7ff8b218e51097cfedda408e3415906c6fa9ca3f4b653d0ada6fefc63023b) | FXS `transfer` ✓ `0xa9059cbb` | 97,233 | 118,929 | -21,696 | **0** (0.00%) | 0 | replay costs more | 9 (6S/2L2/1L3) |  |
+| Frax | [`0xac0f72a0…`](https://etherscan.io/tx/0xac0f72a0d731fa43e4c0884d1fa60ce1e42d766050cab1fd718d3d14524ea421) | FXS `transfer` ✓ `0xa9059cbb` | 97,221 | 118,965 | -21,744 | **0** (0.00%) | 0 | replay costs more | 9 (6S/2L2/1L3) |  |
+| Frax | [`0x7a627d3f…`](https://etherscan.io/tx/0x7a627d3fe217192bfd0e6fcfdf40ae4c1e56d8f50f391717ad196da52e357ee4) | sfrxETH `redeem` ✓ `0xba087652` | 78,365 | 97,929 | -19,564 | **0** (0.00%) | 0 | replay costs more | 6 (3S/1L3/1L4/1C) |  |
+| Frax | [`0xe8708b5a…`](https://etherscan.io/tx/0xe8708b5a62fd630f36c44bdb32be6b9faf46f78c7d5c99181bdadf026841a32a) | frxETH `approve` ✓ `0x095ea7b3` | 46,619 | 55,564 | -8,945 | **0** (0.00%) | 0 | replay costs more | 2 (1S/1L3) | control: bookkeeping, expected 0% |
 | Sky | [`0x77b86295…`](https://etherscan.io/tx/0x77b862956888e2596c3488b625eb227d0ac7da838e711e0dd702c1fea2a60ea2) | sUSDS `redeem` ✓ `0xba087652` | 148,203 | 174,502 | -26,299 | **0** (0.00%) | 0 | replay costs more | 9 (3C/1L1/1L3/1L4/3S) |  |
 | Sky | [`0xd13aa7d3…`](https://etherscan.io/tx/0xd13aa7d3a3b423b3f705b6a42f0dc8960c97b3bdafcae23bb69b3a37edd7fb73) | sUSDS `withdraw` ✓ `0xb460af94` | 148,058 | 174,490 | -26,432 | **0** (0.00%) | 0 | replay costs more | 9 (3C/1L1/1L3/1L4/3S) |  |
 | Sky | [`0x72447406…`](https://etherscan.io/tx/0x72447406351431526cc15cc615b0ea33e721af225347728bacb95a974705b0ea) | sUSDS `deposit` ✓ `0x9b8d6d38` | 145,878 | 177,107 | -31,229 | **0** (0.00%) | 0 | replay costs more | 10 (3C/1L1/3L3/3S) |  |
