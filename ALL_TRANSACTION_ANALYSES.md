@@ -52,7 +52,7 @@ Three reasons, and they are different problems:
 Across all 208 transactions, **68 show a saving** and 140 show none.
 
 Of the 68 savings, **66 are properly measured and 2 are suspect** — the two ERC-4337
-EntryPoint rows at 80.66% and 86.54%, which are probably artifacts of the replay defect
+EntryPoint rows at 85.18% and 78.58%, now **proven** artifacts of the replay defect
 described below. **11 rows are still tagged `heur`** and are not results; re-run them
 serially before using them.
 
@@ -142,11 +142,11 @@ transactions, not by the protocols — which affects who the counterparty in any
 
 ## Scoreboard
 
-Best and typical figures use only properly measured runs. They exclude the two Ondo rows that turned out to be other people's traffic (a 13.37% MEV bot and a 1.64% aggregator that merely touched Ondo), and the two Morpho rows still tagged `heur`.
+Best and typical figures use only properly measured runs. They exclude the two Ondo rows that turned out to be other people's traffic (a 13.37% MEV bot and a 1.64% aggregator that merely touched Ondo), the two Morpho rows still tagged `heur`, and the two ERC-4337 rows proven to be replay artifacts on 2026-09-14.
 
 | protocol | txs | save gas (measured) | best Schnorr | typical win | blockers on the rest |
 |---|---:|---:|---:|---:|---|
-| **ERC-4337 EntryPoint** | 8 | 2 *(suspect)* | *85.18%* | *81.88%* | replay costs more (6); **both wins are probably replay artifacts — do not quote** |
+| **ERC-4337 EntryPoint** | 8 | 0 | **0.00%** | — | replay costs more (6); **the two 85.18% / 78.58% rows are now PROVEN artifacts** — `innerHandleOp` is not re-executed on replay (see below) |
 | **Kelp** | 5 | 4 | **83.29%** | 81.72% | replay costs more (1) |
 | **Railgun** | 18 | 15 | **78.72%** | 72.02% | replay costs more (1) |
 | **Renzo** | 2 | 1 | *62.97%* | *62.97%* | replay costs more (1); **label inferred — entry point unidentified, do not quote** |
@@ -824,11 +824,28 @@ report a measurement and says why. That is correct behaviour.
 
 **The undetected case is not.** If the contract catches its own errors, the revert never
 escapes. The tool sees a call that "succeeded" very cheaply and reports a large saving.
-This is the suspected explanation for the two ERC-4337 EntryPoint rows showing 80.66% and
-86.54%: EntryPoint is designed to catch a failing userOp rather than revert. Two
-structurally identical EntryPoint transactions — same eight updates, same ordering, same
-`validateUserOp` and `innerHandleOp` calls — replay for 201,100 and 2,205,725 gas
-respectively, a 10x divergence with no structural difference.
+**This was confirmed on 2026-09-14, and it is no longer a hypothesis.** The two ERC-4337
+EntryPoint rows reported 85.18% and 78.58%. Both record the identical eight-instruction program,
+whose sixth instruction is a `Call` to `innerHandleOp` (`0x0042dc53`) — EntryPoint calling
+*itself*. Simulating that exact recorded call against the original block settles it:
+
+```
+from a random address  -> execution reverted: "AA92 internal call only"
+from EntryPoint itself -> succeeds, returns 0x000...000, cheaply
+```
+
+`innerHandleOp` is guarded by `require(msg.sender == address(this))`. On replay it either trips
+that guard or returns zero without redoing the work. Either way **the userOp's real execution —
+about 1.4M gas of swaps and transfers carried in its 4,324-byte calldata — is never re-run**, so
+the base estimate comes out at 201,100 and the tool reports a saving that does not exist.
+
+The symptom was visible before the mechanism was: the two transactions differ by **590,841 gas**
+(1,694,622 and 1,103,781) yet replay to within 14,660 of each other (201,100 and 186,440). A
+faithful replay would track the work. The six EntryPoint rows that measure *negative* do exactly
+that — `0x112f2b10…` replays 2,137,036 gas of work for 2,205,725.
+
+Both rows are now recorded as **0.00%**, and the upstream fix `febc11d`, which flags re-entrant
+callbacks, **does not catch this case** — a debug run emits no re-entrancy warning.
 
 | replay fails and… | tool reports | risk |
 |---|---|---|
@@ -1042,8 +1059,8 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | Ethena | [`0x7a4241aa…`](https://etherscan.io/tx/0x7a4241aa594bf958bdb4c5fa93ef04a12f6cc1f6b854584000349f75c809b11d) | `cooldownShares` ✓ `0x9343d9e1` | 72,371 | 86,492 | -14,121 | **0** (0.00%) | 0 | replay costs more | — | **re-measured** — the old `heur` base was 65,909, understated by 20,583 |
 | Ethena | [`0x03c37967…`](https://etherscan.io/tx/0x03c37967a8003d273e3a8b8518689d304fd03c93d429754f0df4a66e663355af) | `deposit` ✓ `0x6e553f65` | 66,559 | 77,548 | -10,989 | **0** (0.00%) | 0 | replay costs more | — | **re-measured** — the old `heur` base was 57,942, understated by 19,606 |
 
-| ERC-4337 EntryPoint | [`0x030b4fd3…`](https://etherscan.io/tx/0x030b4fd3776594fc57df6451e83b61e916554227a0c7208f2f6a039f9a2bc312) | `handleOps` | 1,694,622 | 201,100 | +1,493,522 | **1,443,522** (85.18%) | — | — | — | **SUSPECT** — see EntryPoint section |
-| ERC-4337 EntryPoint | [`0xb752f16b…`](https://etherscan.io/tx/0xb752f16bd51240342af289dfffebd5276e28ec313eb12ba8bf4ad654794bd807) | `handleOps` | 1,103,781 | 186,440 | +917,341 | **867,341** (78.58%) | — | — | — | **SUSPECT** — reproduced twice, but see EntryPoint section |
+| ERC-4337 EntryPoint | [`0x030b4fd3…`](https://etherscan.io/tx/0x030b4fd3776594fc57df6451e83b61e916554227a0c7208f2f6a039f9a2bc312) | `handleOps` | 1,694,622 | 201,100 | +1,493,522 | **0** (0.00%) | — | **artifact** | 8 (3C/4S/1L1) | **PROVEN ARTIFACT 2026-09-14** — the recorded `innerHandleOp` call reverts `AA92 internal call only` on replay; the 1,443,522 is not a saving |
+| ERC-4337 EntryPoint | [`0xb752f16b…`](https://etherscan.io/tx/0xb752f16bd51240342af289dfffebd5276e28ec313eb12ba8bf4ad654794bd807) | `handleOps` | 1,103,781 | 186,440 | +917,341 | **0** (0.00%) | — | **artifact** | 8 (3C/4S/1L1) | **PROVEN ARTIFACT 2026-09-14** — identical 8-instruction program to `0x030b4fd3…`; same `innerHandleOp` mechanism |
 | ERC-4337 EntryPoint | [`0x112f2b10…`](https://etherscan.io/tx/0x112f2b10d8e6fc37032a3103957c8324db6cee480bf030da56bbbcc5bec5816e) | `handleOps` | 2,137,036 | 2,205,725 | -68,689 | **0** (0.00%) | — | replay costs more | — | structurally identical to the 86.54% row |
 | ERC-4337 EntryPoint | [`0x98949778…`](https://etherscan.io/tx/0x989497784755fae4ffaefe945aa8309269455dc966784e3d0a8a8224cf5c27a4) | `handleOps` | 1,141,959 | 1,208,050 | -66,091 | **0** (0.00%) | — | replay costs more | — |  |
 | ERC-4337 EntryPoint | [`0xe64e4eb1…`](https://etherscan.io/tx/0xe64e4eb1fc3306f4eb081b65fc8b3bdf3e2e21c7478980fa9c13aa70540e8e2b) | `handleOps` | 177,986 | 228,198 | -50,212 | **0** (0.00%) | — | replay costs more | — |  |
