@@ -1,6 +1,6 @@
 # Every transaction analysed, in one place
 
-434 Ethereum mainnet transactions across 44 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Eleven more could not be run at all; they are listed at the end.
+444 Ethereum mainnet transactions across 48 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Eleven more could not be run at all; they are listed at the end.
 
 > ### Revised for the new signature floor — 2026-09-04
 >
@@ -147,6 +147,10 @@ Best and typical figures use only properly measured runs. They exclude the two O
 | protocol | txs | save gas (measured) | best Schnorr | typical win | blockers on the rest |
 |---|---:|---:|---:|---:|---|
 | **ERC-4337 EntryPoint** | 8 | 0 | **0.00%** | — | replay costs more (6); **the two 85.18% / 78.58% rows are now PROVEN artifacts** — `innerHandleOp` is not re-executed on replay (see below) |
+| **Starknet** | 2 | 2 | **74.75%** | 64.51% | — ; `updateStateKzgDA`, **no calls in the program** |
+| **Scroll** | 3 | 2 | **65.44%** | 65.00% | under the floor (1, the non-proof batch commit) |
+| **Polygon zkEVM** | 3 | 3 | **60.95%** | 57.73% | — |
+| **Linea** | 2 | 1 | **54.53%** | 54.53% | replay costs more (1) — its other path delegates verification behind a `CALL` |
 | **Kelp** | 5 | 4 | **83.29%** | 81.72% | replay costs more (1) |
 | **Railgun** | 18 | 15 | **78.72%** | 72.02% | replay costs more (1) |
 | **Renzo** | 2 | 1 | *62.97%* | *62.97%* | replay costs more (1); **label inferred — entry point unidentified, do not quote** |
@@ -1327,6 +1331,16 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | Usual | [`0xb3ecb597…`](https://etherscan.io/tx/0xb3ecb597e3958f099893a21135584caff2b48454c784ebbdfba13e9cc453c3a7) | USUAL `transfer` ✓ `0xa9059cbb` | 63,336 | 62,872 | +464 | **0** (0.00%) | 0 | under the floor | — | +464 again on 17,100 more gas |
 | Usual | [`0x99d5c54e…`](https://etherscan.io/tx/0x99d5c54e48ff8903d021dab183b90b21660de194851f6aca8dfbd27e572a1339) | USUALx `approve` ✓ `0x095ea7b3` | 51,436 | 54,988 | -3,552 | **0** (0.00%) | 0 | replay costs more | — |  |
 | Usual | [`0x3a1b8bd9…`](https://etherscan.io/tx/0x3a1b8bd97e9f6fd1e2b49c493a694363d3a588a03089b34641480abde3436b54) | USUAL `approve` ✓ `0x095ea7b3` | 51,409 | 55,012 | -3,603 | **0** (0.00%) | 0 | replay costs more | — |  |
+| Starknet | [`0xdf208a1e…`](https://etherscan.io/tx/0xdf208a1efd933610f34fc9b758676d5d4de344c7dc86d24e4bca9f8d2f9f66a8) | `updateStateKzgDA` ✓ `0x507ee528` | 430,572 | 58,720 | +371,852 | **321,852** (74.75%) | 0 | — | 5 (3S/2L1) | **no calls in the program at all** — the surplus is pure inline proof verification |
+| Scroll | [`0x5dfe029f…`](https://etherscan.io/tx/0x5dfe029fdd4ef15b6d11614d77f813b759f8ef1ca0650e310ac19d838483facd) | *bundle finalisation* `0xc1aa4e19` | 449,337 | 105,300 | +344,037 | **294,037** (65.44%) | 0 | — | 5 (3S/1C/1L3) | recorded call replays successfully from the rollup contract |
+| Scroll | [`0xf715759f…`](https://etherscan.io/tx/0xf715759fa10020e47c7e43557d14155852eb6312a74c25f9b71cb107e8c945b5) | *bundle finalisation* `0xc1aa4e19` | 455,424 | 111,415 | +344,009 | **294,009** (64.56%) | 0 | — |  |  saving is within 28 gas of the row above |
+| Polygon zkEVM | [`0x23b8eef0…`](https://etherscan.io/tx/0x23b8eef0f5c1c42c6c5f84c94944afcbd1d9de147ba5b3a1353ec99a1842d8dd) | *batch verification* `0x6c766877` | 610,721 | 188,497 | +422,224 | **372,224** (60.95%) | 0 | — | 7 (3S/2C/2L3) | both recorded calls replay successfully |
+| Polygon zkEVM | [`0x287570a8…`](https://etherscan.io/tx/0x287570a8c25d027d8bc8caafc22146ca85c4170f4eb6de29f092917b24d606f4) | *batch verification* `0x6c766877` | 699,367 | 245,325 | +454,042 | **404,042** (57.77%) | 0 | — |  | **largest absolute saving in this file** |
+| Linea | [`0x8acb9674…`](https://etherscan.io/tx/0x8acb967410c2d19c339a78d605f952fb5408a568daa754953eccebe66d65a077) | *proof finalisation* `0x99467a35` | 231,160 | 55,108 | +176,052 | **126,052** (54.53%) | 0 | — |  |  |
+| Polygon zkEVM | [`0x6d0af448…`](https://etherscan.io/tx/0x6d0af448a99d15618509dd4802a00ac07be838bdbe12d5e5f08968315bb033c9) | `verifyBatchesTrustedAggregator` ✓ `0x1489ed10` | 409,069 | 136,260 | +272,809 | **222,809** (54.47%) | 0 | — |  | the confirmed-name proof path |
+| Starknet | [`0x89d7d4a5…`](https://etherscan.io/tx/0x89d7d4a50e86de2334bbdafa0ada3abc673aa66d8ac69c02b83763d0a3ce6eb9) | `updateStateKzgDA` ✓ `0x507ee528` | 542,165 | 198,003 | +344,162 | **294,162** (54.26%) | 0 | — |  | bigger state diff (8 logs) so a lower %, same ~294,000 saving |
+| Linea | [`0x4546019a…`](https://etherscan.io/tx/0x4546019a7733a24736b222e6fc45bfceac2a2c1d8caae4ea99b696dd8d254858) | *finalisation* `0x755bc62f` | 427,765 | 426,122 | +1,643 | **0** (0.00%) | 0 | replay costs more | — | **control** — Linea's other path delegates verification to a separate contract, so it replays whole |
+| Scroll | [`0x6e321015…`](https://etherscan.io/tx/0x6e321015331f46cd0ba90af0262be38d49239d3e3e9f7d6a69068527f81aa1e4) | *batch commit* `0x9bbaa2ba` | 65,955 | 62,212 | +3,743 | **0** (0.00%) | 0 | under the floor | — | **control** — Scroll's non-proof call, no verification to remove |
 
 ## Transactions that could not be measured at all
 

@@ -2122,11 +2122,106 @@ The USUAL token transfer is the tidiest illustration of a constant surplus in th
 
 Usual is the last entry on the 49-protocol longlist.
 
+## L2 proof verification — the result the rest of the survey was missing
+
+Added after the 49-protocol longlist was exhausted, on the reasoning that every strong result in
+this file came from cryptographic verification executed inline in the directly-called contract,
+and that L2 rollups do exactly that on a schedule. **10 measured, 8 saving, best 74.75%** — and
+unlike every other winner in this survey, the volume is structural rather than user-driven.
+
+All five contracts verified on-chain: Starknet Core `0xc662c410…` (6,151 B), zkSync Era Diamond
+`0x32400084…` (4,247 B), Scroll `0xa13BAF47…` (2,206 B), Linea `0xd19d4B5d…` (2,227 B), Polygon
+zkEVM RollupManager `0x5132A183…` (2,112 B).
+
+| L2 | function | gas used | base | saving |
+|---|---|---:|---:|---:|
+| Starknet | `updateStateKzgDA` | 430,572 | 58,720 | **321,852 (74.75%)** |
+| Scroll | *bundle finalisation* `0xc1aa4e19` | 449,337 | 105,300 | **294,037 (65.44%)** |
+| Scroll | *bundle finalisation* `0xc1aa4e19` | 455,424 | 111,415 | **294,009 (64.56%)** |
+| Polygon zkEVM | *batch verification* `0x6c766877` | 610,721 | 188,497 | **372,224 (60.95%)** |
+| Polygon zkEVM | *batch verification* `0x6c766877` | 699,367 | 245,325 | **404,042 (57.77%)** |
+| Linea | *proof finalisation* `0x99467a35` | 231,160 | 55,108 | **126,052 (54.53%)** |
+| Polygon zkEVM | `verifyBatchesTrustedAggregator` | 409,069 | 136,260 | **222,809 (54.47%)** |
+| Starknet | `updateStateKzgDA` | 542,165 | 198,003 | **294,162 (54.26%)** |
+| Linea | *finalisation* `0x755bc62f` | 427,765 | 426,122 | 0 |
+| Scroll | *batch commit* `0x9bbaa2ba` | 65,955 | 62,212 | 0 |
+
+**The saving is the same size everywhere — roughly 294,000 to 404,000 gas** — because it is the
+same elliptic-curve verification work regardless of which rollup runs it. The percentage varies
+only with how much bookkeeping each transaction carries alongside it.
+
+### These were checked for the EntryPoint artifact, and they are not it
+
+A base of 58,720 against 430,572 gas has exactly the shape of the two ERC-4337 rows that turned
+out to be replay artifacts, so the same test was applied before publishing:
+
+- **Starknet's program contains no calls at all** — three `Store`s and two `Log1`s. There is
+  nothing that can silently fail on replay, so the 371,852-gas surplus is inline verification by
+  construction.
+- **Scroll's and Polygon's recorded calls replay successfully.** They revert from a foreign
+  sender, as any access-controlled call would, but succeed when replayed from the rollup contract
+  itself, which is the context the handler uses. Their cost is therefore inside base.
+- The original inner call in each is a **`DELEGATECALL`** to the implementation, which the encoder
+  follows, so the implementation's state changes are recorded and attributed correctly.
+
+### The two zeroes are the controls that make the result trustworthy
+
+Scroll's `0x9bbaa2ba` — its batch *commitment*, equally frequent at 15.6/day — saves **nothing**
+(65,955 gas, base 62,212). And Linea runs both shapes: its `0x99467a35` saves 54.53% while its
+`0x755bc62f` saves nothing, because that path delegates verification to a separate contract and
+the call is replayed whole. **Within a single protocol, the inline path saves and the delegated
+path does not.** That is the survey's central claim, demonstrated twice inside one rollup.
+
+### zkSync is the exception
+
+zkSync Era has the highest traffic of the five — 205.8/day — and **no direct entry point at all**
+in the window. Every transaction arrives through an operator contract, so its proving scores as
+the caller, not as zkSync. Same structural position as Grove. No rows are recorded for it.
+
+### What it is worth
+
+Exact per-selector counts over a 7-day window, not extrapolated from a sample:
+
+| L2 | function | tx/day | gas saved each | gas/month | $/month | at 20 gwei |
+|---|---|---:|---:|---:|---:|---:|
+| Starknet | `updateStateKzgDA` | 40.3 | 308,007 | 372,380,463 | **$242** | $18,430 |
+| Scroll | `0xc1aa4e19` | 15.6 | 294,023 | 137,602,764 | **$703** | $6,810 |
+| Polygon zkEVM | `0x6c766877` | 29.4 | 388,133 | 342,333,306 | **$53** | $16,943 |
+| Polygon zkEVM | `verifyBatchesTrustedAggregator` | 19.6 | 222,809 | 131,011,692 | **$20** | $6,484 |
+| Linea | `0x99467a35` | 7.2 | 126,052 | 27,227,232 | **$21** | $1,348 |
+| | **total** | | | **1,010,555,457** | **$1,039** | **$50,016** |
+
+ETH/USD 2,474.68, each row priced at the gas price those transactions actually paid.
+
+**This is 40% again of what the entire 49-protocol longlist produced ($2,600/month), from four
+protocols found in an afternoon.** Scroll alone is worth $703/month — second only to Aave — and it
+gets there on 15.6 transactions a day rather than 555, because it pays 2.064 gwei while everything
+else in this survey pays 0.1–0.4.
+
+### Why this breaks the survey's own pattern
+
+Every other section of this file ends the same way: a good percentage attached to negligible
+volume. These do not, for three reasons.
+
+1. **The work is proof verification**, which is the most compute-dense thing anyone does on
+   mainnet, so the absolute saving is 300,000–400,000 gas rather than 20,000–70,000.
+2. **The volume is a protocol requirement, not user demand.** Rollups must post proofs to stay
+   live. Rocket Pool's 4.39 deposits/day depend on people choosing to deposit; Starknet's 40.3
+   state updates/day do not.
+3. **They pay real gas prices.** Scroll's proofs paid 2.064 gwei against the 0.128–0.443 gwei
+   typical elsewhere in this file, so the same gas saved is worth an order of magnitude more.
+
+The one caveat is that these are the protocols the longlist classified as *peers* rather than
+customers — the ZK infrastructure group. That classification looks wrong on this evidence: a
+rollup posting proofs is a gas consumer like any other, and by this measurement it is the largest
+one identified in the survey.
+
 ## What this is actually worth in dollars
 
 Every figure above is a percentage. Percentages were the wrong unit, and this section is
 the correction. **At the gas prices prevailing when this was measured, the entire
-opportunity across the three best protocols is roughly $2,600 per month.**
+opportunity is roughly $3,650 per month — $2,600 of it from the 49-protocol longlist and
+$1,039 from four L2 proof-verification contracts added afterwards.**
 
 Measured 2026-09-02. Mainnet base fee was **0.15–0.35 gwei**, with blocks running
 11–42M gas against a 60M limit — abundant spare capacity, so gas is nearly free.
@@ -2136,8 +2231,17 @@ ETH/USD $2,386, read from the Chainlink aggregator on-chain.
 |---|---:|---:|---:|---:|---:|
 | Aave V3 | 59.61% | 555 | 107,000 | **$1,392** | $84,986 |
 | Railgun | 78.72% | 106 | 854,737 | **$876** | $130,162 |
+| **Scroll** | **65.44%** | **15.6** | **294,023** | **$703** | **$6,810** |
+| **Starknet** | **74.75%** | **40.3** | **308,007** | **$242** | **$18,430** |
+| **Polygon zkEVM** | **60.95%** | **49.0** | ~310,000 | **$73** | **$23,427** |
+| **Linea** | **54.53%** | **7.2** | **126,052** | **$21** | **$1,348** |
 | Pyth | 28.01% | 29 | 54,614 | **$12** | $2,245 |
-| | | | | **~$2,600** | **~$239,000** |
+| | | | | **~$3,650** | **~$289,000** |
+
+**The four L2 rows were added after the longlist was exhausted and are worth $1,039/month between
+them — 40% again of everything the 49-protocol longlist produced.** They are also the only rows
+here whose volume is a protocol requirement rather than user demand, and the only ones paying more
+than half a gwei. See the L2 proof verification section above.
 
 Note how the ranking inverts. Railgun has the best percentage by a wide margin and saves
 *less money* than Aave, because Aave qualifies 5x more transactions per day. And Pyth —
