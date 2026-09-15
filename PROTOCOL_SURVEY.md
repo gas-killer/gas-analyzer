@@ -2126,7 +2126,7 @@ Usual is the last entry on the 49-protocol longlist.
 
 Added after the 49-protocol longlist was exhausted, on the reasoning that every strong result in
 this file came from cryptographic verification executed inline in the directly-called contract,
-and that L2 rollups do exactly that on a schedule. **10 measured, 8 saving, best 74.75%** — and
+and that L2 rollups do exactly that on a schedule. **16 measured, 14 saving, best 74.76%** — and
 unlike every other winner in this survey, the volume is structural rather than user-driven.
 
 All five contracts verified on-chain: Starknet Core `0xc662c410…` (6,151 B), zkSync Era Diamond
@@ -2146,9 +2146,20 @@ zkEVM RollupManager `0x5132A183…` (2,112 B).
 | Linea | *finalisation* `0x755bc62f` | 427,765 | 426,122 | 0 |
 | Scroll | *batch commit* `0x9bbaa2ba` | 65,955 | 62,212 | 0 |
 
-**The saving is the same size everywhere — roughly 294,000 to 404,000 gas** — because it is the
-same elliptic-curve verification work regardless of which rollup runs it. The percentage varies
-only with how much bookkeeping each transaction carries alongside it.
+**Each L2's base estimate is fixed, and the saving follows from it.** 16 measurements across four
+rollups establish the structure:
+
+| L2 | base | consequence |
+|---|---|---|
+| Starknet | **fixed at ~58,700** over a 2.1x gas range (58,648 / 58,672 / 58,720) | saving scales with gas — 152,421 at its smallest call, 321,864 at its largest |
+| Scroll | fixed at 105,300 | saving pinned at ~294,000; three wins within 108 gas of each other |
+| Linea | fixed at ~55,090 | saving pinned at ~126,046; its 50 calls span just 72 gas end to end |
+| Polygon zkEVM | varies with log count (96,477 / 188,497 / ~247,000) | two clusters, ~372,230 and ~404,048 |
+
+An earlier version of this section said the saving was constant everywhere. That was wrong for
+Starknet: because its base is fixed, its saving tracks transaction size, and its smallest call
+saves 152,421 rather than ~294,000. The dollar table below is computed per transaction over the
+whole window, so it is unaffected.
 
 ### These were checked for the EntryPoint artifact, and they are not it
 
@@ -2182,16 +2193,20 @@ the caller, not as zkSync. Same structural position as Grove. No rows are record
 
 Exact per-selector counts over a 7-day window, not extrapolated from a sample:
 
-| L2 | function | tx/day | gas saved each | gas/month | $/month | at 20 gwei |
-|---|---|---:|---:|---:|---:|---:|
-| Starknet | `updateStateKzgDA` | 40.3 | 308,007 | 372,380,463 | **$242** | $18,430 |
-| Scroll | `0xc1aa4e19` | 15.6 | 294,023 | 137,602,764 | **$703** | $6,810 |
-| Polygon zkEVM | `0x6c766877` | 29.4 | 388,133 | 342,333,306 | **$53** | $16,943 |
-| Polygon zkEVM | `verifyBatchesTrustedAggregator` | 19.6 | 222,809 | 131,011,692 | **$20** | $6,484 |
-| Linea | `0x99467a35` | 7.2 | 126,052 | 27,227,232 | **$21** | $1,348 |
-| | **total** | | | **1,010,555,457** | **$1,039** | **$50,016** |
+| L2 | function | n | tx/day | mean gas | mean saving | gas/month | $/month | at 20 gwei |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Starknet | `updateStateKzgDA` | 283 | 40.8 | 415,242 | 306,542 | 374,766,528 | **$244** | $18,549 |
+| Scroll | `0xc1aa4e19` | 108 | 15.6 | 450,552 | 295,252 | 137,752,540 | **$703** | $6,818 |
+| Polygon zkEVM | `0x6c766877` | 203 | 29.2 | 635,422 | 409,026 | 358,699,108 | **$55** | $17,753 |
+| Polygon zkEVM | `verifyBatchesTrustedAggregator` | 135 | 19.4 | 430,384 | 244,124 | 142,373,277 | **$22** | $7,047 |
+| Linea | `0x99467a35` | 50 | 7.2 | 231,156 | 126,066 | 27,230,291 | **$21** | $1,348 |
+| | **total** | **779** | | | | **1,040,821,744** | **$1,046** | **$51,514** |
 
-ETH/USD 2,474.68, each row priced at the gas price those transactions actually paid.
+ETH/USD 2,474.68, each row priced at the gas price those transactions actually paid. **These are
+computed over every qualifying transaction in the window — all 779 — not extrapolated from a
+sample**: saving is `gas - base - 50,000` per transaction, using the base each L2's measurements
+established. An earlier version of this table used a two-sample mean and gave $1,039/$50,016; the
+distributions are tight enough that it was within 1%.
 
 **This is 40% again of what the entire 49-protocol longlist produced ($2,600/month), from four
 protocols found in an afternoon.** Scroll alone is worth $703/month — second only to Aave — and it
@@ -2231,14 +2246,14 @@ ETH/USD $2,386, read from the Chainlink aggregator on-chain.
 |---|---:|---:|---:|---:|---:|
 | Aave V3 | 59.61% | 555 | 107,000 | **$1,392** | $84,986 |
 | Railgun | 78.72% | 106 | 854,737 | **$876** | $130,162 |
-| **Scroll** | **65.44%** | **15.6** | **294,023** | **$703** | **$6,810** |
-| **Starknet** | **74.75%** | **40.3** | **308,007** | **$242** | **$18,430** |
-| **Polygon zkEVM** | **60.95%** | **49.0** | ~310,000 | **$73** | **$23,427** |
-| **Linea** | **54.53%** | **7.2** | **126,052** | **$21** | **$1,348** |
+| **Scroll** | **65.44%** | **15.6** | **295,252** | **$703** | **$6,818** |
+| **Starknet** | **74.76%** | **40.8** | **306,542** | **$244** | **$18,549** |
+| **Polygon zkEVM** | **71.76%** | **48.6** | ~350,000 | **$77** | **$24,800** |
+| **Linea** | **54.54%** | **7.2** | **126,066** | **$21** | **$1,348** |
 | Pyth | 28.01% | 29 | 54,614 | **$12** | $2,245 |
-| | | | | **~$3,650** | **~$289,000** |
+| | | | | **~$3,650** | **~$291,000** |
 
-**The four L2 rows were added after the longlist was exhausted and are worth $1,039/month between
+**The four L2 rows were added after the longlist was exhausted and are worth $1,046/month between
 them — 40% again of everything the 49-protocol longlist produced.** They are also the only rows
 here whose volume is a protocol requirement rather than user demand, and the only ones paying more
 than half a gwei. See the L2 proof verification section above.

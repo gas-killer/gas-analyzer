@@ -1,6 +1,6 @@
 # Every transaction analysed, in one place
 
-444 Ethereum mainnet transactions across 48 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Eleven more could not be run at all; they are listed at the end.
+450 Ethereum mainnet transactions across 48 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Eleven more could not be run at all; they are listed at the end.
 
 > ### Revised for the new signature floor — 2026-09-04
 >
@@ -147,10 +147,10 @@ Best and typical figures use only properly measured runs. They exclude the two O
 | protocol | txs | save gas (measured) | best Schnorr | typical win | blockers on the rest |
 |---|---:|---:|---:|---:|---|
 | **ERC-4337 EntryPoint** | 8 | 0 | **0.00%** | — | replay costs more (6); **the two 85.18% / 78.58% rows are now PROVEN artifacts** — `innerHandleOp` is not re-executed on replay (see below) |
-| **Starknet** | 2 | 2 | **74.75%** | 64.51% | — ; `updateStateKzgDA`, **no calls in the program** |
-| **Scroll** | 3 | 2 | **65.44%** | 65.00% | under the floor (1, the non-proof batch commit) |
-| **Polygon zkEVM** | 3 | 3 | **60.95%** | 57.73% | — |
-| **Linea** | 2 | 1 | **54.53%** | 54.53% | replay costs more (1) — its other path delegates verification behind a `CALL` |
+| **Starknet** | 4 | 4 | **74.76%** | 65.54% | — ; `updateStateKzgDA`, **no calls in the program**; base fixed at ~58,700 so the saving scales with gas |
+| **Scroll** | 4 | 3 | **65.44%** | 65.14% | under the floor (1, the non-proof batch commit); 3 wins within 108 gas of each other |
+| **Polygon zkEVM** | 5 | 5 | **71.76%** | 60.50% | — ; savings fall into two clusters, ~372,230 and ~404,048 |
+| **Linea** | 3 | 2 | **54.54%** | 54.54% | replay costs more (1) — its other path delegates verification behind a `CALL` |
 | **Kelp** | 5 | 4 | **83.29%** | 81.72% | replay costs more (1) |
 | **Railgun** | 18 | 15 | **78.72%** | 72.02% | replay costs more (1) |
 | **Renzo** | 2 | 1 | *62.97%* | *62.97%* | replay costs more (1); **label inferred — entry point unidentified, do not quote** |
@@ -1341,6 +1341,12 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | Starknet | [`0x89d7d4a5…`](https://etherscan.io/tx/0x89d7d4a50e86de2334bbdafa0ada3abc673aa66d8ac69c02b83763d0a3ce6eb9) | `updateStateKzgDA` ✓ `0x507ee528` | 542,165 | 198,003 | +344,162 | **294,162** (54.26%) | 0 | — |  | bigger state diff (8 logs) so a lower %, same ~294,000 saving |
 | Linea | [`0x4546019a…`](https://etherscan.io/tx/0x4546019a7733a24736b222e6fc45bfceac2a2c1d8caae4ea99b696dd8d254858) | *finalisation* `0x755bc62f` | 427,765 | 426,122 | +1,643 | **0** (0.00%) | 0 | replay costs more | — | **control** — Linea's other path delegates verification to a separate contract, so it replays whole |
 | Scroll | [`0x6e321015…`](https://etherscan.io/tx/0x6e321015331f46cd0ba90af0262be38d49239d3e3e9f7d6a69068527f81aa1e4) | *batch commit* `0x9bbaa2ba` | 65,955 | 62,212 | +3,743 | **0** (0.00%) | 0 | under the floor | — | **control** — Scroll's non-proof call, no verification to remove |
+| Polygon zkEVM | [`0x5d45dec8…`](https://etherscan.io/tx/0x5d45dec824732cb577de414b76596943f90ac8171f2aa7560abf512deed70045) | *batch verification* `0x6c766877` | 518,713 | 96,477 | +422,236 | **372,236** (71.76%) | 0 | — | — | its **smallest** sampled transaction, and its best percentage |
+| Starknet | [`0xe04e714d…`](https://etherscan.io/tx/0xe04e714d933ecadcda0e76dd740aa2d0ad0c0a2e1fb867bd504e56f4424fcc15) | `updateStateKzgDA` ✓ `0x507ee528` | 430,536 | 58,672 | +371,864 | **321,864** (74.76%) | 0 | — | — |  |
+| Scroll | [`0x22912e89…`](https://etherscan.io/tx/0x22912e89717c67196197e392fed4903f6389fa36507bd9e7b4a71c3b273dedf6) | *bundle finalisation* `0xc1aa4e19` | 449,229 | 105,300 | +343,929 | **293,929** (65.43%) | 0 | — | — | same base as the other two rows to the gas |
+| Starknet | [`0xa9c4f70f…`](https://etherscan.io/tx/0xa9c4f70f98f57dbef8b36fce15f1b0d056ac46d8b2e0cb6fc898a11c20347c37) | `updateStateKzgDA` ✓ `0x507ee528` | 261,069 | 58,648 | +202,421 | **152,421** (58.38%) | 0 | — | — | the **smallest** Starknet call; base unchanged, so the saving scales with gas |
+| Polygon zkEVM | [`0x4796a155…`](https://etherscan.io/tx/0x4796a155edc6c34003daedfb132057155cc5f62fe1d4fd50258eb1c6cbf59fb7) | *batch verification* `0x6c766877` | 702,121 | 248,067 | +454,054 | **404,054** (57.55%) | 0 | — | — |  |
+| Linea | [`0xd07acdd6…`](https://etherscan.io/tx/0xd07acdd612e95f7d4aedfa893d92c06c0f9d6261632fc67490a93c4a2b1ce834) | *proof finalisation* `0x99467a35` | 231,112 | 55,072 | +176,040 | **126,040** (54.54%) | 0 | — | — | Linea's 50 calls span just 72 gas end to end |
 
 ## Transactions that could not be measured at all
 
