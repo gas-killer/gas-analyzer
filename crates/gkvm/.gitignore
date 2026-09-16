@@ -1,0 +1,3 @@
+guest/build/
+guest/hello-rs/target/
+guest/hello-rs/Cargo.lock

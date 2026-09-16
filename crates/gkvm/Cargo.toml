@@ -1,0 +1,47 @@
+[package]
+name = "gas-analyzer-gkvm"
+version = "0.1.0"
+edition = "2024"
+
+# UNBOUNDED_V3 guest VM: deterministic execution of riscv64im guest ELFs under
+# SP1's executor lineage, with pinned cycle metering (see src/constants.rs and
+# src/examples/onchain-llm/UNBOUNDED_V3_NATIVE.md in solidity-sdk).
+#
+# Deliberately NOT in the workspace default-members: the SP1 dependency tree
+# (sp1-hypercube and friends) is heavy, and nothing in the default build path
+# needs it until the M3 precompile provider lands in evmsketch.
+
+[dependencies]
+# CONSENSUS-CRITICAL PIN — do not bump casually. The guest cycle model
+# (instruction counting), the rv64im ISA semantics, the ELF loading rules and
+# the hostcall surface all live in this crate. Every operator, the analyzer and
+# the SP1 dispute guest must agree on them bit-for-bit; a version bump is a
+# coordinated GKVM_SPEC_VERSION change rolled out fleet-wide (same doctrine as
+# `revm = "=31.0.2"` in evmsketch — see UNBOUNDED_V3_NATIVE.md § Metering).
+# sp1-jit and sp1-primitives are transitive deps of the executor; they are
+# exact-pinned here too so a lockfile regeneration cannot drift them within
+# the ^6.8.0 ranges sp1-core-executor itself declares.
+sp1-core-executor = "=6.8.0"
+sp1-jit = "=6.8.0"
+sp1-primitives = "=6.8.0"
+
+alloy-primitives = "1.0.37"
+thiserror = "2.0.17"
+memmap2 = "0.9.10"
+serde_json = "1.0"
+hex = "0.4"
+tracing = "0.1"
+
+# CLI boundary only (bin/gk-run); library code uses thiserror error types.
+anyhow = "1.0.98"
+
+[features]
+# Force SP1's portable (pure-Rust interpreter) executor instead of the x86_64
+# native JIT. `sp1-core-executor`'s build script selects the JIT only when the
+# `profiling` and `mprotect` features are both OFF (see its src/build.rs); of
+# the two forcing levers, `mprotect` is chosen because `profiling` drags in
+# profiler dependencies and rewires guest stdout handling. One compiled binary
+# is one tier — `GK_GUEST_EXEC=interp` runs a binary built with this feature,
+# `jit` runs the default build — and M1's differential matrix exists to prove
+# the two tiers produce identical outputs and instruction counts.
+portable-exec = ["sp1-core-executor/mprotect"]
