@@ -6,6 +6,7 @@ members = [
     "crates/core",
     "crates/evmsketch",
     "crates/gas-estimator",
+    "crates/gkvm",
     "crates/rpc",
     "crates/wasm",
 ]

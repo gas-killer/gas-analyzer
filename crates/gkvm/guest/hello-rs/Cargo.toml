@@ -1,0 +1,19 @@
+# hello-rs: the Rust twin of guest/hello/hello.c, built with the succinct
+# rustup toolchain for riscv64im-succinct-zkvm-elf. Deliberately outside the
+# analyzer workspace (guest target, guest toolchain, own tiny lockfile).
+[package]
+name = "gkvm-hello-rs"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "hello-rs"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+codegen-units = 1
