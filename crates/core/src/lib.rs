@@ -6,6 +6,7 @@
 
 pub mod constants;
 pub mod encoding;
+pub mod gkvm;
 pub mod heuristic;
 pub mod overlay;
 pub mod prestate;

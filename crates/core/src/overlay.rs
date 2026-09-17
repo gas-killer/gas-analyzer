@@ -183,14 +183,21 @@ pub fn env_commitment(
     pre.extend_from_slice(&block_gas_limit.to_be_bytes());
     pre.extend_from_slice(&tx_gas_limit.to_be_bytes());
     if let Some(env) = overlay {
-        pre.extend_from_slice(env.manifest.as_slice());
-        pre.extend_from_slice(&(env.overlays.len() as u64).to_be_bytes());
-        for o in &env.overlays {
-            pre.extend_from_slice(o.address.as_slice());
-            pre.extend_from_slice(keccak256(&o.code).as_slice());
-        }
+        extend_overlay_segment(&mut pre, env);
     }
     keccak256(pre)
+}
+
+/// Append the overlay segment of the env-commitment preimage:
+/// `manifest || n_be || (address || keccak(code)) * n`, overlays in chunk
+/// order. Shared verbatim by the V2 arm above and `gkvm::env_commitment_v3`.
+pub(crate) fn extend_overlay_segment(pre: &mut Vec<u8>, env: &OverlayEnv) {
+    pre.extend_from_slice(env.manifest.as_slice());
+    pre.extend_from_slice(&(env.overlays.len() as u64).to_be_bytes());
+    for o in &env.overlays {
+        pre.extend_from_slice(o.address.as_slice());
+        pre.extend_from_slice(keccak256(&o.code).as_slice());
+    }
 }
 
 #[cfg(test)]
@@ -258,6 +265,31 @@ mod tests {
         assert_eq!(
             OverlayEnv::from_blobs(b"", b"tok").unwrap_err(),
             OverlayError::EmptyBlob
+        );
+    }
+
+    /// The V2 preimage assembled by hand, independent of
+    /// `extend_overlay_segment` (which `gkvm::env_commitment_v3` shares).
+    #[test]
+    fn env_commitment_v2_layout_is_pinned() {
+        let env = OverlayEnv::from_blobs(b"weights", b"tok").unwrap();
+        let mut pre = b"gaskiller.env.unbounded.v2".to_vec();
+        pre.extend_from_slice(&UNBOUNDED_V1_BLOCK_GAS_LIMIT.to_be_bytes());
+        pre.extend_from_slice(&UNBOUNDED_V1_TX_GAS_LIMIT.to_be_bytes());
+        pre.extend_from_slice(env.manifest.as_slice());
+        pre.extend_from_slice(&2u64.to_be_bytes());
+        for o in &env.overlays {
+            pre.extend_from_slice(o.address.as_slice());
+            pre.extend_from_slice(keccak256(&o.code).as_slice());
+        }
+        assert_eq!(env.overlays.len(), 2);
+        assert_eq!(
+            env_commitment(
+                UNBOUNDED_V1_BLOCK_GAS_LIMIT,
+                UNBOUNDED_V1_TX_GAS_LIMIT,
+                Some(&env)
+            ),
+            keccak256(pre)
         );
     }
 
