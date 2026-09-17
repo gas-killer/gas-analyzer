@@ -12,7 +12,10 @@
 //! Exit codes map the runner's outcome split so a shim can react without
 //! parsing: 0 success, 10 guest trap, 11 out of cycles, 12 input overflow,
 //! 13 output overflow, 2 environment/executor error (the abstain class),
-//! 3 usage error. A one-line JSON report always goes to stderr — cycles, gas,
+//! 3 usage error. The typed failures keep the one-hex-line discipline so a
+//! shim can rebuild the exact revert data: a trap prints `code (u32 BE) ||
+//! data`, out of cycles prints `used (u64 BE) || limit (u64 BE)`; every other
+//! failure prints nothing. A one-line JSON report always goes to stderr — cycles, gas,
 //! tier, wall time — which is what the M1 matrix and throughput runs consume.
 
 use alloy_primitives::{B256, keccak256};
@@ -229,10 +232,16 @@ fn main_inner() -> Result<ExitCode> {
                 "gk-run: guest trap {code:#010x}: {}",
                 String::from_utf8_lossy(&data)
             );
+            println!("0x{}{}", hex::encode(code.to_be_bytes()), hex::encode(data));
             ExitCode::from(EXIT_TRAP)
         }
         GkVmOutcome::OutOfCycles { used, limit } => {
             eprintln!("gk-run: out of cycles ({used} used, {limit} allowed)");
+            println!(
+                "0x{}{}",
+                hex::encode(used.to_be_bytes()),
+                hex::encode(limit.to_be_bytes())
+            );
             ExitCode::from(EXIT_OUT_OF_CYCLES)
         }
         GkVmOutcome::InputOverflow => {
