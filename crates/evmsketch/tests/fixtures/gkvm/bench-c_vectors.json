@@ -1,0 +1,39 @@
+{
+ "name": "bench-c",
+ "programHash": "0x96d62064c1d4bebccaf9eca17215223900ad538e7987563ce5976f4d06cc9784",
+ "artifactRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+ "vectors": [
+  {
+   "input": "0x0000000000000000",
+   "exit": 0,
+   "outcome": "ok",
+   "stdout": "0x9e3779b97f4a7c15",
+   "cycles": 157,
+   "gasUsed": 40
+  },
+  {
+   "input": "0x00000000000f4240",
+   "exit": 0,
+   "outcome": "ok",
+   "stdout": "0x3e746a84b0b86f03",
+   "cycles": 8000157,
+   "gasUsed": 2000040
+  },
+  {
+   "input": "0x01",
+   "exit": 10,
+   "outcome": "trap",
+   "stdout": "0x0000000162656e63682077616e747320612075363420424520697465726174696f6e20636f756e74",
+   "cycles": 99,
+   "gasUsed": 25
+  },
+  {
+   "input": "0x",
+   "exit": 10,
+   "outcome": "trap",
+   "stdout": "0x0000000162656e63682077616e747320612075363420424520697465726174696f6e20636f756e74",
+   "cycles": 99,
+   "gasUsed": 25
+  }
+ ]
+}

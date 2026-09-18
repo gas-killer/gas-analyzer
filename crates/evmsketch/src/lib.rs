@@ -3131,4 +3131,10 @@ mod tests {
             rpc_elapsed.as_secs_f64() / local_elapsed.as_secs_f64().max(f64::EPSILON)
         );
     }
+
+    // ========================================================================
+    // UNBOUNDED_V3 — ffi ≡ precompile differential (src/tests/gkvm_parity.rs)
+    // ========================================================================
+
+    mod gkvm_parity;
 }
