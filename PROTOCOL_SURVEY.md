@@ -2231,11 +2231,102 @@ customers — the ZK infrastructure group. That classification looks wrong on th
 rollup posting proofs is a gas consumer like any other, and by this measurement it is the largest
 one identified in the survey.
 
+## Doppler — the largest transactions in the survey, and almost none of it removable
+
+Added 2026-09-18, after the longlist and the L2s. Doppler is Whetstone Research's liquidity
+bootstrapping protocol on Uniswap v4. **18 transactions measured, 4 winning, best 13.73%.**
+
+It was worth checking for one reason: `Airlock.create` is the **largest directly-callable
+transaction found anywhere in this survey** — 3.1M gas at the median, 14.6M at the top, against
+Aave's ~180k. Every other high-gas target in the survey turned out to be unreachable behind a
+router. This one is called straight from an EOA.
+
+### The three reachable functions
+
+Contracts resolved from Doppler's own published deployment list and confirmed on-chain by
+codesize; all three selectors verified by hashing the signature against the contract source, not
+by lookup.
+
+| function | contract | n (2M blocks) | median gas | tx/day (30d) |
+|---|---|---:|---:|---:|
+| `create` `0x882db707` | Airlock `0xde3599a2…` | 40 | 3,088,997 | 0.63 |
+| `collectFees(bytes32)` `0x817db73b` | DopplerHookInitializer `0xbdf93814…` | 20 | 742,318 | 0.53 |
+| `migrate(address)` `0xce5494bb` | Airlock `0xde3599a2…` | 3 | 1,514,716 | **0 — dead** |
+
+`migrate` has had no calls in 30 days; all three were one burst months ago. It measured anyway,
+and measured negative (−13,421 to −18,475), so nothing rests on it.
+
+### `Airlock.create` — the constant-surplus signature at maximum scale
+
+**Ten transactions from 2,268,794 to 14,565,475 gas. Surplus on every one of them: between
+−7,377 and +11,729.**
+
+That is the orchestration signature already recorded for Grove, Centrifuge (~9,000), UMA and
+Usual — a fixed dispatch cost independent of transaction size — except here the ratio is
+extreme. A 14.6M-gas transaction yields 11,729 gas of removable work, or **0.08%**.
+
+The reason is visible in the call tree: `create` deploys the token, governance, timelock and pool
+by calling out to a token factory, a governance factory and a pool initializer. Every one of
+those is a regular `CALL`, which the analyzer keeps whole and re-executes. Airlock's own
+contribution is parameter marshalling and a handful of storage writes. **The transaction is
+enormous; the part of it that belongs to the contract you are calling is not.**
+
+These ten are `heur` rows — the RPC rate-limited the state prefetch on all ten, and four retries
+each did not clear it. Normally that would disqualify them. It does not here, and this is the one
+place in the survey where a heuristic row settles a question: **the heuristic understates base
+and therefore overstates surplus.** That was confirmed again on this very run — `0xa031529c…`
+first fell back to a heuristic base of 237,986 and later measured at 276,506, understated by
+38,520. So 8,000–12,000 is an *upper bound* on `create`'s surplus, and the floor is 50,000. The
+conclusion is safe in the direction the error runs.
+
+### `collectFees` — the one that clears, and it is not an artifact
+
+Four of five clear the floor: **13.73%, 5.81%, 3.07%, 1.66%**, with the fifth missing by 1,302 gas.
+
+Every one of these carries the tool's re-entrancy warning — *"a callee re-entered the target
+contract during execution"* — which is precisely the shape that produced the two **proven**
+ERC-4337 artifacts on 2026-09-14. The pattern here is the Uniswap v4 unlock dance:
+
+```
+collectFees(bytes32)                     913,547
+  └ PoolManager.unlock(bytes)            651,084
+      └ hook.unlockCallback(bytes)       648,314
+          └ PoolManager.modifyLiquidity  8 × ~18,000
+```
+
+So they were checked before being counted. The ERC-4337 artifact had a recorded inner call that
+**reverted cheaply on replay** and was swallowed by the contract, collapsing the base far below
+the call's live cost. The opposite happens here. On all five rows the measured base **exceeds**
+the live gas of the re-executed outer call, by 87,015 / 218,539 / 93,893 / 184,671 / 176,147, and
+no top-level call reverted. The `unlock` call is re-executed at full price; the saving is the
+hook's own accounting either side of it. **Real.**
+
+### What it is worth
+
+0.53 `collectFees` per day, four in five qualifying, 61,439 gas mean saving:
+
+| | qualifying txs/day | mean saving | gas/month | **$/month** | at 20 gwei |
+|---|---:|---:|---:|---:|---:|
+| Doppler `collectFees` | 0.42 | 61,439 | 781,504 | **$0.17** | **$37** |
+
+At the 0.093 gwei these transactions actually paid, **seventeen cents a month.** At 20 gwei, $37.
+
+### Verdict
+
+**Not a candidate.** Doppler inverts the usual failure mode and still fails. Everywhere else in
+this survey the problem was that the interesting work sat behind a `CALL` in someone else's
+contract. Here the protocol is directly callable, the transactions are the biggest measured, and
+the work is *still* behind calls — because launching a token is by construction a sequence of
+calls to other contracts. Size of transaction predicts nothing. It is the third distinct way a
+protocol can have huge gas and no removable gas, after Sky (routed) and Euler (mandatory router).
+
+The one bright spot, `collectFees`, is real but runs half a time a day.
+
 ## What this is actually worth in dollars
 
 Every figure above is a percentage. Percentages were the wrong unit, and this section is
 the correction. **At the gas prices prevailing when this was measured, the entire
-opportunity is roughly $3,650 per month — $2,600 of it from the 49-protocol longlist and
+opportunity is roughly $3,650 per month (Doppler, added later, adds 17 cents) — $2,600 of it from the 49-protocol longlist and
 $1,039 from four L2 proof-verification contracts added afterwards.**
 
 Measured 2026-09-02. Mainnet base fee was **0.15–0.35 gwei**, with blocks running
