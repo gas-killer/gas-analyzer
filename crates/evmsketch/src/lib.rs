@@ -107,9 +107,11 @@ fn gnosis_hardforks() -> EthereumChainHardforks {
     ])
 }
 
+pub mod gkvm_precompile;
 pub mod local_exec;
 pub mod overlay_mount;
 pub mod simple_rpc_db;
+pub use gkvm_precompile::{GkvmHost, GkvmHostError, GkvmPrecompiles};
 pub use local_exec::{LocalBlockEnv, LocalStateCache};
 pub use overlay_mount::{OverlayMount, OverlayMountSet, OverlayStateDb};
 use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
@@ -1268,6 +1270,13 @@ async fn call_to_encoded_state_updates_local_with_mounts(
     let block_env = LocalBlockEnv::from_executor(&executor);
     let backend = state_cache.backend_for(rpc_url, block_number, executor.sketch.provider.clone());
 
+    // The V3 axis rides the same funnel as the overlay mounts: whatever guest
+    // host the cache carries is what every pass of this call resolves
+    // `GKVM_ADDRESS` through.
+    let mounts = local_exec::ExecMounts {
+        overlay: mounts,
+        gkvm: state_cache.gkvm_host(),
+    };
     let (state_updates, skipped_opcodes) = local_exec::extract_state_updates_local(
         backend,
         mounts,
