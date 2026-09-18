@@ -5,9 +5,17 @@
 //! ```text
 //! gk-run --program guest.elf --program-hash 0x… --input 0x…|@file
 //!        [--artifact blob[,blob…] --artifact-root 0x…]
-//!        [--schedule kind:page,kind:page,…]
+//!        [--schedule kind:page,kind:page,…|sequential]
 //!        [--cycle-limit N] [--deadline-secs N] [--print-tier]
+//! gk-run --print-artifact-root --artifact blob[,blob…]
 //! ```
+//!
+//! `--schedule sequential` serves the whole bundle front to back (every page
+//! of kind 0, then kind 1, …) — the load order of guests that read their
+//! artifacts once, like `qwen`, whose schedule would not fit on argv.
+//! `--print-artifact-root` runs nothing: it prints the manifest-v3 root of the
+//! given files as the one hex line (re-manifesting a V2 bundle: same bytes,
+//! new root).
 //!
 //! Exit codes map the runner's outcome split so a shim can react without
 //! parsing: 0 success, 10 guest trap, 11 out of cycles, 12 input overflow,
@@ -21,7 +29,9 @@
 use alloy_primitives::{B256, keccak256};
 use anyhow::{Context, Result, anyhow, bail};
 use gas_analyzer_gkvm::{
-    ArtifactMountV3, EXEC_TIER, GkVmJob, GkVmOutcome, GkVmReport, LoadedGuestProgram, run,
+    ArtifactMountV3, EXEC_TIER, GkVmJob, GkVmOutcome, GkVmReport, LoadedGuestProgram,
+    manifest::{ArtifactFileManifest, artifact_root},
+    run,
 };
 use std::{path::Path, process::ExitCode, time::Duration};
 
@@ -39,9 +49,11 @@ struct Args {
     artifact: Vec<String>,
     artifact_root: Option<B256>,
     schedule: Vec<(u32, u64)>,
+    schedule_sequential: bool,
     cycle_limit: u64,
     deadline: Option<Duration>,
     print_tier: bool,
+    print_artifact_root: bool,
 }
 
 fn parse_hex32(value: &str, flag: &str) -> Result<B256> {
@@ -59,11 +71,13 @@ fn parse_args() -> Result<Args> {
         artifact: Vec::new(),
         artifact_root: None,
         schedule: Vec::new(),
+        schedule_sequential: false,
         // Effectively unlimited by default: the sidecar's callers pass the
         // provider-derived budget; a bare invocation is a dev loop.
         cycle_limit: u64::MAX,
         deadline: Some(Duration::from_secs(600)),
         print_tier: false,
+        print_artifact_root: false,
     };
     let mut iter = std::env::args().skip(1);
     let mut input_seen = false;
@@ -98,7 +112,12 @@ fn parse_args() -> Result<Args> {
                     Some(parse_hex32(&value("--artifact-root")?, "--artifact-root")?);
             }
             "--schedule" => {
-                for entry in value("--schedule")?.split(',').filter(|e| !e.is_empty()) {
+                let raw = value("--schedule")?;
+                if raw == "sequential" {
+                    args.schedule_sequential = true;
+                    continue;
+                }
+                for entry in raw.split(',').filter(|e| !e.is_empty()) {
                     let (kind, page) = entry
                         .split_once(':')
                         .ok_or_else(|| anyhow!("--schedule entries are kind:page"))?;
@@ -111,10 +130,17 @@ fn parse_args() -> Result<Args> {
                 args.deadline = (secs > 0).then(|| Duration::from_secs(secs));
             }
             "--print-tier" => args.print_tier = true,
+            "--print-artifact-root" => args.print_artifact_root = true,
             other => bail!("unknown argument {other}"),
         }
     }
     if args.print_tier {
+        return Ok(args);
+    }
+    if args.print_artifact_root {
+        if args.artifact.is_empty() {
+            bail!("--print-artifact-root requires --artifact");
+        }
         return Ok(args);
     }
     if args.program.is_empty() {
@@ -163,6 +189,16 @@ fn main_inner() -> Result<ExitCode> {
         println!("{}", EXEC_TIER.as_str());
         return Ok(ExitCode::SUCCESS);
     }
+    if args.print_artifact_root {
+        let mut files = Vec::with_capacity(args.artifact.len());
+        for path in &args.artifact {
+            let bytes =
+                std::fs::read(path).with_context(|| format!("reading artifact file {path}"))?;
+            files.push(ArtifactFileManifest::from_bytes(&bytes));
+        }
+        println!("0x{}", hex::encode(artifact_root(&files)));
+        return Ok(ExitCode::SUCCESS);
+    }
 
     let elf = std::fs::read(&args.program)
         .with_context(|| format!("reading guest ELF {}", args.program))?;
@@ -185,7 +221,10 @@ fn main_inner() -> Result<ExitCode> {
     // teardown is irrelevant — the sidecar is single-shot by design.
     let (tx, rx) = std::sync::mpsc::channel();
     let payload = args.input.clone();
-    let schedule = args.schedule.clone();
+    let schedule = match &artifact {
+        Some(mount) if args.schedule_sequential => mount.sequential_schedule(),
+        _ => args.schedule.clone(),
+    };
     let program_arc = program.program.clone();
     std::thread::spawn(move || {
         let job = GkVmJob {

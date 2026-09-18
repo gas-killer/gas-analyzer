@@ -224,6 +224,17 @@ impl ArtifactMountV3 {
         page[..end - start].copy_from_slice(&bytes[start..end]);
         Some((page, branch))
     }
+
+    /// The whole bundle, front to back: every page of kind 0 in order, then
+    /// kind 1, and so on. The schedule of a guest that loads its artifacts
+    /// once, sequentially (the `qwen` guest).
+    pub fn sequential_schedule(&self) -> Vec<(u32, u64)> {
+        self.files
+            .iter()
+            .enumerate()
+            .flat_map(|(kind, file)| (0..file.manifest.page_count()).map(move |p| (kind as u32, p)))
+            .collect()
+    }
 }
 
 /// Every guest program and artifact an operator has installed, keyed by the
