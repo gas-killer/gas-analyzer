@@ -41,18 +41,40 @@
 //! 3. wire input shorter than the 64-byte header → empty REVERT;
 //! 4. payload above [`GKVM_INPUT_BYTES_CAP`] → `GkVmInputOverflow`;
 //! 5. program / artifact lookup (environment class);
-//! 6. guest execution.
+//! 6. guest execution — or its memoized verdict.
+//!
+//! # The result memo
+//!
+//! `gkExec` is pure in `(programHash, artifactRoot, keccak(payload))` *and the
+//! cycle budget*: the same guest is `Ok` under one budget and
+//! `GkGuestOutOfCycles` under a smaller one. [`GkvmHost`] keeps the last
+//! [`GKVM_RESULT_MEMO_ENTRIES`] verdicts (LRU) so the classify pass, a forced
+//! replay pass and view-call serving never run an inference twice, and answers
+//! from the memo only when a re-run provably returns the same bytes and the
+//! same cycle count:
+//!
+//! * the budget is the one the verdict was computed under; or
+//! * the verdict was reached within its budget (the guest halted after
+//!   `cycles <= limit`) and the new budget still covers those cycles — the
+//!   run never observes a budget it does not exceed.
+//!
+//! Anything else (a smaller budget than the recorded run needs, a different
+//! budget for an out-of-cycles verdict) re-runs the guest and replaces the
+//! entry. Environment failures are never memoized.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use alloy::primitives::{Address, B256, Bytes};
+use alloy::primitives::{Address, B256, Bytes, keccak256};
 use gas_analyzer_core::gkvm::errors::SolError;
 use gas_analyzer_core::gkvm::{
-    GKVM_ADDRESS, GKVM_INPUT_BYTES_CAP, GKVM_OK_TAG, errors, gas_to_cycle_limit, gkvm_intrinsic_gas,
+    GKVM_ADDRESS, GKVM_INPUT_BYTES_CAP, GKVM_OK_TAG, GKVM_RESULT_MEMO_ENTRIES, errors,
+    gas_to_cycle_limit, gkvm_intrinsic_gas,
 };
 use gas_analyzer_gkvm::{GkVmError, GkVmJob, GkVmMountError, GkVmOutcome, GuestProgramSet};
+use lru::LruCache;
 use revm::context::{Cfg, ContextTr, LocalContextTr};
 use revm::handler::{EthPrecompiles, PrecompileProvider};
 use revm::interpreter::{CallInput, CallInputs, Gas, InstructionResult, InterpreterResult};
@@ -85,7 +107,33 @@ pub enum GkvmHostError {
 pub struct GkvmHost {
     programs: GuestProgramSet,
     schedules: HashMap<B256, Vec<(u32, u64)>>,
+    /// Recent verdicts; see the module docs for when one answers a call.
+    memo: Mutex<LruCache<MemoKey, MemoEntry>>,
     guest_runs: AtomicU64,
+    memo_hits: AtomicU64,
+}
+
+/// `(programHash, artifactRoot, keccak(payload))` — what `gkExec` is pure in,
+/// next to the cycle budget ([`MemoEntry::answers`]).
+type MemoKey = (B256, B256, B256);
+
+/// A memoized verdict and the budget it was computed under.
+struct MemoEntry {
+    outcome: GkVmOutcome,
+    cycles: u64,
+    cycle_limit: u64,
+}
+
+impl MemoEntry {
+    /// Whether a run under `cycle_limit` provably reproduces this verdict.
+    fn answers(&self, cycle_limit: u64) -> bool {
+        if cycle_limit == self.cycle_limit {
+            return true;
+        }
+        let within_budget = !matches!(self.outcome, GkVmOutcome::OutOfCycles { .. })
+            && self.cycles <= self.cycle_limit;
+        within_budget && self.cycles <= cycle_limit
+    }
 }
 
 impl GkvmHost {
@@ -94,7 +142,11 @@ impl GkvmHost {
         Self {
             programs,
             schedules: HashMap::new(),
+            memo: Mutex::new(LruCache::new(
+                NonZeroUsize::new(GKVM_RESULT_MEMO_ENTRIES).expect("non-zero"),
+            )),
             guest_runs: AtomicU64::new(0),
+            memo_hits: AtomicU64::new(0),
         }
     }
 
@@ -112,6 +164,11 @@ impl GkvmHost {
     /// same default as `gk-run` without `--schedule`.
     pub fn with_artifact_schedule(mut self, root: B256, schedule: Vec<(u32, u64)>) -> Self {
         self.schedules.insert(root, schedule);
+        // A verdict is only as good as the schedule it ran under.
+        self.memo
+            .get_mut()
+            .expect("gkvm memo mutex poisoned")
+            .clear();
         self
     }
 
@@ -120,9 +177,52 @@ impl GkvmHost {
         self.guest_runs.load(Ordering::Relaxed)
     }
 
-    /// Run `program_hash` over `payload` under `cycle_limit`, returning the
-    /// deterministic outcome and the cycles it took.
+    /// Calls answered from the result memo without running the guest.
+    pub fn memo_hits(&self) -> u64 {
+        self.memo_hits.load(Ordering::Relaxed)
+    }
+
+    /// The deterministic outcome of `program_hash` over `payload` under
+    /// `cycle_limit` and the cycles it took — from the memo when a recorded
+    /// verdict answers this budget, else by running the guest.
+    ///
+    /// The lock is not held across a run, so two threads racing on the same
+    /// cold key both execute; the passes of one analysis are sequential, which
+    /// is the case the memo exists for.
     fn exec(
+        &self,
+        program_hash: B256,
+        artifact_root: B256,
+        payload: &[u8],
+        cycle_limit: u64,
+    ) -> Result<(GkVmOutcome, u64), GkvmHostError> {
+        let key = (program_hash, artifact_root, keccak256(payload));
+        if let Some(entry) = self
+            .memo
+            .lock()
+            .expect("gkvm memo mutex poisoned")
+            .get(&key)
+            .filter(|entry| entry.answers(cycle_limit))
+        {
+            self.memo_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok((entry.outcome.clone(), entry.cycles));
+        }
+
+        let (outcome, cycles) =
+            self.run_guest(program_hash, artifact_root, payload, cycle_limit)?;
+        self.memo.lock().expect("gkvm memo mutex poisoned").put(
+            key,
+            MemoEntry {
+                outcome: outcome.clone(),
+                cycles,
+                cycle_limit,
+            },
+        );
+        Ok((outcome, cycles))
+    }
+
+    /// Run the guest, unconditionally.
+    fn run_guest(
         &self,
         program_hash: B256,
         artifact_root: B256,
@@ -631,6 +731,147 @@ mod tests {
             out.as_ref(),
             [&[GKVM_OK_TAG][..], b"GKVM-HELLO-V1\n"].concat()
         );
+    }
+
+    #[test]
+    fn a_repeated_call_is_answered_from_the_memo_byte_and_gas_identically() {
+        let host = host();
+        let input = wire(BENCH_C, &1_000u64.to_be_bytes());
+        let first =
+            record(mounts(&host), STATIC_CONSUMER, input.clone(), 3_000_000).expect("first pass");
+        assert_eq!((host.guest_runs(), host.memo_hits()), (1, 0));
+
+        // A second pass over the same transaction (what a forced replay is):
+        // same returndata, same gas charged, no second guest run.
+        let second =
+            record(mounts(&host), STATIC_CONSUMER, input.clone(), 3_000_000).expect("second pass");
+        assert_eq!(first, second);
+        assert_eq!(first[0], word(2), "STATICCALL succeeded");
+        assert_eq!((host.guest_runs(), host.memo_hits()), (1, 1));
+
+        // View serving reaches the precompile with a different budget; the
+        // recorded 8,157 cycles fit it, so it is still the memo answering.
+        let out = call_view_local_blocking(
+            seeded_db(),
+            mounts(&host),
+            &test_env(),
+            &test_tx(VIEW_FORWARDER, input.clone(), 1_000_000),
+            SimProfile::Chain,
+        )
+        .expect("view call");
+        assert_eq!(out[0], GKVM_OK_TAG);
+        assert_eq!((host.guest_runs(), host.memo_hits()), (1, 2));
+
+        // A different payload is a different key.
+        record(
+            mounts(&host),
+            STATIC_CONSUMER,
+            wire(BENCH_C, &1_001u64.to_be_bytes()),
+            3_000_000,
+        )
+        .expect("other payload");
+        assert_eq!((host.guest_runs(), host.memo_hits()), (2, 2));
+    }
+
+    #[test]
+    fn the_memo_never_answers_a_budget_the_recorded_run_does_not_fit() {
+        // bench N = 10^7 needs 20,000,040 gas: out of cycles in a 12M-gas
+        // transaction, fine in a 30M-gas one. Same key, three budgets.
+        let host = host();
+        let input = wire(BENCH_C, &10_000_000u64.to_be_bytes());
+        let run = |gas: u64| record(mounts(&host), STATIC_CONSUMER, input.clone(), gas).unwrap();
+
+        let starved = run(12_000_000);
+        assert_eq!(starved[0], word(1), "out of cycles");
+        assert_eq!((host.guest_runs(), host.memo_hits()), (1, 0));
+
+        // An out-of-cycles verdict says nothing about a larger budget.
+        let funded = run(30_000_000);
+        assert_eq!(funded[0], word(2), "STATICCALL succeeded");
+        assert_eq!((host.guest_runs(), host.memo_hits()), (2, 0));
+
+        // Nor does an in-budget verdict of 80,000,157 cycles answer a budget
+        // below that: the guest runs again and starves exactly as before.
+        assert_eq!(run(12_000_000), starved);
+        assert_eq!((host.guest_runs(), host.memo_hits()), (3, 0));
+
+        // The identical budget is answered from the memo, out of cycles or not.
+        assert_eq!(run(12_000_000), starved);
+        assert_eq!((host.guest_runs(), host.memo_hits()), (3, 1));
+    }
+
+    #[test]
+    fn memo_entries_answer_only_budgets_that_reproduce_them() {
+        let entry = |outcome, cycles, cycle_limit| MemoEntry {
+            outcome,
+            cycles,
+            cycle_limit,
+        };
+        let ok = entry(GkVmOutcome::Ok { output: vec![1] }, 100, 1_000);
+        assert!(ok.answers(1_000) && ok.answers(100) && ok.answers(u64::MAX));
+        assert!(!ok.answers(99));
+
+        let starved = entry(
+            GkVmOutcome::OutOfCycles {
+                used: 5_000,
+                limit: 1_000,
+            },
+            5_000,
+            1_000,
+        );
+        assert!(starved.answers(1_000));
+        assert!(!starved.answers(999) && !starved.answers(1_001) && !starved.answers(5_000));
+
+        // A fault the runner reports past the budget is only ever replayed
+        // under that exact budget.
+        let late_trap = entry(
+            GkVmOutcome::Trap {
+                code: 7,
+                data: Vec::new(),
+            },
+            5_000,
+            1_000,
+        );
+        assert!(late_trap.answers(1_000));
+        assert!(!late_trap.answers(5_000) && !late_trap.answers(u64::MAX));
+    }
+
+    #[test]
+    fn the_memo_is_a_sixteen_entry_lru_and_never_holds_environment_failures() {
+        let host = host();
+        let hello = keccak256(HELLO_C);
+        let exec = |payload: u8| {
+            host.exec(hello, B256::ZERO, &[payload], 1_000_000)
+                .expect("guest runs")
+        };
+
+        let first = exec(0);
+        for payload in 1..=GKVM_RESULT_MEMO_ENTRIES as u8 {
+            exec(payload);
+        }
+        assert_eq!(
+            (host.guest_runs(), host.memo_hits()),
+            (GKVM_RESULT_MEMO_ENTRIES as u64 + 1, 0)
+        );
+
+        // The newest entry is resident; payload 0 was evicted by the 17th
+        // key and runs again — to the same verdict.
+        exec(GKVM_RESULT_MEMO_ENTRIES as u8);
+        assert_eq!(host.memo_hits(), 1);
+        assert_eq!(exec(0), first);
+        assert_eq!(
+            (host.guest_runs(), host.memo_hits()),
+            (GKVM_RESULT_MEMO_ENTRIES as u64 + 2, 1)
+        );
+
+        // An unknown program fails every time it is asked for.
+        for _ in 0..2 {
+            let err = host
+                .exec(B256::repeat_byte(0xee), B256::ZERO, &[], 1_000_000)
+                .expect_err("not installed");
+            assert!(matches!(err, GkvmHostError::ProgramNotInstalled(_)));
+        }
+        assert_eq!(host.memo_hits(), 1);
     }
 
     #[test]
