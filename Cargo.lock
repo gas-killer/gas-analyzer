@@ -3739,6 +3739,7 @@ dependencies = [
  "foundry-fork-db",
  "gas-analyzer-core",
  "gas-analyzer-estimator",
+ "gas-analyzer-gkvm",
  "gas-analyzer-rpc",
  "libc",
  "lru",
@@ -3754,6 +3755,7 @@ dependencies = [
  "sp1-cc-host-executor",
  "stats_alloc",
  "tempfile",
+ "thiserror 2.0.17",
  "tokio",
  "tower",
  "tracing",
@@ -3766,6 +3768,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "anyhow",
+ "gas-analyzer-core",
  "hex",
  "memmap2",
  "serde_json",

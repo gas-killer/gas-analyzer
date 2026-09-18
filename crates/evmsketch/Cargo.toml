@@ -5,6 +5,9 @@ edition = "2024"
 
 [features]
 heap-profile = []
+# Run gkvm guests on SP1's portable interpreter (the consensus tier) instead of
+# the x86_64 JIT — one compiled binary is one tier; see gas-analyzer-gkvm.
+gkvm-portable-exec = ["gas-analyzer-gkvm/portable-exec"]
 
 [dependencies]
 alloy = { version = "1.0.37", features = ["rpc", "rpc-types"] }
@@ -16,6 +19,9 @@ alloy-provider = { version = "1.0.37", features = ["debug-api"] }
 anyhow = "1.0.98"
 gas-analyzer-core = { path = "../core" }
 gas-analyzer-estimator = { path = "../gas-estimator" }
+# UNBOUNDED_V3 guest runner behind the gkvm precompile (src/gkvm_precompile.rs).
+# Carries its own consensus pin (sp1-core-executor =6.8.0).
+gas-analyzer-gkvm = { path = "../gkvm" }
 gas-analyzer-rpc = { path = "../rpc" }
 reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.9.1" }
 # Exact pins: the local execution path (src/local_exec.rs) re-executes tracked
@@ -37,6 +43,7 @@ memmap2 = "0.9"
 sp1-cc-client-executor = { git = "https://github.com/BreadchainCoop/sp1-contract-call", branch = "cancun-v1", package = "sp1-cc-client-executor" }
 sp1-cc-host-executor = { git = "https://github.com/BreadchainCoop/sp1-contract-call", branch = "cancun-v1", package = "sp1-cc-host-executor" }
 lru = "0.13"
+thiserror = "2.0.17"
 tokio = { version = "1", features = ["rt"] }
 tracing = "0.1"
 url = "2.5.4"

@@ -25,6 +25,8 @@ sp1-core-executor = "=6.8.0"
 sp1-jit = "=6.8.0"
 sp1-primitives = "=6.8.0"
 
+# Single home of the UNBOUNDED_V3 constant set (src/constants.rs re-exports it).
+gas-analyzer-core = { path = "../core" }
 alloy-primitives = "1.0.37"
 thiserror = "2.0.17"
 memmap2 = "0.9.10"

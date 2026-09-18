@@ -94,6 +94,38 @@ pub const GKVM_RESULT_MEMO_ENTRIES: usize = 16;
 /// `GkVm.sol` treats anything else as `GkVmUnavailable`.
 pub const GKVM_OK_TAG: u8 = 0x01;
 
+/// Exit code a guest halts with after writing a `GKTRAP01` abort frame via
+/// `gk_abort`. SP1 masks guest exit codes to a byte, so the u32 trap code
+/// travels in the frame and the exit code only marks that a frame is present.
+pub const GKVM_TRAP_EXIT_CODE: u8 = 0xFA;
+
+/// Trap code reported when the guest exceeds [`GKVM_MEM_BYTES_CAP`] on the
+/// consensus tier.
+pub const GKVM_TRAP_CODE_MEM_CAP: u32 = 0xF000_0001;
+
+/// Trap code reported when a guest halts with a bare nonzero exit code (a C
+/// `return 1`, an assert) without writing an abort frame. The exit byte is
+/// carried as the low bits of the code.
+pub const GKVM_TRAP_CODE_BARE_EXIT: u32 = 0xF000_0100;
+
+/// The typed errors the precompile reverts with — the Rust twin of
+/// `src/gkvm/GkVmErrors.sol` in gas-killer/solidity-sdk. Selectors are pinned
+/// by a test; `GkVmUnavailable` is raised by `GkVm.sol` itself (never by the
+/// precompile) and is listed so off-chain consumers can decode it.
+pub mod errors {
+    /// Brings `abi_encode` / `SELECTOR` into scope for the error types.
+    pub use alloy_sol_types::SolError;
+
+    alloy_sol_types::sol! {
+        error GkVmUnavailable();
+        error GkGuestTrap(uint32 code, bytes data);
+        error GkGuestOutOfCycles(uint64 used, uint64 limit);
+        error GkVmInputOverflow();
+        error GkVmOutputOverflow();
+        error GkVmStaticOnly();
+    }
+}
+
 /// [`GKVM_ADDRESS`], recomputed from [`GKVM_ADDRESS_DOMAIN`] — the house
 /// derivation pattern (cf. `overlay::overlay_chunk_address`).
 pub fn gkvm_address() -> Address {
@@ -181,6 +213,38 @@ mod tests {
     #[test]
     fn gkvm_address_matches_its_derivation() {
         assert_eq!(gkvm_address(), GKVM_ADDRESS);
+    }
+
+    #[test]
+    fn error_selectors_match_the_solidity_signatures() {
+        use alloy_sol_types::SolError;
+        let selector = |signature: &str| -> [u8; 4] {
+            keccak256(signature.as_bytes())[..4].try_into().unwrap()
+        };
+        assert_eq!(
+            errors::GkVmUnavailable::SELECTOR,
+            selector("GkVmUnavailable()")
+        );
+        assert_eq!(
+            errors::GkGuestTrap::SELECTOR,
+            selector("GkGuestTrap(uint32,bytes)")
+        );
+        assert_eq!(
+            errors::GkGuestOutOfCycles::SELECTOR,
+            selector("GkGuestOutOfCycles(uint64,uint64)")
+        );
+        assert_eq!(
+            errors::GkVmInputOverflow::SELECTOR,
+            selector("GkVmInputOverflow()")
+        );
+        assert_eq!(
+            errors::GkVmOutputOverflow::SELECTOR,
+            selector("GkVmOutputOverflow()")
+        );
+        assert_eq!(
+            errors::GkVmStaticOnly::SELECTOR,
+            selector("GkVmStaticOnly()")
+        );
     }
 
     #[test]

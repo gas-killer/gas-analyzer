@@ -88,6 +88,7 @@ use gas_analyzer_core::types::IStateUpdateTypes;
 use gas_analyzer_core::{Opcode, OverlayEnv, PrestateEligibility, SimProfile, StateUpdate};
 
 use crate::DefaultEvmSketchExecutor;
+use crate::gkvm_precompile::{GkvmHost, GkvmPrecompiles};
 use crate::overlay_mount::{OverlayMount, OverlayMountSet, OverlayStateDb};
 
 // ============================================================================
@@ -207,6 +208,10 @@ impl LocalTxRequest {
 pub struct LocalStateCache {
     backends: Mutex<LruCache<(String, u64), SharedBackend>>,
     overlay_mounts: Mutex<LruCache<B256, Arc<OverlayMount>>>,
+    /// UNBOUNDED_V3: the installed guest programs/artifacts behind the gkvm
+    /// precompile. `None` means a call to `GKVM_ADDRESS` fails the execution
+    /// (operator abstains) — see `gkvm_precompile`.
+    gkvm_host: Option<Arc<GkvmHost>>,
 }
 
 impl Default for LocalStateCache {
@@ -222,11 +227,26 @@ impl Default for LocalStateCache {
             // model — re-mounting a file-backed model costs a full streaming
             // keccak pass over the blobs (minutes for 35 GB artifacts).
             overlay_mounts: Mutex::new(LruCache::new(NonZeroUsize::new(4).expect("non-zero"))),
+            gkvm_host: None,
         }
     }
 }
 
 impl LocalStateCache {
+    /// Serve UNBOUNDED_V3 guest calls from `host` (typically
+    /// [`GkvmHost::from_env`] at process start). Every local entry point
+    /// taking this cache — tracked-function extraction and view calls alike —
+    /// then resolves `GKVM_ADDRESS` through it.
+    pub fn with_gkvm_host(mut self, host: Arc<GkvmHost>) -> Self {
+        self.gkvm_host = Some(host);
+        self
+    }
+
+    /// The configured guest host, if any.
+    pub fn gkvm_host(&self) -> Option<Arc<GkvmHost>> {
+        self.gkvm_host.clone()
+    }
+
     /// A [`SharedBackend`] pinned to `block_number` on `rpc_url`, spawning
     /// one (with its own fetch thread) on first use.
     pub(crate) fn backend_for(
@@ -799,13 +819,33 @@ impl<CTX> Inspector<CTX, EthInterpreter> for ReplayScriptInspector {
 // Trace runner + extraction dispatcher
 // ============================================================================
 
+/// Everything the pinned simulation env mounts beyond remote chain state: the
+/// V2 axis (`address → code` overlays) and the V3 axis (the gkvm guest host
+/// behind [`gas_analyzer_core::gkvm::GKVM_ADDRESS`]). One bundle, so every
+/// pass of a call — classify, replay, view — sees the same env by
+/// construction.
+#[derive(Clone, Default)]
+pub(crate) struct ExecMounts {
+    pub(crate) overlay: OverlayMountSet,
+    pub(crate) gkvm: Option<Arc<GkvmHost>>,
+}
+
+impl From<OverlayMountSet> for ExecMounts {
+    fn from(overlay: OverlayMountSet) -> Self {
+        Self {
+            overlay,
+            gkvm: None,
+        }
+    }
+}
+
 /// One in-process execution of the tracked call: fresh `CacheDB` over the
 /// overlay-aware view of `db`, env mirroring the RPC trace request, chosen
 /// inspector attached. Returns the execution result, the finalized state and
 /// the inspector for post-processing. Nothing is committed anywhere.
 fn run_pass<DB, INSP>(
     db: DB,
-    overlay: OverlayMountSet,
+    mounts: ExecMounts,
     env: &LocalBlockEnv,
     tx: &LocalTxRequest,
     profile: SimProfile,
@@ -826,7 +866,7 @@ where
 {
     let (block_gas_limit, tx_gas_limit) = resolve_gas_limits(env, tx, profile);
 
-    let cache_db = CacheDB::new(OverlayStateDb::new_multi(db, overlay));
+    let cache_db = CacheDB::new(OverlayStateDb::new_multi(db, mounts.overlay));
     let ctx = Context::mainnet()
         .with_db(cache_db)
         .modify_cfg_chained(|cfg| {
@@ -859,7 +899,12 @@ where
             block.difficulty = env.difficulty;
         });
 
-    let mut evm = ctx.build_mainnet_with_inspector(inspector);
+    // UNBOUNDED_V3: the stock precompiles plus the gkvm guest precompile. The
+    // address is intercepted even with no host configured — see
+    // `gkvm_precompile` on why falling through would be unsound.
+    let mut evm = ctx
+        .build_mainnet_with_inspector(inspector)
+        .with_precompiles(GkvmPrecompiles::new(mounts.gkvm));
     let tx_env = build_tx_env(tx, tx_gas_limit)?;
     let outcome = evm
         .inspect_tx(tx_env)
@@ -876,7 +921,7 @@ where
 /// [`extract_state_updates_local`]).
 pub(crate) fn extract_state_updates_local_blocking<DB>(
     db: DB,
-    overlay: OverlayMountSet,
+    mounts: impl Into<ExecMounts>,
     env: &LocalBlockEnv,
     tx: &LocalTxRequest,
     profile: SimProfile,
@@ -886,12 +931,13 @@ where
     DB: DatabaseRef + Clone,
     DB::Error: core::fmt::Debug,
 {
+    let mounts = mounts.into();
     // Pass 1 — cheap classification run (full interpreter speed, no step
     // hook): the prestateTracer + callTracer equivalent in ONE execution
     // where the RPC fast path costs two.
     let (result, state, inspector) = run_pass(
         db.clone(),
-        overlay.clone(),
+        mounts.clone(),
         env,
         tx,
         profile,
@@ -910,7 +956,7 @@ where
             // with the struct-log tracer on fallback.
             let (_result, _state, inspector) = run_pass(
                 db,
-                overlay,
+                mounts,
                 env,
                 tx,
                 profile,
@@ -926,15 +972,16 @@ where
 /// blocking pool with the backend switched to plain-blocking mode.
 pub(crate) async fn extract_state_updates_local(
     backend: SharedBackend,
-    overlay: OverlayMountSet,
+    mounts: impl Into<ExecMounts>,
     env: LocalBlockEnv,
     tx: LocalTxRequest,
     profile: SimProfile,
     consumer: Address,
 ) -> Result<(Vec<StateUpdate>, HashSet<Opcode>)> {
     let backend = backend.with_blocking_mode(BlockingMode::Block);
+    let mounts = mounts.into();
     tokio::task::spawn_blocking(move || {
-        extract_state_updates_local_blocking(backend, overlay, &env, &tx, profile, consumer)
+        extract_state_updates_local_blocking(backend, mounts, &env, &tx, profile, consumer)
     })
     .await
     .map_err(|e| anyhow!("local extraction task panicked: {e}"))?
@@ -962,7 +1009,7 @@ pub(crate) async fn extract_state_updates_local(
 /// `spawn_blocking` (see [`call_view_local_files_blocking`]).
 pub(crate) fn call_view_local_blocking<DB>(
     db: DB,
-    overlay: OverlayMountSet,
+    mounts: impl Into<ExecMounts>,
     env: &LocalBlockEnv,
     tx: &LocalTxRequest,
     profile: SimProfile,
@@ -971,7 +1018,8 @@ where
     DB: DatabaseRef,
     DB::Error: core::fmt::Debug,
 {
-    let (result, _state, _inspector) = run_pass(db, overlay, env, tx, profile, NoOpInspector)?;
+    let (result, _state, _inspector) =
+        run_pass(db, mounts.into(), env, tx, profile, NoOpInspector)?;
     match result {
         ExecutionResult::Success { output, .. } => Ok(output.into_data()),
         ExecutionResult::Revert { output, gas_used } => Err(anyhow!(
@@ -998,7 +1046,10 @@ pub(crate) fn call_view_local_files_blocking(
     profile: SimProfile,
 ) -> Result<Bytes> {
     let backend = backend.with_blocking_mode(BlockingMode::Block);
-    let mounts = state_cache.overlay_mount_set_from_files(specs)?;
+    let mounts = ExecMounts {
+        overlay: state_cache.overlay_mount_set_from_files(specs)?,
+        gkvm: state_cache.gkvm_host(),
+    };
     call_view_local_blocking(backend, mounts, env, tx, profile)
 }
 
@@ -1423,7 +1474,7 @@ mod tests {
 
         let (updates, _) = extract_state_updates_local_blocking(
             db,
-            mount.into(),
+            OverlayMountSet::from(mount),
             &test_env(),
             &test_tx(consumer),
             SimProfile::Chain,
@@ -1611,7 +1662,7 @@ mod tests {
         );
         let out = call_view_local_blocking(
             db,
-            mount.into(),
+            OverlayMountSet::from(mount),
             &test_env(),
             &test_tx(consumer),
             SimProfile::Chain,
