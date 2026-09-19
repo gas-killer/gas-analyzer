@@ -62,9 +62,20 @@ void *memset(void *dst, int value, unsigned long n) {
     return dst;
 }
 
+/* Word access to memory declared as bytes (hint buffers, pages, digests). */
+typedef u64 u64_alias __attribute__((may_alias));
+
 void *memcpy(void *dst, const void *src, unsigned long n) {
     u8 *d = (u8 *)dst;
     const u8 *s = (const u8 *)src;
+    if ((((u64)d | (u64)s) & 7) == 0) {
+        /* Both 8-aligned (every verified page copy is): move words. */
+        u64_alias *dw = (u64_alias *)d;
+        const u64_alias *sw = (const u64_alias *)s;
+        for (; n >= 8; n -= 8) *dw++ = *sw++;
+        d = (u8 *)dw;
+        s = (const u8 *)sw;
+    }
     for (unsigned long i = 0; i < n; i++) d[i] = s[i];
     return dst;
 }
@@ -100,39 +111,75 @@ static const u64 KECCAK_RC[24] = {
     0x8000000000008080UL, 0x0000000080000001UL, 0x8000000080008008UL,
 };
 
-static inline u64 rotl64(u64 x, unsigned n) { return (x << n) | (x >> (64 - n)); }
+/* n is always a constant; the mask keeps n == 0 (lane ba) a defined shift. */
+#define ROL(x, n) (((x) << (n)) | ((x) >> ((64 - (n)) & 63)))
 
+/* One round, lanes A -> lanes E, theta/rho/pi/chi/iota fused per output row.
+ * Lane names are <row><column>: rows b g k m s = y 0..4, columns a e i o u =
+ * x 0..4, so st[x + 5y]. Every lane is a scalar and every rotation a
+ * constant: artifact verification is paid per page per answer, in metered
+ * cycles, so the permutation is written to be register-allocated. */
+#define KECCAK_ROW(A, E, row, l0, r0, l1, r1, l2, r2, l3, r3, l4, r4)        \
+    B0 = ROL(A##l0, r0), B1 = ROL(A##l1, r1), B2 = ROL(A##l2, r2);           \
+    B3 = ROL(A##l3, r3), B4 = ROL(A##l4, r4);                                \
+    E##row##a = B0 ^ (~B1 & B2), E##row##e = B1 ^ (~B2 & B3);                \
+    E##row##i = B2 ^ (~B3 & B4), E##row##o = B3 ^ (~B4 & B0);                \
+    E##row##u = B4 ^ (~B0 & B1)
+
+#define KECCAK_ROUND(A, E, rc)                                               \
+    do {                                                                     \
+        u64 B0, B1, B2, B3, B4;                                              \
+        u64 Ca = A##ba ^ A##ga ^ A##ka ^ A##ma ^ A##sa;                      \
+        u64 Ce = A##be ^ A##ge ^ A##ke ^ A##me ^ A##se;                      \
+        u64 Ci = A##bi ^ A##gi ^ A##ki ^ A##mi ^ A##si;                      \
+        u64 Co = A##bo ^ A##go ^ A##ko ^ A##mo ^ A##so;                      \
+        u64 Cu = A##bu ^ A##gu ^ A##ku ^ A##mu ^ A##su;                      \
+        u64 Da = Cu ^ ROL(Ce, 1), De = Ca ^ ROL(Ci, 1), Di = Ce ^ ROL(Co, 1); \
+        u64 Do = Ci ^ ROL(Cu, 1), Du = Co ^ ROL(Ca, 1);                      \
+        A##ba ^= Da, A##ga ^= Da, A##ka ^= Da, A##ma ^= Da, A##sa ^= Da;     \
+        A##be ^= De, A##ge ^= De, A##ke ^= De, A##me ^= De, A##se ^= De;     \
+        A##bi ^= Di, A##gi ^= Di, A##ki ^= Di, A##mi ^= Di, A##si ^= Di;     \
+        A##bo ^= Do, A##go ^= Do, A##ko ^= Do, A##mo ^= Do, A##so ^= Do;     \
+        A##bu ^= Du, A##gu ^= Du, A##ku ^= Du, A##mu ^= Du, A##su ^= Du;     \
+        KECCAK_ROW(A, E, b, ba, 0, ge, 44, ki, 43, mo, 21, su, 14);          \
+        E##ba ^= (rc);                                                       \
+        KECCAK_ROW(A, E, g, bo, 28, gu, 20, ka, 3, me, 45, si, 61);          \
+        KECCAK_ROW(A, E, k, be, 1, gi, 6, ko, 25, mu, 8, sa, 18);            \
+        KECCAK_ROW(A, E, m, bu, 27, ga, 36, ke, 10, mi, 15, so, 56);         \
+        KECCAK_ROW(A, E, s, bi, 62, go, 55, ku, 39, ma, 41, se, 2);          \
+    } while (0)
+
+/* no-schedule-insns: gcc 13's rv64 insn scheduler interleaves the rows and
+ * spills ~160 lanes per round; without it the round is ~250 instructions
+ * against an rv64im floor of 213 (no rol/andn). Carried as an attribute so
+ * every build of the crt gets it, whatever its command line. */
+__attribute__((optimize("no-schedule-insns")))
 static void keccakf(u64 st[25]) {
-    static const u8 rho[24] = {1,  3,  6,  10, 15, 21, 28, 36, 45, 55, 2,  14,
-                               27, 41, 56, 8,  25, 43, 62, 18, 39, 61, 20, 44};
-    static const u8 pi[24] = {10, 7,  11, 17, 18, 3, 5,  16, 8,  21, 24, 4,
-                              15, 23, 19, 13, 12, 2, 20, 14, 22, 9,  6,  1};
-    for (int round = 0; round < 24; round++) {
-        u64 bc[5];
-        for (int i = 0; i < 5; i++)
-            bc[i] = st[i] ^ st[i + 5] ^ st[i + 10] ^ st[i + 15] ^ st[i + 20];
-        for (int i = 0; i < 5; i++) {
-            u64 t = bc[(i + 4) % 5] ^ rotl64(bc[(i + 1) % 5], 1);
-            for (int j = 0; j < 25; j += 5) st[j + i] ^= t;
-        }
-        u64 t = st[1];
-        for (int i = 0; i < 24; i++) {
-            u64 next = st[pi[i]];
-            st[pi[i]] = rotl64(t, rho[i]);
-            t = next;
-        }
-        for (int j = 0; j < 25; j += 5) {
-            for (int i = 0; i < 5; i++) bc[i] = st[j + i];
-            for (int i = 0; i < 5; i++)
-                st[j + i] ^= (~bc[(i + 1) % 5]) & bc[(i + 2) % 5];
-        }
-        st[0] ^= KECCAK_RC[round];
+    u64 Aba = st[0], Abe = st[1], Abi = st[2], Abo = st[3], Abu = st[4];
+    u64 Aga = st[5], Age = st[6], Agi = st[7], Ago = st[8], Agu = st[9];
+    u64 Aka = st[10], Ake = st[11], Aki = st[12], Ako = st[13], Aku = st[14];
+    u64 Ama = st[15], Ame = st[16], Ami = st[17], Amo = st[18], Amu = st[19];
+    u64 Asa = st[20], Ase = st[21], Asi = st[22], Aso = st[23], Asu = st[24];
+    u64 Eba, Ebe, Ebi, Ebo, Ebu, Ega, Ege, Egi, Ego, Egu;
+    u64 Eka, Eke, Eki, Eko, Eku, Ema, Eme, Emi, Emo, Emu;
+    u64 Esa, Ese, Esi, Eso, Esu;
+    for (int round = 0; round < 24; round += 2) {
+        KECCAK_ROUND(A, E, KECCAK_RC[round]);
+        KECCAK_ROUND(E, A, KECCAK_RC[round + 1]);
     }
+    st[0] = Aba, st[1] = Abe, st[2] = Abi, st[3] = Abo, st[4] = Abu;
+    st[5] = Aga, st[6] = Age, st[7] = Agi, st[8] = Ago, st[9] = Agu;
+    st[10] = Aka, st[11] = Ake, st[12] = Aki, st[13] = Ako, st[14] = Aku;
+    st[15] = Ama, st[16] = Ame, st[17] = Ami, st[18] = Amo, st[19] = Amu;
+    st[20] = Asa, st[21] = Ase, st[22] = Asi, st[23] = Aso, st[24] = Asu;
 }
 
+/* The generic streaming hash. The block buffer is kept as lanes (rv64 is
+ * little-endian, so its bytes are keccak's byte order), and whole blocks of
+ * 8-aligned data are absorbed in place without passing through it. */
 typedef struct {
     u64 st[25];
-    u8 buf[136];
+    u64 buf[17];
     u64 fill;
 } keccak_ctx;
 
@@ -141,19 +188,23 @@ static void keccak_init(keccak_ctx *ctx) {
 }
 
 static void keccak_update(keccak_ctx *ctx, const u8 *data, u64 len) {
+    if (ctx->fill == 0 && ((u64)data & 7) == 0) {
+        const u64_alias *lanes = (const u64_alias *)data;
+        for (; len >= 136; len -= 136, lanes += 17) {
+            for (int i = 0; i < 17; i++) ctx->st[i] ^= lanes[i];
+            keccakf(ctx->st);
+        }
+        data = (const u8 *)lanes;
+    }
     while (len > 0) {
         u64 take = 136 - ctx->fill;
         if (take > len) take = len;
-        memcpy(ctx->buf + ctx->fill, data, take);
+        memcpy((u8 *)ctx->buf + ctx->fill, data, take);
         ctx->fill += take;
         data += take;
         len -= take;
         if (ctx->fill == 136) {
-            for (int i = 0; i < 17; i++) {
-                u64 word = 0;
-                for (int b = 0; b < 8; b++) word |= (u64)ctx->buf[i * 8 + b] << (8 * b);
-                ctx->st[i] ^= word;
-            }
+            for (int i = 0; i < 17; i++) ctx->st[i] ^= ctx->buf[i];
             keccakf(ctx->st);
             ctx->fill = 0;
         }
@@ -161,17 +212,13 @@ static void keccak_update(keccak_ctx *ctx, const u8 *data, u64 len) {
 }
 
 static void keccak_final(keccak_ctx *ctx, u8 out[32]) {
-    memset(ctx->buf + ctx->fill, 0, 136 - ctx->fill);
-    ctx->buf[ctx->fill] ^= 0x01;
-    ctx->buf[135] ^= 0x80;
-    for (int i = 0; i < 17; i++) {
-        u64 word = 0;
-        for (int b = 0; b < 8; b++) word |= (u64)ctx->buf[i * 8 + b] << (8 * b);
-        ctx->st[i] ^= word;
-    }
+    u8 *block = (u8 *)ctx->buf;
+    memset(block + ctx->fill, 0, 136 - ctx->fill);
+    block[ctx->fill] ^= 0x01;
+    block[135] ^= 0x80;
+    for (int i = 0; i < 17; i++) ctx->st[i] ^= ctx->buf[i];
     keccakf(ctx->st);
-    for (int i = 0; i < 4; i++)
-        for (int b = 0; b < 8; b++) out[i * 8 + b] = (u8)(ctx->st[i] >> (8 * b));
+    memcpy(out, ctx->st, 32);
 }
 
 void gk_keccak256(const u8 *data, u64 len, u8 out[32]) {
@@ -179,6 +226,32 @@ void gk_keccak256(const u8 *data, u64 len, u8 out[32]) {
     keccak_init(&ctx);
     keccak_update(&ctx, data, len);
     keccak_final(&ctx, out);
+}
+
+/* out = keccak256(prefix || lanes[0..count)) — the shape of both Merkle
+ * hashes (leaf = 0x00 || page, node = 0x01 || left || right). The one-byte
+ * prefix shifts every lane by a byte; that shift is done on words (`carry`
+ * is the byte pushed into the next lane) rather than by re-buffering the
+ * message. 1 + 8·count bytes always leaves exactly the carry byte for the
+ * final block, so the padding lands in the lane being filled. */
+static void keccak_prefixed_lanes(u8 prefix, const u64_alias *lanes, u64 count, u64 out[4]) {
+    u64 st[25];
+    for (int i = 0; i < 25; i++) st[i] = 0;
+    u64 carry = prefix;
+    u64 lane = 0;
+    for (u64 k = 0; k < count; k++) {
+        u64 word = lanes[k];
+        st[lane] ^= carry | (word << 8);
+        carry = word >> 56;
+        if (++lane == 17) {
+            keccakf(st);
+            lane = 0;
+        }
+    }
+    st[lane] ^= carry | (0x01UL << 8);
+    st[16] ^= 0x80UL << 56;
+    keccakf(st);
+    out[0] = st[0], out[1] = st[1], out[2] = st[2], out[3] = st[3];
 }
 
 /* --- hostcalls ----------------------------------------------------------- */
@@ -296,15 +369,11 @@ void gk_artifact_read(u32 kind, u64 page_idx, u8 *dst) {
 
     /* Fold leaf → root through the promotion-aware widths (a level with odd
      * width promotes its last node with no sibling). */
-    u8 node[32];
-    {
-        keccak_ctx ctx;
-        static const u8 leaf_prefix = 0x00;
-        keccak_init(&ctx);
-        keccak_update(&ctx, &leaf_prefix, 1);
-        keccak_update(&ctx, buf, GK_ARTIFACT_PAGE_SIZE);
-        keccak_final(&ctx, node);
-    }
+    /* buf is 8-aligned and the branch starts on a lane boundary, so page,
+     * siblings and running node are all hashed as lanes. */
+    u64 node[4];
+    keccak_prefixed_lanes(0x00, (const u64_alias *)buf, GK_ARTIFACT_PAGE_SIZE / 8, node);
+    const u64_alias *branch = (const u64_alias *)(buf + GK_ARTIFACT_PAGE_SIZE);
     u64 idx = page_idx;
     u64 width = page_count;
     u64 consumed = 0;
@@ -312,20 +381,13 @@ void gk_artifact_read(u32 kind, u64 page_idx, u8 *dst) {
         if (!(idx == width - 1 && width % 2 == 1)) {
             if (consumed >= branch_len)
                 gk_abort(GK_TRAP_ARTIFACT_VERIFY, "branch too short", 16);
-            const u8 *sibling = buf + GK_ARTIFACT_PAGE_SIZE + consumed * 32;
+            const u64_alias *sibling = branch + consumed * 4;
             consumed++;
-            keccak_ctx ctx;
-            static const u8 node_prefix = 0x01;
-            keccak_init(&ctx);
-            keccak_update(&ctx, &node_prefix, 1);
-            if (idx % 2 == 0) {
-                keccak_update(&ctx, node, 32);
-                keccak_update(&ctx, sibling, 32);
-            } else {
-                keccak_update(&ctx, sibling, 32);
-                keccak_update(&ctx, node, 32);
-            }
-            keccak_final(&ctx, node);
+            u64 pair[8];
+            u64 *mine = idx % 2 == 0 ? pair : pair + 4;
+            u64 *theirs = idx % 2 == 0 ? pair + 4 : pair;
+            for (int i = 0; i < 4; i++) mine[i] = node[i], theirs[i] = sibling[i];
+            keccak_prefixed_lanes(0x01, pair, 8, node);
         }
         idx /= 2;
         width = (width + 1) / 2;
