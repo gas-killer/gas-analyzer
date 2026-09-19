@@ -40,8 +40,11 @@ pub struct ArtifactFileManifest {
     pub len: u64,
     /// Root of the page tree; [`B256::ZERO`] for an empty file (zero pages).
     pub root: B256,
-    /// Leaf hashes, kept so branches can be served without re-reading pages.
-    leaves: Vec<B256>,
+    /// Every level of the page tree, leaves first, root level last (empty for
+    /// an empty file) — kept so a branch is `depth` lookups. Rebuilding the
+    /// tree per branch is quadratic in pages: ~0.23 s per page served on a
+    /// 146k-page bundle.
+    levels: Vec<Vec<B256>>,
 }
 
 impl ArtifactFileManifest {
@@ -59,11 +62,12 @@ impl ArtifactFileManifest {
                 hasher.finalize()
             })
             .collect();
-        let root = root_from_leaves(&leaves);
+        let levels = tree_levels(leaves);
+        let root = levels.last().map_or(B256::ZERO, |top| top[0]);
         Self {
             len: bytes.len() as u64,
             root,
-            leaves,
+            levels,
         }
     }
 
@@ -78,18 +82,16 @@ impl ArtifactFileManifest {
     /// path can be shorter than `ceil(log2(pages))`.
     pub fn branch(&self, page_idx: u64) -> Option<Vec<B256>> {
         let mut idx = usize::try_from(page_idx).ok()?;
-        if idx >= self.leaves.len() {
+        if idx >= self.levels.first()?.len() {
             return None;
         }
         let mut branch = Vec::new();
-        let mut level: Vec<B256> = self.leaves.clone();
-        while level.len() > 1 {
-            if idx == level.len() - 1 && level.len() % 2 == 1 {
-                // Promoted: no sibling at this level.
+        for level in &self.levels {
+            if level.len() == 1 || (idx == level.len() - 1 && level.len() % 2 == 1) {
+                // The root, or promoted: no sibling at this level.
             } else {
                 branch.push(level[idx ^ 1]);
             }
-            level = parent_level(&level);
             idx /= 2;
         }
         Some(branch)
@@ -188,18 +190,17 @@ fn parent_level(level: &[B256]) -> Vec<B256> {
     parents
 }
 
-fn root_from_leaves(leaves: &[B256]) -> B256 {
-    match leaves {
-        [] => B256::ZERO,
-        [only] => *only,
-        _ => {
-            let mut level = leaves.to_vec();
-            while level.len() > 1 {
-                level = parent_level(&level);
-            }
-            level[0]
-        }
+/// Leaves up to the single-node root level; no levels at all for zero pages.
+fn tree_levels(leaves: Vec<B256>) -> Vec<Vec<B256>> {
+    if leaves.is_empty() {
+        return Vec::new();
     }
+    let mut levels = vec![leaves];
+    while levels[levels.len() - 1].len() > 1 {
+        let parents = parent_level(&levels[levels.len() - 1]);
+        levels.push(parents);
+    }
+    levels
 }
 
 #[cfg(test)]
@@ -288,6 +289,32 @@ mod tests {
             assert!(!verify_page(manifest.root, 5, idx, &padded(chunk), &fat));
         }
         assert!(!verify_page(manifest.root, 5, 5, &[0; PAGE], &[]));
+    }
+
+    #[test]
+    fn stored_levels_serve_a_verifying_branch_at_every_width() {
+        // Widths 1..=33 cover every promotion pattern up to depth 6;
+        // `verify_page` walks widths on its own, never the stored levels.
+        for pages in 1..=33usize {
+            let bytes: Vec<u8> = (0..pages * PAGE - 7)
+                .map(|i| (i / PAGE + i) as u8)
+                .collect();
+            let manifest = ArtifactFileManifest::from_bytes(&bytes);
+            for (idx, chunk) in bytes.chunks(PAGE).enumerate() {
+                let branch = manifest.branch(idx as u64).expect("page exists");
+                assert!(
+                    verify_page(
+                        manifest.root,
+                        pages as u64,
+                        idx as u64,
+                        &padded(chunk),
+                        &branch
+                    ),
+                    "width {pages}: page {idx} must verify"
+                );
+            }
+            assert_eq!(manifest.branch(pages as u64), None);
+        }
     }
 
     #[test]
