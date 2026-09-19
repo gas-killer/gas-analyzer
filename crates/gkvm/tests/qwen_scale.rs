@@ -6,8 +6,8 @@
 //! pages; 146,083 with the token table) — filled with deterministic
 //! pseudo-random weights. Random int8 rows are legal engine-v2 weights; row
 //! shifts, norm gains and RoPE tables are chosen so activations stay
-//! unit-scale and no numeric trap fires (INTENDED — unverified until a run
-//! completes).
+//! unit-scale and no numeric trap fires (observed for `load+1` on the jit
+//! tier; the longer cases are unverified).
 //! It is NOT the real model (the release blob is a HUMAN item): the answers
 //! are noise, and the counts are a property of this stand-in. What the run
 //! settles is what does not depend on the weights' meaning:
@@ -17,15 +17,20 @@
 //! * the real-size memory footprint (597 MB of weights in guest memory, a
 //!   ~680 MB hint stream) under `GKVM_MEM_BYTES_CAP` on the consensus tier.
 //!
-//! **UNPINNED:** the per-case `cycles` / `output` constants are still zero —
-//! no run has completed yet (the generator and `ARTIFACT_ROOT` ARE verified:
-//! the bundle mounts). A zero constant fails with the measured values in the
-//! message; pin them only once BOTH tiers have printed the same line.
+//! **UNPINNED:** the per-case `cycles` / `output` constants are still zero.
+//! Only the jit tier has completed a case so far: `load+1` answered `Ok` with
+//! cycles = 46,465,876,532 and output keccak
+//! 0xc4150374a20548e4cba5f06bdb00908b7b4d2e1079c97ca8bf663c3c4dcd39f1 — so on
+//! that tier no numeric trap fires and the footprint fits. The portable tier
+//! has not finished a run, and one tier's number is not a pin. A zero constant
+//! fails with the measured values in the message; pin them only once BOTH
+//! tiers have printed the same line.
 //!
-//! `#[ignore]`d: ~5×10^10 cycles per case (estimated from the measured
-//! per-page load cost — about a minute on an idle jit, ten and more on the
-//! interpreter), ~600 MB on disk under `target/gkvm-qwen-scale/`, a few GB of
-//! RAM.
+//! `#[ignore]`d: ~4.6×10^10 cycles per case (about a minute on an idle jit
+//! and ten and more on the interpreter — estimates from the bench guest's
+//! throughput, not observed), ~600 MB on disk under `target/gkvm-qwen-scale/`,
+//! GBs of RAM: on a 16 GB host that is already swapping, the portable-tier run
+//! had to be stopped to keep the box alive.
 //! `cargo test -p gas-analyzer-gkvm --release --test qwen_scale -- --ignored --nocapture`
 //! One test per case, so the usual name filter runs a subset (`… -- --ignored load_plus_1`).
 
