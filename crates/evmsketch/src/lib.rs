@@ -112,6 +112,9 @@ pub mod local_exec;
 pub mod overlay_mount;
 pub mod simple_rpc_db;
 pub use gkvm_precompile::{GkvmHost, GkvmHostError, GkvmPrecompiles};
+// Re-exported so the Gas Killer service can configure a `GkvmHost` without a
+// direct gas-analyzer-gkvm dependency (same reason as `SimProfile` below).
+pub use gas_analyzer_gkvm::{ArtifactMountV3, GkVmMountError, GuestProgramSet, LoadedGuestProgram};
 pub use local_exec::{LocalBlockEnv, LocalStateCache};
 pub use overlay_mount::{OverlayMount, OverlayMountSet, OverlayStateDb};
 use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
