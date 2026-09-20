@@ -5,6 +5,7 @@
 #   make check-pin    fail unless $(MPY_SRC) is exactly the pinned commit, unmodified
 #   make docker       build $(GUEST_PY) inside ubuntu:24.04 (no riscv gcc needed on the host)
 #   make native       same, with the host's riscv64-unknown-elf-gcc + picolibc headers
+#   make fixtures     copy the built hello-py.elf into ../../tests/fixtures/
 #   make clean
 #
 # Output: ../build/micropython/<name>/<name>-py.elf
@@ -52,8 +53,14 @@ docker: check-pin
 	   make -f port.mk MPY_SRC=/mpy $(PORT_ARGS); rc=\$$?; \
 	   chown -R \$$(stat -c %u:%g /guest/micropython) /guest/build/micropython /mpy/mpy-cross/build 2>/dev/null; exit \$$rc"
 
+# Only hello.py is a committed fixture (tests/guest_e2e.rs pins its answer and
+# its instruction count); probe.py is a hand-run smoke guest.
+fixtures:
+	mkdir -p ../../tests/fixtures
+	cp ../build/micropython/hello/hello-py.elf ../../tests/fixtures/hello-py.elf
+
 # Children only: ../build itself may be root-owned (left by a docker leg).
 clean:
 	rm -rf ../build/micropython/*
 
-.PHONY: fetch check-pin native docker clean
+.PHONY: fetch check-pin native docker fixtures clean

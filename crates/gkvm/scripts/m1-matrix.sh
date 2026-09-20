@@ -25,6 +25,8 @@ CASES=(
   "hello-rs.elf|0x11223344|"
   "hello-c.elf|0x11223344|"
   "hello-c.elf|0x|"
+  "hello-py.elf|0x11223344|"          # hello.py frozen into the MicroPython port
+  "hello-py.elf|0x|"
   "bench-c.elf|0x0000000000989680|"   # N = 10,000,000
 )
 

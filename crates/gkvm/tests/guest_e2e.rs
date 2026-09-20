@@ -6,11 +6,13 @@
 //! (riscv64-unknown-elf-gcc + GNU ld, linking gk-guest-crt). Rebuild them
 //! with `make -C guest rust docker-c fixtures`; the hello twins implement
 //! identical behavior, which is what turns the doc's "toolchain ABI
-//! mismatch" risk into a checked property.
+//! mismatch" risk into a checked property. `hello-py.elf` is the third twin:
+//! hello.py frozen into the MicroPython gkvm port (`make -C guest/micropython
+//! fetch docker fixtures`).
 
-use alloy_primitives::{Keccak256, keccak256};
+use alloy_primitives::{B256, Keccak256, b256, keccak256};
 use gas_analyzer_gkvm::{
-    ArtifactMountV3, GkVmJob, GkVmOutcome, LoadedGuestProgram, constants, manifest, run,
+    ArtifactMountV3, EXEC_TIER, GkVmJob, GkVmOutcome, LoadedGuestProgram, constants, manifest, run,
 };
 
 fn fixture(name: &str) -> LoadedGuestProgram {
@@ -41,7 +43,7 @@ fn both_hello_toolchains_produce_the_identical_answer() {
         .copied()
         .chain(payload.iter().rev().copied())
         .collect();
-    for name in ["hello-rs.elf", "hello-c.elf"] {
+    for name in ["hello-rs.elf", "hello-c.elf", "hello-py.elf"] {
         let outcome = run_simple(&fixture(name), &payload, u64::MAX);
         assert_eq!(
             outcome,
@@ -75,6 +77,61 @@ fn cycle_counts_are_stable_across_repeated_runs() {
             "instruction counts must not vary"
         );
         assert_eq!(next.outcome, first.outcome, "outputs must not vary");
+    }
+}
+
+/// keccak256 of the committed `hello-py.elf` — interpreter and frozen script
+/// in one image, so this moves with either.
+const HELLO_PY_PROGRAM_HASH: B256 =
+    b256!("0xa270eab73fa9b1599827c57bcc9fe061bb352704a5572a413da4fa5ab35d5689");
+
+/// Instructions retired by `hello-py.elf` on the 4-byte payload, 16 MiB heap.
+const HELLO_PY_CYCLES: u64 = 592_469;
+
+#[test]
+fn hello_py_answers_with_stable_pinned_counts() {
+    // A whole interpreter — GC, heap init, frozen-module import — sits between
+    // the payload and the answer here, so the count is pinned, not only
+    // compared run to run. The cross-tier half lives in scripts/m1-matrix.sh.
+    let program = fixture("hello-py.elf");
+    assert_eq!(
+        program.hash, HELLO_PY_PROGRAM_HASH,
+        "hello-py.elf moved: rebuild it reproducibly and re-pin hash + count together"
+    );
+    let payload = [0x11u8, 0x22, 0x33, 0x44];
+    let expected: Vec<u8> = HELLO_TAG
+        .iter()
+        .copied()
+        .chain(payload.iter().rev().copied())
+        .collect();
+    let job = GkVmJob {
+        program: program.program.clone(),
+        payload: &payload,
+        artifact: None,
+        schedule: &[],
+        cycle_limit: u64::MAX,
+    };
+    for i in 0..10 {
+        let report = run(&job).expect("run");
+        // One line per run under `--nocapture`: the tier is a compile-time
+        // choice, so this is how a log shows which one produced the count.
+        eprintln!(
+            "hello-py run {i}: tier={} cycles={} output=0x{}",
+            EXEC_TIER.as_str(),
+            report.cycles,
+            alloy_primitives::hex::encode(match &report.outcome {
+                GkVmOutcome::Ok { output } => output.as_slice(),
+                _ => &[],
+            })
+        );
+        assert_eq!(report.cycles, HELLO_PY_CYCLES, "run {i}: count moved");
+        assert_eq!(
+            report.outcome,
+            GkVmOutcome::Ok {
+                output: expected.clone()
+            },
+            "run {i}: answer moved"
+        );
     }
 }
 
