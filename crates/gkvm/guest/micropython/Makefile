@@ -24,7 +24,8 @@ MPY_SRC ?= $(abspath ../../../../target/gkvm-micropython/src)
 GUEST_ROOT := $(abspath ..)
 GUEST_PY ?= hello.py
 
-PORT_ARGS = GUEST_PY=$(GUEST_PY) $(if $(GK_MPY_HEAP_BYTES),GK_MPY_HEAP_BYTES=$(GK_MPY_HEAP_BYTES)) \
+PORT_ARGS = GUEST_PY=$(GUEST_PY) $(if $(GUEST_PY_EXTRA),GUEST_PY_EXTRA='$(GUEST_PY_EXTRA)') \
+            $(if $(GK_MPY_HEAP_BYTES),GK_MPY_HEAP_BYTES=$(GK_MPY_HEAP_BYTES)) \
             $(if $(GK_MPY_STACK_BYTES),GK_MPY_STACK_BYTES=$(GK_MPY_STACK_BYTES)) $(if $(V),V=$(V))
 
 fetch:

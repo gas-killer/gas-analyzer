@@ -118,6 +118,13 @@ void gc_collect(void) {
     gc_collect_end();
 }
 
+/* `import` of anything that is neither built in nor frozen: there is no
+ * filesystem to find it on (frozen modules are matched before this is asked). */
+mp_import_stat_t mp_import_stat(const char *path) {
+    (void)path;
+    return MP_IMPORT_STAT_NO_EXIST;
+}
+
 /* print() has nowhere to go: the hostcall surface is payload in, result out.
  * Accept and drop, so library code that prints still runs. */
 mp_uint_t mp_hal_stdout_tx_strn(const char *str, size_t len) {

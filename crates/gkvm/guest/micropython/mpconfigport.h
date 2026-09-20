@@ -13,11 +13,15 @@
  * and linked into the ELF, so programHash commits to it. No compiler in the
  * image means no eval/exec/compile and no source imports. py/mkrules.mk
  * defines MICROPY_MODULE_FROZEN_STR whenever a manifest is set; frozen source
- * needs the compiler, so it is switched back off here. */
+ * needs the compiler, so it is switched back off here.
+ * MICROPY_ENABLE_EXTERNAL_IMPORT is what py/builtinimport.c gates the FROZEN
+ * module lookup on (without it `import` finds built-in modules only), so it is
+ * on — with a filesystem that has nothing in it (mp_import_stat, main.c), and
+ * no way to load what it would find (no compiler, no .mpy loader). */
 #define MICROPY_ENABLE_COMPILER (0)
 #undef MICROPY_MODULE_FROZEN_STR
 #define MICROPY_MODULE_FROZEN_STR (0)
-#define MICROPY_ENABLE_EXTERNAL_IMPORT (0)
+#define MICROPY_ENABLE_EXTERNAL_IMPORT (1)
 #define MICROPY_PERSISTENT_CODE_LOAD (0)
 
 /* Integers only. The target is rv64im: no F/D, and soft-float results are a

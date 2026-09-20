@@ -3,10 +3,12 @@
 # ./Makefile (which pins and fetches upstream); run directly only with
 # MPY_SRC set and a riscv64-unknown-elf toolchain on PATH.
 #
-#   make -f port.mk MPY_SRC=<micropython checkout> [GUEST_PY=hello.py]
+#   make -f port.mk MPY_SRC=<micropython checkout> [GUEST_PY=hello.py] [GUEST_PY_EXTRA="a.py b.py"]
 #
 # One guest script per image: it is frozen (mpy-cross bytecode linked into
 # the ELF), so programHash commits to the interpreter AND the script.
+# GUEST_PY_EXTRA modules are frozen next to it and importable by file stem
+# (the sdk's `gk build` stages the user's module + gk_runtime.py this way).
 
 ifeq ($(MPY_SRC),)
 $(error MPY_SRC must point at the pinned MicroPython checkout — use ./Makefile)
@@ -43,10 +45,12 @@ QSTR_DEFS = qstrdefsport.h
 MICROPY_ROM_TEXT_COMPRESSION ?= 1
 
 # The manifest freezes whatever sits in the stage dir, so the stage holds the
-# guest script and nothing else. Staged at parse time: py/manifest.mk already
-# evaluates the manifest while make is still reading makefiles.
+# guest script (+ GUEST_PY_EXTRA) and nothing else. Staged at parse time:
+# py/manifest.mk already evaluates the manifest while make is still reading
+# makefiles.
+GUEST_PY_EXTRA ?=
 GUEST_STAGE := $(abspath $(BUILD)/stage)
-$(shell rm -rf "$(GUEST_STAGE)" && mkdir -p "$(GUEST_STAGE)" && cp "$(GUEST_PY)" "$(GUEST_STAGE)/")
+$(shell rm -rf "$(GUEST_STAGE)" && mkdir -p "$(GUEST_STAGE)" && cp "$(GUEST_PY)" $(GUEST_PY_EXTRA) "$(GUEST_STAGE)/")
 FROZEN_MANIFEST = manifest.py
 MICROPY_MANIFEST_GUEST_STAGE = $(GUEST_STAGE)
 
