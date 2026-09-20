@@ -172,6 +172,32 @@ impl GkvmHost {
         self
     }
 
+    /// Declare [`ArtifactMountV3::sequential_schedule`] — the whole bundle,
+    /// front to back, `gk-run --schedule sequential` — for every mounted
+    /// artifact that has no schedule yet. What a service operator wants after
+    /// [`GkvmHost::from_env`]: the env slots carry no schedule, and every guest
+    /// shipped so far loads its artifacts once, sequentially.
+    ///
+    /// [`ArtifactMountV3::sequential_schedule`]: gas_analyzer_gkvm::ArtifactMountV3::sequential_schedule
+    pub fn with_sequential_schedules(mut self) -> Self {
+        for root in self.programs.artifact_roots() {
+            if self.schedules.contains_key(&root) {
+                continue;
+            }
+            let artifact = self
+                .programs
+                .artifact(&root)
+                .expect("root listed by artifact_roots");
+            self = self.with_artifact_schedule(root, artifact.sequential_schedule());
+        }
+        self
+    }
+
+    /// The installed programs and mounted artifacts this host serves.
+    pub fn programs(&self) -> &GuestProgramSet {
+        &self.programs
+    }
+
     /// Guest executions actually performed (not calls answered).
     pub fn guest_runs(&self) -> u64 {
         self.guest_runs.load(Ordering::Relaxed)
@@ -424,12 +450,14 @@ mod tests {
     };
     use alloy::primitives::{U256, address, keccak256};
     use gas_analyzer_core::{SimProfile, StateUpdate};
-    use gas_analyzer_gkvm::LoadedGuestProgram;
+    use gas_analyzer_gkvm::{ArtifactMountV3, LoadedGuestProgram};
     use revm::database::{CacheDB, EmptyDB};
     use revm::state::{AccountInfo, Bytecode};
 
     const HELLO_C: &[u8] = include_bytes!("../../gkvm/tests/fixtures/hello-c.elf");
     const BENCH_C: &[u8] = include_bytes!("../../gkvm/tests/fixtures/bench-c.elf");
+    const ARTIFACT_PROBE_C: &[u8] =
+        include_bytes!("../../gkvm/tests/fixtures/artifact-probe-c.elf");
 
     const CALLER: Address = address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
     const STATIC_CONSUMER: Address = address!("0x1000000000000000000000000000000000000001");
@@ -568,6 +596,82 @@ mod tests {
 
     fn word(value: u64) -> B256 {
         B256::from(U256::from(value))
+    }
+
+    #[test]
+    fn an_env_style_host_serves_a_mounted_artifact_front_to_back() {
+        use gas_analyzer_gkvm::constants::GKVM_ARTIFACT_PAGE_SIZE;
+        use gas_analyzer_gkvm::manifest::{ArtifactFileManifest, artifact_root};
+
+        // guest_e2e's bundle: 2.5 pages of a counting pattern + half a page.
+        let weights: Vec<u8> = (0..(GKVM_ARTIFACT_PAGE_SIZE * 5 / 2))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let tokenizer = vec![0x77u8; GKVM_ARTIFACT_PAGE_SIZE / 2];
+        let root = artifact_root(&[
+            ArtifactFileManifest::from_bytes(&weights),
+            ArtifactFileManifest::from_bytes(&tokenizer),
+        ]);
+        let mount = ArtifactMountV3::from_bytes(vec![weights, tokenizer], root).expect("mounts");
+        let requests = mount.sequential_schedule();
+        assert_eq!(requests, [(0, 0), (0, 1), (0, 2), (1, 0)]);
+
+        // artifact-probe-c's fold, host side (as in guest_e2e).
+        let manifests = mount.manifests();
+        let mut acc: Option<B256> = None;
+        let mut payload = Vec::new();
+        for &(kind, page_idx) in &requests {
+            payload.extend_from_slice(&kind.to_be_bytes());
+            payload.extend_from_slice(&page_idx.to_be_bytes());
+            let (page, _) = mount.page(kind, page_idx).expect("in range");
+            let prev = acc.map(|a| a.to_vec()).unwrap_or_default();
+            let len = manifests[kind as usize].len.to_be_bytes();
+            acc = Some(keccak256([&prev[..], &len[..], &page[..]].concat()));
+        }
+        let expected = [&[GKVM_OK_TAG][..], acc.expect("four pages").as_slice()].concat();
+
+        // What `GkvmHost::from_env` hands the service: programs + artifacts,
+        // no schedule — then the service's one call.
+        let mut programs = GuestProgramSet::default();
+        programs.insert_program(
+            LoadedGuestProgram::from_bytes(
+                ARTIFACT_PROBE_C.to_vec(),
+                keccak256(ARTIFACT_PROBE_C),
+                "<fixture>",
+            )
+            .expect("fixture loads"),
+        );
+        programs.insert_artifact(mount);
+        assert_eq!(programs.program_hashes(), [keccak256(ARTIFACT_PROBE_C)]);
+        assert_eq!(programs.artifact_roots(), [root]);
+        let input = [
+            keccak256(ARTIFACT_PROBE_C).as_slice(),
+            root.as_slice(),
+            &payload,
+        ]
+        .concat();
+
+        // Without a declared schedule no page is served: a deterministic trap.
+        let bare = Arc::new(GkvmHost::new(programs));
+        let slots = record(mounts(&bare), STATIC_CONSUMER, input.clone(), 30_000_000)
+            .expect("a guest trap is an EVM outcome");
+        assert_eq!(
+            slots[0],
+            word(1),
+            "no schedule → the guest's page request traps"
+        );
+
+        let host = Arc::new(
+            Arc::into_inner(bare)
+                .expect("sole owner")
+                .with_sequential_schedules(),
+        );
+        let slots = record(mounts(&host), STATIC_CONSUMER, input, 30_000_000).expect("extraction");
+        assert_eq!(slots[0], word(2), "STATICCALL succeeded");
+        assert_eq!(slots[1], keccak256(&expected));
+        assert_eq!(slots[2], word(expected.len() as u64 + 1));
+        // The schedule change dropped the trap verdict from the memo.
+        assert_eq!((host.guest_runs(), host.memo_hits()), (2, 0));
     }
 
     #[test]

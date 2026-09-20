@@ -292,6 +292,21 @@ impl GuestProgramSet {
     pub fn program_count(&self) -> usize {
         self.programs.len()
     }
+
+    /// The `programHash` of every installed program, sorted (what an operator
+    /// logs at startup, and what a consumer gate checks membership against).
+    pub fn program_hashes(&self) -> Vec<B256> {
+        let mut hashes: Vec<B256> = self.programs.keys().copied().collect();
+        hashes.sort_unstable();
+        hashes
+    }
+
+    /// The `artifactRoot` of every mounted artifact bundle, sorted.
+    pub fn artifact_roots(&self) -> Vec<B256> {
+        let mut roots: Vec<B256> = self.artifacts.keys().copied().collect();
+        roots.sort_unstable();
+        roots
+    }
 }
 
 /// The unbounded slot-name sequence `NAME`, `NAME_1`, `NAME_2`, …
