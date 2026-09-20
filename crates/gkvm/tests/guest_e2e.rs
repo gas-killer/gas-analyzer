@@ -83,10 +83,10 @@ fn cycle_counts_are_stable_across_repeated_runs() {
 /// keccak256 of the committed `hello-py.elf` — interpreter and frozen script
 /// in one image, so this moves with either.
 const HELLO_PY_PROGRAM_HASH: B256 =
-    b256!("0xa270eab73fa9b1599827c57bcc9fe061bb352704a5572a413da4fa5ab35d5689");
+    b256!("0x951aafd594c660f21820e50d98df0eb61d5d32d663212cf6f2408bd1cd145443");
 
 /// Instructions retired by `hello-py.elf` on the 4-byte payload, 16 MiB heap.
-const HELLO_PY_CYCLES: u64 = 592_469;
+const HELLO_PY_CYCLES: u64 = 593_442;
 
 #[test]
 fn hello_py_answers_with_stable_pinned_counts() {
