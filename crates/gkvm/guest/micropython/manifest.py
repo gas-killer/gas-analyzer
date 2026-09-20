@@ -1,5 +1,6 @@
-# Freeze exactly what the Makefile staged: the guest script, alone in
-# GUEST_STAGE (passed as a MICROPY_MANIFEST_* variable). Nothing from
-# micropython-lib is pulled in — a guest that wants a library module stages
-# and freezes it explicitly.
-freeze_as_mpy("$(GUEST_STAGE)")
+# Freeze exactly what the Makefile staged, in the order port.mk wrote into the
+# generated manifest (GUEST_PY_EXTRA, then the guest script) — never the stage
+# as a directory: that order would be the host filesystem's, and the freeze
+# order is part of programHash. Nothing from micropython-lib is pulled in — a
+# guest that wants a library module stages and freezes it explicitly.
+include("$(GUEST_MANIFEST)")
