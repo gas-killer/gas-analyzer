@@ -9,6 +9,10 @@
 #   make docker-qwen  `make qwen probe` inside ubuntu:24.04
 #   make fixtures-qwen  copy the two qwen ELFs + artifact-probe into ../tests/fixtures/
 #
+# Python guests are their own build (MicroPython pinned upstream, fetched into
+# target/, frozen-bytecode images): `make -C micropython fetch docker
+# [GUEST_PY=hello.py]` — see micropython/Makefile.
+#
 # All guests share link.ld and the entry/W^X/layout rules it encodes; see
 # link.ld for the SP1 v6 loader contract.
 #
