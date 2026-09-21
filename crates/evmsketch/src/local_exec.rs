@@ -621,7 +621,7 @@ fn build_updates_from_state_diff(
                 .collect()
         })
         .unwrap_or_default();
-    stores.sort_by(|a, b| a.0.cmp(&b.0));
+    stores.sort_by_key(|store| store.0);
 
     let mut updates: Vec<StateUpdate> = stores
         .into_iter()
