@@ -190,7 +190,7 @@ fn greedy_generations_match_the_integer_reference() {
     // bytes, identical on the jit and the portable tier (run this test with
     // `--features portable-exec` for the other half). Rebuilding the guest
     // moves them; re-record from this test's output.
-    for (name, cycles) in [("genShort", 8_473_894u64), ("genLong", 14_593_174)] {
+    for (name, cycles) in [("genShort", 5_021_011u64), ("genLong", 11_140_291)] {
         let (max_new, ids, text) = vectors.generation(name);
         let payload = chat_payload(&vectors.config, &vectors.prompt, U256::from(max_new));
         let report = chat(&program, &mount, &payload);
