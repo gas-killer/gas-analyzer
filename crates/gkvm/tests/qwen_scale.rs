@@ -17,20 +17,16 @@
 //! * the real-size memory footprint (597 MB of weights in guest memory, a
 //!   ~680 MB hint stream) under `GKVM_MEM_BYTES_CAP` on the consensus tier.
 //!
-//! **`load+1` is PINNED:** the jit and the portable tier each answered `Ok`
-//! with cycles = 46,465,876,532 and output keccak
-//! 0xc4150374a20548e4cba5f06bdb00908b7b4d2e1079c97ca8bf663c3c4dcd39f1 — so no
-//! numeric trap fires and the real-size footprint fits on both tiers.
-//! **`prefill2` and `chat4x4` are UNPINNED** (constants still zero; no run on
-//! either tier). A zero constant fails with the measured values in the
-//! message; pin a case only once BOTH tiers have printed the same line.
+//! **All three cases are PINNED** at the KECCAK_PERMUTE crt (2026-09-21), from the
+//! portable tier on aarch64: `load+1` 4,975,845,659 · `prefill2` 7,003,107,628 ·
+//! `chat4x4` 19,224,683,180 cycles. `load+1`'s output keccak (0xc415…39f1) is
+//! the one both tiers produced under the software-keccak crt at 46,465,876,532
+//! cycles — the syscall moved the count 9.3×, not the answer. The jit leg runs
+//! in CI (`gkvm-flagship` workflow) against these same constants.
 //!
-//! `#[ignore]`d: ~4.6×10^10 cycles per case (about a minute on an idle jit
-//! and ten and more on the interpreter — estimates from the bench guest's
-//! throughput; the only observed walls, ~21 min jit and ~34 min interp, are
-//! from a loaded, swapping host and are not measurements), ~600 MB on disk
-//! under `target/gkvm-qwen-scale/`, GBs of RAM: on a 16 GB host that is
-//! already swapping, run one case at a time and watch `free -m`.
+//! `#[ignore]`d: 5–19×10^9 cycles per case (observed on an M-series Mac's
+//! interpreter, sequentially: 40 s / 56 s / 219 s), ~600 MB on disk under
+//! `target/gkvm-qwen-scale/`, GBs of RAM — run one case at a time on a small host.
 //! `cargo test -p gas-analyzer-gkvm --release --test qwen_scale -- --ignored --nocapture`
 //! One test per case, so the usual name filter runs a subset (`… -- --ignored load_plus_1`).
 
@@ -80,22 +76,22 @@ const CASES: &[Case] = &[
         name: "load+1",
         prompt: &[9707],
         max_new: 1,
-        cycles: 46_465_876_532,
+        cycles: 4_975_845_659,
         output: b256!("c4150374a20548e4cba5f06bdb00908b7b4d2e1079c97ca8bf663c3c4dcd39f1"),
     },
     Case {
         name: "prefill2",
         prompt: &[9707, 11],
         max_new: 1,
-        cycles: 0,
-        output: b256!("0000000000000000000000000000000000000000000000000000000000000000"),
+        cycles: 7_003_107_628,
+        output: b256!("2b1ca983336ccb07c699390ba8ea3337fa62135067a900dc3191589a892b98f5"),
     },
     Case {
         name: "chat4x4",
         prompt: &[9707, 11, 1879, 0],
         max_new: 4,
-        cycles: 0,
-        output: b256!("0000000000000000000000000000000000000000000000000000000000000000"),
+        cycles: 19_224_683_180,
+        output: b256!("3537ecf281aba3e00d0df539de0309ca5c30d141c2743d9fd0edcafd72cf3b89"),
     },
 ];
 
