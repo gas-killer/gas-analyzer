@@ -2322,6 +2322,49 @@ protocol can have huge gas and no removable gas, after Sky (routed) and Euler (m
 
 The one bright spot, `collectFees`, is real but runs half a time a day.
 
+## A third proven artifact, and a cheap test that catches the class
+
+Added 2026-09-21, from a Privacy Pools wrapper (`0x13a0b86b…`) submitted for checking. Four
+transactions. Three measured negative. The fourth reported **49.72%** and is a replay artifact.
+
+The two that matter went to the **same contract, the same selector `0xcef6d209`, the same
+calldata length, 20 blocks apart**:
+
+| tx | gas used | replay cost | surplus |
+|---|---:|---:|---:|
+| `0x17c10130…` | 1,002,119 | 1,157,900 | −155,781 |
+| `0x35a5bdc9…` | 1,089,823 | 498,010 | **+591,813** |
+
+That spread is not physical, and it is the tell. Neither transaction reverted at the top level,
+so nothing in the tool's output distinguishes them — this is the same silent failure mode proven
+for ERC-4337 on 2026-09-14, now seen a third time.
+
+### The test
+
+**Compare the measured base against the summed live gas of the top-level calls the replay has to
+re-execute.** The analyzer keeps a regular `CALL` whole and re-runs it, so a faithful replay must
+cost at least what those calls cost live, plus state application. A base that falls *below* that
+total means a recorded call did not actually run.
+
+| tx | base | Σ top-level calls (live) | base − calls | verdict |
+|---|---:|---:|---:|---|
+| `0x17c10130…` | 1,157,900 | 1,116,937 | **+40,963** | full replay — real, and negative |
+| `0x35a5bdc9…` | 498,010 | 1,192,129 | **−694,119** | its 1,073,590-gas `0xd691c964` call never ran |
+
+The same test cleared Doppler's four `collectFees` wins three days earlier (base exceeded calls by
+87,015–218,539 on all five rows). It costs one `debug_traceTransaction` per row. **It should be
+run on every positive result whose transaction contains a large outbound call**, and especially
+on any row carrying the re-entrancy note.
+
+### The wrapper itself
+
+`0x13a0b86b…` is a Privacy Pools deposit wrapper: it pulls USDT with `transferFrom`, approves,
+calls two contracts (347,574 and 493,058 gas), and mints `ppUSDT`. Both direct calls to it
+measured **−7,262 and −7,370** — constant negative, the router signature already recorded for Sky
+and Euler. Its own work is marshalling; everything expensive belongs to somebody else.
+
+**Not a candidate**, and worse than the Privacy Pools entry points already in the survey.
+
 ## What this is actually worth in dollars
 
 Every figure above is a percentage. Percentages were the wrong unit, and this section is

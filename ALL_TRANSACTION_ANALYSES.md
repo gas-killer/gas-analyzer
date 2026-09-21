@@ -1,6 +1,6 @@
 # Every transaction analysed, in one place
 
-468 Ethereum mainnet transactions across 49 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Eleven more could not be run at all; they are listed at the end.
+472 Ethereum mainnet transactions across 49 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Eleven more could not be run at all; they are listed at the end.
 
 > ### Revised for the new signature floor — 2026-09-04
 >
@@ -1367,6 +1367,11 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | Doppler | [`0x4acc3548…`](https://etherscan.io/tx/0x4acc354864884ec88f6220c44117cd6202c3ccb929cb86121d0c2f5e5802b36d) | Airlock `create` ✓ `0x882db707` `heur` | 14,565,475 | 14,553,746 | +11,729 | **0** | 0 | under the floor | — | `heur` — the heuristic **understates** base, so this surplus is an **upper bound**; orchestration only — every module call is a `CALL`; surplus flat at ~8–12k regardless of size |
 | Doppler | [`0xbaf43707…`](https://etherscan.io/tx/0xbaf43707c055b311b89e75bf9e4fdcd2d2f2a49f43f1ddaaa14bf8cd19840a5d) | Airlock `create` ✓ `0x882db707` `heur` | 10,859,630 | 10,849,188 | +10,442 | **0** | 0 | under the floor | — | `heur` — the heuristic **understates** base, so this surplus is an **upper bound**; orchestration only — every module call is a `CALL`; surplus flat at ~8–12k regardless of size |
 | Doppler | [`0xa9d5f961…`](https://etherscan.io/tx/0xa9d5f961645cc40acb7f6fe54451f311268387e3ccf5227787b4378e7b39b689) | Airlock `create` ✓ `0x882db707` `heur` | 6,888,479 | 6,879,544 | +8,935 | **0** | 0 | under the floor | — | `heur` — the heuristic **understates** base, so this surplus is an **upper bound**; orchestration only — every module call is a `CALL`; surplus flat at ~8–12k regardless of size |
+
+| Privacy Pools | [`0x1a18f555…`](https://etherscan.io/tx/0x1a18f5556a44d6c405964019ff6a1ea6020d155777303407240269ecd65ad95a) | wrapper `0x13a0b86b…` `0xc63148e8` | 872,799 | 880,061 | -7,262 | **0** | 0 | replay costs more | — | pulls USDT, approves, calls out twice; its own work is marshalling |
+| Privacy Pools | [`0x660d57a5…`](https://etherscan.io/tx/0x660d57a571258a73e14d1a0126ebae1e9ef2f815e79cbdb4f5dea8731521c1df) | wrapper `0x13a0b86b…` `0xc63148e8` | 908,670 | 916,040 | -7,370 | **0** | 0 | replay costs more | — | same shape, surplus constant to within 108 gas |
+| Privacy Pools | [`0x17c10130…`](https://etherscan.io/tx/0x17c10130f248403cfd7ca99ceafbe51e442e56b017c11ba2aa3afc2cf718d800) | via `0xdb9b1e94…` `0xcef6d209` | 1,002,119 | 1,157,900 | -155,781 | **0** | 0 | replay costs more | — | base exceeds its re-executed calls by 40,963 — full replay, genuinely negative |
+| Privacy Pools | [`0x35a5bdc9…`](https://etherscan.io/tx/0x35a5bdc902dcb2b717effb7be7373a9c8f5edd37813fa1f0bc83c66ba275af7f) | via `0xdb9b1e94…` `0xcef6d209` | 1,089,823 | 498,010 | +591,813 | **0** | 0 | **PROVEN ARTIFACT** | — | reports 49.72%; base falls **694,119 short** of the 1,192,129 of calls it must re-execute. Its 1,073,590-gas `0xd691c964` call did not run. Sibling row above is the same contract, selector and calldata size, 20 blocks apart, and measures −155,781 |
 
 ## Transactions that could not be measured at all
 
