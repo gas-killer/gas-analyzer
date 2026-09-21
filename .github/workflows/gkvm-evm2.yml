@@ -1,0 +1,33 @@
+name: gkvm evm2 lane
+
+# UNBOUNDED_V3 lane L2: the gkvm precompile on alloy-rs/evm2 (excluded crate, own lockfile,
+# pinned git rev) must reproduce the golden vectors the revm-31 provider is held to.
+# Never blocks anything: revm 31 stays the consensus interpreter.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "crates/gkvm-evm2/**"
+      - "crates/gkvm/**"
+      - "crates/core/src/gkvm*"
+      - "crates/evmsketch/tests/fixtures/gkvm/**"
+      - ".github/workflows/gkvm-evm2.yml"
+
+jobs:
+  differential:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/gkvm-evm2
+      - name: fmt + clippy
+        working-directory: crates/gkvm-evm2
+        run: |
+          cargo fmt -- --check
+          cargo clippy --all-targets --locked -- -D warnings
+      - name: golden differential vs the revm-31 vectors
+        working-directory: crates/gkvm-evm2
+        run: cargo test --locked
