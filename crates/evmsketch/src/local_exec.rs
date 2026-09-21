@@ -865,7 +865,7 @@ fn run_pass<DB, INSP>(
 where
     DB: DatabaseRef,
     DB::Error: core::fmt::Debug,
-    INSP: for<'a> Inspector<
+    INSP: Inspector<
             Context<
                 revm::context::BlockEnv,
                 TxEnv,
