@@ -1,6 +1,6 @@
 # Every transaction analysed, in one place
 
-472 Ethereum mainnet transactions across 49 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Eleven more could not be run at all; they are listed at the end.
+477 Ethereum mainnet transactions across 49 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Eleven more could not be run at all; they are listed at the end.
 
 > ### Revised for the new signature floor — 2026-09-04
 >
@@ -160,7 +160,7 @@ Best and typical figures use only properly measured runs. They exclude the two O
 | **Mellow** | 5 | 5 | **41.55%** | 30.00% | — |
 | **Midas** | 12 | 9 | **23.54%** | 10.21% | under the floor (2), replay costs more (1); `depositInstant` wins are **not** call-blocked |
 | **Chronicle** | 24 | 17 | **32.64%** | 30.17% | under the floor (4), replay costs more (3) |
-| **Privacy Pools** | 11 | 2 | **19.47%** | 18.00% | replay costs more (9) |
+| **Privacy Pools** | 20 | 7 | **59.59%** | 18.00% | replay costs more (9) |
 | **Rocket Pool** | 11 | 6 | **15.66%** | 11.55% | under the floor (4), replay costs more (1); **every one of 122 deposits in 27.8 days clears the floor** — but surplus is largely RocketStorage `STATICCALL` overhead, not arithmetic |
 | **Doppler** | 18 | 4 | **13.73%** | 4.44% | under the floor (13), replay costs more (1); **`Airlock.create` is pure orchestration** — surplus flat at ~8–12k whether the transaction is 2.3M or 14.6M gas; only the v4 hook's `collectFees` clears |
 | **Aragon** | 19 | 6 | **24.15%** | 4.64% | replay costs more (11), under the floor (2); all wins **call-dominated**, and only `execute` ever saves — 6 of 6 |
@@ -1372,6 +1372,12 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | Privacy Pools | [`0x660d57a5…`](https://etherscan.io/tx/0x660d57a571258a73e14d1a0126ebae1e9ef2f815e79cbdb4f5dea8731521c1df) | wrapper `0x13a0b86b…` `0xc63148e8` | 908,670 | 916,040 | -7,370 | **0** | 0 | replay costs more | — | same shape, surplus constant to within 108 gas |
 | Privacy Pools | [`0x17c10130…`](https://etherscan.io/tx/0x17c10130f248403cfd7ca99ceafbe51e442e56b017c11ba2aa3afc2cf718d800) | via `0xdb9b1e94…` `0xcef6d209` | 1,002,119 | 1,157,900 | -155,781 | **0** | 0 | replay costs more | — | base exceeds its re-executed calls by 40,963 — full replay, genuinely negative |
 | Privacy Pools | [`0x35a5bdc9…`](https://etherscan.io/tx/0x35a5bdc902dcb2b717effb7be7373a9c8f5edd37813fa1f0bc83c66ba275af7f) | via `0xdb9b1e94…` `0xcef6d209` | 1,089,823 | 498,010 | +591,813 | **0** | 0 | **PROVEN ARTIFACT** | — | reports 49.72%; base falls **694,119 short** of the 1,192,129 of calls it must re-execute. Its 1,073,590-gas `0xd691c964` call did not run. Sibling row above is the same contract, selector and calldata size, 20 blocks apart, and measures −155,781 |
+
+| Privacy Pools | [`0x3585c6e3…`](https://etherscan.io/tx/0x3585c6e357bdf24f500f595ae26d61217c9a1ccc8f911de9e808df32e2d1bfd1) | PoolVault `0x0eb42804…` `0x769284c2` | 485,882 | 160,863 | +325,019 | **275,019** (56.60%) | 75,019 | — | — | the contract that runs the pairing check; only child is a DELEGATECALL, which replay follows |
+| Privacy Pools | [`0x83d92882…`](https://etherscan.io/tx/0x83d928821a47b6fe8b0002b567c6cd32ea6b111a493ecdacf89c06134fdcacc6) | PoolVault `0x0eb42804…` `0x769284c2` | 485,918 | 160,863 | +325,055 | **275,055** (56.60%) | 75,055 | — | — | same base to the gas as the row above |
+| Privacy Pools | [`0x8cc80eae…`](https://etherscan.io/tx/0x8cc80eae520f1c61fe39f18ab0ea82e4afbbb6ed4c0ddca71d26b5627628f92a) | PoolVault `0x0eb42804…` `0x769284c2` | 501,769 | 152,785 | +348,984 | **298,984** (59.59%) | 98,984 | — | — | best measured row |
+| Privacy Pools | [`0x7c4ec4bd…`](https://etherscan.io/tx/0x7c4ec4bdac962c1620a1942b05d6fa1f3ce2b8e504a7ffbee5103b8ad6868ae0) | PoolVault `0x0eb42804…` `0x769284c2` | 477,873 | 179,686 | +298,187 | **248,187** (51.94%) | 48,187 | — | — |  |
+| Privacy Pools | [`0x4cbeadad…`](https://etherscan.io/tx/0x4cbeadad4bc2a553822f5917546fa0c4c2bd37314077a2447b378fb7b93c9fc9) | PoolVault `0x0eb42804…` `0x769284c2` | 482,024 | 207,784 | +274,240 | **224,240** (46.52%) | 24,240 | — | — |  |
 
 ## Transactions that could not be measured at all
 

@@ -2365,6 +2365,48 @@ and Euler. Its own work is marshalling; everything expensive belongs to somebody
 
 **Not a candidate**, and worse than the Privacy Pools entry points already in the survey.
 
+## Privacy Pools, second look — the deposit path does save, one contract down
+
+Added 2026-09-21. A `PPRouter` (`0x13a0b86b…`) was submitted for checking. Its deposit,
+`depositExactShares`, measured **−7,262 and −7,370**. That is not because the work is absent.
+The transaction contains a full Groth16 verification — one pairing (181,000 gas), 4 ecMul,
+4 ecAdd, **205,600 gas, 23.6% of the transaction**.
+
+It is two regular `CALL` boundaries away from the router:
+
+```
+PPRouter          ← the contract instrumented
+  └ CALL      Entrypoint   493,058
+      └ CALL  PoolVault    437,225
+          └ pairing        205,600
+```
+
+Both are regular `CALL`s, kept whole and re-executed, so the router keeps none of it. The router's
+own work is `transferFrom`, two `approve`s and marshalling — bookkeeping, which replays for
+slightly more than it costs to do. Hence the small negative.
+
+**The PoolVault (`0x0eb42804…`) is directly callable, and there the same work does save.**
+Five measured direct calls to `0x769284c2`:
+
+| gas used | replay cost | saved | % |
+|---:|---:|---:|---:|
+| 501,769 | 152,785 | 298,984 | **59.59%** |
+| 485,918 | 160,863 | 275,055 | 56.60% |
+| 485,882 | 160,863 | 275,019 | 56.60% |
+| 477,873 | 179,686 | 248,187 | 51.94% |
+| 482,024 | 207,784 | 224,240 | 46.52% |
+
+Its only child is a `DELEGATECALL` to the implementation, which the analyzer follows rather than
+re-executes, and the pairing sits inside a `STATICCALL`, whose gas lands in surplus. Both work in
+GasKiller's favour.
+
+Note on method: the base-versus-calls artifact test **must count regular `CALL`s only**. Applied
+naively to these rows it flags all five as artifacts, because it counts the `DELEGATECALL` the
+replay legitimately follows. Regular calls here total zero gas, and the rows pass.
+
+**Verdict: the deposit flow is a candidate — but the integration point is the PoolVault, not the
+router.** Volume is the usual problem: 8 direct calls in 500,000 blocks.
+
 ## What this is actually worth in dollars
 
 Every figure above is a percentage. Percentages were the wrong unit, and this section is
