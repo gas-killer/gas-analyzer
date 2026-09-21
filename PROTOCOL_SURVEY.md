@@ -2396,6 +2396,9 @@ Five measured direct calls to `0x769284c2`:
 | 477,873 | 179,686 | 248,187 | 51.94% |
 | 482,024 | 207,784 | 224,240 | 46.52% |
 
+A second PoolVault function, `0x85afaff4`, measured **788,016 → 288,000, saving 450,016 (57.11%)** —
+the largest saving in the Privacy Pools set and the only row in it that also clears the BLS floor.
+
 Its only child is a `DELEGATECALL` to the implementation, which the analyzer follows rather than
 re-executes, and the pairing sits inside a `STATICCALL`, whose gas lands in surplus. Both work in
 GasKiller's favour.
