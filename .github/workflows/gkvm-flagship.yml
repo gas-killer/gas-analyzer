@@ -1,0 +1,63 @@
+name: gkvm flagship
+
+# UNBOUNDED_V3 M4: the real Qwen3-0.6B answer through the gkvm guest on BOTH executor tiers
+# (x86_64 jit and the portable interpreter), plus the real-size synthetic count pins on the
+# jit. The tiers must agree on cycles and output byte for byte; walls are reported, and only
+# the jit wall is meaningful for the ≥10× gate against the V2 baseline (545.1B gas, ~9 min).
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "crates/gkvm/**"
+      - ".github/workflows/gkvm-flagship.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  flagship:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Install foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Build gk-run (jit + portable)
+        run: |
+          cargo build --release -p gas-analyzer-gkvm --bin gk-run
+          cargo build --release -p gas-analyzer-gkvm --bin gk-run \
+            --features gas-analyzer-gkvm/portable-exec --target-dir target/portable
+          echo "jit=$(target/release/gk-run --print-tier) interp=$(target/portable/release/gk-run --print-tier)"
+
+      - name: Determinism matrix (both tiers × 10 runs)
+        run: bash crates/gkvm/scripts/m1-matrix.sh 10
+
+      - name: Host health (80,000,157-cycle bench; ~1e8 ns on an idle jit)
+        run: |
+          for i in 1 2 3; do
+            target/release/gk-run --program crates/gkvm/tests/fixtures/bench-c.elf \
+              --input 0x0000000000989680 2>&1 >/dev/null | grep -o '"wall_nanos":[0-9]*'
+          done
+
+      - name: Real Qwen3-0.6B — jit
+        run: GK_RUN=target/release/gk-run bash crates/gkvm/scripts/flagship/run.sh 1 8 | tee jit.jsonl
+
+      - name: Real Qwen3-0.6B — portable interpreter
+        run: GK_RUN=target/portable/release/gk-run bash crates/gkvm/scripts/flagship/run.sh 1 8 | tee interp.jsonl
+
+      - name: Tiers agree on cycles and output
+        run: |
+          strip() { sed -E 's/"tier":"[a-z]+",//; s/"wall_nanos":[0-9]+,//' "$1"; }
+          diff <(strip jit.jsonl) <(strip interp.jsonl)
+          {
+            echo '### Real Qwen3-0.6B through gkvm'
+            echo '```json'
+            cat jit.jsonl interp.jsonl
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Real-size synthetic pins — jit (load+1, prefill2, chat4x4)
+        run: cargo test -p gas-analyzer-gkvm --release --test qwen_scale -- --ignored --nocapture --test-threads 1
