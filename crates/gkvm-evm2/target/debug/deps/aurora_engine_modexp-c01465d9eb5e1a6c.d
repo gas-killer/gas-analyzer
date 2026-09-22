@@ -1,0 +1,10 @@
+/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/deps/aurora_engine_modexp-c01465d9eb5e1a6c.d: /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.3.0/src/lib.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.3.0/src/arith.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.3.0/src/maybe_std.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.3.0/src/mpnat.rs
+
+/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/deps/libaurora_engine_modexp-c01465d9eb5e1a6c.rlib: /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.3.0/src/lib.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.3.0/src/arith.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.3.0/src/maybe_std.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.3.0/src/mpnat.rs
+
+/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/deps/libaurora_engine_modexp-c01465d9eb5e1a6c.rmeta: /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.3.0/src/lib.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.3.0/src/arith.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.3.0/src/maybe_std.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.3.0/src/mpnat.rs
+
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.3.0/src/lib.rs:
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.3.0/src/arith.rs:
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.3.0/src/maybe_std.rs:
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aurora-engine-modexp-1.3.0/src/mpnat.rs:

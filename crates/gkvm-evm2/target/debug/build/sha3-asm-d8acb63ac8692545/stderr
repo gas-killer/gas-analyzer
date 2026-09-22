@@ -1,0 +1,4 @@
+selected cryptogams script: cryptogams/arm/keccak1600-armv8.pl
+selected cryptogams script flavor: Some("ios64+sha3")
+running script: "perl" "cryptogams/arm/keccak1600-armv8.pl" "ios64+sha3" "/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/build/sha3-asm-d8acb63ac8692545/out/keccak1600-armv8.S"
+stdout for cryptogams/arm/keccak1600-armv8.pl is empty: file "/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/build/sha3-asm-d8acb63ac8692545/out/keccak1600-armv8.S" was written by perl script
