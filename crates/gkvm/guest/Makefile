@@ -16,34 +16,19 @@
 # All guests share link.ld and the entry/W^X/layout rules it encodes; see
 # link.ld for the SP1 v6 loader contract.
 #
-# The committed hello-c.elf / bench-c.elf predate the crt's keccak fast path
-# and are pinned (programHash + cycle counts) by the sdk's golden vectors:
-# `make c fixtures` links today's crt and would move both. Neither guest
-# hashes anything, so they are left as built.
+# Every C guest is built with the same byte-reproducible recipe (named objects, then
+# link), so a committed ELF is a function of the sources and the docker toolchain.
 
 CC := riscv64-unknown-elf-gcc
-CFLAGS := -march=rv64im -mabi=lp64 -mcmodel=medany -O2 -Wall -Wextra \
-          -ffreestanding -fno-builtin -fno-common -fno-jump-tables -nostdlib -nostartfiles \
-          -static -T link.ld -Wl,--build-id=none
-CRT := crt/crt0.S crt/gkvm.c
 
 BUILD := build
 
 c: $(BUILD)/hello-c.elf $(BUILD)/bench-c.elf
 
-$(BUILD)/hello-c.elf: hello/hello.c $(CRT) crt/gkvm.h link.ld
-	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(CRT) hello/hello.c -o $@
-
-$(BUILD)/bench-c.elf: bench/bench.c $(CRT) crt/gkvm.h link.ld
-	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(CRT) bench/bench.c -o $@
-
-# qwen + probe: each unit is compiled to a NAMED object and then linked. The
-# one-shot `gcc a.S b.c -o x.elf` recipe above assembles into a random
-# /tmp/ccXXXXXX.o whose name lands in .symtab, so its ELF bytes — and therefore
-# programHash — differ from build to build; this one is a function of the
-# sources.
+# Each unit is compiled to a NAMED object and then linked. A one-shot
+# `gcc a.S b.c -o x.elf` assembles into a random /tmp/ccXXXXXX.o whose name
+# lands in .symtab, so its ELF bytes — and therefore programHash — differ from
+# build to build; this recipe is a function of the sources.
 CFLAGS_OBJ := -march=rv64im -mabi=lp64 -mcmodel=medany -O2 -Wall -Wextra \
               -ffreestanding -fno-builtin -fno-common -fno-jump-tables
 LDFLAGS_ELF := -march=rv64im -mabi=lp64 -nostdlib -nostartfiles -static -T link.ld -Wl,--build-id=none
@@ -61,6 +46,20 @@ $(OBJ)/crt0.o: crt/crt0.S
 $(OBJ)/gkvm.o: crt/gkvm.c crt/gkvm.h
 	@mkdir -p $(OBJ)
 	$(CC) $(CFLAGS_OBJ) -c crt/gkvm.c -o $@
+
+$(OBJ)/hello.o: hello/hello.c crt/gkvm.h
+	@mkdir -p $(OBJ)
+	$(CC) $(CFLAGS_OBJ) -c hello/hello.c -o $@
+
+$(OBJ)/bench.o: bench/bench.c crt/gkvm.h
+	@mkdir -p $(OBJ)
+	$(CC) $(CFLAGS_OBJ) -c bench/bench.c -o $@
+
+$(BUILD)/hello-c.elf: $(CRT_OBJ) $(OBJ)/hello.o link.ld
+	$(CC) $(LDFLAGS_ELF) $(CRT_OBJ) $(OBJ)/hello.o -o $@
+
+$(BUILD)/bench-c.elf: $(CRT_OBJ) $(OBJ)/bench.o link.ld
+	$(CC) $(LDFLAGS_ELF) $(CRT_OBJ) $(OBJ)/bench.o -o $@
 
 $(OBJ)/qwen.o: qwen/qwen.c crt/gkvm.h
 	@mkdir -p $(OBJ)

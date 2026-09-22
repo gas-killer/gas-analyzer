@@ -100,8 +100,19 @@ fn fixture() -> NativeFixture {
 
 /// The answer.py image, which must be the very program the fixture's consumer
 /// names: a rebuilt guest that moved is a different task, not a parity failure.
-fn answer_elf(fixture: &NativeFixture) -> Vec<u8> {
-    let path = std::env::var("GK_NATIVE_ANSWER_ELF").unwrap_or_else(|_| SIBLING_SDK_ELF.into());
+fn answer_elf(fixture: &NativeFixture) -> Option<Vec<u8>> {
+    // `--ignored` also selects this test in runs that are after the RPC tests and have no
+    // sdk checkout: without an explicit image path, a missing sibling build is a skip.
+    let explicit = std::env::var("GK_NATIVE_ANSWER_ELF")
+        .ok()
+        .filter(|path| !path.is_empty());
+    if explicit.is_none() && !std::path::Path::new(SIBLING_SDK_ELF).exists() {
+        eprintln!(
+            "skipping: no answer.py image at {SIBLING_SDK_ELF} and GK_NATIVE_ANSWER_ELF unset"
+        );
+        return None;
+    }
+    let path = explicit.unwrap_or_else(|| SIBLING_SDK_ELF.into());
     let elf = std::fs::read(&path).unwrap_or_else(|e| {
         panic!(
             "answer.py image not found at {path} ({e}): build it with \
@@ -113,7 +124,7 @@ fn answer_elf(fixture: &NativeFixture) -> Vec<u8> {
         fixture.program_hash,
         "{path} is not the image the committed binding names"
     );
-    elf
+    Some(elf)
 }
 
 fn host(elf: &[u8]) -> Arc<GkvmHost> {
@@ -187,7 +198,9 @@ fn extract(
 #[ignore = "needs the answer.py image (not committed): make -C ../solidity-sdk/tools/gk zero-glue-check"]
 fn forge_and_local_executor_tasks_encode_identical_state_updates() {
     let fixture = fixture();
-    let elf = answer_elf(&fixture);
+    let Some(elf) = answer_elf(&fixture) else {
+        return;
+    };
     assert_eq!(fixture.tasks.len(), 6);
     assert!(fixture.tasks.iter().any(|task| !task.success));
 

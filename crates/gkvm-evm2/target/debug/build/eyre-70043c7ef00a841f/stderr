@@ -1,0 +1,9 @@
+error[E0554]: `#![feature]` may not be used on the stable release channel
+ --> /Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/build/eyre-70043c7ef00a841f/out/probe.rs:2:5
+  |
+2 |     #![feature(error_generic_member_access)]
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0554`.

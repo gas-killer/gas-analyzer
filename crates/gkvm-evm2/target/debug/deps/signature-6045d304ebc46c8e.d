@@ -1,0 +1,12 @@
+/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/deps/signature-6045d304ebc46c8e.d: /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/lib.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/hazmat.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/encoding.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/error.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/keypair.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/signer.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/verifier.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/../README.md
+
+/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/deps/libsignature-6045d304ebc46c8e.rmeta: /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/lib.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/hazmat.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/encoding.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/error.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/keypair.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/signer.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/verifier.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/../README.md
+
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/lib.rs:
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/hazmat.rs:
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/encoding.rs:
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/error.rs:
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/keypair.rs:
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/signer.rs:
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/verifier.rs:
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signature-3.0.0/src/../README.md:

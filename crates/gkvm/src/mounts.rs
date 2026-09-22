@@ -324,9 +324,12 @@ fn env_slots(
 }
 
 /// One env slot: `Ok(None)` ends the scan, a half-configured slot is an
-/// error, never a skip.
+/// error, never a skip. An EMPTY value counts as unset: docker compose and
+/// helm can blank a variable but not remove it, and "this operator has no
+/// guest program" must be expressible there (it was a crash loop instead).
 fn read_slot(path_var: &str, digest_var: &str) -> Result<Option<(String, B256)>, GkVmMountError> {
-    match (std::env::var(path_var).ok(), std::env::var(digest_var).ok()) {
+    let var = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    match (var(path_var), var(digest_var)) {
         (None, None) => Ok(None),
         (Some(_), None) => Err(GkVmMountError::IncompleteEnvSlot {
             present: path_var.to_string(),

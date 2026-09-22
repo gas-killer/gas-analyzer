@@ -176,15 +176,15 @@ const ZERO_PAGE: [u8; GKVM_ARTIFACT_PAGE_SIZE] = [0u8; GKVM_ARTIFACT_PAGE_SIZE];
 
 fn parent_level(level: &[B256]) -> Vec<B256> {
     let mut parents = Vec::with_capacity(level.len().div_ceil(2));
-    let mut chunks = level.chunks_exact(2);
-    for pair in &mut chunks {
+    let (pairs, remainder) = level.as_chunks::<2>();
+    for [left, right] in pairs {
         let mut hasher = Keccak256::new();
         hasher.update([MANIFEST_NODE_PREFIX]);
-        hasher.update(pair[0]);
-        hasher.update(pair[1]);
+        hasher.update(left);
+        hasher.update(right);
         parents.push(hasher.finalize());
     }
-    if let [lonely] = chunks.remainder() {
+    if let [lonely] = remainder {
         parents.push(*lonely);
     }
     parents

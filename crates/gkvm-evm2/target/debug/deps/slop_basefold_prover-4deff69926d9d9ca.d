@@ -1,0 +1,10 @@
+/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/deps/slop_basefold_prover-4deff69926d9d9ca.d: /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-basefold-prover-6.8.0/src/lib.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-basefold-prover-6.8.0/src/encoder.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-basefold-prover-6.8.0/src/fri.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-basefold-prover-6.8.0/src/prover.rs
+
+/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/deps/libslop_basefold_prover-4deff69926d9d9ca.rlib: /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-basefold-prover-6.8.0/src/lib.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-basefold-prover-6.8.0/src/encoder.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-basefold-prover-6.8.0/src/fri.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-basefold-prover-6.8.0/src/prover.rs
+
+/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/deps/libslop_basefold_prover-4deff69926d9d9ca.rmeta: /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-basefold-prover-6.8.0/src/lib.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-basefold-prover-6.8.0/src/encoder.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-basefold-prover-6.8.0/src/fri.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-basefold-prover-6.8.0/src/prover.rs
+
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-basefold-prover-6.8.0/src/lib.rs:
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-basefold-prover-6.8.0/src/encoder.rs:
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-basefold-prover-6.8.0/src/fri.rs:
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-basefold-prover-6.8.0/src/prover.rs:

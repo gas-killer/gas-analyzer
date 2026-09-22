@@ -325,7 +325,10 @@ mod tests {
         assert_eq!(UNBOUNDED_V1_XL_BLOCK_GAS_LIMIT, 1 << 43);
         assert_eq!(UNBOUNDED_V1_XL_TX_GAS_LIMIT, 1 << 43);
         // The tiers must never silently coincide.
-        assert_ne!(UNBOUNDED_V1_XL_BLOCK_GAS_LIMIT, UNBOUNDED_V1_BLOCK_GAS_LIMIT);
+        assert_ne!(
+            UNBOUNDED_V1_XL_BLOCK_GAS_LIMIT,
+            UNBOUNDED_V1_BLOCK_GAS_LIMIT
+        );
     }
 
     #[test]

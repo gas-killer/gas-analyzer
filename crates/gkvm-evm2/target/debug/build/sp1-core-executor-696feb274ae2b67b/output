@@ -1,0 +1,2 @@
+cargo:rustc-cfg=sp1_use_portable_executor
+cargo-if-changed=src/build.rs

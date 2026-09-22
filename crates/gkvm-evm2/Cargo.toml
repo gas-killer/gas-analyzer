@@ -1,0 +1,29 @@
+# gkvm-evm2 — the UNBOUNDED_V3 gkvm precompile on alloy-rs/evm2 (campaign lane L2).
+#
+# DELIBERATELY EXCLUDED from the analyzer workspace (root Cargo.toml `exclude`), the
+# gk-fast-view playbook: evm2 is unreleased, moves daily and needs a recent stable Rust, so
+# it resolves against its OWN Cargo.lock and cannot perturb the consensus-critical lock the
+# revm-31 local executor builds from. revm 31 stays the consensus interpreter; this lane only
+# proves the precompile's semantics carry over bit for bit. Promotion is a HUMAN decision
+# gated on differential CI at scale AND an upstream crates.io release.
+#
+#   cd crates/gkvm-evm2 && cargo test
+[package]
+name = "gkvm-evm2"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# Pinned by rev — never a branch.
+evm2 = { git = "https://github.com/alloy-rs/evm2", rev = "01d0152a64d031fbf9d22c6e7b0b167f8f07b7a0" }
+gas-analyzer-gkvm = { path = "../gkvm" }
+gas-analyzer-core = { path = "../core" }
+alloy-primitives = "1"
+alloy-sol-types = "1"
+thiserror = "2"
+
+[workspace]
+
+[dev-dependencies]
+serde_json = "1"

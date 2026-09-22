@@ -1,0 +1,3 @@
+# Hashes of file build rules.
+31d0e7cdd5a05c94e8087afa89e05885 base64.o
+5b4f513bba0c9e97112ca6588463e882 bint64.o

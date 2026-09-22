@@ -44,15 +44,24 @@ CROSS_COMPILE = riscv64-unknown-elf-
 QSTR_DEFS = qstrdefsport.h
 MICROPY_ROM_TEXT_COMPRESSION ?= 1
 
-# The manifest freezes whatever sits in the stage dir, so the stage holds the
-# guest script (+ GUEST_PY_EXTRA) and nothing else. Staged at parse time:
-# py/manifest.mk already evaluates the manifest while make is still reading
-# makefiles.
+# The stage holds the guest script (+ GUEST_PY_EXTRA) and nothing else. Staged
+# at parse time: py/manifest.mk already evaluates the manifest while make is
+# still reading makefiles.
+#
+# The freeze ORDER is part of the image, hence of programHash. Freezing the
+# stage as a directory leaves the order to os.walk, i.e. to the host
+# filesystem's readdir order (the same sources hashed differently on a CI
+# runner). manifest.py therefore includes a generated manifest that names every
+# script explicitly: GUEST_PY_EXTRA in the order given, then GUEST_PY.
 GUEST_PY_EXTRA ?=
 GUEST_STAGE := $(abspath $(BUILD)/stage)
+GUEST_MANIFEST := $(abspath $(BUILD)/guest_manifest.py)
+GUEST_FROZEN := $(notdir $(GUEST_PY_EXTRA) $(GUEST_PY))
 $(shell rm -rf "$(GUEST_STAGE)" && mkdir -p "$(GUEST_STAGE)" && cp "$(GUEST_PY)" $(GUEST_PY_EXTRA) "$(GUEST_STAGE)/")
+$(shell printf 'freeze_as_mpy("$$(GUEST_STAGE)", (%s))\n' '$(foreach f,$(GUEST_FROZEN),"$(f)",)' > "$(GUEST_MANIFEST)")
 FROZEN_MANIFEST = manifest.py
 MICROPY_MANIFEST_GUEST_STAGE = $(GUEST_STAGE)
+MICROPY_MANIFEST_GUEST_MANIFEST = $(GUEST_MANIFEST)
 
 include $(TOP)/py/py.mk
 include $(TOP)/extmod/extmod.mk

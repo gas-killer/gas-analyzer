@@ -1,0 +1,11 @@
+/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/deps/slop_tensor-6fb210b6b9ca3146.d: /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/lib.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/dimensions.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/dot.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/inner.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/reduce.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/sum.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/transpose.rs
+
+/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/deps/libslop_tensor-6fb210b6b9ca3146.rmeta: /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/lib.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/dimensions.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/dot.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/inner.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/reduce.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/sum.rs /Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/transpose.rs
+
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/lib.rs:
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/dimensions.rs:
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/dot.rs:
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/inner.rs:
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/reduce.rs:
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/sum.rs:
+/Users/wk/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slop-tensor-6.8.0/src/transpose.rs:

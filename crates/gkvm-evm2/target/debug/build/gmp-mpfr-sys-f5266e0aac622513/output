@@ -1,0 +1,16 @@
+cargo:rerun-if-env-changed=GMP_MPFR_SYS_CACHE
+$ mkdir -p "/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/build/gmp-mpfr-sys-f5266e0aac622513/out/lib"
+$ mkdir -p "/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/build/gmp-mpfr-sys-f5266e0aac622513/out/include"
+$ cp "/Users/wk/Library/Caches/gmp-mpfr-sys/1.7/aarch64-apple-darwin/1.7.1/libgmp.a" "/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/build/gmp-mpfr-sys-f5266e0aac622513/out/lib/libgmp.a"
+cargo:limb_bits=64
+cargo:rustc-check-cfg=cfg(nails)
+cargo:rustc-check-cfg=cfg(long_long_limb)
+$ cp "/Users/wk/Library/Caches/gmp-mpfr-sys/1.7/aarch64-apple-darwin/1.7.1/gmp.h" "/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/build/gmp-mpfr-sys-f5266e0aac622513/out/include/gmp.h"
+cargo:limb_bits=64
+cargo:rustc-check-cfg=cfg(nails)
+cargo:rustc-check-cfg=cfg(long_long_limb)
+cargo:out_dir=/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/build/gmp-mpfr-sys-f5266e0aac622513/out
+cargo:lib_dir=/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/build/gmp-mpfr-sys-f5266e0aac622513/out/lib
+cargo:include_dir=/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/build/gmp-mpfr-sys-f5266e0aac622513/out/include
+cargo:rustc-link-search=native=/Users/wk/conductor/workspaces/service-v1/nassau/.context/v3/gas-analyzer/crates/gkvm-evm2/target/debug/build/gmp-mpfr-sys-f5266e0aac622513/out/lib
+cargo:rustc-link-lib=static=gmp

@@ -1,0 +1,2 @@
+cargo::rustc-check-cfg=cfg(rustc_version_1_89_or_later)
+cargo:rustc-cfg=rustc_version_1_89_or_later

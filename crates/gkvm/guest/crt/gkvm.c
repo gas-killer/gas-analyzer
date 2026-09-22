@@ -100,78 +100,25 @@ int memcmp(const void *a, const void *b, unsigned long n) {
 
 /* --- keccak256 (keccak-f[1600], rate 136) ------------------------------- */
 
-static const u64 KECCAK_RC[24] = {
-    0x0000000000000001UL, 0x0000000000008082UL, 0x800000000000808aUL,
-    0x8000000080008000UL, 0x000000000000808bUL, 0x0000000080000001UL,
-    0x8000000080008081UL, 0x8000000000008009UL, 0x000000000000008aUL,
-    0x0000000000000088UL, 0x0000000080008009UL, 0x000000008000000aUL,
-    0x000000008000808bUL, 0x800000000000008bUL, 0x8000000000008089UL,
-    0x8000000000008003UL, 0x8000000000008002UL, 0x8000000000000080UL,
-    0x000000000000800aUL, 0x800000008000000aUL, 0x8000000080008081UL,
-    0x8000000000008080UL, 0x0000000080000001UL, 0x8000000080008008UL,
-};
+/* keccak-f[1600] is SP1's KECCAK_PERMUTE precompile: one ecall permutes the
+ * 25 little-endian lanes at `st` in place (a1 must be 0). GKVM_HOSTCALLS_V1
+ * deviation, decided 2026-09-21: the spec's hostcall set was "stock SP1
+ * syscalls for I/O only"; hashing in guest instructions cost ~6k cycles per
+ * permutation (~190k per artifact page), which made verified weight loading
+ * the dominant cost of an answer. The executor services this ecall natively
+ * (tiny-keccak, identical on the jit and portable tiers — one shared
+ * implementation in sp1-core-executor's minimal::precompiles::keccak), it
+ * retires as ONE cycle, and it stays provable: the dispute guest proves it
+ * with SP1's keccak circuit. Consequence for metering: a cycle is no longer
+ * "one rv64im instruction of comparable cost" — a permutation is priced at 1.
+ * `st` must be 8-byte aligned (every caller's is: a u64 array). */
+#define SP1_KECCAK_PERMUTE 0x00010109u
 
-/* n is always a constant; the mask keeps n == 0 (lane ba) a defined shift. */
-#define ROL(x, n) (((x) << (n)) | ((x) >> ((64 - (n)) & 63)))
-
-/* One round, lanes A -> lanes E, theta/rho/pi/chi/iota fused per output row.
- * Lane names are <row><column>: rows b g k m s = y 0..4, columns a e i o u =
- * x 0..4, so st[x + 5y]. Every lane is a scalar and every rotation a
- * constant: artifact verification is paid per page per answer, in metered
- * cycles, so the permutation is written to be register-allocated. */
-#define KECCAK_ROW(A, E, row, l0, r0, l1, r1, l2, r2, l3, r3, l4, r4)        \
-    B0 = ROL(A##l0, r0), B1 = ROL(A##l1, r1), B2 = ROL(A##l2, r2);           \
-    B3 = ROL(A##l3, r3), B4 = ROL(A##l4, r4);                                \
-    E##row##a = B0 ^ (~B1 & B2), E##row##e = B1 ^ (~B2 & B3);                \
-    E##row##i = B2 ^ (~B3 & B4), E##row##o = B3 ^ (~B4 & B0);                \
-    E##row##u = B4 ^ (~B0 & B1)
-
-#define KECCAK_ROUND(A, E, rc)                                               \
-    do {                                                                     \
-        u64 B0, B1, B2, B3, B4;                                              \
-        u64 Ca = A##ba ^ A##ga ^ A##ka ^ A##ma ^ A##sa;                      \
-        u64 Ce = A##be ^ A##ge ^ A##ke ^ A##me ^ A##se;                      \
-        u64 Ci = A##bi ^ A##gi ^ A##ki ^ A##mi ^ A##si;                      \
-        u64 Co = A##bo ^ A##go ^ A##ko ^ A##mo ^ A##so;                      \
-        u64 Cu = A##bu ^ A##gu ^ A##ku ^ A##mu ^ A##su;                      \
-        u64 Da = Cu ^ ROL(Ce, 1), De = Ca ^ ROL(Ci, 1), Di = Ce ^ ROL(Co, 1); \
-        u64 Do = Ci ^ ROL(Cu, 1), Du = Co ^ ROL(Ca, 1);                      \
-        A##ba ^= Da, A##ga ^= Da, A##ka ^= Da, A##ma ^= Da, A##sa ^= Da;     \
-        A##be ^= De, A##ge ^= De, A##ke ^= De, A##me ^= De, A##se ^= De;     \
-        A##bi ^= Di, A##gi ^= Di, A##ki ^= Di, A##mi ^= Di, A##si ^= Di;     \
-        A##bo ^= Do, A##go ^= Do, A##ko ^= Do, A##mo ^= Do, A##so ^= Do;     \
-        A##bu ^= Du, A##gu ^= Du, A##ku ^= Du, A##mu ^= Du, A##su ^= Du;     \
-        KECCAK_ROW(A, E, b, ba, 0, ge, 44, ki, 43, mo, 21, su, 14);          \
-        E##ba ^= (rc);                                                       \
-        KECCAK_ROW(A, E, g, bo, 28, gu, 20, ka, 3, me, 45, si, 61);          \
-        KECCAK_ROW(A, E, k, be, 1, gi, 6, ko, 25, mu, 8, sa, 18);            \
-        KECCAK_ROW(A, E, m, bu, 27, ga, 36, ke, 10, mi, 15, so, 56);         \
-        KECCAK_ROW(A, E, s, bi, 62, go, 55, ku, 39, ma, 41, se, 2);          \
-    } while (0)
-
-/* no-schedule-insns: gcc 13's rv64 insn scheduler interleaves the rows and
- * spills ~160 lanes per round; without it the round is ~250 instructions
- * against an rv64im floor of 213 (no rol/andn). Carried as an attribute so
- * every build of the crt gets it, whatever its command line. */
-__attribute__((optimize("no-schedule-insns")))
-static void keccakf(u64 st[25]) {
-    u64 Aba = st[0], Abe = st[1], Abi = st[2], Abo = st[3], Abu = st[4];
-    u64 Aga = st[5], Age = st[6], Agi = st[7], Ago = st[8], Agu = st[9];
-    u64 Aka = st[10], Ake = st[11], Aki = st[12], Ako = st[13], Aku = st[14];
-    u64 Ama = st[15], Ame = st[16], Ami = st[17], Amo = st[18], Amu = st[19];
-    u64 Asa = st[20], Ase = st[21], Asi = st[22], Aso = st[23], Asu = st[24];
-    u64 Eba, Ebe, Ebi, Ebo, Ebu, Ega, Ege, Egi, Ego, Egu;
-    u64 Eka, Eke, Eki, Eko, Eku, Ema, Eme, Emi, Emo, Emu;
-    u64 Esa, Ese, Esi, Eso, Esu;
-    for (int round = 0; round < 24; round += 2) {
-        KECCAK_ROUND(A, E, KECCAK_RC[round]);
-        KECCAK_ROUND(E, A, KECCAK_RC[round + 1]);
-    }
-    st[0] = Aba, st[1] = Abe, st[2] = Abi, st[3] = Abo, st[4] = Abu;
-    st[5] = Aga, st[6] = Age, st[7] = Agi, st[8] = Ago, st[9] = Agu;
-    st[10] = Aka, st[11] = Ake, st[12] = Aki, st[13] = Ako, st[14] = Aku;
-    st[15] = Ama, st[16] = Ame, st[17] = Ami, st[18] = Amo, st[19] = Amu;
-    st[20] = Asa, st[21] = Ase, st[22] = Asi, st[23] = Aso, st[24] = Asu;
+static inline void keccakf(u64 st[25]) {
+    register u64 t0 __asm__("t0") = SP1_KECCAK_PERMUTE;
+    register u64 a0 __asm__("a0") = (u64)st;
+    register u64 a1 __asm__("a1") = 0;
+    __asm__ volatile("ecall" : "+r"(t0) : "r"(a0), "r"(a1) : "memory");
 }
 
 /* The generic streaming hash. The block buffer is kept as lanes (rv64 is

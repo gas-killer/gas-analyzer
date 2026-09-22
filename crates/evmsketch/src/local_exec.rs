@@ -80,6 +80,7 @@ use revm::interpreter::{
     CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, Interpreter,
 };
 use revm::primitives::Log;
+use revm::primitives::eip7825::TX_GAS_LIMIT_CAP;
 use revm::primitives::hardfork::SpecId;
 use revm::state::EvmState;
 use revm::{InspectEvm, Inspector, MainBuilder, MainContext};
@@ -380,14 +381,24 @@ impl LocalStateCache {
 /// Resolve the pinned gas limits for a trace: profile overrides win
 /// unconditionally (they are protocol constants — see
 /// `gas_analyzer_core::sim_profile`), mirroring `apply_sim_profile` on the
-/// RPC path; under [`SimProfile::Chain`] the request's gas (or the header
-/// limit) stands.
+/// RPC path; under [`SimProfile::Chain`] the request's gas stands, and a
+/// request without gas gets the most a real transaction could carry: the
+/// header limit, capped at EIP-7825's 2^24 from Osaka on. (Uncapped, every
+/// gas-less Chain analysis on an Osaka chain with a >2^24 block limit died
+/// in revm's validation with `TxGasLimitGreaterThanCap` before running any
+/// code.) A request that itself asks for more than the cap still fails —
+/// that transaction could not exist on the chain.
 fn resolve_gas_limits(env: &LocalBlockEnv, tx: &LocalTxRequest, profile: SimProfile) -> (u64, u64) {
     let block_gas_limit = profile.block_gas_limit_override().unwrap_or(env.gas_limit);
+    let chain_default = if env.spec.is_enabled_in(SpecId::OSAKA) {
+        block_gas_limit.min(TX_GAS_LIMIT_CAP)
+    } else {
+        block_gas_limit
+    };
     let tx_gas_limit = profile
         .tx_gas_limit_override()
         .or(tx.gas)
-        .unwrap_or(block_gas_limit);
+        .unwrap_or(chain_default);
     (block_gas_limit, tx_gas_limit)
 }
 
@@ -610,7 +621,7 @@ fn build_updates_from_state_diff(
                 .collect()
         })
         .unwrap_or_default();
-    stores.sort_by(|a, b| a.0.cmp(&b.0));
+    stores.sort_by_key(|store| store.0);
 
     let mut updates: Vec<StateUpdate> = stores
         .into_iter()
@@ -854,7 +865,7 @@ fn run_pass<DB, INSP>(
 where
     DB: DatabaseRef,
     DB::Error: core::fmt::Debug,
-    INSP: for<'a> Inspector<
+    INSP: Inspector<
             Context<
                 revm::context::BlockEnv,
                 TxEnv,
@@ -1436,6 +1447,20 @@ mod tests {
             (30_000_000, 30_000_000),
             "Chain without request gas: fall back to the block limit"
         );
+        let osaka = LocalBlockEnv {
+            spec: SpecId::OSAKA,
+            ..test_env()
+        };
+        assert_eq!(
+            resolve_gas_limits(&osaka, &no_gas, SimProfile::Chain),
+            (30_000_000, TX_GAS_LIMIT_CAP),
+            "Chain without request gas on Osaka: EIP-7825 caps the fallback"
+        );
+        assert_eq!(
+            resolve_gas_limits(&osaka, &tx, SimProfile::UnboundedV1).1,
+            resolve_gas_limits(&env, &tx, SimProfile::UnboundedV1).1,
+            "the unbounded pins ignore the cap"
+        );
         assert_eq!(
             resolve_gas_limits(&env, &tx, SimProfile::UnboundedV1),
             (1 << 40, 1 << 40),
@@ -1885,7 +1910,10 @@ mod tests {
         a.jump_to("loop");
         a.label("end");
         a.op(POP);
-        a.push_bytes(&ACC.to_be_bytes()).op(MLOAD).push0().op(MSTORE);
+        a.push_bytes(&ACC.to_be_bytes())
+            .op(MLOAD)
+            .push0()
+            .op(MSTORE);
         a.push1(0x20).push0().op(RETURN);
         let mut cd = vec![0u8; 32];
         cd[24..32].copy_from_slice(&iters.to_be_bytes());
@@ -1965,8 +1993,9 @@ mod tests {
                 access_list: Default::default(),
                 authorization_list: Default::default(),
             };
-            let out = call_view_local_blocking(db, mounts, &gen_env(), &tx, SimProfile::UnboundedV1)
-                .expect("revm-31 view call");
+            let out =
+                call_view_local_blocking(db, mounts, &gen_env(), &tx, SimProfile::UnboundedV1)
+                    .expect("revm-31 view call");
 
             let mut text = String::new();
             let _ = writeln!(
