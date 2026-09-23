@@ -28,7 +28,7 @@ default-members = [
 # same reason as the harness — revm 41 + revmc + LLVM must never touch the
 # revm-31 consensus-critical Cargo.lock. It has its own Cargo.lock and is
 # built/tested standalone (LLVM_SYS_221_PREFIX=/opt/homebrew/opt/llvm@22).
-exclude = ["revmc-harness", "crates/gk-fast-view", "crates/gkvm-evm2"]
+exclude = ["revmc-harness", "crates/gk-fast-view", "crates/gkvm-evm2", "crates/gk-anvil"]
 
 [profile.bench]
 debug = 1

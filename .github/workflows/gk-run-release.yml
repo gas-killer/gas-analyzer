@@ -29,20 +29,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - name: Build
+      - name: Build gk-run
         run: cargo build --release --locked -p gas-analyzer-gkvm --bin gk-run ${{ matrix.features }}
+      # gk-anvil (Phase B): anvil + the gkvm precompile. Its own lockfile (foundry's tree);
+      # the same tier feature applies through the gas-analyzer-gkvm dependency.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/gk-anvil
+      - name: Build gk-anvil
+        run: cargo build --release --locked --manifest-path crates/gk-anvil/Cargo.toml ${{ matrix.features }}
       - name: Package
         run: |
           tier="$(target/release/gk-run --print-tier)"
           echo "tier=$tier"
           name="gk-run-${{ matrix.target }}"
           tar -czf "$name.tar.gz" -C target/release gk-run
+          tar -czf "gk-anvil-${{ matrix.target }}.tar.gz" -C crates/gk-anvil/target/release gk-anvil
           echo "${{ matrix.target }} $tier" > "$name.tier"
       - uses: actions/upload-artifact@v4
         with:
           name: gk-run-${{ matrix.target }}
           path: |
             gk-run-${{ matrix.target }}.tar.gz
+            gk-anvil-${{ matrix.target }}.tar.gz
             gk-run-${{ matrix.target }}.tier
 
   release:
@@ -57,8 +66,8 @@ jobs:
         id: meta
         run: |
           cd dist
-          sha256sum gk-run-*.tar.gz > SHA256SUMS
-          { echo "Prebuilt \`gk-run\` sidecars (gas-analyzer ${GITHUB_SHA}). Tier per target:"; echo; echo '```'; cat *.tier; echo '```'; echo; echo "Install: \`curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/install-gk.sh | sh\`"; } > NOTES.md
+          sha256sum gk-run-*.tar.gz gk-anvil-*.tar.gz > SHA256SUMS
+          { echo "Prebuilt \`gk-run\` sidecars and \`gk-anvil\` nodes (gas-analyzer ${GITHUB_SHA}). Tier per target:"; echo; echo '```'; cat *.tier; echo '```'; echo; echo "Install: \`curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/install-gk.sh | sh\`"; } > NOTES.md
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then tag="${GITHUB_REF_NAME}"; else tag="gk-run-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"; fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - name: Publish pre-release
@@ -68,8 +77,8 @@ jobs:
           cd dist
           tag="${{ steps.meta.outputs.tag }}"
           if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$tag" -R "$GITHUB_REPOSITORY" --clobber gk-run-*.tar.gz SHA256SUMS
+            gh release upload "$tag" -R "$GITHUB_REPOSITORY" --clobber gk-run-*.tar.gz gk-anvil-*.tar.gz SHA256SUMS
           else
             gh release create "$tag" -R "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" \
-              --title "gk-run $tag" --notes-file NOTES.md gk-run-*.tar.gz SHA256SUMS
+              --title "gk-run $tag" --notes-file NOTES.md gk-run-*.tar.gz gk-anvil-*.tar.gz SHA256SUMS
           fi

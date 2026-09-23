@@ -6,6 +6,7 @@
 # Installs into $GK_HOME (default ~/.gk):
 #   bin/gk-run   the guest executor sidecar, prebuilt for this OS/arch (GitHub release
 #                assets of the `gk-run release` workflow, sha256-verified)
+#   bin/gk-anvil anvil with the gkvm precompile (when the release carries it) — `gk anvil`
 #   bin/gk       the `gk` command: runs solidity-sdk's tools/gk from the forge project you
 #                are in (lib/solidity-sdk after `forge install gas-killer/solidity-sdk`, or
 #                $GK_SDK), with GK_RUN pointed at the sidecar
@@ -54,6 +55,19 @@ tar -xzf "$tmp/gk-run.tar.gz" -C "$BIN"
 chmod +x "$BIN/gk-run"
 say "  gk-run: $("$BIN/gk-run" --print-tier) tier"
 
+# gk-anvil rides the same release when it was built (older pre-releases have none)
+if curl -fsSL -o "$tmp/gk-anvil.tar.gz" "$base/gk-anvil-$target.tar.gz" 2>/dev/null; then
+  want="$(grep " gk-anvil-$target.tar.gz\$" "$tmp/SHA256SUMS" | cut -d' ' -f1)"
+  if command -v sha256sum >/dev/null 2>&1; then have="$(sha256sum "$tmp/gk-anvil.tar.gz" | cut -d' ' -f1)"
+  else have="$(shasum -a 256 "$tmp/gk-anvil.tar.gz" | cut -d' ' -f1)"; fi
+  [ -n "$want" ] && [ "$want" = "$have" ] || die "sha256 mismatch for gk-anvil-$target.tar.gz"
+  tar -xzf "$tmp/gk-anvil.tar.gz" -C "$BIN"
+  chmod +x "$BIN/gk-anvil"
+  say "  gk-anvil: installed"
+else
+  say "  gk-anvil: not in $tag (build it: cargo build --release --manifest-path crates/gk-anvil/Cargo.toml)"
+fi
+
 cat > "$BIN/gk" <<'SHIM'
 #!/usr/bin/env bash
 # `gk` — solidity-sdk's tools/gk, found from the forge project you are in.
@@ -95,3 +109,4 @@ say "Done. Next, in a forge project:"
 say "  forge install gas-killer/solidity-sdk"
 say "  gk init --python      # a Python guest, its Solidity binding, a consumer and a test"
 say "  gk test               # forge test with the guest really executing"
+say "  gk anvil              # a local node where GkVm.exec works: cast call your consumer"

@@ -1,0 +1,47 @@
+# gk-anvil — anvil with the gkvm precompile (UNBOUNDED_V3 Phase B).
+#
+# Developer UX only: `cast call` / `forge script` a native-guest consumer against a local
+# node, demo deployments. NOT the operator path (that is the analyzer's local executor) and
+# never a real chain: the precompile exists on this node and nowhere else.
+#
+# Excluded from the analyzer workspace (root Cargo.toml `exclude`), own Cargo.lock: it
+# pulls foundry's anvil-as-a-library (revm 33 + alloy-evm), which must not touch the
+# consensus-critical lock the revm-31 local executor resolves against. The guest runner it
+# wraps is the same gas-analyzer-gkvm crate; the precompile logic is a port of
+# crates/evmsketch/src/gkvm_precompile.rs (same evaluation order, same typed errors).
+#
+#   cd crates/gk-anvil && cargo build --release
+#   target/release/gk-anvil --guest ../../../solidity-sdk/cache/gkvm/build/greet/guest.elf
+[package]
+name = "gk-anvil"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "gk-anvil"
+path = "src/main.rs"
+
+[dependencies]
+# pinned by rev — the cached checkout the gas-analyzer-anvil crate already builds against
+anvil = { git = "https://github.com/foundry-rs/foundry", rev = "ad5ff80cc8576274bc20e3218bafd4c9d45994fb", package = "anvil", default-features = false, features = ["cli"] }
+alloy-evm = "0.25.2"
+alloy-primitives = "1.5"
+alloy-sol-types = "1.5"
+revm = { version = "33.1.0", default-features = false }
+gas-analyzer-gkvm = { path = "../gkvm" }
+gas-analyzer-core = { path = "../core" }
+clap = { version = "4", features = ["derive", "env"] }
+eyre = "0.6"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+
+[workspace]
+
+# foundry's own [patch.crates-io] (its workspace applies these; a crate outside it must
+# repeat them or resolve solar from crates.io at a version foundry ad5ff80 does not build with)
+[patch.crates-io]
+solar = { package = "solar-compiler", git = "https://github.com/paradigmxyz/solar.git", rev = "1f28069" }
+solar-interface = { package = "solar-interface", git = "https://github.com/paradigmxyz/solar.git", rev = "1f28069" }
+solar-ast = { package = "solar-ast", git = "https://github.com/paradigmxyz/solar.git", rev = "1f28069" }
+solar-sema = { package = "solar-sema", git = "https://github.com/paradigmxyz/solar.git", rev = "1f28069" }
