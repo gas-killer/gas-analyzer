@@ -1,0 +1,75 @@
+name: gk-run release
+
+# Prebuilt `gk-run` sidecars for the installer (install-gk.sh): x86_64 Linux carries the jit
+# tier, everything else the portable interpreter (sp1-jit is x86_64-only). Publishes a GitHub
+# pre-release `gk-run-<yyyymmdd>-<short sha>` (or the pushed `gk-run-v*` tag) with one tarball
+# per target and a SHA256SUMS file.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["gk-run-v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, features: "" }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, features: "--features gas-analyzer-gkvm/portable-exec" }
+          - { os: macos-latest, target: aarch64-apple-darwin, features: "--features gas-analyzer-gkvm/portable-exec" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked -p gas-analyzer-gkvm --bin gk-run ${{ matrix.features }}
+      - name: Package
+        run: |
+          tier="$(target/release/gk-run --print-tier)"
+          echo "tier=$tier"
+          name="gk-run-${{ matrix.target }}"
+          tar -czf "$name.tar.gz" -C target/release gk-run
+          echo "${{ matrix.target }} $tier" > "$name.tier"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gk-run-${{ matrix.target }}
+          path: |
+            gk-run-${{ matrix.target }}.tar.gz
+            gk-run-${{ matrix.target }}.tier
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums + notes
+        id: meta
+        run: |
+          cd dist
+          sha256sum gk-run-*.tar.gz > SHA256SUMS
+          { echo "Prebuilt \`gk-run\` sidecars (gas-analyzer ${GITHUB_SHA}). Tier per target:"; echo; echo '```'; cat *.tier; echo '```'; echo; echo "Install: \`curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/install-gk.sh | sh\`"; } > NOTES.md
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then tag="${GITHUB_REF_NAME}"; else tag="gk-run-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Publish pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          tag="${{ steps.meta.outputs.tag }}"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" -R "$GITHUB_REPOSITORY" --clobber gk-run-*.tar.gz SHA256SUMS
+          else
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" \
+              --title "gk-run $tag" --notes-file NOTES.md gk-run-*.tar.gz SHA256SUMS
+          fi

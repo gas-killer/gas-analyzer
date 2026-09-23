@@ -1,0 +1,40 @@
+name: gk toolchain image
+
+# Prebuilt guest toolchain (crates/gkvm/toolchain/Dockerfile) → ghcr.io/gas-killer/gk-toolchain,
+# multi-arch (amd64 for CI and x86 hosts, arm64 for Apple silicon). Tags: `v1` (the stable
+# name `gk build` and the installer pull) and `sha-<short>`.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "crates/gkvm/toolchain/**"
+      - ".github/workflows/gk-toolchain.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push (linux/amd64, linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: crates/gkvm/toolchain
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/gas-killer/gk-toolchain:v1
+            ghcr.io/gas-killer/gk-toolchain:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

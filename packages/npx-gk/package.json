@@ -1,0 +1,9 @@
+{
+  "name": "@gas-killer/gk",
+  "version": "0.1.0",
+  "description": "gkvm guest toolchain launcher: installs gk-run + gk on first use, then runs gk",
+  "bin": { "gk": "bin/gk.js" },
+  "license": "AGPL-3.0-only",
+  "repository": { "type": "git", "url": "https://github.com/gas-killer/gas-analyzer" },
+  "files": ["bin"]
+}
