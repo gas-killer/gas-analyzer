@@ -1,0 +1,3 @@
+# own build dir: the crate is excluded from the workspace (see Cargo.toml), so the root
+# .gitignore's anchored /target does not cover it
+/target
