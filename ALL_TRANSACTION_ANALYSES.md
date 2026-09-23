@@ -1,6 +1,6 @@
 # Every transaction analysed, in one place
 
-478 Ethereum mainnet transactions across 49 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Eleven more could not be run at all; they are listed at the end.
+479 Ethereum mainnet transactions across 50 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Eleven more could not be run at all; they are listed at the end.
 
 > ### Revised for the new signature floor — 2026-09-04
 >
@@ -194,6 +194,7 @@ Best and typical figures use only properly measured runs. They exclude the two O
 | **Securitize** | 8 | 0 | **0.00%** | — | replay costs more (6), under the floor (2); every `transfer` routes compliance through a `CALL` — **1.14M gas yields 3,777 removable** |
 | **OriginTrail** | 6 | 0 | **0.00%** | — | replay costs more (6); TRAC token only — the knowledge graph runs on NeuroWeb, not mainnet |
 | **UMA** | 8 | 0 | **0.00%** | — | replay costs more (6), under the floor (2); OOv2 and the DVM have **zero mainnet traffic** — Polymarket settles on Polygon |
+| **Null** | 1 | 0 | **0.00%** | — | replay costs more (1); `depositMarket` is periphery — every deposit is a `CALL` into an ERC-4626 vault, so none of it is removable |
 | **Usual** | 9 | 0 | **0.00%** | — | under the floor (7), replay costs more (2); `redeem` is 5.65/day at 524,715 gas and yields only ~18,000 removable |
 
 ## ENS: 18 transactions, 18 measured, nothing saved
@@ -1380,6 +1381,8 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | Privacy Pools | [`0x4cbeadad…`](https://etherscan.io/tx/0x4cbeadad4bc2a553822f5917546fa0c4c2bd37314077a2447b378fb7b93c9fc9) | PoolVault `0x0eb42804…` `0x769284c2` | 482,024 | 207,784 | +274,240 | **224,240** (46.52%) | 24,240 | — | — |  |
 
 | Privacy Pools | [`0xe7015e7f…`](https://etherscan.io/tx/0xe7015e7fe38f6833b43f71619d8fab285666773f6b6723437bae56f7eca1d58b) | PoolVault `0x0eb42804…` `0x85afaff4` | 788,016 | 288,000 | +500,016 | **450,016** (57.11%) | 250,016 | — | — | a second PoolVault function; largest saving in the Privacy Pools set, and the only row here that also clears the BLS floor |
+
+| Null | [`0x36b6116b…`](https://etherscan.io/tx/0x36b6116b621b2cfaa9f082f1f4295c4aca95435a105ed9f2eccce42232c555db) | `0x085d78fd…` `depositMarket` ✓ `0x22cfce7b` | 677,834 | 707,063 | -29,229 | **0** | 0 | replay costs more | — | periphery router: pulls USDC, approves, deposits into two ERC-4626 vaults; 742,903 gas sits in top-level CALLs, more than the transaction's own total |
 
 ## Transactions that could not be measured at all
 
