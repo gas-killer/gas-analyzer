@@ -86,7 +86,7 @@ else
   done
 fi
 if [ -z "$tools" ]; then
-  echo "gk: no solidity-sdk found. In a forge project run: forge install gas-killer/solidity-sdk   (or set GK_SDK=/path/to/solidity-sdk)" >&2
+  echo "gk: no solidity-sdk found. In a forge project run: forge install gas-killer/solidity-sdk@gkvm-preview   (or set GK_SDK=/path/to/solidity-sdk)" >&2
   exit 2
 fi
 exec python3 -B "$tools" "$@"
@@ -106,7 +106,7 @@ case ":$PATH:" in
 esac
 say ""
 say "Done. Next, in a forge project:"
-say "  forge install gas-killer/solidity-sdk"
+say "  forge install gas-killer/solidity-sdk@gkvm-preview   # the tag that carries tools/gk (plain install once it is on main)"
 say "  gk init --python      # a Python guest, its Solidity binding, a consumer and a test"
 say "  gk test               # forge test with the guest really executing"
 say "  gk anvil              # a local node where GkVm.exec works: cast call your consumer"

@@ -1,0 +1,39 @@
+name: npm publish (gaskiller)
+
+# Publishes packages/npx-gk as `gaskiller` (npx gaskiller init --python) on a `gk-npm-v*` tag,
+# via npm trusted publishing (OIDC: no token in secrets; the workflow's identity is the
+# credential). One-time human setup: publish the first version by hand (`npm login && npm
+# publish --access public` in packages/npx-gk), then on npmjs.com → package → Settings →
+# Trusted publisher: GitHub Actions, repository gas-killer/gas-analyzer, workflow
+# npm-publish.yml. From then on: bump the version, push the tag, done.
+
+on:
+  push:
+    tags: ["gk-npm-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: npm --version ≥ 11.5 (trusted publishing)
+        run: npm install -g npm@latest && npm --version
+      - name: Tag matches package version
+        working-directory: packages/npx-gk
+        run: |
+          v="$(node -p "require('./package.json').version")"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            [ "${GITHUB_REF_NAME}" = "gk-npm-v$v" ] || { echo "tag ${GITHUB_REF_NAME} != package version $v"; exit 1; }
+          fi
+      - name: Publish
+        working-directory: packages/npx-gk
+        run: npm publish --access public --provenance

@@ -1,9 +1,23 @@
 {
-  "name": "@gas-killer/gk",
+  "name": "gaskiller",
   "version": "0.1.0",
-  "description": "gkvm guest toolchain launcher: installs gk-run + gk on first use, then runs gk",
-  "bin": { "gk": "bin/gk.js" },
+  "description": "Gas Killer gkvm toolchain launcher: installs gk-run, gk-anvil and gk on first use, then runs gk",
+  "bin": {
+    "gk": "bin/gk.js"
+  },
   "license": "AGPL-3.0-only",
-  "repository": { "type": "git", "url": "https://github.com/gas-killer/gas-analyzer" },
-  "files": ["bin"]
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gas-killer/gas-analyzer"
+  },
+  "files": [
+    "bin"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "engines": {
+    "node": ">=18"
+  }
 }
