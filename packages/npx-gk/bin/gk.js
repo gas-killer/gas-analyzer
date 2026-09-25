@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// `npx gaskiller <args>`: the one-line install (install-gk.sh) on first use, then `gk`.
+// `npx gas-killer <args>`: the one-line install (install-gk.sh) on first use, then `gk`.
 const { spawnSync } = require("child_process");
 const { existsSync } = require("fs");
 const path = require("path");

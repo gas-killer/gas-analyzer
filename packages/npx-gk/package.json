@@ -1,5 +1,5 @@
 {
-  "name": "gaskiller",
+  "name": "gas-killer",
   "version": "0.1.0",
   "description": "Gas Killer gkvm toolchain launcher: installs gk-run, gk-anvil and gk on first use, then runs gk",
   "bin": {
@@ -8,7 +8,7 @@
   "license": "AGPL-3.0-only",
   "repository": {
     "type": "git",
-    "url": "https://github.com/gas-killer/gas-analyzer"
+    "url": "git+https://github.com/gas-killer/gas-analyzer.git"
   },
   "files": [
     "bin"
