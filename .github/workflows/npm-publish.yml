@@ -1,6 +1,6 @@
-name: npm publish (gaskiller)
+name: npm publish (gas-killer)
 
-# Publishes packages/npx-gk as `gaskiller` (npx gaskiller init --python) on a `gk-npm-v*` tag,
+# Publishes packages/npx-gk as `gas-killer` (npx gas-killer init --python) on a `gk-npm-v*` tag,
 # via npm trusted publishing (OIDC: no token in secrets; the workflow's identity is the
 # credential). One-time human setup: publish the first version by hand (`npm login && npm
 # publish --access public` in packages/npx-gk), then on npmjs.com → package → Settings →
