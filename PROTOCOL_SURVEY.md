@@ -2417,11 +2417,14 @@ list. A `NullV1Router` deposit measured −29,229; 414,298 of its 677,834 gas sa
 `CALL` to `0xbeef0880…`, Steakhouse Prime USDC, a Morpho `VaultV2`. That vault was the real
 target all along.
 
-**Six of nine measured direct calls clear the floor, at 19.58% to 24.24%.**
+**Seven of ten measured direct calls clear the floor, at 19.58% to 24.24%.** The absolute saving
+is near-constant across three different functions — 93,499, 93,443 and 93,156 gas — which says the
+removable part is the vault's fixed share-pricing read, not anything that scales with the trade.
 
 | function | gas used | replay cost | saved | % |
 |---|---:|---:|---:|---:|
 | `redeem` `0xba087652` | 384,248 | 241,092 | 93,156 | **24.24%** |
+| `redeem` | 405,914 | 262,415 | 93,499 | 23.03% |
 | `withdraw` `0xb460af94` | 389,035 | 245,592 | 93,443 | **24.02%** |
 | `deposit` `0x6e553f65` | 394,794 | 255,938 | 88,856 | 22.51% |
 | `deposit` | 416,694 | 277,814 | 88,880 | 21.33% |

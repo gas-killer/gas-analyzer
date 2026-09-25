@@ -1,6 +1,6 @@
 # Every transaction analysed, in one place
 
-488 Ethereum mainnet transactions across 50 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Eleven more could not be run at all; they are listed at the end.
+489 Ethereum mainnet transactions across 50 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Eleven more could not be run at all; they are listed at the end.
 
 > ### Revised for the new signature floor — 2026-09-04
 >
@@ -168,7 +168,7 @@ Best and typical figures use only properly measured runs. They exclude the two O
 | **Ether.fi** | 13 | 2 | **11.09%** | 5.61% | replay costs more (6), under the floor (5) |
 | **Puffer** | 2 | 1 | *7.06%* | *7.06%* | replay costs more (1); **label inferred — entry point unidentified, do not quote** |
 | **Pendle** | 8 | 1 | **2.60%** | 2.60% | under the floor (5), replay costs more (2) |
-| **Morpho** | 34 | 7 | **24.24%** | 22.51% | replay costs more (17), under the floor (3); **the five wins are all on a VaultV2** (`0xbeef0880…` steakUSDC) where 164–190k of `STATICCALL` is skipped by replay — `multicall` on the same vault still scores 0 |
+| **Morpho** | 35 | 8 | **24.24%** | 22.51% | replay costs more (17), under the floor (3); **the five wins are all on a VaultV2** (`0xbeef0880…` steakUSDC) where 164–190k of `STATICCALL` is skipped by replay — `multicall` on the same vault still scores 0 |
 | **EigenLayer** | 13 | 0 | **0.00%** | — | under the floor (9), replay costs more (4) |
 | **Safe** | 12 | 0 | **0.00%** | — | under the floor (11), replay costs more (1) |
 | **World ID** | 7 | 0 | **0.00%** | — | under the floor (7) |
@@ -1384,6 +1384,7 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 
 | Null | [`0x36b6116b…`](https://etherscan.io/tx/0x36b6116b621b2cfaa9f082f1f4295c4aca95435a105ed9f2eccce42232c555db) | `0x085d78fd…` `depositMarket` ✓ `0x22cfce7b` | 677,834 | 707,063 | -29,229 | **0** | 0 | replay costs more | — | periphery router: pulls USDC, approves, deposits into two ERC-4626 vaults; 742,903 gas sits in top-level CALLs, more than the transaction's own total |
 
+| Morpho | [`0xabcab7b2…`](https://etherscan.io/tx/0xabcab7b2196099bdc6b929bd080566f0799c6aeb09ade509846f33bf0fee3833) | steakUSDC VaultV2 `0xbeef0880…` `redeem` ✓ `0xba087652` | 405,914 | 262,415 | +143,499 | **93,499** (23.03%) | 0 | — | — | savings cluster tightly: 93,499 / 93,443 / 93,156 across three different functions |
 | Morpho | [`0x91e57e07…`](https://etherscan.io/tx/0x91e57e0729ba753226ff5c8b43f45565b247135c45d806e0d3e176cbb16f3421) | steakUSDC VaultV2 `0xbeef0880…` `redeem` ✓ `0xba087652` | 384,248 | 241,092 | +143,156 | **93,156** (24.24%) | 0 | — | — | best percentage on this vault; the heuristic had claimed 43.8% — measured base is 75,336 higher |
 | Morpho | [`0x20bae938…`](https://etherscan.io/tx/0x20bae938d175a58c26685748430a215dea799b3cf92c16402dc84c0e1152e499) | steakUSDC VaultV2 `0xbeef0880…` `withdraw` ✓ `0xb460af94` | 389,035 | 245,592 | +143,443 | **93,443** (24.02%) | 0 | — | — | 190,686 gas of `STATICCALL` is skipped by replay; regular calls only 131,230 |
 | Morpho | [`0xfe9a9643…`](https://etherscan.io/tx/0xfe9a9643982496fd29db08dcca684d45aa256e472bc63c8c39891fb76b77e5d3) | steakUSDC VaultV2 `0xbeef0880…` `deposit` ✓ `0x6e553f65` | 416,694 | 277,814 | +138,880 | **88,880** (21.33%) | 0 | — | — |  |
