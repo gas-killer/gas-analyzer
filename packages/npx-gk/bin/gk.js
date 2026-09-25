@@ -8,7 +8,7 @@ const os = require("os");
 const home = process.env.GK_HOME || path.join(os.homedir(), ".gk");
 const gk = path.join(home, "bin", "gk");
 const installer = process.env.GK_INSTALLER_URL ||
-  "https://raw.githubusercontent.com/gas-killer/gas-analyzer/RonTuretzky/gkvm-m6-host/install-gk.sh";
+  "https://gaskiller.xyz/bash";
 
 if (!existsSync(gk)) {
   const r = spawnSync("sh", ["-c", `curl -fsSL "${installer}" | sh`], { stdio: "inherit" });

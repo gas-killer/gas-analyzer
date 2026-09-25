@@ -1,7 +1,7 @@
 #!/bin/sh
 # gk installer — one line to a working gkvm toolchain:
 #
-#   curl -fsSL https://raw.githubusercontent.com/gas-killer/gas-analyzer/RonTuretzky/gkvm-m6-host/install-gk.sh | sh
+#   curl -fsSL https://gaskiller.xyz/bash | sh
 #
 # Installs into $GK_HOME (default ~/.gk):
 #   bin/gk-run   the guest executor sidecar, prebuilt for this OS/arch (GitHub release
