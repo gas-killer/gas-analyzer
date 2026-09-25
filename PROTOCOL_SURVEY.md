@@ -2410,6 +2410,62 @@ replay legitimately follows. Regular calls here total zero gas, and the rows pas
 **Verdict: the deposit flow is a candidate — but the integration point is the PoolVault, not the
 router.** Volume is the usual problem: 8 direct calls in 500,000 blocks.
 
+## Morpho VaultV2 (steakUSDC) — the volume the survey kept failing to find
+
+Added 2026-09-25, reached by working *down* from a router rather than sideways from a protocol
+list. A `NullV1Router` deposit measured −29,229; 414,298 of its 677,834 gas sat in a single
+`CALL` to `0xbeef0880…`, Steakhouse Prime USDC, a Morpho `VaultV2`. That vault was the real
+target all along.
+
+**Six of nine measured direct calls clear the floor, at 19.58% to 24.24%.**
+
+| function | gas used | replay cost | saved | % |
+|---|---:|---:|---:|---:|
+| `redeem` `0xba087652` | 384,248 | 241,092 | 93,156 | **24.24%** |
+| `withdraw` `0xb460af94` | 389,035 | 245,592 | 93,443 | **24.02%** |
+| `deposit` `0x6e553f65` | 394,794 | 255,938 | 88,856 | 22.51% |
+| `deposit` | 416,694 | 277,814 | 88,880 | 21.33% |
+| `withdraw` | 369,830 | 245,447 | 74,383 | 20.11% |
+| `deposit` | 347,045 | 229,099 | 67,946 | 19.58% |
+| `multicall` `0xac9650d8` ×3 | 788k–1,098k | higher | 0 | replay costs more |
+
+All six pass the artifact test: measured base exceeds the regular `CALL`s the replay must re-run
+by 109,862–141,762, and nothing reverted.
+
+### Why it works, when the router that called it did not
+
+**164,072–190,686 gas of each transaction is `STATICCALL`.** The analyzer skips a `STATICCALL`
+entirely, so its gas falls straight into surplus. Regular `CALL`s are only ~131,230. That ratio is
+the exact inverse of `NullV1Router`, where 742,903 of 677,834 gas was regular `CALL`s.
+
+The largest single component is a 179,571-gas `STATICCALL` to `0x2b968101…` — the vault reading
+its own allocation and accrued interest across markets before it can price a share. Read-only
+work, no state produced, which is the definition of what GasKiller removes.
+
+`multicall` on the same vault scores zero: batching entry points is bookkeeping, and the batch
+wrapper adds state without adding computation.
+
+### Volume — the part that has been missing everywhere else
+
+**100 qualifying direct calls in 60,000 blocks (8.3 days) = 12.0/day.** For comparison, Privacy
+Pools' PoolVault runs 0.12/day and Kelp's pool 0.36/day.
+
+| | qualifying/day | mean saving | gas/month | **$/month** | at 20 gwei |
+|---|---:|---:|---:|---:|---:|
+| steakUSDC VaultV2 | **12.0** | 82,702 | 29,784,634 | **$31** | **$1,421** |
+
+Median effective gas price on these transactions was 0.434 gwei, the highest of any non-L2 row in
+the survey. At 20 gwei this is **third on the dollar table**, behind only Aave ($84,986) and
+Railgun ($130,162), and ahead of every L2.
+
+### What it means for targeting
+
+This is the first result found by following gas *downward through a call tree* instead of
+screening protocols by name. Every router measured — NullV1Router, the Privacy Pools PPRouter,
+Doppler's Airlock — scored zero while pointing at a contract that scores well. **The router is a
+signpost, not a target.** Morpho runs many VaultV2 instances on the same code; this measurement
+plausibly generalises across them, which has not been checked.
+
 ## What this is actually worth in dollars
 
 Every figure above is a percentage. Percentages were the wrong unit, and this section is

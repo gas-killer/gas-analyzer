@@ -1,6 +1,6 @@
 # Every transaction analysed, in one place
 
-479 Ethereum mainnet transactions across 50 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Eleven more could not be run at all; they are listed at the end.
+488 Ethereum mainnet transactions across 50 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Eleven more could not be run at all; they are listed at the end.
 
 > ### Revised for the new signature floor — 2026-09-04
 >
@@ -168,7 +168,7 @@ Best and typical figures use only properly measured runs. They exclude the two O
 | **Ether.fi** | 13 | 2 | **11.09%** | 5.61% | replay costs more (6), under the floor (5) |
 | **Puffer** | 2 | 1 | *7.06%* | *7.06%* | replay costs more (1); **label inferred — entry point unidentified, do not quote** |
 | **Pendle** | 8 | 1 | **2.60%** | 2.60% | under the floor (5), replay costs more (2) |
-| **Morpho** | 25 | 1 | **0.51%** | 0.51% | replay costs more (14), under the floor (3) |
+| **Morpho** | 34 | 7 | **24.24%** | 22.51% | replay costs more (17), under the floor (3); **the five wins are all on a VaultV2** (`0xbeef0880…` steakUSDC) where 164–190k of `STATICCALL` is skipped by replay — `multicall` on the same vault still scores 0 |
 | **EigenLayer** | 13 | 0 | **0.00%** | — | under the floor (9), replay costs more (4) |
 | **Safe** | 12 | 0 | **0.00%** | — | under the floor (11), replay costs more (1) |
 | **World ID** | 7 | 0 | **0.00%** | — | under the floor (7) |
@@ -1383,6 +1383,16 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | Privacy Pools | [`0xe7015e7f…`](https://etherscan.io/tx/0xe7015e7fe38f6833b43f71619d8fab285666773f6b6723437bae56f7eca1d58b) | PoolVault `0x0eb42804…` `0x85afaff4` | 788,016 | 288,000 | +500,016 | **450,016** (57.11%) | 250,016 | — | — | a second PoolVault function; largest saving in the Privacy Pools set, and the only row here that also clears the BLS floor |
 
 | Null | [`0x36b6116b…`](https://etherscan.io/tx/0x36b6116b621b2cfaa9f082f1f4295c4aca95435a105ed9f2eccce42232c555db) | `0x085d78fd…` `depositMarket` ✓ `0x22cfce7b` | 677,834 | 707,063 | -29,229 | **0** | 0 | replay costs more | — | periphery router: pulls USDC, approves, deposits into two ERC-4626 vaults; 742,903 gas sits in top-level CALLs, more than the transaction's own total |
+
+| Morpho | [`0x91e57e07…`](https://etherscan.io/tx/0x91e57e0729ba753226ff5c8b43f45565b247135c45d806e0d3e176cbb16f3421) | steakUSDC VaultV2 `0xbeef0880…` `redeem` ✓ `0xba087652` | 384,248 | 241,092 | +143,156 | **93,156** (24.24%) | 0 | — | — | best percentage on this vault; the heuristic had claimed 43.8% — measured base is 75,336 higher |
+| Morpho | [`0x20bae938…`](https://etherscan.io/tx/0x20bae938d175a58c26685748430a215dea799b3cf92c16402dc84c0e1152e499) | steakUSDC VaultV2 `0xbeef0880…` `withdraw` ✓ `0xb460af94` | 389,035 | 245,592 | +143,443 | **93,443** (24.02%) | 0 | — | — | 190,686 gas of `STATICCALL` is skipped by replay; regular calls only 131,230 |
+| Morpho | [`0xfe9a9643…`](https://etherscan.io/tx/0xfe9a9643982496fd29db08dcca684d45aa256e472bc63c8c39891fb76b77e5d3) | steakUSDC VaultV2 `0xbeef0880…` `deposit` ✓ `0x6e553f65` | 416,694 | 277,814 | +138,880 | **88,880** (21.33%) | 0 | — | — |  |
+| Morpho | [`0xb53a6aee…`](https://etherscan.io/tx/0xb53a6aee035d498b1caca243b6f075146f3150802be5baa1fd7243d312825d6a) | steakUSDC VaultV2 `0xbeef0880…` `deposit` ✓ `0x6e553f65` | 394,794 | 255,938 | +138,856 | **88,856** (22.51%) | 0 | — | — |  |
+| Morpho | [`0x4a7e43f8…`](https://etherscan.io/tx/0x4a7e43f8844c3bcd8dde0e9f5b466759e1607885b8c65fab5acb9afcc7f2785b) | steakUSDC VaultV2 `0xbeef0880…` `withdraw` ✓ `0xb460af94` | 369,830 | 245,447 | +124,383 | **74,383** (20.11%) | 0 | — | — |  |
+| Morpho | [`0x7c90ad7d…`](https://etherscan.io/tx/0x7c90ad7d8c848368f02e2730cc23e9a20b83fa2a2324369e07937714354e2c4c) | steakUSDC VaultV2 `0xbeef0880…` `deposit` ✓ `0x6e553f65` | 347,045 | 229,099 | +117,946 | **67,946** (19.58%) | 0 | — | — | smallest sampled deposit |
+| Morpho | [`0x3b1f0d29…`](https://etherscan.io/tx/0x3b1f0d2927a605b39c80648daf89008c68974cd41b38ec6d6f29dcdd240de665) | steakUSDC VaultV2 `0xbeef0880…` `multicall` ✓ `0xac9650d8` | 1,098,462 | 1,218,084 | -119,622 | **0** | 0 | replay costs more | — | multicall batches the vault's own entry points; the batching itself is bookkeeping |
+| Morpho | [`0x6d5e5068…`](https://etherscan.io/tx/0x6d5e50687c3d9e6b82e9357fa30be3e67c1d391452185d1de8a6081abc0847ae) | steakUSDC VaultV2 `0xbeef0880…` `multicall` ✓ `0xac9650d8` | 1,054,323 | 1,163,791 | -109,468 | **0** | 0 | replay costs more | — |  |
+| Morpho | [`0x40200a01…`](https://etherscan.io/tx/0x40200a01e2a5567589e40f40b357dc8df0e1d0928de29d3f5941fcf27539b02e) | steakUSDC VaultV2 `0xbeef0880…` `multicall` ✓ `0xac9650d8` | 788,287 | 906,286 | -117,999 | **0** | 0 | replay costs more | — |  |
 
 ## Transactions that could not be measured at all
 
