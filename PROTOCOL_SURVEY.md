@@ -2461,6 +2461,34 @@ Median effective gas price on these transactions was 0.434 gwei, the highest of 
 the survey. At 20 gwei this is **third on the dollar table**, behind only Aave ($84,986) and
 Railgun ($130,162), and ahead of every L2.
 
+### Does it generalise? Three vaults, three curators — yes
+
+Checked 2026-09-25. The VaultV2 factory (`0xa1d94f74…`) has created **717 vaults**; 138 were active in
+the last 20,000 blocks. Four were picked from four different curators. Two had **no direct traffic at
+all** — Techblock EURCV is the busiest VaultV2 on the chain (6,124 transactions in 8 days) and Spark
+USDT is busy too, but every call arrives through another contract. The other two were measured:
+
+| vault | curator | direct qualifying/day | saved per call | % | wins |
+|---|---|---:|---:|---:|---:|
+| senRLUSDv2 `0x6dc58a0f…` | Sentora | 9.0 | 113,415–113,568 | **37.48–40.43%** | 4 / 4 |
+| steakUSDC `0xbeef0880…` | Steakhouse | 12.0 | 67,946–93,499 | 19.58–24.24% | 7 / 10 |
+| gtusdcp `0x8c106eed…` | Gauntlet | 4.8 | 50,429–55,298 | 13.67–16.65% | 4 / 4 |
+
+All 15 wins pass the artifact test. **The mechanism holds on every vault; the size of the saving does
+not.** Each vault has its own near-constant saving — Sentora's four rows sit within 153 gas of each
+other — set by how expensive its share-pricing read is (roughly 150–190k of `STATICCALL` per call).
+Gauntlet's is the thinnest, only just above the 50,000 floor.
+
+| | gas/month | at 20 gwei |
+|---|---:|---:|
+| steakUSDC | 29.8M | $1,421 |
+| senRLUSDv2 | 30.6M | $1,462 |
+| gtusdcp | 7.6M | $360 |
+| **three vaults** | **68.0M** | **$3,243** |
+
+The practical filter is **direct traffic**, not vault size: half the vaults sampled are only ever
+reached through routers, and those score nothing.
+
 ### What it means for targeting
 
 This is the first result found by following gas *downward through a call tree* instead of

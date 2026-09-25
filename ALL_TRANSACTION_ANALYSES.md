@@ -1,6 +1,6 @@
 # Every transaction analysed, in one place
 
-489 Ethereum mainnet transactions across 50 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Eleven more could not be run at all; they are listed at the end.
+497 Ethereum mainnet transactions across 50 protocols, all run through this repo's analyzer (`gas-analyzer-cli t <hash>`). Eleven more could not be run at all; they are listed at the end.
 
 > ### Revised for the new signature floor — 2026-09-04
 >
@@ -168,7 +168,7 @@ Best and typical figures use only properly measured runs. They exclude the two O
 | **Ether.fi** | 13 | 2 | **11.09%** | 5.61% | replay costs more (6), under the floor (5) |
 | **Puffer** | 2 | 1 | *7.06%* | *7.06%* | replay costs more (1); **label inferred — entry point unidentified, do not quote** |
 | **Pendle** | 8 | 1 | **2.60%** | 2.60% | under the floor (5), replay costs more (2) |
-| **Morpho** | 35 | 8 | **24.24%** | 22.51% | replay costs more (17), under the floor (3); **the five wins are all on a VaultV2** (`0xbeef0880…` steakUSDC) where 164–190k of `STATICCALL` is skipped by replay — `multicall` on the same vault still scores 0 |
+| **Morpho** | 43 | 16 | **40.43%** | 22.51% | replay costs more (17), under the floor (3); **all 15 VaultV2 wins across three vaults and three curators** (steakUSDC, Sentora RLUSD, Gauntlet USDC) where 164–190k of `STATICCALL` is skipped by replay — `multicall` on the same vault still scores 0 |
 | **EigenLayer** | 13 | 0 | **0.00%** | — | under the floor (9), replay costs more (4) |
 | **Safe** | 12 | 0 | **0.00%** | — | under the floor (11), replay costs more (1) |
 | **World ID** | 7 | 0 | **0.00%** | — | under the floor (7) |
@@ -1394,6 +1394,15 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | Morpho | [`0x3b1f0d29…`](https://etherscan.io/tx/0x3b1f0d2927a605b39c80648daf89008c68974cd41b38ec6d6f29dcdd240de665) | steakUSDC VaultV2 `0xbeef0880…` `multicall` ✓ `0xac9650d8` | 1,098,462 | 1,218,084 | -119,622 | **0** | 0 | replay costs more | — | multicall batches the vault's own entry points; the batching itself is bookkeeping |
 | Morpho | [`0x6d5e5068…`](https://etherscan.io/tx/0x6d5e50687c3d9e6b82e9357fa30be3e67c1d391452185d1de8a6081abc0847ae) | steakUSDC VaultV2 `0xbeef0880…` `multicall` ✓ `0xac9650d8` | 1,054,323 | 1,163,791 | -109,468 | **0** | 0 | replay costs more | — |  |
 | Morpho | [`0x40200a01…`](https://etherscan.io/tx/0x40200a01e2a5567589e40f40b357dc8df0e1d0928de29d3f5941fcf27539b02e) | steakUSDC VaultV2 `0xbeef0880…` `multicall` ✓ `0xac9650d8` | 788,287 | 906,286 | -117,999 | **0** | 0 | replay costs more | — |  |
+
+| Morpho | [`0x2e91acd5…`](https://etherscan.io/tx/0x2e91acd5286eeda304294f8f2c9803b7d140dd0cf7426e16ee285e9f6b1f0fca) | senRLUSDv2 VaultV2 `0x6dc58a0f…` `redeem` ✓ `0xba087652` | 280,874 | 117,306 | +163,568 | **113,568** (40.43%) | 0 | — | — | second-vault check; passes artifact test |
+| Morpho | [`0xe0576f55…`](https://etherscan.io/tx/0xe0576f554f4d0e3d4bc866f7d14346505171563e04152d098b822017d15eeca5) | senRLUSDv2 VaultV2 `0x6dc58a0f…` `redeem` ✓ `0xba087652` | 297,986 | 134,454 | +163,532 | **113,532** (38.10%) | 0 | — | — | second-vault check; passes artifact test |
+| Morpho | [`0xf1a44360…`](https://etherscan.io/tx/0xf1a443607f902beb8c70aa2b768c5b611e65c8d52c4b1cce8eeb17129fe608d0) | senRLUSDv2 VaultV2 `0x6dc58a0f…` `withdraw` ✓ `0xb460af94` | 285,593 | 122,178 | +163,415 | **113,415** (39.71%) | 0 | — | — | second-vault check; passes artifact test |
+| Morpho | [`0x6472ad5e…`](https://etherscan.io/tx/0x6472ad5e3b21b636e3de25e2cbce9268303ed3045cb97d8d00a6d8222dc43565) | senRLUSDv2 VaultV2 `0x6dc58a0f…` `withdraw` ✓ `0xb460af94` | 302,821 | 139,338 | +163,483 | **113,483** (37.48%) | 0 | — | — | second-vault check; passes artifact test |
+| Morpho | [`0x1b1dc70c…`](https://etherscan.io/tx/0x1b1dc70c3e2dac7be16b8fbaa63efd9c998bdafd2edff719946cf00f947858bf) | gtusdcp VaultV2 `0x8c106eed…` `deposit` ✓ `0x6e553f65` | 351,765 | 251,318 | +100,447 | **50,447** (14.34%) | 0 | — | — | second-vault check; passes artifact test |
+| Morpho | [`0x05fdbd23…`](https://etherscan.io/tx/0x05fdbd2326b38111ed43d27205359937f69c8c2cf9d37728403a4785c0d8c562) | gtusdcp VaultV2 `0x8c106eed…` `deposit` ✓ `0x6e553f65` | 368,992 | 268,563 | +100,429 | **50,429** (13.67%) | 0 | — | — | second-vault check; passes artifact test |
+| Morpho | [`0x75d0b00d…`](https://etherscan.io/tx/0x75d0b00d40f55130935e8a92b81c0c27c32a81c17370f31e3146cde5cb11eace) | gtusdcp VaultV2 `0x8c106eed…` `withdraw` ✓ `0xb460af94` | 322,057 | 218,439 | +103,618 | **53,618** (16.65%) | 0 | — | — | second-vault check; passes artifact test |
+| Morpho | [`0xedc1284b…`](https://etherscan.io/tx/0xedc1284bbe3ea340b0a683dc46631d8bda7a20d544c50ef6c538c2025ab4bbd4) | gtusdcp VaultV2 `0x8c106eed…` `withdraw` ✓ `0xb460af94` | 350,806 | 245,508 | +105,298 | **55,298** (15.76%) | 0 | — | — | second-vault check; passes artifact test |
 
 ## Transactions that could not be measured at all
 
