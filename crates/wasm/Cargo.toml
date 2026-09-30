@@ -2,6 +2,7 @@
 name = "gas-killer-wasm"
 version = "0.2.0"
 edition = "2024"
+description = "Gas Killer's WebAssembly gas analyzer: estimates a transaction's gas savings from its Geth trace in the browser"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
