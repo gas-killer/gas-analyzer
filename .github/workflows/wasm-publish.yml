@@ -19,6 +19,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Differs from the crate name: the @gas-killer scope already carries the brand.
+  NPM_PACKAGE: '@gas-killer/analyzer-wasm'
 
 jobs:
   publish:
@@ -43,7 +45,7 @@ jobs:
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       - name: Build WASM package
-        run: wasm-pack build crates/wasm --target web --release --scope gas-killer
+        run: wasm-pack build crates/wasm --target web --release
 
       - name: Configure package for npm
         id: pkg
@@ -61,8 +63,8 @@ jobs:
             VERSION="$VERSION-$(git rev-parse --short HEAD)"
             echo "dist_tag=next" >> "$GITHUB_OUTPUT"
           fi
-          jq --arg v "$VERSION" --arg repo "https://github.com/${{ github.repository }}.git" \
-            '.version = $v | . + {"repository": {"type": "git", "url": $repo}}' \
+          jq --arg name "$NPM_PACKAGE" --arg v "$VERSION" --arg repo "https://github.com/${{ github.repository }}.git" \
+            '.name = $name | .version = $v | . + {"repository": {"type": "git", "url": $repo}}' \
             package.json > package.tmp.json
           mv package.tmp.json package.json
 
