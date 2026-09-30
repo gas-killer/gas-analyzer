@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     tags: ['wasm-v*']
+    # GitHub doesn't evaluate path filters on tag pushes, so these gate only main; release tags always run.
     paths:
       - 'crates/core/**'
       - 'crates/gas-estimator/**'
@@ -67,6 +68,12 @@ jobs:
             '.name = $name | .version = $v | . + {"repository": {"type": "git", "url": $repo}}' \
             package.json > package.tmp.json
           mv package.tmp.json package.json
+          # A re-run for a version that's already out is a no-op rather than a red "cannot publish over" failure.
+          if npm view "$NPM_PACKAGE@$VERSION" version >/dev/null 2>&1; then
+            echo "$NPM_PACKAGE@$VERSION is already published; skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Publish to npm
+        if: steps.pkg.outputs.skip != 'true'
         run: npm publish ./crates/wasm/pkg --access public --tag ${{ steps.pkg.outputs.dist_tag }}
