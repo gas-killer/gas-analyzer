@@ -1,11 +1,12 @@
 name: npm publish (gas-killer)
 
-# Publishes packages/npx-gk as `gas-killer` (npx gas-killer init --python) on a `gk-npm-v*` tag,
+# Stages packages/npx-gk as `gas-killer` (npx gas-killer init --python) on a `gk-npm-v*` tag,
 # via npm trusted publishing (OIDC: no token in secrets; the workflow's identity is the
 # credential). One-time human setup: publish the first version by hand (`npm login && npm
 # publish --access public` in packages/npx-gk), then on npmjs.com → package → Settings →
 # Trusted publisher: GitHub Actions, repository gas-killer/gas-analyzer, workflow
-# npm-publish.yml. From then on: bump the version, push the tag, done.
+# npm-publish.yml, stage publish only. From then on: bump the version, push the tag, then
+# approve the staged version (`npm stage list gas-killer`, `npm stage approve <stage-id>`).
 
 on:
   push:
@@ -25,7 +26,7 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
-      - name: npm --version ≥ 11.5 (trusted publishing)
+      - name: npm --version ≥ 12 (staged publishing)
         run: npm install -g npm@latest && npm --version
       - name: Tag matches package version
         working-directory: packages/npx-gk
@@ -34,6 +35,7 @@ jobs:
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             [ "${GITHUB_REF_NAME}" = "gk-npm-v$v" ] || { echo "tag ${GITHUB_REF_NAME} != package version $v"; exit 1; }
           fi
-      - name: Publish
+      # Staged only: the version stays hidden until a maintainer runs `npm stage approve`, which requires 2FA.
+      - name: Stage
         working-directory: packages/npx-gk
-        run: npm publish --access public --provenance
+        run: npm stage publish --access public --provenance
