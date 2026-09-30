@@ -3,6 +3,8 @@ name: Publish WASM Package
 on:
   push:
     branches: [main]
+    tags: ['wasm-v*']
+    # GitHub doesn't evaluate path filters on tag pushes, so these gate only main; release tags always run.
     paths:
       - 'crates/core/**'
       - 'crates/gas-estimator/**'
@@ -13,10 +15,13 @@ on:
 
 permissions:
   contents: read
-  packages: write
+  # Trusted Publishing: npm exchanges the workflow's OIDC token for a short-lived publish credential.
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
+  # Differs from the crate name: the @gas-killer scope already carries the brand.
+  NPM_PACKAGE: '@gas-killer/analyzer-wasm'
 
 jobs:
   publish:
@@ -26,6 +31,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Upgrade npm for Trusted Publishing
+        run: npm install -g npm@latest
+
       - name: Install wasm32 target
         run: rustup target add wasm32-unknown-unknown
 
@@ -33,21 +46,34 @@ jobs:
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       - name: Build WASM package
-        run: wasm-pack build crates/wasm --target web --release --scope ${{ github.repository_owner }}
+        run: wasm-pack build crates/wasm --target web --release
 
-      - name: Set up npm auth
-        run: echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" >> ~/.npmrc
-
-      - name: Configure package for GitHub Packages
+      - name: Configure package for npm
+        id: pkg
         run: |
           cd crates/wasm/pkg
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          jq --arg sha "$SHORT_SHA" --arg repo "https://github.com/${{ github.repository }}.git" \
-            '.version = .version + "-" + $sha | . + {"publishConfig": {"registry": "https://npm.pkg.github.com"}, "repository": {"type": "git", "url": $repo}}' \
+          VERSION=$(jq -r .version package.json)
+          if [[ "$GITHUB_REF" == refs/tags/wasm-v* ]]; then
+            # A release tag must match the crate version so npm and Cargo agree.
+            if [[ "${GITHUB_REF_NAME#wasm-v}" != "$VERSION" ]]; then
+              echo "Tag $GITHUB_REF_NAME does not match crate version $VERSION" >&2
+              exit 1
+            fi
+            echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
+          else
+            VERSION="$VERSION-$(git rev-parse --short HEAD)"
+            echo "dist_tag=next" >> "$GITHUB_OUTPUT"
+          fi
+          jq --arg name "$NPM_PACKAGE" --arg v "$VERSION" --arg repo "https://github.com/${{ github.repository }}.git" \
+            '.name = $name | .version = $v | . + {"repository": {"type": "git", "url": $repo}}' \
             package.json > package.tmp.json
           mv package.tmp.json package.json
+          # A re-run for a version that's already out is a no-op rather than a red "cannot publish over" failure.
+          if npm view "$NPM_PACKAGE@$VERSION" version >/dev/null 2>&1; then
+            echo "$NPM_PACKAGE@$VERSION is already published; skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Publish to GitHub Packages
-        run: npm publish ./crates/wasm/pkg
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish to npm
+        if: steps.pkg.outputs.skip != 'true'
+        run: npm publish ./crates/wasm/pkg --access public --tag ${{ steps.pkg.outputs.dist_tag }}
