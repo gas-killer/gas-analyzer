@@ -1,7 +1,7 @@
 {
   "name": "gas-killer",
   "version": "0.1.1",
-  "description": "Gas Killer gkvm toolchain launcher: installs gk-run, gk-anvil and gk on first use, then runs gk",
+  "description": "Gas Killer's gkvm toolchain launcher: installs gk-run, gk-anvil and gk on first use, then runs gk",
   "bin": {
     "gk": "bin/gk.js"
   },
