@@ -36,7 +36,7 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
-      - name: Upgrade npm for Trusted Publishing
+      - name: Upgrade npm for staged publishing
         run: npm install -g npm@latest
 
       - name: Install wasm32 target
@@ -74,6 +74,7 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Publish to npm
+      # Staged only: the version stays hidden until a maintainer runs `npm stage approve`, which requires 2FA.
+      - name: Stage on npm
         if: steps.pkg.outputs.skip != 'true'
-        run: npm publish ./crates/wasm/pkg --access public --tag ${{ steps.pkg.outputs.dist_tag }}
+        run: npm stage publish ./crates/wasm/pkg --access public --tag ${{ steps.pkg.outputs.dist_tag }}
