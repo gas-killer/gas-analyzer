@@ -14,6 +14,8 @@ on:
 
 permissions:
   contents: read
+  # Trusted Publishing: npm exchanges the workflow's OIDC token for a short-lived publish credential.
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,8 +30,11 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           registry-url: https://registry.npmjs.org
+
+      - name: Upgrade npm for Trusted Publishing
+        run: npm install -g npm@latest
 
       - name: Install wasm32 target
         run: rustup target add wasm32-unknown-unknown
@@ -38,7 +43,7 @@ jobs:
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       - name: Build WASM package
-        run: wasm-pack build crates/wasm --target web --release --scope gaskiller
+        run: wasm-pack build crates/wasm --target web --release --scope gas-killer
 
       - name: Configure package for npm
         id: pkg
@@ -63,5 +68,3 @@ jobs:
 
       - name: Publish to npm
         run: npm publish ./crates/wasm/pkg --access public --tag ${{ steps.pkg.outputs.dist_tag }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
