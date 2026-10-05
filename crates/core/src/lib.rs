@@ -7,7 +7,6 @@
 pub mod constants;
 pub mod encoding;
 pub mod heuristic;
-pub mod history;
 pub mod prestate;
 pub mod sim_profile;
 pub mod trace;
@@ -23,11 +22,6 @@ pub use heuristic::{
     LOG_DATA_COST_PER_BYTE, LOG_TOPIC_COST, MAX_REFUND_QUOTIENT, TraceOperations, calldata_gas,
     estimate_gas_from_operations, estimate_gas_from_state_updates,
     extract_operation_counts_from_trace,
-};
-pub use history::{
-    HISTORY_CALL_GAS, HISTORY_CALL_INNER_GAS_LIMIT, HISTORY_PRECOMPILE_ADDRESS, HISTORY_READ_GAS,
-    HistoricalRead, HistoryAnswer, HistoryQuery, HistoryQueryError, HistoryReadKind,
-    IGasKillerHistory, encode_history_answer, history_read_record, history_reads_commitment,
 };
 pub use prestate::{
     PrestateEligibility, build_state_updates_from_prestate, classify_prestate_eligibility,

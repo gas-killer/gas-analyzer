@@ -50,13 +50,6 @@ cargo run -- t 0x9add9d0f26bc6d867c1d6d41dda6287d9721a377cea42440250884f76d2a0fa
 cargo run -- r path/to/file.json
 ```
 
-### Run a tracked function that reads historical state
-```bash
-cargo run -- h path/to/request.json
-```
-Tracked functions can read state at earlier blocks through the Gas Killer history precompile. See
-[`docs/HISTORICAL_STATE.md`](docs/HISTORICAL_STATE.md) for the Solidity interface, semantics and request format.
-
 ### Legacy Anvil Mode
 
 To use the legacy Anvil-based implementation (requires running Anvil, provides precise gas estimates):
