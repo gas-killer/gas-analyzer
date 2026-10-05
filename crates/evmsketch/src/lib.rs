@@ -114,6 +114,7 @@ use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 // Re-exported so downstream consumers (e.g. the Gas Killer service) can name
 // the profile without a direct gas-analyzer-core dependency.
 pub use gas_analyzer_core::SimProfile;
+pub use gas_analyzer_core::nested;
 
 use gas_analyzer_core::nested::{FrameProgram, NestingCostModel, compute_frame_tree_canonical};
 use gas_analyzer_core::sim_profile::STATE_TRACKER_SLOT;
