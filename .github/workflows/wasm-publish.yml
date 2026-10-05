@@ -1,10 +1,11 @@
 name: Publish WASM Package
 
+# Bumping the version in crates/wasm/Cargo.toml is the release: a push to main stages that version,
+# and pushes that leave it unchanged find it already on npm and skip.
 on:
+  workflow_dispatch:
   push:
     branches: [main]
-    tags: ['wasm-v*']
-    # GitHub doesn't evaluate path filters on tag pushes, so these gate only main; release tags always run.
     paths:
       - 'crates/core/**'
       - 'crates/gas-estimator/**'
@@ -23,9 +24,36 @@ env:
   # Differs from the crate name: the @gas-killer scope already carries the brand.
   NPM_PACKAGE: '@gas-killer/analyzer-wasm'
 
+# Two merges landing together would otherwise race to stage the same version.
+concurrency:
+  group: wasm-publish
+  cancel-in-progress: false
+
 jobs:
-  publish:
+  # Runs first, so the many pushes that don't bump the version finish in seconds without building.
+  check:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      published: ${{ steps.version.outputs.published }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check whether this version is on npm
+        id: version
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/wasm/Cargo.toml | head -1)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "$(npm view "$NPM_PACKAGE@$VERSION" version 2>/dev/null)" == "$VERSION" ]]; then
+            echo "$NPM_PACKAGE@$VERSION is already published; skipping"
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    needs: check
+    if: needs.check.outputs.published != 'true'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -49,32 +77,24 @@ jobs:
         run: wasm-pack build crates/wasm --target web --release
 
       - name: Configure package for npm
-        id: pkg
         run: |
           cd crates/wasm/pkg
-          VERSION=$(jq -r .version package.json)
-          if [[ "$GITHUB_REF" == refs/tags/wasm-v* ]]; then
-            # A release tag must match the crate version so npm and Cargo agree.
-            if [[ "${GITHUB_REF_NAME#wasm-v}" != "$VERSION" ]]; then
-              echo "Tag $GITHUB_REF_NAME does not match crate version $VERSION" >&2
-              exit 1
-            fi
-            echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
-          else
-            VERSION="$VERSION-$(git rev-parse --short HEAD)"
-            echo "dist_tag=next" >> "$GITHUB_OUTPUT"
-          fi
           jq --arg name "$NPM_PACKAGE" --arg v "$VERSION" --arg repo "https://github.com/${{ github.repository }}.git" \
             '.name = $name | .version = $v | . + {"repository": {"type": "git", "url": $repo}}' \
             package.json > package.tmp.json
           mv package.tmp.json package.json
-          # A re-run for a version that's already out is a no-op rather than a red "cannot publish over" failure.
-          if npm view "$NPM_PACKAGE@$VERSION" version >/dev/null 2>&1; then
-            echo "$NPM_PACKAGE@$VERSION is already published; skipping"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          fi
 
       # Staged only: the version stays hidden until a maintainer runs `npm stage approve`, which requires 2FA.
+      # A staged version isn't visible to `npm view` until approved, so a push while one awaits approval
+      # tries to stage it again; that refusal is expected, not a failure.
       - name: Stage on npm
-        if: steps.pkg.outputs.skip != 'true'
-        run: npm stage publish ./crates/wasm/pkg --access public --tag ${{ steps.pkg.outputs.dist_tag }}
+        run: |
+          set +e
+          out=$(npm stage publish ./crates/wasm/pkg --access public --tag latest 2>&1)
+          status=$?
+          echo "$out"
+          if [[ $status -ne 0 ]] && grep -qiE "already (been )?(staged|exists|published)|cannot publish over|EPUBLISHCONFLICT" <<<"$out"; then
+            echo "::notice::$NPM_PACKAGE@$VERSION is already staged; approve or discard it on npm"
+            exit 0
+          fi
+          exit $status
