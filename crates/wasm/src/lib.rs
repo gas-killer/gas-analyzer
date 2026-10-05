@@ -1,7 +1,10 @@
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
 use alloy_primitives::{Address, B256, U256};
-use alloy_rpc_types::trace::geth::DefaultFrame;
+use alloy_rpc_types::trace::geth::{CallFrame, DefaultFrame, DiffMode};
 use gas_analyzer_core::{
-    TraceExtract, compute_state_updates, encode_state_updates_to_abi,
+    PrestateEligibility, StateUpdate, TraceExtract, build_state_updates_from_prestate,
+    classify_prestate_eligibility, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_state_updates,
 };
 use gas_analyzer_estimator::{SimEnvOpts, estimate_state_changes_gas};
@@ -31,6 +34,15 @@ pub struct AnalyzeTraceResult {
     /// execution; the estimate counts that callback gas as external and may
     /// overshoot. Only detected when an origin address was supplied.
     pub reentered: bool,
+}
+
+/// The outcome of [`analyze_prestate`]: a result when the call has a prestate net form, otherwise
+/// the reason it doesn't, so the caller can fall back to [`analyze_trace`].
+#[derive(Debug, serde::Serialize)]
+pub struct PrestateAnalysis {
+    pub eligible: bool,
+    pub reason: Option<String>,
+    pub result: Option<AnalyzeTraceResult>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -90,7 +102,126 @@ pub fn analyze_trace_inner(
     origin_address: Option<&str>,
 ) -> Result<AnalyzeTraceResult, String> {
     let extract = parse_and_compute(trace_json, parse_origin(origin_address)?)?;
-    let state_updates = &extract.state_updates;
+    analyze_extract(
+        &extract,
+        estimator_address,
+        caller_address,
+        estimate_state_changes_block_number,
+    )
+}
+
+/// Analyze a call from its `prestateTracer` (`diffMode`) diff and `callTracer` (`withLog`) frame,
+/// which stay small however much computation the call does, unlike its struct-log trace.
+///
+/// Returns `eligible: false` with a reason when the net form can't represent the call (see
+/// [`classify_prestate_eligibility`]); its state updates then have to come from the struct-log trace.
+/// For the same call the net form can differ from [`analyze_trace_inner`]'s program: repeated writes
+/// to a slot collapse to one, and a slot written back to its original value produces none.
+pub fn analyze_prestate_inner(
+    diff_json: &str,
+    call_frame_json: &str,
+    consumer_address: &str,
+    estimator_address: &str,
+    caller_address: &str,
+    estimate_state_changes_block_number: Option<u64>,
+) -> Result<PrestateAnalysis, String> {
+    let diff: DiffMode = serde_json::from_str(diff_json)
+        .map_err(|e| format!("Failed to parse prestate diff: {}", e))?;
+    let frame: CallFrame = serde_json::from_str(call_frame_json)
+        .map_err(|e| format!("Failed to parse call frame: {}", e))?;
+    let consumer: Address = consumer_address
+        .parse()
+        .map_err(|e| format!("Invalid consumer address: {}", e))?;
+
+    let ineligible = |reason: String| PrestateAnalysis {
+        eligible: false,
+        reason: Some(reason),
+        result: None,
+    };
+    // A creation's storage comes from its constructor, which the net form can't stand in for.
+    if frame.typ != "CALL" {
+        return Ok(ineligible(format!(
+            "top-level frame is {}, not CALL",
+            frame.typ
+        )));
+    }
+    if let PrestateEligibility::Fallback(reason) =
+        classify_prestate_eligibility(&frame, &diff, consumer)
+    {
+        return Ok(ineligible(reason));
+    }
+
+    let (sstore_gas_total, refund_counter) = net_sstore_costs(&diff, consumer);
+    let extract = TraceExtract {
+        state_updates: build_state_updates_from_prestate(consumer, &diff, &frame),
+        skipped_opcodes: HashSet::new(),
+        // Eligibility rules out regular CALLs at target depth, and with them re-entry.
+        call_gas_total: 0,
+        sstore_gas_total,
+        refund_counter,
+        reentered: false,
+    };
+    Ok(PrestateAnalysis {
+        eligible: true,
+        reason: None,
+        result: Some(analyze_extract(
+            &extract,
+            estimator_address,
+            caller_address,
+            estimate_state_changes_block_number,
+        )?),
+    })
+}
+
+/// EIP-2929/2200 cold SSTORE charges.
+const SSTORE_COLD_SET_COST: u64 = 22_100;
+const SSTORE_COLD_RESET_COST: u64 = 5_000;
+/// EIP-3529 refund for clearing a slot.
+const SSTORE_CLEARS_REFUND: u64 = 4_800;
+
+/// SSTORE gas and refunds for the heuristic, priced as one cold write per changed slot: a diff has
+/// no per-write `gasCost` the way a struct-log trace does.
+fn net_sstore_costs(diff: &DiffMode, consumer: Address) -> (u64, u64) {
+    let empty = BTreeMap::new();
+    let pre = diff
+        .pre
+        .get(&consumer)
+        .map(|a| &a.storage)
+        .unwrap_or(&empty);
+    let post = diff
+        .post
+        .get(&consumer)
+        .map(|a| &a.storage)
+        .unwrap_or(&empty);
+    let slots: BTreeSet<&B256> = pre.keys().chain(post.keys()).collect();
+    let (mut gas, mut refund) = (0, 0);
+    for slot in slots {
+        let old = pre.get(slot).copied().unwrap_or(B256::ZERO);
+        let new = post.get(slot).copied().unwrap_or(B256::ZERO);
+        if old == new {
+            continue;
+        }
+        gas += if old == B256::ZERO {
+            SSTORE_COLD_SET_COST
+        } else {
+            SSTORE_COLD_RESET_COST
+        };
+        if old != B256::ZERO && new == B256::ZERO {
+            refund += SSTORE_CLEARS_REFUND;
+        }
+    }
+    (gas, refund)
+}
+
+/// Encode an extraction's state updates and estimate their gas with revm, falling back to the
+/// heuristic when the simulation fails.
+fn analyze_extract(
+    extract: &TraceExtract,
+    estimator_address: &str,
+    caller_address: &str,
+    estimate_state_changes_block_number: Option<u64>,
+) -> Result<AnalyzeTraceResult, String> {
+    let state_updates: &[StateUpdate] = &extract.state_updates;
 
     let encoded = encode_state_updates_to_abi(state_updates);
 
@@ -121,7 +252,7 @@ pub fn analyze_trace_inner(
     let (gas_estimate, is_heuristic) =
         match estimate_state_changes_gas(&mut cache_db, addr, caller, state_updates, &sim_env) {
             Ok(gas) => (gas, false),
-            Err(_) => (estimate_gas_from_state_updates(&extract), true),
+            Err(_) => (estimate_gas_from_state_updates(extract), true),
         };
 
     let mut skipped = extract.skipped_opcodes.iter().cloned().collect::<Vec<_>>();
@@ -214,6 +345,39 @@ pub fn analyze_trace(
     to_js(&result)
 }
 
+/// Analyze a transaction from its `prestateTracer` diff and `callTracer` frame instead of its
+/// struct-log trace, for calls that admit the prestate net form.
+///
+/// `diff_json` is the `result` of `debug_traceTransaction` with
+/// `{"tracer":"prestateTracer","tracerConfig":{"diffMode":true}}`, and `call_frame_json` the
+/// `result` with `{"tracer":"callTracer","tracerConfig":{"withLog":true}}`.
+///
+/// `consumer_address` is the transaction's target contract (its `to`). The other arguments are as
+/// for [`analyze_trace`].
+///
+/// Returns a JS object with `eligible`, and either `result` (shaped like [`analyze_trace`]'s) or
+/// `reason`, why the call has no net form; analyze its struct-log trace with [`analyze_trace`] then.
+#[wasm_bindgen]
+pub fn analyze_prestate(
+    diff_json: &str,
+    call_frame_json: &str,
+    consumer_address: &str,
+    estimator_address: &str,
+    caller_address: &str,
+    estimate_state_changes_block_number: Option<u64>,
+) -> Result<JsValue, JsError> {
+    let result = analyze_prestate_inner(
+        diff_json,
+        call_frame_json,
+        consumer_address,
+        estimator_address,
+        caller_address,
+        estimate_state_changes_block_number,
+    )
+    .map_err(|e| JsError::new(&e))?;
+    to_js(&result)
+}
+
 /// Heuristic-only gas estimation (no revm, faster, less accurate).
 ///
 /// `origin_address` enables re-entry detection — see [`analyze_trace`].
@@ -247,6 +411,12 @@ export interface AnalyzeTraceResult {
     state_update_count: number;
     skipped_opcodes: string[];
     reentered: boolean;
+}
+
+export interface PrestateAnalysis {
+    eligible: boolean;
+    reason: string | null;
+    result: AnalyzeTraceResult | null;
 }
 
 export interface EncodeTraceResult {
@@ -828,5 +998,143 @@ mod tests {
         // Each call uses a fresh CacheDB, so results should differ
         assert_eq!(result1.state_update_count, 1);
         assert_eq!(result2.state_update_count, 2);
+    }
+
+    // ===== Prestate net form =====
+
+    const CONSUMER: &str = "0x00000000000000000000000000000000000000c0";
+
+    fn slot(n: u64) -> String {
+        format!("0x{:064x}", n)
+    }
+
+    /// A `callTracer` root frame from the caller to the consumer, with `calls` and `logs` as given.
+    fn make_frame(
+        typ: &str,
+        calls: Vec<serde_json::Value>,
+        logs: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "type": typ,
+            "from": test_caller_address(),
+            "to": CONSUMER,
+            "gas": "0x100000",
+            "gasUsed": "0x5208",
+            "input": "0x",
+            "calls": calls,
+            "logs": logs,
+        })
+    }
+
+    /// A `prestateTracer` diff of the consumer's storage, as (slot, value) pairs before and after.
+    fn make_diff(pre: &[(u64, u64)], post: &[(u64, u64)]) -> String {
+        let storage = |pairs: &[(u64, u64)]| {
+            pairs
+                .iter()
+                .map(|&(k, v)| (slot(k), serde_json::Value::String(slot(v))))
+                .collect::<serde_json::Map<_, _>>()
+        };
+        serde_json::json!({
+            "pre": { CONSUMER: { "storage": storage(pre) } },
+            "post": { CONSUMER: { "storage": storage(post) } },
+        })
+        .to_string()
+    }
+
+    fn analyze_prestate_fixture(diff: &str, frame: &serde_json::Value) -> PrestateAnalysis {
+        analyze_prestate_inner(
+            diff,
+            &frame.to_string(),
+            CONSUMER,
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_prestate_eligible_call_is_analyzed() {
+        let log = serde_json::json!({
+            "address": CONSUMER,
+            "topics": [slot(0xaa)],
+            "data": "0x01",
+            "position": "0x0",
+        });
+        // Slot 1 changes, slot 2 is new, slot 3 is written back to its original value.
+        let diff = make_diff(&[(1, 1), (3, 7)], &[(1, 2), (2, 3), (3, 7)]);
+        let out = analyze_prestate_fixture(&diff, &make_frame("CALL", vec![], vec![log]));
+        assert!(out.eligible);
+        assert!(out.reason.is_none());
+        let result = out.result.unwrap();
+        // Two stores (slots 1 and 2) and one log; slot 3 is unchanged so it produces none.
+        assert_eq!(result.state_update_count, 3);
+        assert!(!result.is_heuristic);
+        assert!(result.gas_estimate > 0);
+        assert!(!result.reentered);
+        assert!(result.skipped_opcodes.is_empty());
+    }
+
+    #[test]
+    fn test_prestate_external_call_is_ineligible() {
+        let call = serde_json::json!({
+            "type": "CALL",
+            "from": CONSUMER,
+            "to": "0x00000000000000000000000000000000000000d0",
+            "input": "0x",
+        });
+        let out = analyze_prestate_fixture(
+            &make_diff(&[], &[(1, 1)]),
+            &make_frame("CALL", vec![call], vec![]),
+        );
+        assert!(!out.eligible);
+        assert!(out.result.is_none());
+        assert!(out.reason.unwrap().contains("regular CALL"));
+    }
+
+    #[test]
+    fn test_prestate_reverted_call_is_ineligible() {
+        let mut frame = make_frame("CALL", vec![], vec![]);
+        frame["error"] = "execution reverted".into();
+        let out = analyze_prestate_fixture(&make_diff(&[], &[]), &frame);
+        assert!(!out.eligible);
+        assert!(out.reason.unwrap().contains("reverted"));
+    }
+
+    #[test]
+    fn test_prestate_contract_creation_is_ineligible() {
+        let out = analyze_prestate_fixture(
+            &make_diff(&[], &[(1, 1)]),
+            &make_frame("CREATE", vec![], vec![]),
+        );
+        assert!(!out.eligible);
+        assert!(out.reason.unwrap().contains("CREATE"));
+    }
+
+    #[test]
+    fn test_prestate_invalid_json_is_an_error() {
+        let frame = make_frame("CALL", vec![], vec![]).to_string();
+        let addr = test_estimator_address();
+        let caller = test_caller_address();
+        assert!(analyze_prestate_inner("{", &frame, CONSUMER, &addr, &caller, None).is_err());
+        let diff = make_diff(&[], &[]);
+        assert!(analyze_prestate_inner(&diff, "[]", CONSUMER, &addr, &caller, None).is_err());
+        assert!(analyze_prestate_inner(&diff, &frame, "0x12", &addr, &caller, None).is_err());
+    }
+
+    #[test]
+    fn test_net_sstore_costs_price_each_changed_slot_once() {
+        // Set from zero, reset, cleared (refunded), and unchanged.
+        let diff: DiffMode = serde_json::from_str(&make_diff(
+            &[(2, 5), (3, 6), (4, 9)],
+            &[(1, 1), (2, 8), (4, 9)],
+        ))
+        .unwrap();
+        let (gas, refund) = net_sstore_costs(&diff, CONSUMER.parse().unwrap());
+        assert_eq!(
+            gas,
+            SSTORE_COLD_SET_COST + SSTORE_COLD_RESET_COST + SSTORE_COLD_RESET_COST
+        );
+        assert_eq!(refund, SSTORE_CLEARS_REFUND);
     }
 }
