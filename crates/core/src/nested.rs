@@ -880,11 +880,16 @@ fn depth_of(programs: &[ProgramState], mut id: usize) -> u64 {
     depth
 }
 
-/// Turns back into a `CALL` every nested frame whose computation does not pay for its
-/// nesting overhead, children first so a parent's witness is sized with only the children
-/// that stay nested. Returns the native gas of the frames turned back into calls.
+/// Turns back into a `CALL` every nested frame that does not pay for its nesting overhead,
+/// children first so a parent's witness is sized with only the children that stay nested.
+///
+/// A frame's benefit is its own computation plus the net savings of the children it keeps
+/// nested, because turning a frame back into a `CALL` runs its whole subtree natively. A cheap
+/// frame in front of an expensive one therefore stays nested when the pair pays for itself.
+/// Returns the native gas of the frames turned back into calls.
 fn prune_unprofitable(programs: &mut [ProgramState], cost: &NestingCostModel) -> u64 {
     let mut witness_bytes = vec![0usize; programs.len()];
+    let mut net_savings = vec![0u64; programs.len()];
     let mut restored_call_gas = 0u64;
     for id in (1..programs.len()).rev() {
         if programs[id].dropped {
@@ -909,7 +914,10 @@ fn prune_unprofitable(programs: &mut [ProgramState], cost: &NestingCostModel) ->
             .native_gas
             .saturating_sub(programs[id].effect_gas)
             .saturating_sub(programs[id].child_call_gas);
-        if computation > overhead {
+        let children_savings: u64 = programs[id].children.iter().map(|c| net_savings[*c]).sum();
+        let benefit = computation.saturating_add(children_savings);
+        if benefit > overhead {
+            net_savings[id] = benefit - overhead;
             continue;
         }
 
@@ -1391,6 +1399,41 @@ mod tests {
             tree.call_gas_total, 5_000,
             "the restored call replays natively"
         );
+    }
+
+    #[test]
+    fn cheap_frame_in_front_of_an_expensive_one_stays_nested() {
+        let logs = vec![
+            bump(1, 1),
+            call(1, 3_000_000, B),
+            bump(2, 1),
+            call(2, 2_990_000, C),
+            bump(3, 1),
+            resume(2, 100_000, true),
+            resume(1, 95_000, true),
+        ];
+        let tree = split(logs, &[B, C]);
+        let targets: Vec<Address> = tree.frames.iter().map(|f| f.target).collect();
+        assert_eq!(
+            targets,
+            vec![ROOT, B, C],
+            "B alone computes ~5k, C carries it"
+        );
+    }
+
+    #[test]
+    fn cheap_frames_all_the_way_down_are_calls() {
+        let logs = vec![
+            bump(1, 1),
+            call(1, 3_000_000, B),
+            bump(2, 1),
+            call(2, 2_995_000, C),
+            bump(3, 1),
+            resume(2, 2_990_000, true),
+            resume(1, 2_985_000, true),
+        ];
+        let tree = split(logs, &[B, C]);
+        assert_eq!(tree.frames.len(), 1);
     }
 
     #[test]

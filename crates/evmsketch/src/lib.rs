@@ -17,7 +17,7 @@ use alloy_provider::Provider;
 use alloy_provider::RootProvider;
 use alloy_provider::ext::DebugApi;
 use alloy_provider::network::{AnyNetwork, Ethereum};
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use lru::LruCache;
 use reth_primitives::EthPrimitives;
 use revm::database::CacheDB;
@@ -115,6 +115,8 @@ use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 // the profile without a direct gas-analyzer-core dependency.
 pub use gas_analyzer_core::SimProfile;
 
+use gas_analyzer_core::nested::{FrameProgram, NestingCostModel, compute_frame_tree_canonical};
+use gas_analyzer_core::sim_profile::STATE_TRACKER_SLOT;
 use gas_analyzer_core::{
     Opcode, PrestateEligibility, SignatureType, StateUpdate, build_state_updates_from_prestate,
     classify_prestate_eligibility, compute_state_updates, compute_state_updates_canonical,
@@ -1313,6 +1315,292 @@ async fn try_prestate_net<P: Provider + DebugApi>(
 }
 
 // ============================================================================
+// Nested settlement
+// ============================================================================
+
+/// `type(IGasKillerNested).interfaceId` in solidity-sdk.
+pub const GAS_KILLER_NESTED_INTERFACE_ID: [u8; 4] = [0x78, 0x48, 0x18, 0x74];
+/// `supportsInterface(bytes4)`
+const SUPPORTS_INTERFACE_SELECTOR: [u8; 4] = [0x01, 0xff, 0xc9, 0xa7];
+/// `schnorrRegistry()`
+const SCHNORR_REGISTRY_SELECTOR: [u8; 4] = [0x5c, 0xc3, 0x74, 0x50];
+
+/// A call split into per-frame programs for nested settlement.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct EncodedFrameTree {
+    /// Frames in execution order, root first. A single frame means nothing was nested and the
+    /// call settles through `verifyAndUpdate` exactly as without nesting.
+    pub frames: Vec<FrameProgram>,
+    /// Every contract whose transition counter the call moves.
+    pub counter_moves: std::collections::BTreeSet<Address>,
+    /// Gas to apply every frame's program, plus the nesting overhead of the frames beyond the
+    /// root. An estimate for reporting savings; which frames nest is decided by the cost model.
+    pub gas_estimate: u64,
+    pub skipped_opcodes: HashSet<Opcode>,
+    pub extraction: Extraction,
+    pub executor_cache_hit: bool,
+    pub timings: EncodePhaseTimings,
+}
+
+/// Like [`call_to_encoded_state_updates_with_evmsketch_profiled`], but a `CALL` into another
+/// SDK consumer that shares the root's registry becomes its own frame.
+///
+/// Whether a callee can be nested is read at `block_number`, the state the call is traced
+/// against, so every operator answers the same way. A read that reverts means the callee is not
+/// a nestable consumer; any other RPC failure fails the run rather than guessing, since a guess
+/// could split operators across two different trees.
+///
+/// Only the canonical encoder splits a trace: the legacy encoder drops callee writes, and the
+/// prestate net form never applies to a call that makes a regular `CALL`. Under
+/// [`StateEncoding::PrestateNet`] a call the net form represents is returned as a single frame.
+#[tracing::instrument(name = "evmsketch.encode_frame_tree", skip_all, fields(block_number, encoding = ?encoding, profile = ?profile, frame_count = tracing::field::Empty))]
+pub async fn call_to_frame_tree_with_evmsketch(
+    cache: &EvmSketchExecutorCache,
+    rpc_url: impl AsRef<str>,
+    tx_request: TransactionRequest,
+    block_number: u64,
+    encoding: StateEncoding,
+    profile: SimProfile,
+    cost: &NestingCostModel,
+) -> Result<EncodedFrameTree> {
+    if encoding == StateEncoding::Legacy {
+        bail!(
+            "nested settlement needs the canonical encoder; the legacy encoding cannot split a trace"
+        );
+    }
+    let rpc_url = rpc_url.as_ref();
+    let provider = cache.get_or_create_trace_provider(rpc_url)?;
+    let root = tx_request
+        .to
+        .and_then(|t| match t {
+            TxKind::Call(addr) => Some(addr),
+            TxKind::Create => None,
+        })
+        .ok_or_else(|| anyhow!("Transaction must have a 'to' address"))?;
+    let caller_address = tx_request.from.unwrap_or_default();
+    let block = BlockId::Number(BlockNumberOrTag::Number(block_number));
+
+    let mut trace_fetch = Duration::ZERO;
+    let mut extraction = Extraction::StructLog;
+    if encoding.signs_prestate_net() {
+        let started = Instant::now();
+        let net = try_prestate_net(&provider, &tx_request, block, root, profile).await?;
+        trace_fetch += started.elapsed();
+        extraction = Extraction::PrestateFallback;
+        if let Some(updates) = net {
+            let (executor, lookup) = cache.get_or_build_timed(rpc_url, block_number).await?;
+            let hints = hints_from_state_updates(root, &updates);
+            let (gas_estimate, estimate) = executor
+                .estimate_state_changes_gas_with_hints_timed(root, caller_address, &updates, &hints)
+                .await?;
+            let frame = FrameProgram {
+                target: root,
+                caller: Address::ZERO,
+                value: U256::ZERO,
+                calldata_hash: B256::ZERO,
+                transition_index: tracker_index(&updates),
+                updates,
+                children: Vec::new(),
+            };
+            return Ok(EncodedFrameTree {
+                counter_moves: std::iter::once(root).collect(),
+                frames: vec![frame],
+                gas_estimate,
+                skipped_opcodes: HashSet::new(),
+                extraction: Extraction::PrestateNet,
+                executor_cache_hit: lookup.cache_hit,
+                timings: EncodePhaseTimings {
+                    trace_fetch,
+                    parse: Duration::ZERO,
+                    executor_build: lookup.build,
+                    prefetch: estimate.prefetch,
+                    revm_estimate: estimate.execute,
+                },
+            });
+        }
+    }
+
+    let started = Instant::now();
+    let ((trace, nestable), (executor, executor_lookup)) = tokio::try_join!(
+        async {
+            let trace =
+                get_trace_from_call_with_profile(&provider, tx_request, block, profile).await?;
+            let nestable = nestable_callees(&provider, &trace, root, block).await?;
+            Ok::<_, anyhow::Error>((trace, nestable))
+        },
+        cache.get_or_build_timed(rpc_url, block_number),
+    )?;
+    trace_fetch += started.elapsed();
+
+    let started = Instant::now();
+    let tree = compute_frame_tree_canonical(trace, root, &|a| nestable.contains(&a), cost)?;
+    let parse = started.elapsed();
+    tracing::Span::current().record("frame_count", tree.frames.len());
+
+    // The whole tree lands in one transaction, so the unbounded profile's payload budget covers
+    // every frame together.
+    if let Some(budget) = profile.payload_gas_budget() {
+        let all: Vec<StateUpdate> = tree
+            .frames
+            .iter()
+            .flat_map(|f| replayable(&f.updates))
+            .collect();
+        let signature_floor = SignatureType::Bls.turetzky_upper_gas_limit();
+        validate_unbounded_cost(&all, tree.call_gas_total, signature_floor, budget).map_err(
+            |violation| {
+                anyhow!("unbounded-profile payload rejected for consumer {root}: {violation}")
+            },
+        )?;
+    }
+
+    let mut gas_estimate = 0u64;
+    let mut prefetch = Duration::ZERO;
+    let mut revm_estimate = Duration::ZERO;
+    for (i, frame) in tree.frames.iter().enumerate() {
+        // The estimator replays programs through a handler that predates NESTED; each frame is
+        // priced on its own and the nesting overhead added per frame instead.
+        let updates = replayable(&frame.updates);
+        let hints = hints_from_state_updates(frame.target, &updates);
+        // Programs never read `msg.sender`, and a frame's real caller is a contract, which
+        // revm refuses as a transaction sender (EIP-3607); price every frame from the root's.
+        let (gas, estimate) = executor
+            .estimate_state_changes_gas_with_hints_timed(
+                frame.target,
+                caller_address,
+                &updates,
+                &hints,
+            )
+            .await?;
+        gas_estimate = gas_estimate.saturating_add(gas);
+        if i > 0 {
+            gas_estimate = gas_estimate.saturating_add(cost.frame_overhead_gas);
+        }
+        prefetch += estimate.prefetch;
+        revm_estimate += estimate.execute;
+    }
+
+    Ok(EncodedFrameTree {
+        frames: tree.frames,
+        counter_moves: tree.counter_moves,
+        gas_estimate,
+        skipped_opcodes: tree.skipped_opcodes,
+        extraction,
+        executor_cache_hit: executor_lookup.cache_hit,
+        timings: EncodePhaseTimings {
+            trace_fetch,
+            parse,
+            executor_build: executor_lookup.build,
+            prefetch,
+            revm_estimate,
+        },
+    })
+}
+
+/// A program without its `NESTED` ops, for pricers that cannot execute them.
+fn replayable(updates: &[StateUpdate]) -> Vec<StateUpdate> {
+    updates
+        .iter()
+        .filter(|u| !matches!(u, StateUpdate::Nested(_)))
+        .cloned()
+        .collect()
+}
+
+/// The transition index a program's tracker store implies, for programs not built from a
+/// struct-log trace.
+fn tracker_index(updates: &[StateUpdate]) -> Option<U256> {
+    updates.iter().find_map(|u| match u {
+        StateUpdate::Store(s) if s.slot == STATE_TRACKER_SLOT => {
+            Some(U256::from_be_bytes(s.value.0).saturating_sub(U256::from(1)))
+        }
+        _ => None,
+    })
+}
+
+/// The `CALL` targets in `trace` that are nestable consumers: they report `IGasKillerNested`
+/// and share the root's registry. Empty when the root itself cannot settle a tree.
+async fn nestable_callees<P: Provider>(
+    provider: &P,
+    trace: &alloy::rpc::types::trace::geth::DefaultFrame,
+    root: Address,
+    block: BlockId,
+) -> Result<HashSet<Address>> {
+    let mut nestable = HashSet::new();
+    let Some(registry) = nested_registry(provider, root, block).await? else {
+        return Ok(nestable);
+    };
+    let callees: std::collections::BTreeSet<Address> = trace
+        .struct_logs
+        .iter()
+        .filter(|l| l.op.as_ref() == "CALL" && l.error.is_none())
+        .filter_map(|l| {
+            let stack = l.stack.as_ref()?;
+            stack
+                .get(stack.len().wrapping_sub(2))
+                .map(|v| Address::from_word((*v).into()))
+        })
+        .collect();
+    for callee in callees {
+        if nested_registry(provider, callee, block).await? == Some(registry) {
+            nestable.insert(callee);
+        }
+    }
+    Ok(nestable)
+}
+
+/// `Some(registry)` when `contract` reports `IGasKillerNested` at `block`, `None` when it does
+/// not or the read reverts. Transport failures are errors.
+async fn nested_registry<P: Provider>(
+    provider: &P,
+    contract: Address,
+    block: BlockId,
+) -> Result<Option<Address>> {
+    let mut probe = SUPPORTS_INTERFACE_SELECTOR.to_vec();
+    let mut word = [0u8; 32];
+    word[..4].copy_from_slice(&GAS_KILLER_NESTED_INTERFACE_ID);
+    probe.extend_from_slice(&word);
+    let Some(supports) = static_read(provider, contract, probe, block).await? else {
+        return Ok(None);
+    };
+    if supports.len() != 32 || U256::from_be_slice(&supports).is_zero() {
+        return Ok(None);
+    }
+    let Some(registry) = static_read(
+        provider,
+        contract,
+        SCHNORR_REGISTRY_SELECTOR.to_vec(),
+        block,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    if registry.len() != 32 {
+        return Ok(None);
+    }
+    Ok(Some(Address::from_slice(&registry[12..])))
+}
+
+/// `eth_call` at `block`: `Ok(None)` when the call reverts, `Err` when the node could not answer.
+async fn static_read<P: Provider>(
+    provider: &P,
+    to: Address,
+    data: Vec<u8>,
+    block: BlockId,
+) -> Result<Option<Bytes>> {
+    let request = TransactionRequest::default().to(to).input(data.into());
+    match provider.call(request).block(block).await {
+        Ok(out) => Ok(Some(out)),
+        Err(alloy::transports::RpcError::ErrorResp(payload))
+            if payload.code == 3 || payload.message.to_lowercase().contains("revert") =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(anyhow!("eth_call to {to} failed: {e}")),
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1850,6 +2138,244 @@ mod tests {
         // outputs compared. Contracts are hand-assembled runtime bytecode set via
         // `anvil_setCode` — no solc/forge build step.
         // ========================================================================
+
+        // ========================================================================
+        // Nested settlement — the nested-chain example contracts from solidity-sdk
+        // (`NestedRouter` → `NestedVault` → `NestedLedger`), deployed from their
+        // creation bytecode (`tests/fixtures/nested/*.hex`, `forge inspect <C> bytecode`).
+        // ========================================================================
+
+        const DEV: Address = address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+        const AVS: Address = address!("0x0000000000000000000000000000000000000a75");
+
+        fn word_u(v: u64) -> [u8; 32] {
+            U256::from(v).to_be_bytes()
+        }
+
+        fn word_a(a: Address) -> [u8; 32] {
+            let mut w = [0u8; 32];
+            w[12..].copy_from_slice(a.as_slice());
+            w
+        }
+
+        async fn deploy(
+            provider: &RootProvider<Ethereum>,
+            creation_hex: &str,
+            args: &[[u8; 32]],
+        ) -> Address {
+            let mut data = alloy::hex::decode(creation_hex.trim()).expect("valid creation hex");
+            for word in args {
+                data.extend_from_slice(word);
+            }
+            let tx = serde_json::json!({
+                "from": DEV,
+                "data": format!("0x{}", alloy::hex::encode(data)),
+                "gas": "0x1c9c380",
+            });
+            let hash: B256 = provider
+                .raw_request("eth_sendTransaction".into(), (tx,))
+                .await
+                .expect("eth_sendTransaction");
+            let mut receipt = serde_json::Value::Null;
+            for _ in 0..100 {
+                receipt = provider
+                    .raw_request("eth_getTransactionReceipt".into(), (hash,))
+                    .await
+                    .expect("eth_getTransactionReceipt");
+                if !receipt.is_null() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(receipt["status"], "0x1", "deployment reverted: {receipt}");
+            receipt["contractAddress"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no contract address in {receipt}"))
+                .parse()
+                .expect("an address")
+        }
+
+        struct NestedChain {
+            registry: Address,
+            ledger: Address,
+            vault: Address,
+            router: Address,
+        }
+
+        async fn deploy_registry(provider: &RootProvider<Ethereum>) -> Address {
+            deploy(
+                provider,
+                include_str!("../tests/fixtures/nested/SchnorrStakeRegistry.hex"),
+                &[word_u(2), word_u(3), word_a(DEV), word_u(0)],
+            )
+            .await
+        }
+
+        /// `vault_registry` lets a test give the vault a different registry from the router.
+        async fn deploy_chain(
+            provider: &RootProvider<Ethereum>,
+            rounds: u64,
+            vault_registry: Option<Address>,
+        ) -> NestedChain {
+            let registry = deploy_registry(provider).await;
+            let ledger = deploy(
+                provider,
+                include_str!("../tests/fixtures/nested/NestedLedger.hex"),
+                &[word_a(AVS), word_a(registry), word_u(rounds)],
+            )
+            .await;
+            let vault = deploy(
+                provider,
+                include_str!("../tests/fixtures/nested/NestedVault.hex"),
+                &[
+                    word_a(AVS),
+                    word_a(vault_registry.unwrap_or(registry)),
+                    word_a(ledger),
+                ],
+            )
+            .await;
+            let router = deploy(
+                provider,
+                include_str!("../tests/fixtures/nested/NestedRouter.hex"),
+                &[word_a(AVS), word_a(registry), word_a(vault)],
+            )
+            .await;
+            NestedChain {
+                registry,
+                ledger,
+                vault,
+                router,
+            }
+        }
+
+        /// `NestedRouter.process(user, weights)`.
+        fn process_request(router: Address, weights: u64) -> TransactionRequest {
+            let mut data = vec![0x9c, 0x6e, 0xfc, 0x5a];
+            data.extend_from_slice(&word_a(address!(
+                "0x000000000000000000000000000000000000beef"
+            )));
+            data.extend_from_slice(&word_u(0x40));
+            data.extend_from_slice(&word_u(weights));
+            for i in 0..weights {
+                data.extend_from_slice(&word_u(i * 7 + 3));
+            }
+            call_request(router).input(Bytes::from(data).into())
+        }
+
+        /// Nests every eligible callee, so the splitting tests can use a small, fast workload;
+        /// the cost model is exercised by `test_cheap_callees_stay_calls` and the core tests.
+        const FREE_NESTING: NestingCostModel = NestingCostModel {
+            frame_overhead_gas: 0,
+            witness_byte_gas: 0,
+            witness_byte_gas_per_level: 0,
+        };
+
+        async fn frame_tree(
+            anvil: &LocalAnvil,
+            request: TransactionRequest,
+            cost: &NestingCostModel,
+        ) -> EncodedFrameTree {
+            let block = anvil
+                .provider()
+                .get_block_number()
+                .await
+                .expect("block number");
+            call_to_frame_tree_with_evmsketch(
+                &EvmSketchExecutorCache::new(1),
+                &anvil.url,
+                request,
+                block,
+                StateEncoding::Canonical,
+                SimProfile::Chain,
+                cost,
+            )
+            .await
+            .expect("frame tree")
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; run with --ignored"]
+        async fn test_nested_chain_splits_into_one_frame_per_consumer() {
+            let anvil =
+                LocalAnvil::spawn_with(&["--chain-id", &SEPOLIA_CHAIN_ID.to_string()]).await;
+            let chain = deploy_chain(&anvil.provider(), 5, None).await;
+            let tree = frame_tree(&anvil, process_request(chain.router, 5), &FREE_NESTING).await;
+
+            let targets: Vec<Address> = tree.frames.iter().map(|f| f.target).collect();
+            assert_eq!(targets, vec![chain.router, chain.vault, chain.ledger]);
+            assert_eq!(tree.frames[0].children, vec![1]);
+            assert_eq!(tree.frames[1].children, vec![2]);
+            assert_eq!(tree.frames[1].caller, chain.router);
+            assert_eq!(tree.frames[2].caller, chain.vault);
+            for frame in &tree.frames {
+                assert_eq!(frame.transition_index, Some(U256::ZERO));
+            }
+            assert_eq!(
+                tree.counter_moves,
+                [chain.router, chain.vault, chain.ledger]
+                    .into_iter()
+                    .collect()
+            );
+            assert!(
+                tree.frames[0]
+                    .updates
+                    .iter()
+                    .any(|u| matches!(u, StateUpdate::Nested(n) if n.target == chain.vault))
+            );
+
+            let encoded = gas_analyzer_core::nested::encode_frame_tree(
+                &tree.frames,
+                [0x9c, 0x6e, 0xfc, 0x5a].into(),
+                SEPOLIA_CHAIN_ID,
+                1_000,
+            )
+            .expect("encodable tree");
+            assert_eq!(encoded.leaves.len(), 4);
+            assert_eq!(encoded.root_children.len(), 1);
+            let _ = chain.registry;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; run with --ignored"]
+        async fn test_callee_on_another_registry_stays_a_call() {
+            let anvil =
+                LocalAnvil::spawn_with(&["--chain-id", &SEPOLIA_CHAIN_ID.to_string()]).await;
+            let other_registry = deploy_registry(&anvil.provider()).await;
+            let chain = deploy_chain(&anvil.provider(), 5, Some(other_registry)).await;
+            let tree = frame_tree(&anvil, process_request(chain.router, 5), &FREE_NESTING).await;
+
+            assert_eq!(tree.frames.len(), 1);
+            assert!(
+                tree.frames[0]
+                    .updates
+                    .iter()
+                    .any(|u| matches!(u, StateUpdate::Call(c) if c.target == chain.vault))
+            );
+            assert!(tree.counter_moves.contains(&chain.vault));
+            assert!(
+                tree.counter_moves.contains(&chain.ledger),
+                "pinned even though it runs natively"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; run with --ignored"]
+        async fn test_cheap_callees_stay_calls() {
+            let anvil =
+                LocalAnvil::spawn_with(&["--chain-id", &SEPOLIA_CHAIN_ID.to_string()]).await;
+            let chain = deploy_chain(&anvil.provider(), 1, None).await;
+            let tree = frame_tree(
+                &anvil,
+                process_request(chain.router, 1),
+                &gas_analyzer_core::nested::NESTING_COST_MODEL_V1,
+            )
+            .await;
+            assert_eq!(
+                tree.frames.len(),
+                1,
+                "nesting a near-empty frame costs more than running it"
+            );
+        }
 
         /// A local anvil instance on an OS-assigned free port, killed on drop.
         struct LocalAnvil {
