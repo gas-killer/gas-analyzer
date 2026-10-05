@@ -368,6 +368,9 @@ pub fn tx_request_to_contract_input(tx_request: &TransactionRequest) -> Result<C
     })
 }
 
+pub mod history;
+pub use history::{HistoricalEncodedStateUpdates, call_to_encoded_state_updates_with_history};
+
 // ============================================================================
 // EvmSketch Executor
 // ============================================================================
@@ -1090,17 +1093,8 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
     let caller_address = tx_request.from.unwrap_or_default();
 
     // Collect storage hints from the EIP-2930 access list before tx_request
-    // is consumed by get_trace_from_call. Address-only entries (no storage keys)
-    // are included with an empty slot list so their account info is prefetched.
-    let mut storage_hints: HashMap<Address, Vec<B256>> = HashMap::new();
-    if let Some(al) = &tx_request.access_list {
-        for item in al.iter() {
-            storage_hints
-                .entry(item.address)
-                .or_default()
-                .extend(item.storage_keys.iter().copied());
-        }
-    }
+    // is consumed by get_trace_from_call.
+    let storage_hints = access_list_storage_hints(&tx_request);
 
     let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
 
@@ -1118,6 +1112,44 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
         ),
         cache.get_or_build_timed(rpc_url, block_number),
     )?;
+    finish_encoded_state_updates(
+        &executor,
+        executor_lookup,
+        contract_address,
+        caller_address,
+        storage_hints,
+        extracted,
+        profile,
+    )
+    .await
+}
+
+/// Storage hints from a request's EIP-2930 access list: `address → slots`. Address-only entries
+/// (no storage keys) are included with an empty slot list so their account info is prefetched.
+fn access_list_storage_hints(tx_request: &TransactionRequest) -> HashMap<Address, Vec<B256>> {
+    let mut storage_hints: HashMap<Address, Vec<B256>> = HashMap::new();
+    if let Some(al) = &tx_request.access_list {
+        for item in al.iter() {
+            storage_hints
+                .entry(item.address)
+                .or_default()
+                .extend(item.storage_keys.iter().copied());
+        }
+    }
+    storage_hints
+}
+
+/// Everything after extraction, shared by every extraction path: enforce the unbounded payload
+/// budget, ABI-encode the program, and estimate the gas to apply it on-chain.
+async fn finish_encoded_state_updates(
+    executor: &DefaultEvmSketchExecutor,
+    executor_lookup: ExecutorLookup,
+    contract_address: Address,
+    caller_address: Address,
+    storage_hints: HashMap<Address, Vec<B256>>,
+    extracted: Extracted,
+    profile: SimProfile,
+) -> Result<EncodedStateUpdates> {
     let Extracted {
         state_updates,
         skipped_opcodes,

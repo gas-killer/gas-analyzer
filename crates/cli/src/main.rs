@@ -11,6 +11,9 @@ use gas_analyzer_core::RevertingContext;
 use std::env;
 use url::Url;
 
+#[cfg(feature = "evmsketch")]
+mod history;
+
 /// Try to decode a `RevertingContext` error from an anyhow error.
 ///
 /// Looks for hex-encoded revert data in the error message (the format revm
@@ -34,6 +37,7 @@ use alloy_eips::BlockNumberOrTag;
 enum Commands {
     Transaction(String),
     Request(String),
+    History(String),
 }
 
 struct CliArgs {
@@ -67,6 +71,7 @@ fn parse_args() -> CliArgs {
         match input_type {
             "t" | "tx" => Some(Commands::Transaction(value)),
             "r" | "request" => Some(Commands::Request(value)),
+            "h" | "history" => Some(Commands::History(value)),
             "d" | "debug" => Some(Commands::Transaction(value)),
             _ => None,
         }
@@ -520,6 +525,20 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             }
         }
 
+        Some(Commands::History(file)) => {
+            #[cfg(feature = "evmsketch")]
+            history::run_history_request(&rpc_url, &file).await?;
+            #[cfg(not(feature = "evmsketch"))]
+            {
+                let _ = file;
+                println!(
+                    "{}",
+                    "Error: the history command needs the evmsketch backend (default features)"
+                        .red()
+                );
+            }
+        }
+
         Some(Commands::Request(_file)) => {
             // Note: The request command (for simulating unexecuted transactions) has been removed.
             // Use the transaction command to analyze existing transactions via their tx hash.
@@ -539,6 +558,10 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             println!(
                 "  {} for transaction requests",
                 "r/request <JSON_FILE>".bold()
+            );
+            println!(
+                "  {} run a tracked function that reads historical state",
+                "h/history <JSON_FILE>".bold()
             );
             println!("\nFlags:\n");
             println!(
