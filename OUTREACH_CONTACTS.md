@@ -1,9 +1,9 @@
 # Outreach contacts for the protocols that measured savings
 
-Companion to `ALL_TRANSACTION_ANALYSES.md` and `PROTOCOL_SURVEY.md`. Compiled 2026-09-17.
+Companion to `ALL_TRANSACTION_ANALYSES.md` and `PROTOCOL_SURVEY.md`. Compiled 2026-09-17, updated 2026-10-05.
 
-**21 of 48 surveyed protocols had at least one transaction clear the 50,000-gas Schnorr
-floor.** They are not equally worth an email. This document ranks them by the *measured
+**22 of 50 surveyed protocols had at least one transaction clear the 50,000-gas Schnorr
+floor**, plus two projects measured outside the survey (Tacit and USD8). They are not equally worth an email. This document ranks them by the *measured
 dollar value* of the saving, routes each one to a contact channel, and flags what is
 verified versus what still needs a human to confirm.
 
@@ -72,7 +72,7 @@ Six protocols. Everything else is rounding error at any gas price.
 ### Starknet / StarkWare
 - **Contact form at <https://starkware.co>** → "Contact Us" in the nav. The form has a
   **Topic dropdown including "Customers/Partner Inquiries"** — use that. Verified.
-- `info@starkware.co` — search-derived, **not verified**; the site lists no email directly.
+- `info@starkware.co` — **not on any StarkWare page checked**; only `legal@` appears (privacy policy). Use the form.
 - GitHub <https://github.com/starkware-libs>, X `@StarkWareLtd`.
 - Also consider the **Starknet Foundation** separately from StarkWare — the L1 state-update
   transactions are posted by the sequencer operator, so confirm who actually owns that cost.
@@ -95,23 +95,87 @@ Contact them only if there is a strategic reason (logo, case study, ecosystem in
 |---|---:|---:|---|---|
 | **Linea** | 54.54% | $21 ($1,348 @20) | `linea.build/contact/inquiries` — "Speak to an expert" | ✅ |
 | **Pyth** | 52.06% | $12 ($2,245 @20) | DAO forum <https://forum.pyth.network>; Douro Labs interest form `data.dourolabs.xyz/pyth-interest-form` | ✅ |
-| **Kelp** | 83.29% | $25 | Now under KernelDAO — <https://kerneldao.com/kelp/> | ⚠️ no contact found in footer |
-| **Symbiotic** | 57.04% | $14 | <https://symbiotic.fi> — no contact channels published | ❌ needs a pass |
-| **Mellow** | 41.55% | $3 | — | ❌ needs a pass |
+| **Kelp** | 83.29% | $25 | Now under KernelDAO. X `@KelpDAO`, Discord `discord.gg/wfDdcmbMjN`; no email, form or forum found | ⚠️ search-derived |
+| **Symbiotic** | 57.04% | $14 | X `@symbioticfi` (only real channel; no Discord, email or form); Telegram is announce-only; or intro via Mellow | ✅ docs.symbiotic.fi |
+| **Mellow** | 41.55% | $3 | Discord <https://discord.gg/mellow>; X `@Mellowprotocol`; no email or form | ✅ mellow.finance |
 | **Rocket Pool** | 15.66% | — | <https://dao.rocketpool.net> — **has a dedicated `Integration` category** | ✅ best-structured forum of any target |
-| **Morpho** | 0.51% | — | <https://forum.morpho.org> | ✅ |
+| **Morpho** | 40.43% | — | see *Added since 2026-09-17* — pitch the vault curators, not only Morpho | ✅ |
 | **Aragon** | 24.15% | ~$3.62 | Discord `discord.gg/aragonorg`; `press@aragon.org` (press only) | ✅ |
 | **Ondo** | 12.09% | — | `support@ondo.finance`, `press@ondo.finance`, contact form | ✅ |
 | **Ether.fi** | 11.09% | — | Discord `discord.gg/etherfi`; <https://governance.ether.fi> | ✅ |
-| **Midas** | 23.54% | — | midas.app returned 403 | ❌ needs a pass |
-| **Renzo** | 62.97% | — | — | ❌ needs a pass |
-| **Puffer** | 7.06% | — | — | ❌ needs a pass |
-| **Privacy Pools** | 19.47% | — | — | ❌ needs a pass |
-| **Pendle** | 2.60% | — | `forum.pendle.finance` does not resolve | ❌ needs a pass |
+| **Midas** | 23.54% | — | midas.app and docs both 403. Co-founder Dennis Dinkelmeyer (public X/LinkedIn); open the midas.app footer in a browser | ❌ still unverified |
+| **Renzo** | 62.97% | — | Site moved to renzofinance.com. Discord `discord.com/invite/renzoprotocol`, X `@RenzoProtocol`, Telegram `t.me/RenzoProtocolChat`; no email or form | ⚠️ search-derived |
+| **Puffer** | 7.06% | — | **Partnerships form** <https://forms.gle/9QdfbmGuCc934KJh6>; forum <https://governance.puffer.fi>; Discord `discord.com/invite/pufferfi`; X `@Puffer_Finance` | ✅ puffer.fi footer |
+| **Privacy Pools** | 59.59% | — | see *Added since 2026-09-17* | ⚠️ partial |
+| **Pendle** | 2.60% | — | No forum exists (`forum.` and `governance.pendle.finance` both fail); governance is sPENDLE snapshot votes. Use the Discord linked in the pendle.finance footer | ❌ links need a browser |
+| **Doppler** | 13.73% | — | see *Added since 2026-09-17* | ✅ |
 
 Renzo and Puffer are flagged in the survey as **inferred-only contract identifications** —
 their percentages rest on contracts that were never positively identified. Do not quote
 those numbers to them without re-verifying first.
+
+---
+
+## Added since 2026-09-17
+
+These were measured after the first version of this file. None has a monthly-volume figure
+yet, so they are not ranked by dollars. Every number below is a measured replay, not the
+heuristic fallback.
+
+| project | best % (Schnorr) | best tx | what saves |
+|---|---:|---|---|
+| **Privacy Pools** | 59.59% | [`0x8cc80eae…`](https://etherscan.io/tx/0x8cc80eae520f1c61fe39f18ab0ea82e4afbbb6ed4c0ddca71d26b5627628f92a) | PoolVault `ragequit`; the proof check lives in the pool. Also clears the BLS floor. The PPRouter wrapper saves nothing |
+| **Tacit** | 54.50% | [`0xe98ed820…`](https://etherscan.io/tx/0xe98ed82065ba594d6b51dd7833c3b7d0a91026c6be4a30b6901c762490698a53) | `TacitEvmPool` ZK proof check (254k gas `STATICCALL` to `TransactVerifier`); no regular calls. Only one tx measured |
+| **Morpho VaultV2** | 40.43% | [`0x2e91acd5…`](https://etherscan.io/tx/0x2e91acd5286eeda304294f8f2c9803b7d140dd0cf7426e16ee285e9f6b1f0fca) | `redeem`/`deposit` on VaultV2; 15 wins across 3 vaults and 3 curators |
+| **Doppler** | 13.73% | [`0x7b08cf0d…`](https://etherscan.io/tx/0x7b08cf0df79aaaf918bc03d62d402bceb70e3ac68e662a18464c3097d02071ff) | only the v4 hook's `collectFees`; `Airlock.create` saves nothing |
+| **USD8** | ~17.5% | Sepolia only | Treasury `0xd2840edb`; approximate (replayed against current state). **Not a gas pitch** — see below |
+| Null | 0.00% | [`0x36b6116b…`](https://etherscan.io/tx/0x36b6116b621b2cfaa9f082f1f4295c4aca95435a105ed9f2eccce42232c555db) | not a candidate: `depositMarket` is a router, all its gas is in the vault `CALL` |
+
+### Privacy Pools (0xbow)
+- Builder: **0xbow** (<https://0xbow.io>). Press coverage names Ameen Soleimani (CTO) and
+  Zak Cole — search-derived.
+- X `@0xbowio` (search-derived). GitHub <https://github.com/0xbow-io/privacy-pools-core>,
+  docs <https://docs.privacypools.com> (verified).
+- 0xbow.io has a "Contact Us" item, but no email, Discord or form showed up when fetched.
+  **Open it in a browser**, or DM `@0xbowio`.
+- Lead with the pool-level result (59.59%), not the router — their router is a CALL wrapper and
+  scores 0.
+
+### Tacit
+- `TacitEvmPool` is the shielded ETH pool of **Tacit** (Bitcoin metaprotocol with a ZK bridge to
+  Ethereum). Repo <https://github.com/z0r0z/tacit> lists the pool address in `docs/DEPLOYMENTS.md`
+  (verified). App: <https://tacit.finance> (not loaded).
+- Team: GitHub user **`z0r0z`**; no company named. Also deployed on Base and Robinhood Chain.
+- No X, email or Telegram found. **Best route: a GitHub issue/discussion on `z0r0z/tacit`**, or
+  check its `SECURITY.md` for a contact.
+- Do not confuse with "Tacit Protocol", an unrelated Chainlink hackathon project.
+
+### Morpho VaultV2 — pitch the curators
+The saving sits in the vault contract, and curators deploy and run the vaults. They are the
+people who would adopt it.
+- **Morpho** (Association + Morpho Labs): forum <https://forum.morpho.org> (verified; has
+  vault-provider categories), docs <https://docs.morpho.org>. No BD email found.
+- **Steakhouse Financial** (steakUSDC): "Get in touch" form
+  <https://steakhouse.notion.site/258a4ef3031c809e88e7c50331ca1236>, X `@SteakhouseFi`,
+  LinkedIn `linkedin.com/company/steakhouse-financial` — verified.
+- **Sentora** (ex-IntoTheBlock; senRLUSDv2): contact page <https://sentora.com/contact>
+  (verified), X `@SentoraHQ` (search-derived).
+- **Gauntlet** (gtUSDCp): X `@gauntlet_xyz` and the Gauntlet category on the Morpho forum
+  <https://forum.morpho.org/t/about-the-gauntlet-category/551> (verified);
+  `gov@gauntlet.xyz` (search-derived, unconfirmed).
+- The 40.43% row is Sentora's vault, so Sentora is the natural first email.
+
+### Doppler (Whetstone Research)
+- Builder: **Whetstone Research** <https://whetstone.cc>. X <https://x.com/dopplerprotocol>,
+  Telegram <https://doppler.lol/telegram/>, GitHub <https://github.com/whetstoneresearch>,
+  docs <https://docs.doppler.lol> — all verified on doppler.lol. No email.
+- Weak pitch on gas alone: only the hook's fee collection saves.
+
+### USD8
+- Already in contact with the founder. Gas is not their problem. They want off-chain compute
+  over **historical** chain data, which they run in a TEE today.
+- The answer is the historical-reads feature on branch `claude/historical-state-reads`
+  (`docs/HISTORICAL_STATE.md`, example `VaultLossOracle`). Pitch that, not a percentage.
 
 ---
 
@@ -120,7 +184,8 @@ those numbers to them without re-verifying first.
 Two warm-intro paths exist and are held outside this repository (they involve private
 correspondence). See the session notes rather than this file.
 
-**No existing correspondence with any of the 21 protocols exists.** Every direct contact
+**No existing correspondence with any of the 22 surveyed protocols exists.** USD8 is the
+only project already in conversation. Every direct contact
 listed above would be cold.
 
 ---
@@ -141,6 +206,9 @@ listed above would be cold.
 
 ## What still needs doing
 
-- Verify `gm@chroniclelabs.org` and `info@starkware.co` before use — both are search-derived.
-- Find contacts for Symbiotic, Mellow, Midas, Renzo, Puffer, Privacy Pools, Pendle.
+- `gm@chroniclelabs.org` is still unverified (site rate-limits every fetch). `info@starkware.co`
+  is **not** on StarkWare's site — use the contact form ("Customers/Partner Inquiries").
+- Needs a real browser: midas.app footer, pendle.finance footer (Discord/BD), 0xbow.io contact,
+  morpho.org footer, renzofinance.com.
+- Tacit and the Morpho curators: measure transaction volume so they can be ranked in dollars.
 - Decide whether Starknet's L1 costs are StarkWare's or the Starknet Foundation's.
