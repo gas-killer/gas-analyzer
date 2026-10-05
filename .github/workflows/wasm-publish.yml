@@ -16,8 +16,6 @@ on:
 
 permissions:
   contents: read
-  # Trusted Publishing: npm exchanges the workflow's OIDC token for a short-lived publish credential.
-  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,6 +40,7 @@ jobs:
         id: version
         run: |
           VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/wasm/Cargo.toml | head -1)
+          [[ -n "$VERSION" ]] || { echo "::error::no version found in crates/wasm/Cargo.toml"; exit 1; }
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           if [[ "$(npm view "$NPM_PACKAGE@$VERSION" version 2>/dev/null)" == "$VERSION" ]]; then
             echo "$NPM_PACKAGE@$VERSION is already published; skipping"
@@ -52,6 +51,10 @@ jobs:
     needs: check
     if: needs.check.outputs.published != 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Trusted Publishing: npm exchanges the workflow's OIDC token for a short-lived publish credential.
+      id-token: write
     env:
       VERSION: ${{ needs.check.outputs.version }}
     steps:
