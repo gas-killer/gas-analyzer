@@ -11419,7 +11419,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "gas-analyzer-evmsketch"
-version = "0.1.0"
