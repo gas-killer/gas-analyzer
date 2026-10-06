@@ -1,6 +1,6 @@
 use wasm_bindgen_test::*;
 
-use gas_killer_wasm::{analyze_trace, encode_trace, estimate_gas_heuristic};
+use gas_killer_wasm::{analyze_trace, analyze_trace_bytes, encode_trace, estimate_gas_heuristic};
 
 mod common;
 use common::{test_caller_address, test_estimator_address, valid_sstore_trace};
@@ -120,4 +120,45 @@ fn test_wasm_analyze_trace_response_fields() {
     assert!(obj["encoded_updates"].as_str().unwrap().starts_with("0x"));
     assert!(obj["gas_estimate"].as_u64().unwrap() > 0);
     assert_eq!(obj["state_update_count"], 1);
+}
+
+#[wasm_bindgen_test]
+fn test_wasm_analyze_trace_bytes_unwraps_the_envelope() {
+    let response = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"result":{}}}"#,
+        valid_sstore_trace()
+    );
+    let result = analyze_trace_bytes(
+        response.as_bytes(),
+        &test_estimator_address(),
+        &test_caller_address(),
+        None,
+        None,
+    )
+    .unwrap();
+    let json: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
+    assert_eq!(json["state_update_count"], 1);
+}
+
+#[wasm_bindgen_test]
+fn test_wasm_analyze_trace_bytes_names_rpc_errors() {
+    let name = |message: &str| {
+        let response =
+            serde_json::json!({ "id": 1, "error": { "code": -32000, "message": message } });
+        let err = analyze_trace_bytes(
+            response.to_string().as_bytes(),
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+            None,
+        )
+        .unwrap_err();
+        let err: js_sys::Error = err.into();
+        (String::from(err.name()), String::from(err.message()))
+    };
+    assert_eq!(
+        name("execution timeout"),
+        ("RpcError".into(), "execution timeout".into())
+    );
+    assert_eq!(name("response too large").0, "TraceTooLargeError");
 }

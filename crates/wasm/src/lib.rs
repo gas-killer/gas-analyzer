@@ -3,14 +3,14 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types::trace::geth::{CallFrame, DefaultFrame, DiffMode};
 use gas_analyzer_core::{
-    PrestateEligibility, StateUpdate, TraceExtract, build_state_updates_from_prestate,
+    LeanFrame, PrestateEligibility, StateUpdate, TraceExtract, build_state_updates_from_prestate,
     classify_prestate_eligibility, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_state_updates,
 };
 use gas_analyzer_estimator::{SimEnvOpts, estimate_state_changes_gas};
 use revm::database::{CacheDB, EmptyDB};
 use revm::primitives::hardfork::SpecId;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
 /// Initialize panic hook for better error messages in browser console.
@@ -67,10 +67,48 @@ pub struct EstimateGasResult {
 // ---------------------------------------------------------------------------
 
 fn parse_and_compute(trace_json: &str, origin: Option<Address>) -> Result<TraceExtract, String> {
-    let trace: DefaultFrame =
+    let trace: LeanFrame =
         serde_json::from_str(trace_json).map_err(|e| format!("Failed to parse trace: {}", e))?;
-    compute_state_updates(trace, origin)
+    compute(trace, origin)
+}
+
+fn compute(trace: LeanFrame, origin: Option<Address>) -> Result<TraceExtract, String> {
+    compute_state_updates(DefaultFrame::from(trace), origin)
         .map_err(|e| format!("Failed to compute state updates: {}", e))
+}
+
+/// A `debug_traceTransaction` JSON-RPC response; `jsonrpc` and `id` are ignored.
+#[derive(Deserialize)]
+struct TraceResponse {
+    result: Option<LeanFrame>,
+    error: Option<RpcErrorBody>,
+}
+
+#[derive(Deserialize)]
+struct RpcErrorBody {
+    #[serde(default)]
+    message: String,
+}
+
+/// Why [`analyze_trace_bytes_inner`] produced no result.
+#[derive(Debug, PartialEq)]
+pub enum AnalyzeTraceBytesError {
+    /// The node answered with an error instead of a trace. `too_large` marks a provider refusing
+    /// to send a trace over its response size limit.
+    Rpc { message: String, too_large: bool },
+    /// The response couldn't be parsed or analyzed.
+    Analysis(String),
+}
+
+/// Whether an RPC error message is a provider's response size limit, as worded by geth, Erigon,
+/// Alchemy, QuickNode and others.
+fn is_too_large(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("too big")
+        || m.contains("too large")
+        || m.contains("size exceeds")
+        || m.contains("larger than")
+        || m.find("exceeds").is_some_and(|i| m[i..].contains("limit"))
 }
 
 /// Parse an optional hex origin address for re-entry detection.
@@ -108,6 +146,43 @@ pub fn analyze_trace_inner(
         caller_address,
         estimate_state_changes_block_number,
     )
+}
+
+/// [`analyze_trace_inner`] on a whole `debug_traceTransaction` JSON-RPC response, undecoded.
+pub fn analyze_trace_bytes_inner(
+    response: &[u8],
+    estimator_address: &str,
+    caller_address: &str,
+    estimate_state_changes_block_number: Option<u64>,
+    origin_address: Option<&str>,
+) -> Result<AnalyzeTraceResult, AnalyzeTraceBytesError> {
+    use AnalyzeTraceBytesError::{Analysis, Rpc};
+    let origin = parse_origin(origin_address).map_err(Analysis)?;
+    let response: TraceResponse = serde_json::from_slice(response)
+        .map_err(|e| Analysis(format!("Failed to parse trace: {}", e)))?;
+    let trace = match (response.result, response.error) {
+        (_, Some(error)) => {
+            let too_large = is_too_large(&error.message);
+            return Err(Rpc {
+                message: error.message,
+                too_large,
+            });
+        }
+        (Some(trace), None) => trace,
+        (None, None) => {
+            return Err(Analysis(
+                "RPC response has neither a result nor an error".to_string(),
+            ));
+        }
+    };
+    let extract = compute(trace, origin).map_err(Analysis)?;
+    analyze_extract(
+        &extract,
+        estimator_address,
+        caller_address,
+        estimate_state_changes_block_number,
+    )
+    .map_err(Analysis)
 }
 
 /// Analyze a call from its `prestateTracer` (`diffMode`) diff and `callTracer` (`withLog`) frame,
@@ -343,6 +418,46 @@ pub fn analyze_trace(
     )
     .map_err(|e| JsError::new(&e))?;
     to_js(&result)
+}
+
+/// [`analyze_trace`] on the raw bytes of a whole `debug_traceTransaction` JSON-RPC response, so a
+/// large trace never has to be decoded into a JS string or unwrapped from its envelope in JS.
+///
+/// When the node answered with an error, throws an `Error` named `RpcError` with the node's
+/// message, or `TraceTooLargeError` when the message is the provider's response size limit.
+/// Other failures throw a plain `Error`, as [`analyze_trace`] does.
+#[wasm_bindgen]
+pub fn analyze_trace_bytes(
+    response: &[u8],
+    estimator_address: &str,
+    caller_address: &str,
+    estimate_state_changes_block_number: Option<u64>,
+    origin_address: Option<String>,
+) -> Result<JsValue, JsValue> {
+    let result = analyze_trace_bytes_inner(
+        response,
+        estimator_address,
+        caller_address,
+        estimate_state_changes_block_number,
+        origin_address.as_deref(),
+    )
+    .map_err(|e| {
+        let (name, message) = match e {
+            AnalyzeTraceBytesError::Rpc { message, too_large } => (
+                if too_large {
+                    "TraceTooLargeError"
+                } else {
+                    "RpcError"
+                },
+                message,
+            ),
+            AnalyzeTraceBytesError::Analysis(message) => ("Error", message),
+        };
+        let error = js_sys::Error::new(&message);
+        error.set_name(name);
+        JsValue::from(error)
+    })?;
+    Ok(to_js(&result)?)
 }
 
 /// Analyze a transaction from its `prestateTracer` diff and `callTracer` frame instead of its
@@ -1136,5 +1251,96 @@ mod tests {
             SSTORE_COLD_SET_COST + SSTORE_COLD_RESET_COST + SSTORE_COLD_RESET_COST
         );
         assert_eq!(refund, SSTORE_CLEARS_REFUND);
+    }
+
+    // ===== analyze_trace_bytes =====
+
+    fn analyze_bytes(response: &str) -> Result<AnalyzeTraceResult, AnalyzeTraceBytesError> {
+        analyze_trace_bytes_inner(
+            response.as_bytes(),
+            &test_estimator_address(),
+            &test_caller_address(),
+            Some(1),
+            None,
+        )
+    }
+
+    fn mixed_trace() -> String {
+        let data_hex = "00000000000000000000000000000000000000000000000000000000000000ff";
+        let topic = "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+        make_trace(vec![
+            make_sstore_log("1", "2a", 90000),
+            make_log1_log(data_hex, topic, 80000),
+        ])
+    }
+
+    #[test]
+    fn test_bytes_matches_analyze_trace_on_its_result() {
+        let trace = mixed_trace();
+        let expected = analyze_trace_inner(
+            &trace,
+            &test_estimator_address(),
+            &test_caller_address(),
+            Some(1),
+            None,
+        )
+        .unwrap();
+        for response in [
+            format!(r#"{{"jsonrpc":"2.0","id":1,"result":{trace}}}"#),
+            format!(r#"{{"jsonrpc":"2.0","result":{trace},"id":1}}"#),
+        ] {
+            let got = analyze_bytes(&response).unwrap();
+            assert_eq!(got.encoded_updates, expected.encoded_updates);
+            assert_eq!(got.gas_estimate, expected.gas_estimate);
+            assert_eq!(got.state_update_count, 2);
+        }
+    }
+
+    #[test]
+    fn test_bytes_rpc_error_is_typed() {
+        let err = analyze_bytes(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"execution timeout"}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            AnalyzeTraceBytesError::Rpc {
+                message: "execution timeout".to_string(),
+                too_large: false
+            }
+        );
+    }
+
+    #[test]
+    fn test_bytes_size_limit_error_is_too_large() {
+        for message in [
+            "response too large",
+            "Response size exceeds the limit",
+            "trace exceeds the 150MB response limit",
+            "Response is larger than 10MB",
+            "Response body too big",
+        ] {
+            let response =
+                serde_json::json!({ "id": 1, "error": { "code": -32000, "message": message } });
+            match analyze_bytes(&response.to_string()) {
+                Err(AnalyzeTraceBytesError::Rpc { too_large, .. }) => {
+                    assert!(too_large, "{message}")
+                }
+                other => panic!("{message}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_bytes_malformed_response_is_an_analysis_error() {
+        for response in [r#"{"jsonrpc":"2.0","id":1}"#, r#"{"result":"#, "not json"] {
+            assert!(
+                matches!(
+                    analyze_bytes(response),
+                    Err(AnalyzeTraceBytesError::Analysis(_))
+                ),
+                "{response}"
+            );
+        }
     }
 }

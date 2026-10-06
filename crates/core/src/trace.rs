@@ -55,6 +55,15 @@ pub fn parse_trace_memory(memory: Vec<String>) -> Vec<u8> {
 // State Update Extraction
 // ============================================================================
 
+/// Opcodes whose memory [`append_state_update_from_struct_log`] reads; it must cover every
+/// `copy_memory` there, since [`crate::lean_trace`] drops memory for every other opcode.
+pub fn reads_memory(op: &str) -> bool {
+    matches!(
+        op,
+        "CREATE" | "CREATE2" | "CALL" | "LOG0" | "LOG1" | "LOG2" | "LOG3" | "LOG4"
+    )
+}
+
 /// Extract a state update from a Geth StructLog entry.
 ///
 /// Returns `Ok(Some(opcode))` if the opcode is unsupported and was skipped (SELFDESTRUCT, TSTORE),
