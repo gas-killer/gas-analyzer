@@ -231,7 +231,11 @@ mod tests {
     #[test]
     #[ignore]
     fn fixture_extraction_matches_full_parse() {
-        let path = std::env::var("GAS_ANALYZER_STRUCT_LOG_FIXTURE").expect("fixture path");
+        // CI runs every ignored test when RPC_URL is set; this one only runs when asked for.
+        let Ok(path) = std::env::var("GAS_ANALYZER_STRUCT_LOG_FIXTURE") else {
+            eprintln!("GAS_ANALYZER_STRUCT_LOG_FIXTURE not set, skipping");
+            return;
+        };
         let json = std::fs::read(path).unwrap();
         let lean = compute_state_updates(parse_lean_frame(&json).unwrap(), None).unwrap();
         let full = compute_state_updates(serde_json::from_slice(&json).unwrap(), None).unwrap();
