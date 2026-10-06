@@ -18,10 +18,11 @@ use alloy_sol_types::{SolValue, sol};
 use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 
-use crate::encoding::encode_state_updates_to_abi;
+pub use crate::encoding::encode_state_updates_to_abi as encoded_program;
 use crate::sim_profile::STATE_TRACKER_SLOT;
 use crate::trace::append_state_update_from_struct_log;
-use crate::types::{IStateUpdateTypes, Opcode, StateUpdate};
+use crate::types::Opcode;
+pub use crate::types::{IStateUpdateTypes, StateUpdate};
 
 /// `keccak256("gaskiller.nested.leaf.v1")`
 pub const NESTED_LEAF_TAG: B256 =
@@ -896,7 +897,7 @@ fn prune_unprofitable(programs: &mut [ProgramState], cost: &NestingCostModel) ->
             continue;
         }
         let program_bytes =
-            encode_state_updates_to_abi(programs[id].updates.as_deref().unwrap_or_default()).len();
+            encoded_program(programs[id].updates.as_deref().unwrap_or_default()).len();
         let children_bytes: usize = programs[id]
             .children
             .iter()
@@ -1035,7 +1036,7 @@ pub fn encode_frame_tree(
         if children.next().is_some() {
             bail!("frame {i} has more children than NESTED ops");
         }
-        programs[i] = encode_state_updates_to_abi(&updates);
+        programs[i] = encoded_program(&updates);
         let index = frame
             .transition_index
             .ok_or_else(|| anyhow::anyhow!("frame {i} has no transition index"))?;
@@ -1358,8 +1359,8 @@ mod tests {
         let tree = split(logs, &[]);
         assert_eq!(tree.frames.len(), 1);
         assert_eq!(
-            encode_state_updates_to_abi(&tree.frames[0].updates),
-            encode_state_updates_to_abi(&canonical)
+            encoded_program(&tree.frames[0].updates),
+            encoded_program(&canonical)
         );
         assert_eq!(kinds(&canonical), ["STORE", "STORE", "CALL"]);
         assert_eq!(tree.call_gas_total, 900_000);
@@ -1619,7 +1620,7 @@ mod tests {
         let enc = |t: &FrameTreeExtract| -> Vec<Bytes> {
             t.frames
                 .iter()
-                .map(|f| encode_state_updates_to_abi(&f.updates))
+                .map(|f| encoded_program(&f.updates))
                 .collect()
         };
         assert_eq!(enc(&a), enc(&b));
