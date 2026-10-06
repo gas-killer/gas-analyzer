@@ -56,7 +56,7 @@ pub fn parse_trace_memory(memory: Vec<String>) -> Vec<u8> {
 // ============================================================================
 
 /// Opcodes whose memory [`append_state_update_from_struct_log`] reads; it must cover every
-/// `copy_memory` there, since [`crate::lean_trace`] drops memory for every other opcode.
+/// `copy_memory` there, since the wasm crate's lean trace parser drops memory for every other opcode.
 pub fn reads_memory(op: &str) -> bool {
     matches!(
         op,

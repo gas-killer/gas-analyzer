@@ -3,6 +3,9 @@
 //! Memory snapshots are most of a struct-log trace, yet only a few opcodes read them (see
 //! [`reads_memory`]). Parsing into [`LeanFrame`] skips the rest, along with `storage` and
 //! `returnData`, so a trace takes a fraction of its size once parsed.
+//!
+//! It lives here rather than in core because compiling it into core slows `compute_state_updates`
+//! by ~60% (`prestate_parsing/compute_state_updates_heavy`), from codegen alone.
 
 use std::fmt;
 
@@ -11,7 +14,7 @@ use alloy_rpc_types::trace::geth::{DefaultFrame, StructLog};
 use serde::Deserialize;
 use serde::de::{self, IgnoredAny, MapAccess, Visitor};
 
-use crate::trace::reads_memory;
+use gas_analyzer_core::trace::reads_memory;
 
 /// A [`DefaultFrame`] whose steps hold memory only where [`reads_memory`] says it's needed.
 #[derive(Deserialize)]
@@ -33,11 +36,6 @@ impl From<LeanFrame> for DefaultFrame {
             struct_logs: frame.struct_logs.into_iter().map(|log| log.0).collect(),
         }
     }
-}
-
-/// Parse a `debug_traceTransaction` struct-log result, skipping memory no extractor reads.
-pub fn parse_lean_frame(json: &[u8]) -> serde_json::Result<DefaultFrame> {
-    serde_json::from_slice::<LeanFrame>(json).map(Into::into)
 }
 
 #[repr(transparent)]
@@ -119,7 +117,11 @@ impl<'de> Visitor<'de> for LeanStructLogVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{compute_state_updates, encode_state_updates_to_abi};
+    use gas_analyzer_core::{compute_state_updates, encode_state_updates_to_abi};
+
+    fn parse_lean_frame(json: &[u8]) -> serde_json::Result<DefaultFrame> {
+        serde_json::from_slice::<LeanFrame>(json).map(Into::into)
+    }
 
     const WORD: &str = "00000000000000000000000000000000000000000000000000000000deadbeef";
 

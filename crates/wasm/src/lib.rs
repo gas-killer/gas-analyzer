@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types::trace::geth::{CallFrame, DefaultFrame, DiffMode};
 use gas_analyzer_core::{
-    LeanFrame, PrestateEligibility, StateUpdate, TraceExtract, build_state_updates_from_prestate,
+    PrestateEligibility, StateUpdate, TraceExtract, build_state_updates_from_prestate,
     classify_prestate_eligibility, compute_state_updates, encode_state_updates_to_abi,
     estimate_gas_from_state_updates,
 };
@@ -12,6 +12,9 @@ use revm::database::{CacheDB, EmptyDB};
 use revm::primitives::hardfork::SpecId;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
+
+mod lean_trace;
+use lean_trace::LeanFrame;
 
 /// Initialize panic hook for better error messages in browser console.
 #[wasm_bindgen(start)]
