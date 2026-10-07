@@ -4,9 +4,9 @@
 //! Geth-format transaction traces (`DefaultFrame`). Contains only
 //! pure computation functions - no async, no I/O, no RPC calls.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::Address;
 use alloy_rpc_types::trace::geth::{DefaultFrame, StructLog};
 use anyhow::{Result, bail};
 
@@ -374,63 +374,6 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
 // Canonical-checkpoint extraction
 // ============================================================================
 
-/// An execution frame observed while walking the trace.
-struct CanonFrame {
-    /// Depth of the code executing *inside* this frame (root = 1).
-    depth: u64,
-    /// Whose storage `SSTORE`s in this frame write to. `None` for frames whose
-    /// storage can never be the target (CREATE initcode — the target already
-    /// has code, so a fresh deployment cannot alias it).
-    storage_ctx: Option<Address>,
-    /// Whether state-changing ops in this frame are emitted as updates. True for
-    /// the root frame and for DELEGATECALL/CALLCODE frames entered from an
-    /// emitting frame (their writes hit the target's storage directly); false
-    /// inside any CALL/STATICCALL/CREATE frame — those replay natively on-chain
-    /// as part of the emitted parent update.
-    emitting: bool,
-    /// Writes to the *target's* storage made inside this frame (and merged from
-    /// successfully-completed child frames). Committed into the parent only if
-    /// this frame completes successfully; discarded on revert — exactly
-    /// mirroring EVM journaling.
-    journal: BTreeMap<B256, B256>,
-    /// Emitted updates buffered in this frame, in order. Appended to the parent
-    /// on success, dropped on revert (so a reverted emitting frame's writes/logs
-    /// never reach the signed program). The root frame's buffer *is* the program.
-    out: Vec<StateUpdate>,
-    /// Replay-side view of the target's storage as of this frame's emissions —
-    /// only meaningful in emitting frames. Used to suppress re-emitting a slot
-    /// whose canonical value a prior slice already set (same-value writes).
-    emitted_view: BTreeMap<B256, B256>,
-    /// For frames entered via an *emitted* CALL update: the gas remaining right
-    /// after the CALL opcode, used to account the call's gas on exit.
-    emitted_call_gas: Option<u64>,
-}
-
-/// A frame-creating opcode was just executed; whether a frame actually opens is
-/// only known from the next log's depth (calls to EOAs/precompiles run inline).
-struct PendingFrame {
-    parent_depth: u64,
-    storage_ctx: Option<Address>,
-    emitting: bool,
-    /// Snapshot of the parent's replay-side view, inherited by an emitting child.
-    emitted_view: BTreeMap<B256, B256>,
-    emitted_call_gas: Option<u64>,
-}
-
-/// The target's canonical storage image visible right now = every open frame's
-/// journal merged bottom-up (deeper frames override shallower ones). At an
-/// emitting boundary every open frame is emitting and target-scoped, so this is
-/// exactly what native execution would have in the target's storage.
-fn canonical_visible_image(frames: &[CanonFrame]) -> BTreeMap<B256, B256> {
-    let mut image = BTreeMap::new();
-    for f in frames {
-        for (slot, value) in &f.journal {
-            image.insert(*slot, *value);
-        }
-    }
-    image
-}
-
 /// Compute state updates with **canonical state checkpointing**.
 ///
 /// Same extraction as [`compute_state_updates`] for `CALL`/`LOG*`/`CREATE*`
@@ -465,243 +408,24 @@ pub fn compute_state_updates_canonical(
     trace: DefaultFrame,
     target: Address,
 ) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64)> {
-    let mut skipped_opcodes = HashSet::new();
-    let mut total_call_gas = 0u64;
-
-    let mut frames: Vec<CanonFrame> = vec![CanonFrame {
-        depth: 1,
-        storage_ctx: Some(target),
-        emitting: true,
-        journal: BTreeMap::new(),
-        out: Vec::new(),
-        emitted_view: BTreeMap::new(),
-        emitted_call_gas: None,
-    }];
-    let mut pending: Option<PendingFrame> = None;
-
-    // Emit a canonical state slice into the current (emitting) frame: for every
-    // slot in the target's currently-visible image whose value differs from what
-    // this frame has already emitted, push a Store and advance the emitted view.
-    // Must be called only when the current frame is emitting.
-    fn flush_slice(frames: &mut [CanonFrame]) {
-        let visible = canonical_visible_image(frames);
-        let cur = frames.last_mut().expect("root frame must remain");
-        for (slot, value) in visible {
-            if cur.emitted_view.get(&slot) != Some(&value) {
-                cur.out
-                    .push(StateUpdate::Store(IStateUpdateTypes::Store { slot, value }));
-                cur.emitted_view.insert(slot, value);
-            }
-        }
-    }
-
-    for struct_log in trace.struct_logs {
-        let depth = struct_log.depth;
-        let op = struct_log.op.as_ref().to_string();
-
-        // Resolve a pending frame from the previous log's frame-creating op.
-        if let Some(p) = pending.take() {
-            if depth == p.parent_depth + 1 {
-                frames.push(CanonFrame {
-                    depth,
-                    storage_ctx: p.storage_ctx,
-                    emitting: p.emitting,
-                    journal: BTreeMap::new(),
-                    out: Vec::new(),
-                    emitted_view: p.emitted_view,
-                    emitted_call_gas: p.emitted_call_gas,
-                });
-            } else {
-                // No frame was entered (EOA / precompile / failed call): the
-                // call completed inline. Account its gas now if it was emitted.
-                if let Some(gas_after_opcode) = p.emitted_call_gas {
-                    total_call_gas += gas_after_opcode.saturating_sub(struct_log.gas);
-                }
-            }
-        }
-
-        // Pop frames we have stepped out of. The resume log (this one) carries
-        // the child's success flag on top of the parent's stack.
-        while frames.last().map(|f| f.depth).unwrap_or(1) > depth {
-            let frame = frames.pop().expect("frame stack underflow");
-            if frame.depth != depth + 1 {
-                bail!(
-                    "trace depth jumped from {} to {} without resume logs — cannot attribute frame outcomes",
-                    frame.depth,
-                    depth
-                );
-            }
-            let stack = struct_log
-                .stack
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("resume log at depth {depth} has no stack"))?;
-            let success = stack
-                .last()
-                .map(|v| !v.is_zero())
-                .ok_or_else(|| anyhow::anyhow!("resume log at depth {depth} has empty stack"))?;
-            if let Some(gas_after_opcode) = frame.emitted_call_gas {
-                total_call_gas += gas_after_opcode.saturating_sub(struct_log.gas);
-            }
-            if success {
-                let child_emitting = frame.emitting;
-                let child_view = frame.emitted_view;
-                let parent = frames.last_mut().expect("root frame must remain");
-                // Commit the child's target writes and buffered emissions.
-                for (slot, value) in frame.journal {
-                    parent.journal.insert(slot, value);
-                }
-                parent.out.extend(frame.out);
-                // An emitting child ran while the parent was suspended, so its
-                // emitted view is a superset of the parent's — adopt it.
-                if child_emitting {
-                    parent.emitted_view = child_view;
-                }
-            }
-            // On failure everything (journal, out, view) is dropped — the EVM
-            // rolled the whole sub-frame back.
-        }
-
-        let idx = frames.len() - 1;
-        let cur_emitting = frames[idx].emitting;
-        let cur_ctx = frames[idx].storage_ctx;
-        let op_errored = struct_log.error.is_some();
-
-        match op.as_str() {
-            "SSTORE" => {
-                if cur_ctx == Some(target) && !op_errored {
-                    let mut stack = struct_log
-                        .stack
-                        .clone()
-                        .ok_or_else(|| anyhow::anyhow!("SSTORE log has no stack"))?;
-                    stack.reverse();
-                    let slot: B256 = stack[0].into();
-                    let value: B256 = stack[1].into();
-                    frames[idx].journal.insert(slot, value);
-                }
-            }
-            "TSTORE" | "SELFDESTRUCT" => {
-                if cur_emitting {
-                    skipped_opcodes.insert(op.clone());
-                }
-            }
-            "DELEGATECALL" | "CALLCODE" => {
-                if !op_errored {
-                    // Runs with the target's storage: inherits ctx and emitting.
-                    let emitted_view = if cur_emitting {
-                        frames[idx].emitted_view.clone()
-                    } else {
-                        BTreeMap::new()
-                    };
-                    pending = Some(PendingFrame {
-                        parent_depth: depth,
-                        storage_ctx: cur_ctx,
-                        emitting: cur_emitting,
-                        emitted_view,
-                        emitted_call_gas: None,
-                    });
-                }
-            }
-            "STATICCALL" => {
-                if !op_errored {
-                    // Read-only: never writes, never emitted. Track only for depth.
-                    let stack = struct_log
-                        .stack
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("STATICCALL log has no stack"))?;
-                    let callee = stack
-                        .get(stack.len().wrapping_sub(2))
-                        .map(|v| Address::from_word((*v).into()));
-                    pending = Some(PendingFrame {
-                        parent_depth: depth,
-                        storage_ctx: callee,
-                        emitting: false,
-                        emitted_view: BTreeMap::new(),
-                        emitted_call_gas: None,
-                    });
-                }
-            }
-            "CALL" => {
-                let stack = struct_log
-                    .stack
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("CALL log has no stack"))?;
-                let callee = stack
-                    .get(stack.len().wrapping_sub(2))
-                    .map(|v| Address::from_word((*v).into()));
-                let gas_after_opcode = struct_log.gas;
-                let mut emitted_call_gas = None;
-                if cur_emitting && !op_errored {
-                    // Boundary: external code is about to observe the target's
-                    // storage — bring it to the canonical image first, then emit
-                    // the CALL so on-chain the same external code runs against it.
-                    flush_slice(&mut frames);
-                    if append_state_update_from_struct_log(&mut frames[idx].out, struct_log)?
-                        .is_some()
-                    {
-                        unreachable!("CALL is never a skipped opcode");
-                    }
-                    emitted_call_gas = Some(gas_after_opcode);
-                }
-                if !op_errored {
-                    pending = Some(PendingFrame {
-                        parent_depth: depth,
-                        storage_ctx: callee,
-                        emitting: false,
-                        emitted_view: BTreeMap::new(),
-                        emitted_call_gas,
-                    });
-                }
-            }
-            "CREATE" | "CREATE2" => {
-                if cur_emitting && !op_errored {
-                    // Initcode can call back into the target: boundary here too.
-                    flush_slice(&mut frames);
-                    if append_state_update_from_struct_log(&mut frames[idx].out, struct_log)?
-                        .is_some()
-                    {
-                        unreachable!("CREATE/CREATE2 are never skipped opcodes");
-                    }
-                }
-                if !op_errored {
-                    pending = Some(PendingFrame {
-                        parent_depth: depth,
-                        // A fresh deployment can never alias the target (the
-                        // target already has code), so its writes are never ours.
-                        storage_ctx: None,
-                        emitting: false,
-                        emitted_view: BTreeMap::new(),
-                        emitted_call_gas: None,
-                    });
-                }
-            }
-            "LOG0" | "LOG1" | "LOG2" | "LOG3" | "LOG4" if cur_emitting && !op_errored => {
-                let skipped =
-                    append_state_update_from_struct_log(&mut frames[idx].out, struct_log)?;
-                debug_assert!(skipped.is_none(), "LOG* is never a skipped opcode");
-            }
-            _ => {}
-        }
-    }
-
-    if frames.len() != 1 {
-        bail!(
-            "trace ended with {} unclosed frame(s) — malformed trace",
-            frames.len() - 1
-        );
-    }
-
-    // Final slice: the signed program must fully determine the target's end
-    // state, even if a re-entrant call's on-chain replay diverged.
-    flush_slice(&mut frames);
-
-    let root = frames.pop().expect("root frame present");
-    tracing::Span::current().record("state_update_count", root.out.len());
-    Ok((root.out, skipped_opcodes, total_call_gas))
+    let tree = crate::nested::compute_frame_tree_canonical(
+        trace,
+        target,
+        &|_| false,
+        &crate::nested::NESTING_COST_MODEL_V1,
+    )?;
+    let root = tree
+        .frames
+        .into_iter()
+        .next()
+        .expect("a frame tree always has its root frame");
+    tracing::Span::current().record("state_update_count", root.updates.len());
+    Ok((root.updates, tree.skipped_opcodes, tree.call_gas_total))
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::U256;
+    use alloy_primitives::{B256, U256};
 
     use super::*;
 

@@ -120,6 +120,8 @@ pub fn estimate_gas_from_state_updates(extract: &TraceExtract) -> u64 {
             StateUpdate::Store(_) => 0,
             // CALL gas is already included in external_call_gas from the trace
             StateUpdate::Call(_) => 0,
+            // A nested frame's replay is estimated with its own program.
+            StateUpdate::Nested(_) => 0,
             StateUpdate::Log0(log) => {
                 LOG_BASE_COST + log.data.len() as u64 * LOG_DATA_COST_PER_BYTE
             }

@@ -15,7 +15,8 @@ sol! {
         LOG3,
         LOG4,
         CREATE,
-        CREATE2
+        CREATE2,
+        NESTED
     }
 
     #[derive(Debug)]
@@ -70,6 +71,12 @@ sol! {
             bytes32 salt;
             uint256 value;
             bytes initcode;
+        }
+
+        struct Nested {
+            address target;
+            uint256 value;
+            bytes32 childLeaf;
         }
     }
 }
@@ -137,7 +144,7 @@ pub type Opcode = String;
 
 /// Enum representing different types of state updates
 #[allow(warnings)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum StateUpdate {
     Store(IStateUpdateTypes::Store),
     Call(IStateUpdateTypes::Call),
@@ -148,4 +155,8 @@ pub enum StateUpdate {
     Log4(IStateUpdateTypes::Log4),
     Create(IStateUpdateTypes::Create),
     Create2(IStateUpdateTypes::Create2),
+    /// Hand an SDK-enabled callee its own frame of a nested tree. Extraction leaves
+    /// `childLeaf` zeroed; it is filled in when the frame tree is encoded, because a leaf
+    /// hashes its frame's encoded program.
+    Nested(IStateUpdateTypes::Nested),
 }

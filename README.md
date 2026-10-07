@@ -45,6 +45,22 @@ Add `--debug` to print full error details when gas estimation or trace extractio
 cargo run -- t 0x9add9d0f26bc6d867c1d6d41dda6287d9721a377cea42440250884f76d2a0fa7 --debug
 ```
 
+### Price a transaction as a nested settlement
+Pass `--owned` with the contracts that would integrate the SDK alongside the root (the
+transaction's `to`). If a root `A` calls `B` and `C`, and only `C` belongs to the same owner as `A`:
+```bash
+cargo run -- t <TX_HASH> --owned <C_ADDRESS>
+```
+The trace is split into one frame per owned contract that the root or another owned frame calls
+directly, and each frame is measured against the block's state. The report compares the root-only
+program with the nested tree, per signature scheme, and says why any owned contract got no frame:
+- it was reached only through a contract outside the set, so it ran inside that contract's call;
+- its own computation is smaller than what nesting costs under the versioned cost model;
+- it reverted, or uses transient storage or `SELFDESTRUCT`.
+
+The contracts never integrated the SDK, so this is an estimate: each frame is measured from the state
+before the transaction, and the cost model's fixed overhead stands in for proofs and witnesses.
+
 ### Analyze a transaction request
 ```bash
 cargo run -- r path/to/file.json

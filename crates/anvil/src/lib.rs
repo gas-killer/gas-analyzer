@@ -932,6 +932,20 @@ mod tests {
         Ok(())
     }
 
+    /// The block before `tx_hash`'s. A fork there sees the state the transaction ran against
+    /// however the chain has moved since, so gas figures pinned in a test stay put, and no
+    /// request can land past a lagging RPC node's head.
+    async fn block_before(provider: &impl Provider, tx_hash: FixedBytes<32>) -> Result<u64> {
+        let receipt = provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
+        let block = receipt
+            .block_number
+            .ok_or_else(|| anyhow!("tx {} is not mined", tx_hash))?;
+        Ok(block - 1)
+    }
+
     #[tokio::test]
     async fn test_csv_writer() -> Result<()> {
         dotenv::dotenv().ok();
@@ -940,7 +954,8 @@ mod tests {
             .expect("RPC_URL must be set")
             .parse()?;
         let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
-        let gk = GasKillerDefault::new(rpc_url, None).await?;
+        let fork_block = block_before(&provider, SIMPLE_ARRAY_ITERATION_TX_HASH).await?;
+        let gk = GasKillerDefault::new(rpc_url, Some(fork_block)).await?;
         let report = gas_estimate_tx(provider, SIMPLE_ARRAY_ITERATION_TX_HASH, &gk).await?;
 
         let _ = File::create("test.csv")?;
@@ -968,11 +983,13 @@ mod tests {
         let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let state_updates = compute_state_updates(trace, None)?.state_updates;
 
-        let gk = GasKillerDefault::new(rpc_url, None).await?;
+        let fork_block = block_before(&provider, tx_hash).await?;
+        let gk = GasKillerDefault::new(rpc_url, Some(fork_block)).await?;
         let gas_estimate = gk
             .estimate_state_changes_gas(SIMPLE_STORAGE_ADDRESS, &state_updates)
             .await?;
-        assert_eq!(gas_estimate, 32525);
+        // Priced against the state before the transaction, not whatever the chain holds now.
+        assert_eq!(gas_estimate, 52425);
         Ok(())
     }
 
@@ -993,11 +1010,13 @@ mod tests {
         let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let state_updates = compute_state_updates(trace, None)?.state_updates;
 
-        let gk = GasKillerDefault::new(rpc_url, None).await?;
+        let fork_block = block_before(&provider, tx_hash).await?;
+        let gk = GasKillerDefault::new(rpc_url, Some(fork_block)).await?;
         let gas_estimate = gk
             .estimate_state_changes_gas(ACCESS_CONTROL_MAIN_ADDRESS, &state_updates)
             .await?;
-        assert_eq!(gas_estimate, 37161);
+        // Priced against the state before the transaction, not whatever the chain holds now.
+        assert_eq!(gas_estimate, 54261);
         Ok(())
     }
 
@@ -1018,7 +1037,8 @@ mod tests {
         let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let state_updates = compute_state_updates(trace, None)?.state_updates;
 
-        let gk = GasKillerDefault::new(rpc_url, None).await?;
+        let fork_block = block_before(&provider, tx_hash).await?;
+        let gk = GasKillerDefault::new(rpc_url, Some(fork_block)).await?;
         let gas_estimate = gk
             .estimate_state_changes_gas(FAKE_ADDRESS, &state_updates)
             .await;
@@ -1247,7 +1267,8 @@ mod tests {
             SimpleStorage::SimpleStorageInstance::new(SIMPLE_STORAGE_ADDRESS, &provider);
         let tx_request = simple_storage.set(U256::from(1)).into_transaction_request();
 
-        let trace = get_trace_from_call(rpc_url, tx_request, None).await?;
+        let fork_block = block_before(&provider, SIMPLE_STORAGE_SET_TX_HASH).await?;
+        let trace = get_trace_from_call(rpc_url, tx_request, Some(fork_block)).await?;
         let state_updates = compute_state_updates(trace, None)?.state_updates;
 
         assert_eq!(state_updates.len(), 2);

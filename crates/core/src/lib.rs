@@ -7,6 +7,7 @@
 pub mod constants;
 pub mod encoding;
 pub mod heuristic;
+pub mod nested;
 pub mod prestate;
 pub mod sim_profile;
 pub mod trace;
