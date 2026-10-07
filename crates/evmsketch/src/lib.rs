@@ -116,13 +116,15 @@ use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 pub use gas_analyzer_core::SimProfile;
 pub use gas_analyzer_core::nested;
 
-use gas_analyzer_core::nested::{FrameProgram, NestingCostModel, compute_frame_tree_canonical};
+use gas_analyzer_core::nested::{
+    FrameProgram, NestingCostModel, compute_frame_tree_canonical, without_nested_ops,
+};
 use gas_analyzer_core::sim_profile::STATE_TRACKER_SLOT;
 use gas_analyzer_core::{
-    Opcode, PrestateEligibility, SignatureType, StateUpdate, build_state_updates_from_prestate,
-    classify_prestate_eligibility, compute_state_updates, compute_state_updates_canonical,
-    encode_state_updates_to_abi, estimate_gas_from_operations, extract_operation_counts_from_trace,
-    validate_unbounded_cost,
+    BASE_TX_COST, Opcode, PrestateEligibility, SignatureType, StateUpdate,
+    build_state_updates_from_prestate, classify_prestate_eligibility, compute_state_updates,
+    compute_state_updates_canonical, encode_state_updates_to_abi, estimate_gas_from_operations,
+    extract_operation_counts_from_trace, validate_unbounded_cost,
 };
 use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
 use gas_analyzer_rpc::{
@@ -898,6 +900,57 @@ enum StructLogEncoder {
     Canonical,
 }
 
+/// What settling a historical transaction as a nested tree would have cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameTreeGas {
+    /// Measured gas to apply each frame's program on its own, in frame order.
+    pub frame_gas: Vec<u64>,
+    /// The tree in one transaction: every frame's gas, less the base transaction cost each
+    /// child frame was measured with, plus the nesting overhead of each child.
+    pub total: u64,
+}
+
+impl GasKillerEvmSketchDefault {
+    /// Prices `frames` (root first) against the mid-block state `preceding_txs` leave, the way
+    /// [`call_to_frame_tree_with_evmsketch`] prices a live tree: each frame measured on its own
+    /// and the per-frame nesting overhead added for every frame past the root.
+    ///
+    /// Each frame starts from the state before the transaction rather than the state its
+    /// parent's earlier writes leave, so a frame whose program depends on that ordering is
+    /// priced approximately.
+    pub fn estimate_frame_tree_gas_with_preceding(
+        &self,
+        frames: &[FrameProgram],
+        sender: Address,
+        preceding_txs: &[PrecedingTx],
+        tx_value: U256,
+        cost: &NestingCostModel,
+    ) -> Result<FrameTreeGas> {
+        let mut frame_gas = Vec::with_capacity(frames.len());
+        let mut total = 0u64;
+        for (i, frame) in frames.iter().enumerate() {
+            let value = if i == 0 { tx_value } else { frame.value };
+            let gas = self
+                .estimate_state_changes_gas_with_preceding(
+                    frame.target,
+                    sender,
+                    &without_nested_ops(&frame.updates),
+                    preceding_txs,
+                    value,
+                )
+                .with_context(|| format!("pricing frame {i} ({})", frame.target))?;
+            frame_gas.push(gas);
+            total = total.saturating_add(if i == 0 {
+                gas
+            } else {
+                gas.saturating_sub(BASE_TX_COST)
+                    .saturating_add(cost.frame_overhead_gas)
+            });
+        }
+        Ok(FrameTreeGas { frame_gas, total })
+    }
+}
+
 impl StateEncoding {
     /// Whether this encoding signs the prestate net form for the calls that admit it.
     fn signs_prestate_net(self) -> bool {
@@ -1445,7 +1498,7 @@ pub async fn call_to_frame_tree_with_evmsketch(
         let all: Vec<StateUpdate> = tree
             .frames
             .iter()
-            .flat_map(|f| replayable(&f.updates))
+            .flat_map(|f| without_nested_ops(&f.updates))
             .collect();
         let signature_floor = SignatureType::Bls.turetzky_upper_gas_limit();
         validate_unbounded_cost(&all, tree.call_gas_total, signature_floor, budget).map_err(
@@ -1461,7 +1514,7 @@ pub async fn call_to_frame_tree_with_evmsketch(
     for (i, frame) in tree.frames.iter().enumerate() {
         // The estimator replays programs through a handler that predates NESTED; each frame is
         // priced on its own and the nesting overhead added per frame instead.
-        let updates = replayable(&frame.updates);
+        let updates = without_nested_ops(&frame.updates);
         let hints = hints_from_state_updates(frame.target, &updates);
         // Programs never read `msg.sender`, and a frame's real caller is a contract, which
         // revm refuses as a transaction sender (EIP-3607); price every frame from the root's.
@@ -1496,15 +1549,6 @@ pub async fn call_to_frame_tree_with_evmsketch(
             revm_estimate,
         },
     })
-}
-
-/// A program without its `NESTED` ops, for pricers that cannot execute them.
-fn replayable(updates: &[StateUpdate]) -> Vec<StateUpdate> {
-    updates
-        .iter()
-        .filter(|u| !matches!(u, StateUpdate::Nested(_)))
-        .cloned()
-        .collect()
 }
 
 /// The transition index a program's tracker store implies, for programs not built from a
@@ -2334,6 +2378,104 @@ mod tests {
             assert_eq!(encoded.leaves.len(), 4);
             assert_eq!(encoded.root_children.len(), 1);
             let _ = chain.registry;
+        }
+
+        /// A mined transaction's hash, for the historical (`debug_traceTransaction`) path.
+        async fn send(provider: &RootProvider<Ethereum>, request: TransactionRequest) -> B256 {
+            let to = match request.to {
+                Some(TxKind::Call(to)) => to,
+                _ => panic!("a call request"),
+            };
+            let data = request.input.input().cloned().unwrap_or_default();
+            let tx = serde_json::json!({
+                "from": DEV,
+                "to": to,
+                "data": data,
+                "gas": "0x1c9c380",
+            });
+            let hash: B256 = provider
+                .raw_request("eth_sendTransaction".into(), (tx,))
+                .await
+                .expect("eth_sendTransaction");
+            for _ in 0..100 {
+                if provider
+                    .get_transaction_receipt(hash)
+                    .await
+                    .expect("receipt")
+                    .is_some()
+                {
+                    return hash;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!("{hash} was never mined");
+        }
+
+        /// A mined transaction priced as if some of the contracts it calls had integrated the SDK.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; run with --ignored"]
+        async fn test_historical_transaction_priced_with_an_owned_set() {
+            let anvil = LocalAnvil::spawn_with(&[
+                "--chain-id",
+                &SEPOLIA_CHAIN_ID.to_string(),
+                "--steps-tracing",
+            ])
+            .await;
+            let provider = anvil.provider();
+            let chain = deploy_chain(&provider, 5, None).await;
+            let hash = send(&provider, process_request(chain.router, 5)).await;
+            let receipt = provider
+                .get_transaction_receipt(hash)
+                .await
+                .expect("receipt")
+                .expect("mined");
+            let trace = gas_analyzer_rpc::get_tx_trace(&provider, hash, receipt.status())
+                .await
+                .expect("historical trace");
+            let split = |owned: &[Address]| {
+                gas_analyzer_core::nested::compute_frame_tree_hypothetical(
+                    trace.clone(),
+                    chain.router,
+                    &owned.iter().copied().collect(),
+                    &FREE_NESTING,
+                )
+                .expect("frame tree")
+            };
+
+            let behind_a_foreign_vault = split(&[chain.ledger]);
+            assert_eq!(
+                behind_a_foreign_vault.frames.len(),
+                1,
+                "the ledger runs inside the vault's call"
+            );
+
+            let tree = split(&[chain.vault, chain.ledger]);
+            let targets: Vec<Address> = tree.frames.iter().map(|f| f.target).collect();
+            assert_eq!(targets, vec![chain.router, chain.vault, chain.ledger]);
+
+            let block = receipt.block_number.expect("block");
+            let gk = GasKillerEvmSketchDefault::builder(anvil.url.parse().expect("url"))
+                .at_block(BlockNumberOrTag::Number(block))
+                .build()
+                .await
+                .expect("estimator");
+            let gas = gk
+                .estimate_frame_tree_gas_with_preceding(
+                    &tree.frames,
+                    DEV,
+                    &[],
+                    U256::ZERO,
+                    &FREE_NESTING,
+                )
+                .expect("priced");
+            assert_eq!(gas.frame_gas.len(), 3);
+            assert!(gas.frame_gas.iter().all(|g| *g > BASE_TX_COST));
+            let children: u64 = gas.frame_gas[1..].iter().map(|g| g - BASE_TX_COST).sum();
+            assert_eq!(
+                gas.total,
+                gas.frame_gas[0] + children,
+                "one base cost for the whole tree"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread")]

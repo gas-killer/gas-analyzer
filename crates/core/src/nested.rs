@@ -484,11 +484,75 @@ fn flush_slice(frames: &mut [WalkFrame], programs: &[ProgramState]) {
 /// `NESTED`) its target is brought to the canonical image, and a final slice re-asserts every
 /// slot the target's image holds when the frame returns. A callee that reverts natively yields
 /// no frame and no `NESTED` op.
-#[tracing::instrument(name = "gas.trace_parse_frame_tree", skip_all, fields(frame_count = tracing::field::Empty))]
 pub fn compute_frame_tree_canonical(
     trace: DefaultFrame,
     root: Address,
     is_nestable: &dyn Fn(Address) -> bool,
+    cost: &NestingCostModel,
+) -> Result<FrameTreeExtract> {
+    split_frame_tree(trace, root, Eligibility::Consumers(is_nestable), cost)
+}
+
+/// [`compute_frame_tree_canonical`] for code that never integrated the SDK: what a historical
+/// transaction would have settled as had `root` and every contract in `owned` been consumers.
+///
+/// Any `CALL` from a frame into a contract in `owned` may become a frame, since these
+/// contracts have no transition counter whose increment the rule could look for. Frames are
+/// still kept only where nesting is cheaper under `cost`, and a callee using an op a program
+/// cannot express stays a `CALL`. A contract in `owned` that is reached only through a contract
+/// outside it runs inside that contract's native `CALL`, as it would in a real settlement.
+/// Frames carry their counter's index where the trace shows one, and zero otherwise; the split
+/// is for pricing, not for signing.
+pub fn compute_frame_tree_hypothetical(
+    trace: DefaultFrame,
+    root: Address,
+    owned: &BTreeSet<Address>,
+    cost: &NestingCostModel,
+) -> Result<FrameTreeExtract> {
+    split_frame_tree(trace, root, Eligibility::Hypothetical(owned), cost)
+}
+
+/// A program without its `NESTED` ops, for pricers that cannot execute them.
+pub fn without_nested_ops(updates: &[StateUpdate]) -> Vec<StateUpdate> {
+    updates
+        .iter()
+        .filter(|u| !matches!(u, StateUpdate::Nested(_)))
+        .cloned()
+        .collect()
+}
+
+/// Which callees a split may turn into frames.
+#[derive(Clone, Copy)]
+enum Eligibility<'a> {
+    /// Deployed consumers: `is_nestable`, and the callee's first effect is its counter increment.
+    Consumers(&'a dyn Fn(Address) -> bool),
+    /// Contracts priced as if they were consumers.
+    Hypothetical(&'a BTreeSet<Address>),
+}
+
+impl Eligibility<'_> {
+    /// The transition index the callee's frame takes, or `None` when the call stays a `CALL`.
+    fn frame_index(self, candidate: Option<&Candidate>, callee: Option<Address>) -> Option<U256> {
+        let candidate = candidate.filter(|c| !c.unsupported_op)?;
+        let callee = callee?;
+        match (self, candidate.bump) {
+            (Self::Consumers(is_nestable), Bump::First(index)) if is_nestable(callee) => {
+                Some(index)
+            }
+            (Self::Hypothetical(owned), bump) if owned.contains(&callee) => Some(match bump {
+                Bump::First(index) => index,
+                Bump::Undecided | Bump::Disqualified => U256::ZERO,
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[tracing::instrument(name = "gas.trace_parse_frame_tree", skip_all, fields(frame_count = tracing::field::Empty))]
+fn split_frame_tree(
+    trace: DefaultFrame,
+    root: Address,
+    eligibility: Eligibility<'_>,
     cost: &NestingCostModel,
 ) -> Result<FrameTreeExtract> {
     let (candidates, root_index) = scan_candidates(&trace.struct_logs, root)?;
@@ -737,13 +801,7 @@ pub fn compute_frame_tree_canonical(
                     // Boundary: external code is about to observe the current target's
                     // storage — bring it to the canonical image first.
                     flush_slice(&mut frames, &programs);
-                    let nested_index = match candidates.get(&log_index) {
-                        Some(Candidate {
-                            bump: Bump::First(index),
-                            unsupported_op: false,
-                        }) if callee.is_some_and(is_nestable) => Some(*index),
-                        _ => None,
-                    };
+                    let nested_index = eligibility.frame_index(candidates.get(&log_index), callee);
                     let mut decoded = Vec::with_capacity(1);
                     if append_state_update_from_struct_log(&mut decoded, struct_log)?.is_some() {
                         unreachable!("CALL is never a skipped opcode");
@@ -1592,6 +1650,93 @@ mod tests {
             tree.skipped_opcodes.is_empty(),
             "the native call carries it, not a program"
         );
+    }
+
+    fn what_if(logs: Vec<StructLog>, owned: &[Address]) -> FrameTreeExtract {
+        compute_frame_tree_hypothetical(
+            trace(logs),
+            ROOT,
+            &owned.iter().copied().collect(),
+            &NESTING_COST_MODEL_V1,
+        )
+        .expect("frame tree")
+    }
+
+    /// The root writes slot 1, then calls B and C in turn; each writes slot 5. Nothing touches
+    /// a transition counter, as in code that never integrated the SDK.
+    fn historical_root_calls_b_then_c() -> Vec<StructLog> {
+        vec![
+            sstore(1, slot(1), 10),
+            call(1, 1_000_000, B),
+            sstore(2, slot(5), 50),
+            resume(1, 100_000, true),
+            call(1, 1_000_000, C),
+            sstore(2, slot(5), 60),
+            resume(1, 100_000, true),
+        ]
+    }
+
+    #[test]
+    fn only_owned_callees_become_frames_in_a_what_if() {
+        let tree = what_if(historical_root_calls_b_then_c(), &[C]);
+        assert_eq!(tree.frames.len(), 2);
+        assert_eq!(kinds(&tree.frames[0].updates), ["STORE", "CALL", "NESTED"]);
+        let c = &tree.frames[1];
+        assert_eq!(c.target, C);
+        assert_eq!(c.caller, ROOT);
+        assert_eq!(c.transition_index, Some(U256::ZERO));
+        assert_eq!(stores(&c.updates), vec![(slot(5), slot(60))]);
+    }
+
+    #[test]
+    fn a_what_if_owning_nothing_but_the_root_is_the_canonical_program() {
+        let logs = historical_root_calls_b_then_c();
+        let canonical = compute_state_updates_canonical(trace(logs.clone()), ROOT)
+            .unwrap()
+            .0;
+        let tree = what_if(logs, &[]);
+        assert_eq!(tree.frames.len(), 1);
+        assert_eq!(
+            encoded_program(&tree.frames[0].updates),
+            encoded_program(&canonical)
+        );
+    }
+
+    /// C is owned but only reached through B, which is not: it runs inside B's native call.
+    #[test]
+    fn an_owned_contract_behind_a_foreign_one_stays_inside_its_call() {
+        let logs = vec![
+            sstore(1, slot(1), 10),
+            call(1, 1_000_000, B),
+            call(2, 900_000, C),
+            sstore(3, slot(5), 50),
+            resume(2, 100_000, true),
+            resume(1, 50_000, true),
+        ];
+        let tree = what_if(logs, &[C]);
+        assert_eq!(tree.frames.len(), 1);
+        assert_eq!(kinds(&tree.frames[0].updates), ["STORE", "CALL"]);
+    }
+
+    #[test]
+    fn a_cheap_owned_callee_stays_a_call_in_a_what_if() {
+        let logs = vec![
+            sstore(1, slot(1), 10),
+            call(1, 1_000_000, C),
+            sstore(2, slot(5), 60),
+            resume(1, 995_000, true),
+        ];
+        assert_eq!(what_if(logs, &[C]).frames.len(), 1);
+    }
+
+    #[test]
+    fn an_owned_callee_using_transient_storage_stays_a_call_in_a_what_if() {
+        let mut logs = historical_root_calls_b_then_c();
+        logs.insert(
+            5,
+            log("TSTORE", 2, 600_000, &[U256::from(1), U256::from(1)], 0),
+        );
+        assert_eq!(what_if(logs, &[C]).frames.len(), 1);
     }
 
     #[test]
