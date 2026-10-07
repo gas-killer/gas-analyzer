@@ -40,6 +40,8 @@ struct CliArgs {
     command: Option<Commands>,
     use_anvil: bool,
     debug: bool,
+    /// `--owned`: contracts priced as if they had integrated the SDK alongside the root.
+    owned: Result<Vec<alloy::primitives::Address>, String>,
 }
 
 fn parse_args() -> CliArgs {
@@ -51,11 +53,28 @@ fn parse_args() -> CliArgs {
     // Check for --debug flag
     let debug = args.iter().any(|a| a == "--debug");
 
-    // Filter out flags to get positional args
-    let positional: Vec<&str> = args
+    // `--owned A,B` or `--owned=A,B`; its value is not a positional argument.
+    let mut owned_raw = Vec::new();
+    let mut positional: Vec<&str> = Vec::new();
+    let mut rest = args.iter().map(|s| s.as_str());
+    while let Some(arg) = rest.next() {
+        if arg == "--owned" {
+            owned_raw.extend(rest.next());
+        } else if let Some(value) = arg.strip_prefix("--owned=") {
+            owned_raw.push(value);
+        } else if !arg.starts_with("--") {
+            positional.push(arg);
+        }
+    }
+    let owned = owned_raw
         .iter()
-        .map(|s| s.as_str())
-        .filter(|a| !a.starts_with("--"))
+        .flat_map(|list| list.split(','))
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .map(|a| {
+            a.parse()
+                .map_err(|e| format!("--owned: `{a}` is not an address: {e}"))
+        })
         .collect();
 
     let command = if positional.len() < 3 {
@@ -82,6 +101,7 @@ fn parse_args() -> CliArgs {
         command,
         use_anvil,
         debug,
+        owned,
     }
 }
 
@@ -112,6 +132,7 @@ async fn main() {
 }
 
 async fn execute_command(cli_args: CliArgs) -> Result<()> {
+    let owned = cli_args.owned.clone().map_err(anyhow::Error::msg)?;
     let rpc_url: Url = std::env::var("RPC_URL")
         .expect("RPC_URL must be set")
         .parse()
@@ -156,6 +177,31 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 })?;
             #[cfg(feature = "evmsketch")]
             let tx_value = tx.value();
+
+            if !owned.is_empty() {
+                if cli_args.use_anvil {
+                    anyhow::bail!("--owned runs on the EvmSketch backend; drop --anvil");
+                }
+                #[cfg(feature = "evmsketch")]
+                return what_if::run(what_if::Inputs {
+                    provider: &provider,
+                    rpc_url: rpc_url.clone(),
+                    tx_hash: bytes.into(),
+                    status: original_status,
+                    root: receipt
+                        .to
+                        .ok_or_else(|| anyhow::anyhow!("Transaction has no 'to' address"))?,
+                    sender: tx_sender,
+                    value: tx_value,
+                    block_number,
+                    tx_index,
+                    gas_used,
+                    owned: &owned,
+                })
+                .await;
+                #[cfg(not(feature = "evmsketch"))]
+                anyhow::bail!("--owned needs the evmsketch feature");
+            }
 
             #[cfg(feature = "anvil")]
             if cli_args.use_anvil {
@@ -549,12 +595,197 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 "  {} Print full error details including RPC errors",
                 "--debug".bold()
             );
+            println!(
+                "  {} Price the transaction as a nested settlement in which these\n           \
+                 contracts, beside the root, had integrated the SDK",
+                "--owned <ADDR,...>".bold()
+            );
             println!("\nExamples:\n");
             println!("  # Default (EvmSketch - Anvil-free):");
             println!("  cargo run -- t <TX_HASH>");
             println!("\n  # With Anvil (legacy, more accurate gas estimates):");
             println!("  cargo run --features anvil -- --anvil t <TX_HASH>");
+            println!("\n  # What the root and C would have saved together as one nested tree:");
+            println!("  cargo run -- t <TX_HASH> --owned <C_ADDRESS>");
         }
     }
     Ok(())
+}
+
+/// `t <HASH> --owned ...`: what a historical transaction would have cost settled as a nested
+/// tree, had its root and the owned contracts integrated the SDK.
+#[cfg(feature = "evmsketch")]
+mod what_if {
+    use alloy::primitives::{Address, FixedBytes, U256};
+    use alloy_eips::BlockNumberOrTag;
+    use alloy_provider::Provider;
+    use alloy_provider::ext::DebugApi;
+    use anyhow::Result;
+    use colored::Colorize;
+    use gas_analyzer_core::SignatureType;
+    use gas_analyzer_core::nested::{
+        FrameProgram, NESTING_COST_MODEL_V1, compute_frame_tree_hypothetical,
+    };
+    use gas_analyzer_core::types::StateUpdate;
+    use gas_analyzer_evmsketch::GasKillerEvmSketchDefault;
+    use std::collections::BTreeSet;
+
+    pub struct Inputs<'a, P> {
+        pub provider: &'a P,
+        pub rpc_url: url::Url,
+        pub tx_hash: FixedBytes<32>,
+        pub status: bool,
+        pub root: Address,
+        pub sender: Address,
+        pub value: U256,
+        pub block_number: u64,
+        pub tx_index: u64,
+        pub gas_used: u64,
+        pub owned: &'a [Address],
+    }
+
+    pub async fn run<P: Provider + DebugApi>(inputs: Inputs<'_, P>) -> Result<()> {
+        let Inputs {
+            provider,
+            rpc_url,
+            tx_hash,
+            status,
+            root,
+            sender,
+            value,
+            block_number,
+            tx_index,
+            gas_used,
+            owned,
+        } = inputs;
+        let owned: BTreeSet<Address> = owned.iter().copied().filter(|a| *a != root).collect();
+        let cost = NESTING_COST_MODEL_V1;
+
+        let trace = gas_analyzer_rpc::get_tx_trace(provider, tx_hash, status).await?;
+        // Root-only and nested are split from the same trace by the same walker, so the
+        // difference between them is the nesting alone.
+        let flat = compute_frame_tree_hypothetical(trace.clone(), root, &BTreeSet::new(), &cost)?;
+        let nested = compute_frame_tree_hypothetical(trace, root, &owned, &cost)?;
+
+        let gk = GasKillerEvmSketchDefault::builder(rpc_url)
+            .at_block(BlockNumberOrTag::Number(block_number))
+            .build()
+            .await?;
+        let preceding =
+            gas_analyzer_rpc::get_preceding_transactions(provider, block_number, tx_index)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to fetch preceding transactions for block {block_number} \
+                         (tx index {tx_index}): {e}"
+                    )
+                })?;
+        let flat_gas = gk.estimate_frame_tree_gas_with_preceding(
+            &flat.frames,
+            sender,
+            &preceding,
+            value,
+            &cost,
+        )?;
+        let nested_gas = gk.estimate_frame_tree_gas_with_preceding(
+            &nested.frames,
+            sender,
+            &preceding,
+            value,
+            &cost,
+        )?;
+
+        println!("\n{}", "=== Nested Settlement What-If ===".blue().bold());
+        println!("Transaction: {tx_hash}");
+        println!("Block: {block_number} | Tx Index: {tx_index}");
+        println!("Gas used: {gas_used}");
+        println!("Root (tx.to): {root}");
+        println!(
+            "Owned: {}",
+            if owned.is_empty() {
+                "none beside the root".to_owned()
+            } else {
+                owned
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        );
+
+        println!("\n{}", "Frames".bold());
+        for (i, (frame, gas)) in nested.frames.iter().zip(&nested_gas.frame_gas).enumerate() {
+            let role = if i == 0 {
+                "root".to_owned()
+            } else {
+                format!("called by {}", frame.caller)
+            };
+            println!(
+                "  #{i} {} ({role}): {} ops, {} gas measured alone",
+                frame.target,
+                frame.updates.len(),
+                gas
+            );
+        }
+        for (contract, reason) in not_nested(&owned, &nested.frames) {
+            println!("  {} {contract}: {reason}", "not nested".yellow());
+        }
+
+        println!(
+            "\nRoot-only program: {} gas | Nested tree: {} gas (incl. {} per nested frame)",
+            flat_gas.total, nested_gas.total, cost.frame_overhead_gas
+        );
+        for signature_type in SignatureType::ALL {
+            let (flat_total, flat_savings, flat_pct) =
+                signature_type.savings(flat_gas.total, gas_used);
+            let (nested_total, nested_savings, nested_pct) =
+                signature_type.savings(nested_gas.total, gas_used);
+            println!(
+                "\n{} (Turetzky upper gas limit: {})",
+                format!("[{}]", signature_type.label()).bold(),
+                signature_type.turetzky_upper_gas_limit()
+            );
+            println!("  Root only:   {flat_total} gas, saves {flat_savings} ({flat_pct:.2}%)");
+            println!(
+                "  Nested tree: {nested_total} gas, saves {nested_savings} ({nested_pct:.2}%)"
+            );
+        }
+        println!(
+            "\n{}",
+            "Each frame is measured from the state before the transaction, and the cost model's \
+             fixed overhead stands in for the per-frame proof and witness cost."
+                .dimmed()
+        );
+        Ok(())
+    }
+
+    /// Why each owned contract did not get a frame.
+    fn not_nested(
+        owned: &BTreeSet<Address>,
+        frames: &[FrameProgram],
+    ) -> Vec<(Address, &'static str)> {
+        let framed: BTreeSet<Address> = frames.iter().map(|f| f.target).collect();
+        let called: BTreeSet<Address> = frames
+            .iter()
+            .flat_map(|f| &f.updates)
+            .filter_map(|u| match u {
+                StateUpdate::Call(call) => Some(call.target),
+                _ => None,
+            })
+            .collect();
+        owned
+            .iter()
+            .filter(|a| !framed.contains(*a))
+            .map(|a| {
+                let reason = if called.contains(a) {
+                    "called directly, but cheaper as a plain CALL (or it reverted, or uses \
+                     transient storage or selfdestruct)"
+                } else {
+                    "not called from a nested frame: its caller is outside the owned set or \
+                     was itself kept as a CALL, so it ran inside that call"
+                };
+                (*a, reason)
+            })
+            .collect()
+    }
 }
