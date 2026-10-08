@@ -124,7 +124,7 @@ heuristic fallback.
 
 | project | best % (Schnorr) | best tx | what saves |
 |---|---:|---|---|
-| **Privacy Pools** | 59.59% | [`0x8cc80eae…`](https://etherscan.io/tx/0x8cc80eae520f1c61fe39f18ab0ea82e4afbbb6ed4c0ddca71d26b5627628f92a) | PoolVault `ragequit`; the proof check lives in the pool. Also clears the BLS floor. The PPRouter wrapper saves nothing |
+| **Privacy Pools** | 59.59% | [`0x8cc80eae…`](https://etherscan.io/tx/0x8cc80eae520f1c61fe39f18ab0ea82e4afbbb6ed4c0ddca71d26b5627628f92a) | PoolVault `ragequit`; the proof check lives in the pool. The PPRouter wrapper saves nothing |
 | **Tacit** | 54.50% | [`0xe98ed820…`](https://etherscan.io/tx/0xe98ed82065ba594d6b51dd7833c3b7d0a91026c6be4a30b6901c762490698a53) | `TacitEvmPool` ZK proof check (254k gas `STATICCALL` to `TransactVerifier`); no regular calls. Only one tx measured |
 | **Morpho VaultV2** | 40.43% | [`0x2e91acd5…`](https://etherscan.io/tx/0x2e91acd5286eeda304294f8f2c9803b7d140dd0cf7426e16ee285e9f6b1f0fca) | `redeem`/`deposit` on VaultV2; 15 wins across 3 vaults and 3 curators |
 | **Doppler** | 13.73% | [`0x7b08cf0d…`](https://etherscan.io/tx/0x7b08cf0df79aaaf918bc03d62d402bceb70e3ac68e662a18464c3097d02071ff) | only the v4 hook's `collectFees`; `Airlock.create` saves nothing |

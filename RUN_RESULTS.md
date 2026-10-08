@@ -85,26 +85,23 @@ $ curl -sS -X POST -H 'content-type: application/json' \
 | GasKiller base estimate (before signature floor) | **2,734,965** (measured via StateChangeHandler) |
 
 Per signature scheme, base estimate + Turetzky upper gas limit
-(Schnorr at `crates/core/src/encoding.rs:21`, BLS at `:17`):
+(Schnorr at `crates/core/src/encoding.rs:21`):
 
 | Scheme | Turetzky upper gas limit | GasKiller gas estimate | Gas savings | Percent savings |
 |---|---|---|---|---|
-| **BLS** | 250,000 | **2,984,965** | **0** | **0.00%** |
 | **Schnorr** | 50,000 | **2,784,965** | **0** | **0.00%** |
 
 ### Reading these numbers
 
-Both schemes report zero savings, and that is a genuine result — not an error, a revert, or
+Schnorr reports zero savings, and that is a genuine result — not an error, a revert, or
 a failed estimation. The base state-change replay cost alone (2,734,965) already exceeds the
-original transaction's 2,540,464 gas, so adding either floor keeps the estimate above actual
+original transaction's 2,540,464 gas, so adding the floor keeps the estimate above actual
 usage. `SignatureType::savings` computes savings as
 `gas_used.saturating_sub(total_estimate)` (`crates/core/src/encoding.rs`), so the negative
 difference saturates to 0 and the percentage follows.
 
-Schnorr remains the cheaper scheme by exactly the floor difference —
-2,984,965 − 2,784,965 = **200,000 gas** (250,000 − 50,000). That simply isn't enough to
-close the **194,501 gas** deficit already present in the base estimate
-(2,734,965 − 2,540,464), which is why Schnorr's much lower floor still yields 0%.
+The base estimate is already **194,501 gas** above the original transaction
+(2,734,965 − 2,540,464), so even before the 50,000 floor there is nothing to save.
 
 The dominant cost is state update #1: a `CREATE2` carrying a **12,698-byte** initcode.
 Redeploying that contract through the StateChangeHandler is what pushes the replay above the
@@ -186,10 +183,6 @@ Transaction: 0x2dcd16b5645202184d37532d00f4e34dff1c61332ca325f830ab580f45b0c78a
 Block: 25755918 (0xe78bf06d319a6d2800180a1adc1820d424ab449094f85fc0889c089c9203ad38) | Tx Index: 65
 Gas used: 2540464
 GasKiller base estimate (before signature floor): 2734965 (measured via StateChangeHandler)
-
-[BLS] (Turetzky upper gas limit: 250000)
-  GasKiller gas estimate: 2984965
-  Gas savings: 0 (0.00%)
 
 [Schnorr] (Turetzky upper gas limit: 50000)
   GasKiller gas estimate: 2761965

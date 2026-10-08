@@ -18,11 +18,9 @@ Every number in the results tables is analyzer output. Where a figure is my own 
 
 ## Headline: Railgun
 
-**15 direct calls to the Railgun smart wallet, all trace-measured, all clearing both signature floors.** Schnorr savings range **60.83%–78.72%** (median 72.02%). BLS savings range 19.53%–64.86%.
+**15 direct calls to the Railgun smart wallet, all trace-measured, all clearing the Schnorr floor.** Schnorr savings range **60.83%–78.72%** (median 72.02%).
 
 In aggregate: 15,174,097 gas used on chain becomes 3,765,439 under GasKiller with Schnorr — a saving of **11,408,658 gas (75.2%)**.
-
-Railgun is the only protocol where **every** transaction clears the BLS floor. Aave manages it on 2 of 9 borrows; across the remaining seven protocols, 0 of ~60 transactions cleared it.
 
 ### Why it works
 
@@ -42,23 +40,23 @@ All 3 RelayAdapt transactions analyzed scored zero.
 
 ### Railgun results
 
-| tx | gas used | GasKiller cost | Schnorr saved | BLS saved | state updates |
-|---|---:|---:|---:|---:|---|
-| [`0xaa357a48…`](https://etherscan.io/tx/0xaa357a4824001aed7173b3bc7d976f997fc7839def4c56ec070db97ec2121bc4) | 1,085,832 | 181,095 | **854,737** (78.72%) | 654,737 (60.30%) | `Store`×11, `Log1`×3 |
-| [`0x32daef80…`](https://etherscan.io/tx/0x32daef80a0c5180dcf45b15130e10ecced485242f0d3305b30942ebeb5aec364) | 1,056,246 | 197,859 | **808,387** (76.53%) | 608,387 (57.60%) | `Store`×12, `Log1`×3 |
-| [`0xe7e605b6…`](https://etherscan.io/tx/0xe7e605b6520aaf757f4531a88af4966866d86fee61ec06e93b3423b30a934adc) | 1,615,755 | 317,840 | **1,247,915** (77.23%) | 1,047,915 (64.86%) | `Store`×15, `Log1`×5, `Call`×2 |
-| [`0xa2177825…`](https://etherscan.io/tx/0xa21778257ba78ce1354a4ff25a48ee07854e5e858f4facfe3e3c3893d9a1945f) | 1,561,573 | 312,286 | **1,199,287** (76.80%) | 999,287 (63.99%) | `Store`×16, `Log1`×5, `Call`×2 |
-| [`0x73a1d71e…`](https://etherscan.io/tx/0x73a1d71e2cfa678b63c934c8c04eb6b6069de89c85faf16d0376241ecabfb0ec) | 1,097,058 | 213,396 | **833,662** (75.99%) | 633,662 (57.76%) | `Store`×14, `Log1`×3 |
-| [`0xa3a010fa…`](https://etherscan.io/tx/0xa3a010fa890d910e669fba1ea7b681a4c1f464b754c5b7bff7d62ae15ae25e71) | 1,113,545 | 241,625 | **821,920** (73.81%) | 621,920 (55.85%) | `Store`×12, `Log1`×4, `Call`×2 |
-| [`0x04736806…`](https://etherscan.io/tx/0x04736806756593b664eb29591a2ea046b2261c5a4fa1bdd1707a6dc5abf54f07) | 1,136,044 | 266,554 | **819,490** (72.14%) | 619,490 (54.53%) | `Store`×13, `Log1`×4, `Call`×2 |
-| [`0x39a67a29…`](https://etherscan.io/tx/0x39a67a2964b675ccd1be1939c513b46f62cae71c3f320bece6acdaf71934b3ae) | 1,131,080 | 266,430 | **814,650** (72.02%) | 614,650 (54.34%) | `Store`×14, `Log1`×4, `Call`×2 |
-| [`0xaf36e218…`](https://etherscan.io/tx/0xaf36e2187e095fa88299a8859632963594414b716f36aae541318d4ce71740e6) | 1,177,014 | 282,477 | **844,537** (71.75%) | 644,537 (54.76%) | `Store`×15, `Log1`×4, `Call`×2 |
-| [`0x0376edd3…`](https://etherscan.io/tx/0x0376edd36b0c9211b1a38f41e5f1c04233478ca4dcf7d4852ef313deb1c57ade) | 724,515 | 168,652 | **505,863** (69.82%) | 305,863 (42.22%) | `Store`×10, `Log1`×2, `Call`×2 |
-| [`0xab44777b…`](https://etherscan.io/tx/0xab44777b4e3a37169ea03163ec5d14dbf668bcb18219c3a95cc2313c2be55a3d) | 736,786 | 177,753 | **509,033** (69.09%) | 309,033 (41.94%) | `Store`×9, `Log1`×2, `Call`×2 |
-| [`0x27ce0220…`](https://etherscan.io/tx/0x27ce022039ef027d473c61f3140da32c8e58f0a8daaee826e6f04a58744db447) | 742,727 | 185,294 | **507,433** (68.32%) | 307,433 (41.39%) | `Store`×10, `Log1`×2, `Call`×2 |
-| [`0x3d54cfc3…`](https://etherscan.io/tx/0x3d54cfc375e626acd71432b2ab59a94bde2f6ee2490528ca8259417091e3ab97) | 752,878 | 197,812 | **505,066** (67.08%) | 305,066 (40.52%) | `Store`×11, `Log1`×2, `Call`×2 |
-| [`0x6837bb8d…`](https://etherscan.io/tx/0x6837bb8d629ee0dce5f045acfc6c1e296df4abe1907897820bf621462dc23425) | 758,741 | 211,644 | **497,097** (65.52%) | 297,097 (39.16%) | `Store`×14, `Log1`×2, `Call`×2 |
-| [`0x792a8e57…`](https://etherscan.io/tx/0x792a8e5783cec82cc456d83f0f1703a2bf71eafa05984a17896809bd952567cc) | 484,303 | 139,722 | **294,581** (60.83%) | 94,581 (19.53%) | `Log1`×3, `Store`×2, `Call`×2 |
+| tx | gas used | GasKiller cost | Schnorr saved | state updates |
+|---|---:|---:|---:|---|
+| [`0xaa357a48…`](https://etherscan.io/tx/0xaa357a4824001aed7173b3bc7d976f997fc7839def4c56ec070db97ec2121bc4) | 1,085,832 | 181,095 | **854,737** (78.72%) | `Store`×11, `Log1`×3 |
+| [`0x32daef80…`](https://etherscan.io/tx/0x32daef80a0c5180dcf45b15130e10ecced485242f0d3305b30942ebeb5aec364) | 1,056,246 | 197,859 | **808,387** (76.53%) | `Store`×12, `Log1`×3 |
+| [`0xe7e605b6…`](https://etherscan.io/tx/0xe7e605b6520aaf757f4531a88af4966866d86fee61ec06e93b3423b30a934adc) | 1,615,755 | 317,840 | **1,247,915** (77.23%) | `Store`×15, `Log1`×5, `Call`×2 |
+| [`0xa2177825…`](https://etherscan.io/tx/0xa21778257ba78ce1354a4ff25a48ee07854e5e858f4facfe3e3c3893d9a1945f) | 1,561,573 | 312,286 | **1,199,287** (76.80%) | `Store`×16, `Log1`×5, `Call`×2 |
+| [`0x73a1d71e…`](https://etherscan.io/tx/0x73a1d71e2cfa678b63c934c8c04eb6b6069de89c85faf16d0376241ecabfb0ec) | 1,097,058 | 213,396 | **833,662** (75.99%) | `Store`×14, `Log1`×3 |
+| [`0xa3a010fa…`](https://etherscan.io/tx/0xa3a010fa890d910e669fba1ea7b681a4c1f464b754c5b7bff7d62ae15ae25e71) | 1,113,545 | 241,625 | **821,920** (73.81%) | `Store`×12, `Log1`×4, `Call`×2 |
+| [`0x04736806…`](https://etherscan.io/tx/0x04736806756593b664eb29591a2ea046b2261c5a4fa1bdd1707a6dc5abf54f07) | 1,136,044 | 266,554 | **819,490** (72.14%) | `Store`×13, `Log1`×4, `Call`×2 |
+| [`0x39a67a29…`](https://etherscan.io/tx/0x39a67a2964b675ccd1be1939c513b46f62cae71c3f320bece6acdaf71934b3ae) | 1,131,080 | 266,430 | **814,650** (72.02%) | `Store`×14, `Log1`×4, `Call`×2 |
+| [`0xaf36e218…`](https://etherscan.io/tx/0xaf36e2187e095fa88299a8859632963594414b716f36aae541318d4ce71740e6) | 1,177,014 | 282,477 | **844,537** (71.75%) | `Store`×15, `Log1`×4, `Call`×2 |
+| [`0x0376edd3…`](https://etherscan.io/tx/0x0376edd36b0c9211b1a38f41e5f1c04233478ca4dcf7d4852ef313deb1c57ade) | 724,515 | 168,652 | **505,863** (69.82%) | `Store`×10, `Log1`×2, `Call`×2 |
+| [`0xab44777b…`](https://etherscan.io/tx/0xab44777b4e3a37169ea03163ec5d14dbf668bcb18219c3a95cc2313c2be55a3d) | 736,786 | 177,753 | **509,033** (69.09%) | `Store`×9, `Log1`×2, `Call`×2 |
+| [`0x27ce0220…`](https://etherscan.io/tx/0x27ce022039ef027d473c61f3140da32c8e58f0a8daaee826e6f04a58744db447) | 742,727 | 185,294 | **507,433** (68.32%) | `Store`×10, `Log1`×2, `Call`×2 |
+| [`0x3d54cfc3…`](https://etherscan.io/tx/0x3d54cfc375e626acd71432b2ab59a94bde2f6ee2490528ca8259417091e3ab97) | 752,878 | 197,812 | **505,066** (67.08%) | `Store`×11, `Log1`×2, `Call`×2 |
+| [`0x6837bb8d…`](https://etherscan.io/tx/0x6837bb8d629ee0dce5f045acfc6c1e296df4abe1907897820bf621462dc23425) | 758,741 | 211,644 | **497,097** (65.52%) | `Store`×14, `Log1`×2, `Call`×2 |
+| [`0x792a8e57…`](https://etherscan.io/tx/0x792a8e5783cec82cc456d83f0f1703a2bf71eafa05984a17896809bd952567cc) | 484,303 | 139,722 | **294,581** (60.83%) | `Log1`×3, `Store`×2, `Call`×2 |
 
 By function:
 
@@ -71,36 +69,36 @@ On the RelayAdapt side, only 1 of the 3 completed a real replay (`0x2d754e6f…`
 
 Best trace-measured Schnorr saving per protocol, and whether the winning shape is reachable in practice.
 
-| protocol | best measured | BLS | winning shape | how common |
-|---|---:|---:|---|---|
-| **Kelp** | **83.29%** | **58.85%** | direct `depositETH` — 4 updates, 1 call | **0.36 qualifying txs/day** |
-| **Railgun** | **78.72%** | **60.30%** | direct call to smart wallet | 374 of 704 (53%) |
-| **Aave** | **59.61%** | **yes (2 txs)** | direct `borrow` (any borrower); `withdraw` if multi-asset | ~25% of txs are direct borrows |
-| **Pyth** | **52.06%** | 0% | few feeds written per update; no external calls | **649 of 655 direct (99.1%)** |
-| **Chronicle** | **32.64%** | 0% | direct feed poke; 2 updates, no external calls | **17 of 24 measured win; ~90% of traffic direct** |
-| **Symbiotic** | **57.04%** | 0% | direct ERC-4626 `withdraw`/`redeem` on a vault | 1.49/day on the one vault measured |
-| **Renzo** | *62.97%* | 0% | `claim` via the withdraw contract (**label inferred**) | 1 of 2 measured |
-| **Mellow** | **41.55%** | 0% | direct ERC-4626 `withdraw`/`redeem` on a vault | 1.61/day on steakLRT |
-| Puffer | *7.06%* | 0% | direct `requestWithdrawal` (**label inferred**) | 1 of 2 measured |
-| Swell | 0% | 0% | none — withdrawal routes are call-blocked | 0 of 3 |
-| Privacy Pools | 19.47% | 0% | direct call to pool | 2 in 17 days |
-| Ether.fi | 11.09% | 0% | EtherFiAdmin oracle report | every ~4 hours |
-| EigenLayer | **0%** | 0% | none — checkpoint surplus (23,927–38,841) is under the 50,000 floor | 0 of 13 at the new floor |
-| Pendle | 2.60% *(aggregator tx, not Pendle's own)* | 0% | none of Pendle's own entry points clear the floor | 1 of 8 |
-| World ID | **0%** | 0% | none — best surplus 35,578, under the floor | 0 of 7 at the new floor |
-| Morpho | 0.51% | 0% | bundler multicall reallocation | 1 of 25 |
-| Safe | **0%** | 0% | none — best surplus 37,454, under the floor | 0 of 12 at the new floor |
-| **Euler** | **0%** | 0% | none — EVC router mandatory | **0 of 191 direct** |
-| **Ondo** | **0%** own *(12.09% is an MEV bot that merely touches Ondo)* | 0% | none of Ondo's own mint/redeem clear the floor | 52 mint/burns in 60k blocks |
-| Chainlink | 0% | 0% | none — all traffic via forwarder | 0 of 242 direct |
-| Lido | **0%** | 0% | none — best surplus 46,558, under the floor | 0 of 13 at the new floor |
-| Ethena | **0%** | 0% | none — best surplus 48,699, 1,301 short of the floor | 0 of 22 at the new floor |
-| ERC-4337 EntryPoint | *85.18%?* | *60%?* | **suspect — likely estimator false positive** | 2 of 8 measured |
-| Panther | 0% | 0% | none — shielded pool is not on mainnet | 0 of 1 |
-| **Umbra** | **0%** | 0% | **none — all 8 txs have negative surplus** | 1.4 txs/day (lowest surveyed) |
-| **Sky (Maker)** | **0%** | 0% | **none — 0 direct calls to Vat/PSM/Jug in 3h** | ~6,500/day core txs, all indirect |
-| Notional | — | — | **nothing to measure — not active on mainnet** | 0 protocol events in 8 days |
-| **ENS** | **0%** | 0% | **none — 18 of 18 measured, best is 68% short of the floor** | 877 txs/day, all shapes zero |
+| protocol | best measured | winning shape | how common |
+|---|---:|---|---|
+| **Kelp** | **83.29%** | direct `depositETH` — 4 updates, 1 call | **0.36 qualifying txs/day** |
+| **Railgun** | **78.72%** | direct call to smart wallet | 374 of 704 (53%) |
+| **Aave** | **59.61%** | direct `borrow` (any borrower); `withdraw` if multi-asset | ~25% of txs are direct borrows |
+| **Pyth** | **52.06%** | few feeds written per update; no external calls | **649 of 655 direct (99.1%)** |
+| **Chronicle** | **32.64%** | direct feed poke; 2 updates, no external calls | **17 of 24 measured win; ~90% of traffic direct** |
+| **Symbiotic** | **57.04%** | direct ERC-4626 `withdraw`/`redeem` on a vault | 1.49/day on the one vault measured |
+| **Renzo** | *62.97%* | `claim` via the withdraw contract (**label inferred**) | 1 of 2 measured |
+| **Mellow** | **41.55%** | direct ERC-4626 `withdraw`/`redeem` on a vault | 1.61/day on steakLRT |
+| Puffer | *7.06%* | direct `requestWithdrawal` (**label inferred**) | 1 of 2 measured |
+| Swell | 0% | none — withdrawal routes are call-blocked | 0 of 3 |
+| Privacy Pools | 19.47% | direct call to pool | 2 in 17 days |
+| Ether.fi | 11.09% | EtherFiAdmin oracle report | every ~4 hours |
+| EigenLayer | **0%** | none — checkpoint surplus (23,927–38,841) is under the 50,000 floor | 0 of 13 at the new floor |
+| Pendle | 2.60% *(aggregator tx, not Pendle's own)* | none of Pendle's own entry points clear the floor | 1 of 8 |
+| World ID | **0%** | none — best surplus 35,578, under the floor | 0 of 7 at the new floor |
+| Morpho | 0.51% | bundler multicall reallocation | 1 of 25 |
+| Safe | **0%** | none — best surplus 37,454, under the floor | 0 of 12 at the new floor |
+| **Euler** | **0%** | none — EVC router mandatory | **0 of 191 direct** |
+| **Ondo** | **0%** own *(12.09% is an MEV bot that merely touches Ondo)* | none of Ondo's own mint/redeem clear the floor | 52 mint/burns in 60k blocks |
+| Chainlink | 0% | none — all traffic via forwarder | 0 of 242 direct |
+| Lido | **0%** | none — best surplus 46,558, under the floor | 0 of 13 at the new floor |
+| Ethena | **0%** | none — best surplus 48,699, 1,301 short of the floor | 0 of 22 at the new floor |
+| ERC-4337 EntryPoint | *85.18%?* | **suspect — likely estimator false positive** | 2 of 8 measured |
+| Panther | 0% | none — shielded pool is not on mainnet | 0 of 1 |
+| **Umbra** | **0%** | **none — all 8 txs have negative surplus** | 1.4 txs/day (lowest surveyed) |
+| **Sky (Maker)** | **0%** | **none — 0 direct calls to Vat/PSM/Jug in 3h** | ~6,500/day core txs, all indirect |
+| Notional | — | **nothing to measure — not active on mainnet** | 0 protocol events in 8 days |
+| **ENS** | **0%** | **none — 18 of 18 measured, best is 68% short of the floor** | 877 txs/day, all shapes zero |
 
 ## What predicts a good candidate
 
@@ -150,8 +148,6 @@ is nothing wrapped around it to remove.
 | 2 | 252,529 | 164,712 | **37,817** (14.98%) |
 
 **GasKiller's cost barely moves: 163,828–206,699, while gas used runs 252,529–571,333.** The diff is effectively fixed and the computation on top varies — the same fixed-diff/variable-workload signature seen in Ether.fi's oracle report and World ID's identity registration.
-
-Two borrows also clear the **BLS** floor (140,592 and 36,377) — only Railgun has managed that elsewhere in this survey.
 
 ### Why the operation decides it
 
@@ -341,7 +337,7 @@ On this evidence the RWA category looks unpromising as a whole — Midas, Centri
 
 ### The proof work is real but it sits on a fixed ceiling
 
-The five EigenPod checkpoint transactions have surpluses of **23,927 / 30,785 / 30,785 / 30,968 / 38,841** regardless of how much gas they burn (76,444 up to 417,090). That is a fixed cost — verifying beacon-chain Merkle proofs and BLS-adjacent balance checks. Against the old 27,000 floor four of five cleared it by 4,000–12,000 gas. **Against the 50,000 floor none of them clear it, and EigenLayer scores zero across all 13 transactions.** The fixed-cost observation is what matters: the surplus does not scale with gas burned, so a higher floor removes the protocol entirely rather than reducing it.
+The five EigenPod checkpoint transactions have surpluses of **23,927 / 30,785 / 30,785 / 30,968 / 38,841** regardless of how much gas they burn (76,444 up to 417,090). That is a fixed cost — verifying beacon-chain Merkle proofs and balance checks. Against the old 27,000 floor four of five cleared it by 4,000–12,000 gas. **Against the 50,000 floor none of them clear it, and EigenLayer scores zero across all 13 transactions.** The fixed-cost observation is what matters: the surplus does not scale with gas burned, so a higher floor removes the protocol entirely rather than reducing it.
 
 Withdrawals go the other way. `queueWithdrawals` produces 24 state updates for a 440,000-gas transaction, so GasKiller costs **31,569 more** than the transaction did. Share accounting again: many writes, little compute.
 
@@ -599,8 +595,6 @@ and `executeGovernanceInstruction(bytes)` (`0xb6ed701e`, keccak-verified) on
 | `0x3862ae1b964adcdc8932bfd4583854ad2fb749ed85cce0ae8d0e85440f41a571` | 195,004 | 2148B | 12 | 113,393 | 28.01% |
 | `0x90b34b5df172d1d050f207ab34da927e4f81f7e710ae1edc1aa945e0fbc887d9` | 194,995 | 2148B | 12 | 113,405 | 28.00% |
 | `0x9f3e08104c3a853674bb012ae9331fccb6f00dacd90c0661bf5d3de97079c7ee` | 194,989 | 2148B | 12 | 113,405 | 27.99% |
-
-BLS is 0% on every row — the surplus never approaches the 250,000 BLS floor. Schnorr only.
 
 ### A predictive model for Pyth
 
@@ -2397,7 +2391,7 @@ Five measured direct calls to `0x769284c2`:
 | 482,024 | 207,784 | 224,240 | 46.52% |
 
 A second PoolVault function, `0x85afaff4`, measured **788,016 → 288,000, saving 450,016 (57.11%)** —
-the largest saving in the Privacy Pools set and the only row in it that also clears the BLS floor.
+the largest saving in the Privacy Pools set.
 
 Its only child is a `DELEGATECALL` to the implementation, which the analyzer follows rather than
 re-executes, and the pairing sits inside a `STATICCALL`, whose gas lands in surplus. Both work in
@@ -2781,13 +2775,13 @@ Added 2026-10-08. Derive (formerly Lyra) moved from Derive Chain to Ethereum mai
 - The verifier is a read-only call, so its gas is removable. Each submission makes only one small
   regular `CALL` (~8.7k, to the outbox).
 
-| tx | gas used | saved (Schnorr) | % | BLS % |
-|---|---:|---:|---:|---:|
-| [`0xf83f7406…`](https://etherscan.io/tx/0xf83f74064b25f3a5b0533d1f1e02a891eca4c91b5d4363b5e4dffed26eb22ebb) | 442,743 | 288,710 | **65.21%** | 20.04% |
-| [`0x60ff3054…`](https://etherscan.io/tx/0x60ff3054b8337ce75a7e6995c81bb877e6831cfc61e6ad56fe24d65b1e598af2) | 448,335 | 290,698 | **64.84%** | 20.23% |
-| [`0xe66eaac6…`](https://etherscan.io/tx/0xe66eaac6d541a0e548e35ddc543edcdb5b650fa3ce872ff8a3ed752a4dc3b4c3) | 448,395 | 290,722 | **64.84%** | 20.23% |
-| [`0x333c2069…`](https://etherscan.io/tx/0x333c2069a02734879b6dd07c6444f778ba2373db7f089e5cab9692424d652cc8) | 573,819 | 292,750 | **51.02%** | 16.16% |
-| [`0x8a320a2a…`](https://etherscan.io/tx/0x8a320a2a28bc2292c66817374e77889aef59662996702e52731c5db7e30ecfc0) | 842,171 | 298,986 | **35.50%** | 11.75% |
+| tx | gas used | saved (Schnorr) | % |
+|---|---:|---:|---:|
+| [`0xf83f7406…`](https://etherscan.io/tx/0xf83f74064b25f3a5b0533d1f1e02a891eca4c91b5d4363b5e4dffed26eb22ebb) | 442,743 | 288,710 | **65.21%** |
+| [`0x60ff3054…`](https://etherscan.io/tx/0x60ff3054b8337ce75a7e6995c81bb877e6831cfc61e6ad56fe24d65b1e598af2) | 448,335 | 290,698 | **64.84%** |
+| [`0xe66eaac6…`](https://etherscan.io/tx/0xe66eaac6d541a0e548e35ddc543edcdb5b650fa3ce872ff8a3ed752a4dc3b4c3) | 448,395 | 290,722 | **64.84%** |
+| [`0x333c2069…`](https://etherscan.io/tx/0x333c2069a02734879b6dd07c6444f778ba2373db7f089e5cab9692424d652cc8) | 573,819 | 292,750 | **51.02%** |
+| [`0x8a320a2a…`](https://etherscan.io/tx/0x8a320a2a28bc2292c66817374e77889aef59662996702e52731c5db7e30ecfc0) | 842,171 | 298,986 | **35.50%** |
 
 All five rows are measured replays with the plain analyzer, not the heuristic fallback.
 - **The saving is flat at ~290k gas per submission:** the proof check is removable, while the

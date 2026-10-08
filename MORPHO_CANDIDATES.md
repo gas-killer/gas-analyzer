@@ -62,30 +62,30 @@ Two code-size families dominate: **19,340 B** and **19,730 B** vault-like contra
 
 ## Results
 
-All 20 analyzed transactions, sorted by Schnorr savings descending. `surplus` = `gas_used − base_estimate`; savings are `gas_used − (base_estimate + floor)`, saturating at 0, with floor = 50,000 (Schnorr) or 250,000 (BLS).
+All 20 analyzed transactions, sorted by Schnorr savings descending. `surplus` = `gas_used − base_estimate`; savings are `gas_used − (base_estimate + floor)`, saturating at 0, with floor = 50,000 (Schnorr).
 
-| # | tx | block | `to` | what it does | gas_used | base_estimate | surplus | Schnorr est. | Schnorr saved | BLS saved | est. source | state updates |
-|---:|---|---:|---|---|---:|---:|---:|---:|---:|---:|---|---|
-| 1 | [`0x4e547494…`](https://etherscan.io/tx/0x4e547494fcf332b50465117a6467c8cb097787e4b54fd5b97ff6ff5cfec96ceb) | 25774052 | `0x5af8b1e9…` | Flash-loan leverage open: `FlashLoan`+`SupplyCollateral`+`Borrow`, 12,324 B calldata (label from events; selector `0x642ba7a7` not identified) 🟢 **SCHNORR-ONLY** | 1,779,190 | 1,720,040 | 59,150 | 1,747,040 | **9,150** (0.51%) | 0 (0.00%) | trace | 6: Store×3, Call×2, Log1×1 |
-| 2 | [`0x80329618…`](https://etherscan.io/tx/0x80329618f5c5261829097e2a8a079c765c6ae0ce35f6d98e09a4d246a694c8bf) | 25774472 | `0x3a618e9d…` | Bundler `multicall(bytes[])` (selector verified): 2-market `Supply`+`Withdraw` reallocation 🟢 **SCHNORR-ONLY** | 380,049 | 343,154 | 36,895 | 370,154 | **0** (0.00%) | 0 (0.00%) | trace | 18: Store×10, Call×4, Log3×3, Log1×1 |
-| 3 | [`0x1c71eb76…`](https://etherscan.io/tx/0x1c71eb76549cc6a80467e06e8bc938b7fc1e67e9575c2aece8d98345243bb218) | 25774086 | `0x9e9110cf…` | 9-market reallocation: `Supply`+`Withdraw`+`AccrueInterest` across 9 market ids (label from events; selector `0xeb7499cf` not identified)  | 725,295 | 699,768 | 25,527 | 726,768 | **0** (0.00%) | 0 (0.00%) | trace | 1: Call×1 |
-| 4 | [`0x9a08a526…`](https://etherscan.io/tx/0x9a08a526e05f5fe827840f0ec4e3d1ce31906fa5a7a9bda7677098e4d78903df) | 25774239 | `0x00000f91…` | Flash-loan-only MEV/arb bot: single `FlashLoan` event (label from event; selector `0x03f00196` not identified)  | 420,293 | 414,721 | 5,572 | 441,721 | **0** (0.00%) | 0 (0.00%) | ⚠️ **heuristic** | 5: Call×5 |
-| 5 | [`0x8e4616ac…`](https://etherscan.io/tx/0x8e4616acfaf812a41b471e139924a1bc906e03e8e1203760ae6117113682b760) | 25774072 | `0x64c18dcc…` | Bundler `multicall(bytes[])` (selector verified): 2-market `Supply`+`Withdraw` reallocation  | 312,814 | 314,184 | -1,370 | 341,184 | **0** (0.00%) | 0 (0.00%) | trace | 18: Store×10, Call×4, Log3×3, Log1×1 |
-| 6 | [`0x8d0c4018…`](https://etherscan.io/tx/0x8d0c40187a36dd2de2b64800b87d8db9b235624479d35202a11c2b2fb98fd76a) | 25774169 | `0x4095f064…` | Bundler `multicall(bytes[])` (selector verified): single-market `Supply`+`AccrueInterest`  | 157,756 | 161,582 | -3,826 | 188,582 | **0** (0.00%) | 0 (0.00%) | trace | 5: Call×3, Store×2 |
-| 7 | [`0x50305a21…`](https://etherscan.io/tx/0x50305a216cbeabbc02ad2262619090e91c6928ecc30def46af4eaab7bde99e9b) | 25774272 | `0x4095f064…` | Bundler `multicall(bytes[])` (selector verified): single-market `Supply`+`AccrueInterest`  | 179,644 | 183,470 | -3,826 | 210,470 | **0** (0.00%) | 0 (0.00%) | trace | 5: Call×3, Store×2 |
-| 8 | [`0x2d7cebfe…`](https://etherscan.io/tx/0x2d7cebfe726192fe692ccfa905b401fdedb108f5a3ecdf34aff20d2e77b3c320) | 25774308 | `0x65661941…` | Router call emitting only `SupplyCollateral` (label from event; selector `0x374f435d` not identified)  | 122,812 | 126,798 | -3,986 | 153,798 | **0** (0.00%) | 0 (0.00%) | ⚠️ **heuristic** | 3: Call×3 |
-| 9 | [`0x3dffb38b…`](https://etherscan.io/tx/0x3dffb38b03f52c07073a0ad32f336c5d3106640c2462f72204c9d6fe02534ed1) | 25774475 | `0x4095f064…` | Bundler `multicall(bytes[])` (selector verified): signature-authorised position open — `SetAuthorization`+`IncrementNonce`+`SupplyCollateral`+`Borrow`  | 360,323 | 371,754 | -11,431 | 398,754 | **0** (0.00%) | 0 (0.00%) | trace | 8: Call×6, Store×2 |
-| 10 | [`0xdc74e020…`](https://etherscan.io/tx/0xdc74e020e296fbb968edfc2ffd630bad47d557c71dabe901938315be6329c5c9) | 25774018 | `0x65661941…` | Same router selector `0x374f435d`, this time `Repay`+`AccrueInterest` (label from events)  | 134,366 | 148,620 | -14,254 | 175,620 | **0** (0.00%) | 0 (0.00%) | ⚠️ **heuristic** | 2: Call×2 |
-| 11 | [`0x1338ba16…`](https://etherscan.io/tx/0x1338ba16b0a7f61988caf43896fde0e32edac97cd7dab32bb6136bf9e77f0302) | 25774092 | `0x06cff708…` | Flash-loan-only MEV/arb bot: single `FlashLoan` event, no Morpho market mutation (label from event; selector `0x99999999` not identified)  | 405,201 | 423,289 | -18,088 | 450,289 | **0** (0.00%) | 0 (0.00%) | trace | 1: Call×1 |
-| 12 | [`0xcd59750e…`](https://etherscan.io/tx/0xcd59750e91859ec6af4209c588997b61962dcec2aad6c549ef35324476870bdf) | 25774397 | `0xc54b4e08…` | MetaMorpho vault `reallocate(((address,address,address,address,uint256),uint256)[])` (selector verified) called by an **EOA** allocator: `accrueInterest`+`withdraw` from 3 USDT markets (wstETH 86% / WBTC 86% / sUSDS 96% LLTV) then `accrueInterest`+`supply` into the idle market in 2 tranches — all selectors and the `ReallocateWithdraw`/`ReallocateSupply` topics keccak-verified  | 324,608 | 349,625 | -25,017 | 376,625 | **0** (0.00%) | 0 (0.00%) | trace | 15: Call×10, Log3×5 |
-| 13 | [`0x441cd851…`](https://etherscan.io/tx/0x441cd85183e88986305c0721c98bdd3c25edbe5ecc4578baeb964f09b8b42686) | 25774438 | `0xbbbbbbbb…` | Direct Morpho Blue `withdrawCollateral(MarketParams,uint256,address,address)` (selector verified)  | 132,478 | 158,129 | -25,651 | 185,129 | **0** (0.00%) | 0 (0.00%) | trace | 8: Store×4, Call×2, Log2×1, Log4×1 |
-| 14 | [`0xe520cf76…`](https://etherscan.io/tx/0xe520cf761e3fd61b115b0f31bd7f182a9cce43ec747b1aeaf77bf3457ebdc91f) | 25774420 | `0xbeef00a5…` | Bundler `multicall(bytes[])` (selector verified): 3-market `Supply`+`Withdraw` reallocation  | 366,689 | 393,924 | -27,235 | 420,924 | **0** (0.00%) | 0 (0.00%) | trace | 24: Store×13, Call×6, Log3×3, Log1×2 |
-| 15 | [`0x4419f117…`](https://etherscan.io/tx/0x4419f1176b254fa8b1f0cb0daa7093b223379894701addb921fa02f00f373f8d) | 25774413 | `0xbbbbbbbb…` | Direct Morpho Blue `withdraw(MarketParams,uint256,uint256,address,address)` (selector verified)  | 111,792 | 142,279 | -30,487 | 169,279 | **0** (0.00%) | 0 (0.00%) | trace | 10: Store×6, Call×2, Log2×1, Log4×1 |
-| 16 | [`0x8a27bff6…`](https://etherscan.io/tx/0x8a27bff6e7606ee0f89b63f01241c1a6a8d5cff37d726ee413df165b243c2f64) | 25774103 | `0xbbbbbbbb…` | Direct Morpho Blue `supply(MarketParams,uint256,uint256,address,bytes)` (selector verified)  | 99,912 | 130,941 | -31,029 | 157,941 | **0** (0.00%) | 0 (0.00%) | trace | 10: Store×6, Call×2, Log2×1, Log4×1 |
-| 17 | [`0xbeffded8…`](https://etherscan.io/tx/0xbeffded8df725752edea428f171d8ec2a842dcdb645977ea9cf5bedba14ca414) | 25774418 | `0x68aea7b8…` | MetaMorpho vault `reallocate(((address,address,address,address,uint256),uint256)[])` (selector verified), 5-market `Supply`+`Withdraw`; sender is an **EIP-7702-delegated EOA** (code `0xef0100…`, verified) calling the 19,730 B vault directly — not the public allocator  | 416,744 | 451,366 | -34,622 | 478,366 | **0** (0.00%) | 0 (0.00%) | trace | 18: Call×12, Log3×6 |
-| 18 | [`0x09fd0f6e…`](https://etherscan.io/tx/0x09fd0f6eb66388ce7cdc484b2020d300b5c6d519df89c5bddc73307d9e68bd80) | 25774216 | `0x591a8529…` | Liquidation of one borrower (label from `Liquidate`+`AccrueInterest` events; selector `0x1a28e979` not identified)  | 619,024 | 733,358 | -114,334 | 760,358 | **0** (0.00%) | 0 (0.00%) | ⚠️ **heuristic** | 2: Call×1, Log3×1 |
-| 19 | [`0xb1bf36be…`](https://etherscan.io/tx/0xb1bf36beaf1aeeb69e575a1230468d917ef4646c6416ab465201bca70d8c7a72) | 25774269 | `0xbeeff2c5…` | Bundler `multicall(bytes[])` (selector verified): 11-market reallocation — `Supply`+`Withdraw`+`AccrueInterest` across 11 market ids  | 1,278,050 | 1,457,568 | -179,518 | 1,484,568 | **0** (0.00%) | 0 (0.00%) | trace | 84: Store×45, Call×22, Log3×12, Log1×5 |
-| 20 | [`0x16a0a31c…`](https://etherscan.io/tx/0x16a0a31c0547f2f35018c38f0c2fa3bdcf1320e6a75f998caaa957747e9dc568) | 25774313 | `0xaad84c80…` | Flash-loan deleverage: `FlashLoan`+`Repay`+`WithdrawCollateral` (label from events; selector `0x2f5066dd` not identified)  | 1,312,558 | 1,577,595 | -265,037 | 1,604,595 | **0** (0.00%) | 0 (0.00%) | ⚠️ **heuristic** | 1: Call×1 |
+| # | tx | block | `to` | what it does | gas_used | base_estimate | surplus | Schnorr est. | Schnorr saved | est. source | state updates |
+|---:|---|---:|---|---|---:|---:|---:|---:|---:|---|---|
+| 1 | [`0x4e547494…`](https://etherscan.io/tx/0x4e547494fcf332b50465117a6467c8cb097787e4b54fd5b97ff6ff5cfec96ceb) | 25774052 | `0x5af8b1e9…` | Flash-loan leverage open: `FlashLoan`+`SupplyCollateral`+`Borrow`, 12,324 B calldata (label from events; selector `0x642ba7a7` not identified) 🟢 **SCHNORR-ONLY** | 1,779,190 | 1,720,040 | 59,150 | 1,747,040 | **9,150** (0.51%) | trace | 6: Store×3, Call×2, Log1×1 |
+| 2 | [`0x80329618…`](https://etherscan.io/tx/0x80329618f5c5261829097e2a8a079c765c6ae0ce35f6d98e09a4d246a694c8bf) | 25774472 | `0x3a618e9d…` | Bundler `multicall(bytes[])` (selector verified): 2-market `Supply`+`Withdraw` reallocation 🟢 **SCHNORR-ONLY** | 380,049 | 343,154 | 36,895 | 370,154 | **0** (0.00%) | trace | 18: Store×10, Call×4, Log3×3, Log1×1 |
+| 3 | [`0x1c71eb76…`](https://etherscan.io/tx/0x1c71eb76549cc6a80467e06e8bc938b7fc1e67e9575c2aece8d98345243bb218) | 25774086 | `0x9e9110cf…` | 9-market reallocation: `Supply`+`Withdraw`+`AccrueInterest` across 9 market ids (label from events; selector `0xeb7499cf` not identified)  | 725,295 | 699,768 | 25,527 | 726,768 | **0** (0.00%) | trace | 1: Call×1 |
+| 4 | [`0x9a08a526…`](https://etherscan.io/tx/0x9a08a526e05f5fe827840f0ec4e3d1ce31906fa5a7a9bda7677098e4d78903df) | 25774239 | `0x00000f91…` | Flash-loan-only MEV/arb bot: single `FlashLoan` event (label from event; selector `0x03f00196` not identified)  | 420,293 | 414,721 | 5,572 | 441,721 | **0** (0.00%) | ⚠️ **heuristic** | 5: Call×5 |
+| 5 | [`0x8e4616ac…`](https://etherscan.io/tx/0x8e4616acfaf812a41b471e139924a1bc906e03e8e1203760ae6117113682b760) | 25774072 | `0x64c18dcc…` | Bundler `multicall(bytes[])` (selector verified): 2-market `Supply`+`Withdraw` reallocation  | 312,814 | 314,184 | -1,370 | 341,184 | **0** (0.00%) | trace | 18: Store×10, Call×4, Log3×3, Log1×1 |
+| 6 | [`0x8d0c4018…`](https://etherscan.io/tx/0x8d0c40187a36dd2de2b64800b87d8db9b235624479d35202a11c2b2fb98fd76a) | 25774169 | `0x4095f064…` | Bundler `multicall(bytes[])` (selector verified): single-market `Supply`+`AccrueInterest`  | 157,756 | 161,582 | -3,826 | 188,582 | **0** (0.00%) | trace | 5: Call×3, Store×2 |
+| 7 | [`0x50305a21…`](https://etherscan.io/tx/0x50305a216cbeabbc02ad2262619090e91c6928ecc30def46af4eaab7bde99e9b) | 25774272 | `0x4095f064…` | Bundler `multicall(bytes[])` (selector verified): single-market `Supply`+`AccrueInterest`  | 179,644 | 183,470 | -3,826 | 210,470 | **0** (0.00%) | trace | 5: Call×3, Store×2 |
+| 8 | [`0x2d7cebfe…`](https://etherscan.io/tx/0x2d7cebfe726192fe692ccfa905b401fdedb108f5a3ecdf34aff20d2e77b3c320) | 25774308 | `0x65661941…` | Router call emitting only `SupplyCollateral` (label from event; selector `0x374f435d` not identified)  | 122,812 | 126,798 | -3,986 | 153,798 | **0** (0.00%) | ⚠️ **heuristic** | 3: Call×3 |
+| 9 | [`0x3dffb38b…`](https://etherscan.io/tx/0x3dffb38b03f52c07073a0ad32f336c5d3106640c2462f72204c9d6fe02534ed1) | 25774475 | `0x4095f064…` | Bundler `multicall(bytes[])` (selector verified): signature-authorised position open — `SetAuthorization`+`IncrementNonce`+`SupplyCollateral`+`Borrow`  | 360,323 | 371,754 | -11,431 | 398,754 | **0** (0.00%) | trace | 8: Call×6, Store×2 |
+| 10 | [`0xdc74e020…`](https://etherscan.io/tx/0xdc74e020e296fbb968edfc2ffd630bad47d557c71dabe901938315be6329c5c9) | 25774018 | `0x65661941…` | Same router selector `0x374f435d`, this time `Repay`+`AccrueInterest` (label from events)  | 134,366 | 148,620 | -14,254 | 175,620 | **0** (0.00%) | ⚠️ **heuristic** | 2: Call×2 |
+| 11 | [`0x1338ba16…`](https://etherscan.io/tx/0x1338ba16b0a7f61988caf43896fde0e32edac97cd7dab32bb6136bf9e77f0302) | 25774092 | `0x06cff708…` | Flash-loan-only MEV/arb bot: single `FlashLoan` event, no Morpho market mutation (label from event; selector `0x99999999` not identified)  | 405,201 | 423,289 | -18,088 | 450,289 | **0** (0.00%) | trace | 1: Call×1 |
+| 12 | [`0xcd59750e…`](https://etherscan.io/tx/0xcd59750e91859ec6af4209c588997b61962dcec2aad6c549ef35324476870bdf) | 25774397 | `0xc54b4e08…` | MetaMorpho vault `reallocate(((address,address,address,address,uint256),uint256)[])` (selector verified) called by an **EOA** allocator: `accrueInterest`+`withdraw` from 3 USDT markets (wstETH 86% / WBTC 86% / sUSDS 96% LLTV) then `accrueInterest`+`supply` into the idle market in 2 tranches — all selectors and the `ReallocateWithdraw`/`ReallocateSupply` topics keccak-verified  | 324,608 | 349,625 | -25,017 | 376,625 | **0** (0.00%) | trace | 15: Call×10, Log3×5 |
+| 13 | [`0x441cd851…`](https://etherscan.io/tx/0x441cd85183e88986305c0721c98bdd3c25edbe5ecc4578baeb964f09b8b42686) | 25774438 | `0xbbbbbbbb…` | Direct Morpho Blue `withdrawCollateral(MarketParams,uint256,address,address)` (selector verified)  | 132,478 | 158,129 | -25,651 | 185,129 | **0** (0.00%) | trace | 8: Store×4, Call×2, Log2×1, Log4×1 |
+| 14 | [`0xe520cf76…`](https://etherscan.io/tx/0xe520cf761e3fd61b115b0f31bd7f182a9cce43ec747b1aeaf77bf3457ebdc91f) | 25774420 | `0xbeef00a5…` | Bundler `multicall(bytes[])` (selector verified): 3-market `Supply`+`Withdraw` reallocation  | 366,689 | 393,924 | -27,235 | 420,924 | **0** (0.00%) | trace | 24: Store×13, Call×6, Log3×3, Log1×2 |
+| 15 | [`0x4419f117…`](https://etherscan.io/tx/0x4419f1176b254fa8b1f0cb0daa7093b223379894701addb921fa02f00f373f8d) | 25774413 | `0xbbbbbbbb…` | Direct Morpho Blue `withdraw(MarketParams,uint256,uint256,address,address)` (selector verified)  | 111,792 | 142,279 | -30,487 | 169,279 | **0** (0.00%) | trace | 10: Store×6, Call×2, Log2×1, Log4×1 |
+| 16 | [`0x8a27bff6…`](https://etherscan.io/tx/0x8a27bff6e7606ee0f89b63f01241c1a6a8d5cff37d726ee413df165b243c2f64) | 25774103 | `0xbbbbbbbb…` | Direct Morpho Blue `supply(MarketParams,uint256,uint256,address,bytes)` (selector verified)  | 99,912 | 130,941 | -31,029 | 157,941 | **0** (0.00%) | trace | 10: Store×6, Call×2, Log2×1, Log4×1 |
+| 17 | [`0xbeffded8…`](https://etherscan.io/tx/0xbeffded8df725752edea428f171d8ec2a842dcdb645977ea9cf5bedba14ca414) | 25774418 | `0x68aea7b8…` | MetaMorpho vault `reallocate(((address,address,address,address,uint256),uint256)[])` (selector verified), 5-market `Supply`+`Withdraw`; sender is an **EIP-7702-delegated EOA** (code `0xef0100…`, verified) calling the 19,730 B vault directly — not the public allocator  | 416,744 | 451,366 | -34,622 | 478,366 | **0** (0.00%) | trace | 18: Call×12, Log3×6 |
+| 18 | [`0x09fd0f6e…`](https://etherscan.io/tx/0x09fd0f6eb66388ce7cdc484b2020d300b5c6d519df89c5bddc73307d9e68bd80) | 25774216 | `0x591a8529…` | Liquidation of one borrower (label from `Liquidate`+`AccrueInterest` events; selector `0x1a28e979` not identified)  | 619,024 | 733,358 | -114,334 | 760,358 | **0** (0.00%) | ⚠️ **heuristic** | 2: Call×1, Log3×1 |
+| 19 | [`0xb1bf36be…`](https://etherscan.io/tx/0xb1bf36beaf1aeeb69e575a1230468d917ef4646c6416ab465201bca70d8c7a72) | 25774269 | `0xbeeff2c5…` | Bundler `multicall(bytes[])` (selector verified): 11-market reallocation — `Supply`+`Withdraw`+`AccrueInterest` across 11 market ids  | 1,278,050 | 1,457,568 | -179,518 | 1,484,568 | **0** (0.00%) | trace | 84: Store×45, Call×22, Log3×12, Log1×5 |
+| 20 | [`0x16a0a31c…`](https://etherscan.io/tx/0x16a0a31c0547f2f35018c38f0c2fa3bdcf1320e6a75f998caaa957747e9dc568) | 25774313 | `0xaad84c80…` | Flash-loan deleverage: `FlashLoan`+`Repay`+`WithdrawCollateral` (label from events; selector `0x2f5066dd` not identified)  | 1,312,558 | 1,577,595 | -265,037 | 1,604,595 | **0** (0.00%) | ⚠️ **heuristic** | 1: Call×1 |
 
 Full hashes, in the same order:
 
@@ -110,17 +110,17 @@ Full hashes, in the same order:
 19. `0xb1bf36beaf1aeeb69e575a1230468d917ef4646c6416ab465201bca70d8c7a72`
 20. `0x16a0a31c0547f2f35018c38f0c2fa3bdcf1320e6a75f998caaa957747e9dc568`
 
-## ⭐ Transactions where Schnorr saves but BLS does not
+## ⭐ Transactions near the Schnorr floor
 
-These are the headline result: the surplus (`gas_used − base_estimate`) lands inside the 50,000–250,000 band, so Schnorr's cheaper floor turns a non-candidate into a candidate.
+These are the headline result: the two transactions whose surplus (`gas_used − base_estimate`) comes closest to, or clears, the 50,000 Schnorr floor.
 
-| tx | what it does | gas_used | base_estimate | **surplus** | Schnorr saved | BLS saved | est. source |
-|---|---|---:|---:|---:|---:|---:|---|
-| `0x4e547494fcf332b5…` | Flash-loan leverage open: `FlashLoan`+`SupplyCollateral`+`Borrow`, 12,324 B calldata (label from events; selector `0x642ba7a7` not identified) | 1,779,190 | 1,720,040 | **59,150** | **9,150** (0.51%) | 0 | trace |
-| `0x80329618f5c52618…` | Bundler `multicall(bytes[])` (selector verified): 2-market `Supply`+`Withdraw` reallocation | 380,049 | 343,154 | **36,895** | **0** (0.00%) | 0 | trace |
+| tx | what it does | gas_used | base_estimate | **surplus** | Schnorr saved | est. source |
+|---|---|---:|---:|---:|---:|---|
+| `0x4e547494fcf332b5…` | Flash-loan leverage open: `FlashLoan`+`SupplyCollateral`+`Borrow`, 12,324 B calldata (label from events; selector `0x642ba7a7` not identified) | 1,779,190 | 1,720,040 | **59,150** | **9,150** (0.51%) | trace |
+| `0x80329618f5c52618…` | Bundler `multicall(bytes[])` (selector verified): 2-market `Supply`+`Withdraw` reallocation | 380,049 | 343,154 | **36,895** | **0** (0.00%) | trace |
 
-- `0x4e547494fcf332b50465117a6467c8cb097787e4b54fd5b97ff6ff5cfec96ceb` — surplus **59,150**, i.e. 32,150 gas above the Schnorr floor and 190,850 gas below the BLS floor.
-- `0x80329618f5c5261829097e2a8a079c765c6ae0ce35f6d98e09a4d246a694c8bf` — surplus **36,895**, i.e. **13,105 gas BELOW the 50,000 Schnorr floor** (it cleared the old 27,000 floor by 9,895) and 213,105 gas below the BLS floor.
+- `0x4e547494fcf332b50465117a6467c8cb097787e4b54fd5b97ff6ff5cfec96ceb` — surplus **59,150**, i.e. 32,150 gas above the Schnorr floor.
+- `0x80329618f5c5261829097e2a8a079c765c6ae0ce35f6d98e09a4d246a694c8bf` — surplus **36,895**, i.e. **13,105 gas BELOW the 50,000 Schnorr floor** (it cleared the old 27,000 floor by 9,895).
 
 ## Follow-up: the top result was re-measured and it collapsed
 
@@ -134,9 +134,8 @@ The highest-scoring transaction in the first pass was a heuristic fallback. It h
 | base_estimate | 253,881 | **349,625** |
 | surplus | 70,727 | **-25,017** |
 | Schnorr savings | 43,727 (13.47%) *— heuristic, old 27,000 floor* | **0 (0.00%)** |
-| BLS savings | 0 | 0 |
 
-The heuristic understated the replay cost by **95,744 gas** (27% of the true `base_estimate`). An apparent 13.47% win is in fact a **25,017 gas loss** — not a candidate under either scheme.
+The heuristic understated the replay cost by **95,744 gas** (27% of the true `base_estimate`). An apparent 13.47% win is in fact a **25,017 gas loss** — not a candidate.
 
 ### Why the first pass fell back (it was not a trace failure)
 
@@ -198,18 +197,18 @@ The first pass had exactly one `Liquidate` in its 501-block window, and it fell 
 
 All 6 were successful liquidations with **zero bad debt realized** (`badDebtAssets`/`badDebtShares` both 0 in every `Liquidate` event, decoded from the log data).
 
-| tx | block | idx | gas_used | base_estimate | surplus | Schnorr saved | BLS saved | outcome |
-|---|---:|---:|---:|---:|---:|---:|---:|---|
-| [`0x584c52d9…`](https://etherscan.io/tx/0x584c52d957c165432f32e42e0ebacc4683d0e6f9cb251d926060701f8f71322b) | 25766097 | 11 | 362,143 | 382,655 | −20,512 | 0 | 0 | ✅ **trace** |
-| [`0x482fb3b2…`](https://etherscan.io/tx/0x482fb3b2dfb2d336237a0112285a14d7847af91006e64e6fd442f11864360e9c) | 25774008 | 625 | 457,129 | 462,926 | −5,797 | 0 | 0 | ✅ **trace** |
-| [`0x9a5fecc6…`](https://etherscan.io/tx/0x9a5fecc64422a0e8f8edb3b914eaed17cd675a09f1e2811a79d0cf0181893851) | 25767442 | 0 | 2,661,881 | 2,335,360 | 326,521 | 276,521 (10.39%) | 76,521 (2.87%) | ⚠️ heuristic — **could not be measured**, see below |
-| [`0x641b76f4…`](https://etherscan.io/tx/0x641b76f483f45a02815116bb7b0213530d0f2aee019b7cc4840a2d71a2940f0e) | 25764980 | 242 | 721,933 | 577,085 | 144,848 | 94,848 (13.14%) | 0 | ⚠️ heuristic — **could not be measured**, see below |
-| [`0x6ed1eaa3…`](https://etherscan.io/tx/0x6ed1eaa33eff8b3b992ee3fc55d5548d2072edd5f32ba437854d784dc9e62946) | 25770383 | 292 | 307,371 | 273,856 | 33,515 | 0 (0.00%) | 0 | ⚠️ heuristic — **could not be measured**, see below |
-| [`0x09fd0f6e…`](https://etherscan.io/tx/0x09fd0f6eb66388ce7cdc484b2020d300b5c6d519df89c5bddc73307d9e68bd80) | 25774216 | 76 | 619,024 | 733,358 | −114,334 | 0 | 0 | ⚠️ heuristic — **the original tx, re-run in isolation, still cannot be measured** |
+| tx | block | idx | gas_used | base_estimate | surplus | Schnorr saved | outcome |
+|---|---:|---:|---:|---:|---:|---:|---|
+| [`0x584c52d9…`](https://etherscan.io/tx/0x584c52d957c165432f32e42e0ebacc4683d0e6f9cb251d926060701f8f71322b) | 25766097 | 11 | 362,143 | 382,655 | −20,512 | 0 | ✅ **trace** |
+| [`0x482fb3b2…`](https://etherscan.io/tx/0x482fb3b2dfb2d336237a0112285a14d7847af91006e64e6fd442f11864360e9c) | 25774008 | 625 | 457,129 | 462,926 | −5,797 | 0 | ✅ **trace** |
+| [`0x9a5fecc6…`](https://etherscan.io/tx/0x9a5fecc64422a0e8f8edb3b914eaed17cd675a09f1e2811a79d0cf0181893851) | 25767442 | 0 | 2,661,881 | 2,335,360 | 326,521 | 276,521 (10.39%) | ⚠️ heuristic — **could not be measured**, see below |
+| [`0x641b76f4…`](https://etherscan.io/tx/0x641b76f483f45a02815116bb7b0213530d0f2aee019b7cc4840a2d71a2940f0e) | 25764980 | 242 | 721,933 | 577,085 | 144,848 | 94,848 (13.14%) | ⚠️ heuristic — **could not be measured**, see below |
+| [`0x6ed1eaa3…`](https://etherscan.io/tx/0x6ed1eaa33eff8b3b992ee3fc55d5548d2072edd5f32ba437854d784dc9e62946) | 25770383 | 292 | 307,371 | 273,856 | 33,515 | 0 (0.00%) | ⚠️ heuristic — **could not be measured**, see below |
+| [`0x09fd0f6e…`](https://etherscan.io/tx/0x09fd0f6eb66388ce7cdc484b2020d300b5c6d519df89c5bddc73307d9e68bd80) | 25774216 | 76 | 619,024 | 733,358 | −114,334 | 0 | ⚠️ heuristic — **the original tx, re-run in isolation, still cannot be measured** |
 
 ### The two that could actually be measured both show zero savings
 
-`0x584c52d9…` and `0x482fb3b2…` both completed the real `StateChangeHandler` replay and both land where the rest of this survey lands: negative surplus, zero savings under either scheme. `0x584c52d9…` is a flash-loan liquidation — its 8-update diff is almost entirely reentrancy-lock `Store`s (`Store`×6) around two `Call`s (a `flashLoan(address,uint256,bytes)` into Morpho Blue and a USDC `approve(address,uint256)`, both selectors keccak-verified) — the same "leverage bundle nets out to a lock and a call" shape seen earlier in `0x4e547494…`, except here the surplus is negative instead of positive. `0x482fb3b2…`'s diff is 4 `Call`s only, selectors `0xd8eabcb8` (matches Morpho Blue's `liquidate((address,address,address,address,uint256),address,uint256,uint256,bytes)`, keccak-verified) plus two selectors (`0x500d2a0f`, `0x96986a8d`) I could not identify against any signature I constructed — private liquidator-contract functions, not decompiled.
+`0x584c52d9…` and `0x482fb3b2…` both completed the real `StateChangeHandler` replay and both land where the rest of this survey lands: negative surplus, zero savings. `0x584c52d9…` is a flash-loan liquidation — its 8-update diff is almost entirely reentrancy-lock `Store`s (`Store`×6) around two `Call`s (a `flashLoan(address,uint256,bytes)` into Morpho Blue and a USDC `approve(address,uint256)`, both selectors keccak-verified) — the same "leverage bundle nets out to a lock and a call" shape seen earlier in `0x4e547494…`, except here the surplus is negative instead of positive. `0x482fb3b2…`'s diff is 4 `Call`s only, selectors `0xd8eabcb8` (matches Morpho Blue's `liquidate((address,address,address,address,uint256),address,uint256,uint256,bytes)`, keccak-verified) plus two selectors (`0x500d2a0f`, `0x96986a8d`) I could not identify against any signature I constructed — private liquidator-contract functions, not decompiled.
 
 **On the only two liquidations this tool can actually measure, liquidations are not a candidate.**
 
@@ -228,7 +227,7 @@ This is a materially different finding from the first pass, where the one liquid
 All three heuristic liquidations have diffs that are **entirely or almost entirely `Call` updates**: `0x9a5fecc6…` is 8× `Call` and nothing else; `0x641b76f4…` is 3× `Call` + 1× `Log2`; `0x6ed1eaa3…` is 3× `Call` only. This is exactly the diff shape already shown, in this same document, to make the heuristic unreliable: `crates/core/src/heuristic.rs:40` prices every `Call` update at **zero gas**. The one time this survey had a chance to compare a heuristic estimate against a real measurement on a `Call`-heavy diff — `0xcd59750e…`, the reallocation in the *"Follow-up"* section above — the heuristic understated `base_estimate` by **95,744 gas across 10 `Call` updates** (~9,574 gas/call), enough to turn a reported 13.47% Schnorr win into a real loss.
 
 Applying that same per-call magnitude as a sanity check, not a substitute for measurement:
-- `0x9a5fecc6…` (8 calls, reported 11.25% Schnorr / 2.87% BLS): a correction on the order of ~76,000 gas would erase its entire 76,521-gas BLS win outright and cut deep into its 299,521-gas Schnorr win.
+- `0x9a5fecc6…` (8 calls, reported 11.25% Schnorr): a correction on the order of ~76,000 gas would cut deep into its 299,521-gas Schnorr win.
 - `0x641b76f4…` (3 calls, reported 16.32% Schnorr): a correction on the order of ~29,000 gas would erase more than half of its 117,848-gas Schnorr margin.
 - `0x6ed1eaa3…` (3 calls, reported 2.12% Schnorr): its entire margin is only 6,515 gas — smaller than even a single call's worth of the observed correction magnitude.
 
@@ -236,9 +235,9 @@ None of this proves the true numbers are zero — the per-call correction is not
 
 ## What the numbers say structurally
 
-### Headline: no transaction in this sample saved anything under BLS
+### Headline: 2 of 20 transactions cleared the Schnorr floor
 
-**0 of 20** transactions cleared the 250,000 BLS floor. **2 of 20** cleared the 50,000 Schnorr floor. Every single win in this sample is a Schnorr-only win — the 223,000-gas band is doing all of the work here. On this evidence, Morpho is a protocol GasKiller can only address with the cheaper signature scheme.
+**2 of 20** transactions cleared the 50,000 Schnorr floor.
 
 ### The controlling variable is surplus, and surplus is usually negative
 
