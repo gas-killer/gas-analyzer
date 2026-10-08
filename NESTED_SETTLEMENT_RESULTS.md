@@ -84,3 +84,67 @@ Doppler (3 of 13).
 | Railgun "gas price too low" | Railgun ×2 |
 | timed out (15 min) | Centrifuge, ENS, Grove, Morpho, Securitize (1 each) |
 | RPC error during replay of earlier txs in the block | World ID ×1 |
+
+## Who to contact
+
+Only the protocols where nesting produced a saving are listed, ordered by result. ✅ means the
+channel was seen on the organisation's own site or code. ⚠️ means it came from search or a
+summary and still needs checking in a browser. Contacts for Railgun, Linea and Privacy Pools
+are repeated from `OUTREACH_CONTACTS.md`.
+
+### Securitize: 86–88% on BUIDL transfers
+- **Who:** Securitize, Inc., the tokenization and transfer-agent platform behind BlackRock's BUIDL.
+  The saving is in their own compliance-service contract, so this is a conversation with
+  Securitize, not BlackRock.
+- **Email:** `info@securitize.io` ✅ (in the site's own code). The site also has a contact form
+  at `securitize.io/contact-form` and a `partner-ecosystem` page ✅. Both are routes inside the
+  app; open them in a browser.
+- **X** [`@Securitize`](https://twitter.com/Securitize) ✅, **LinkedIn**
+  <https://www.linkedin.com/company/securitize/> ✅.
+- **Developer docs:** <https://sec-connect-api-docs.securitize.io/> ⚠️
+- **Pitch:** every transfer spends about 1M gas on compliance checks. Nested settlement removes
+  86–88% of it, and it still clears the BLS floor.
+
+### Usual: ~55% on USD0 minting
+- **Who:** Usual Labs (France) ⚠️. Governance runs through the Usual DAO.
+- **Contact form** <https://usual.money/form/contact-us> ✅
+- **X** [`@usualmoney`](https://x.com/usualmoney) ✅, **LinkedIn**
+  <https://www.linkedin.com/company/usualmoney> ✅
+- **Discord** <https://discord.usual.money> ✅, Snapshot governance `usualmoney.eth` ✅,
+  docs <https://docs.usual.money> ✅
+- No governance forum or partnerships email found.
+
+### World ID: 50–55% on `registerIdentities`
+- **Who:** Tools for Humanity (main contributor) and the World Foundation
+  (<https://foundation.world.org>).
+- **Developers** <https://world.org/developers> ✅, docs <https://docs.world.org> ✅,
+  GitHub <https://github.com/worldcoin> ✅. The identity-manager contracts live there, so a
+  technical issue or discussion is a reasonable first contact.
+- **X** [`@worldnetwork`](https://x.com/worldnetwork) ✅. Enterprise page
+  <https://world.org/solutions> ✅, grants <https://world.org/grants> ✅.
+- No Discord or BD email found.
+- **Pitch:** the saving is entirely in the Groth16 verifier. Under the old analyzer this
+  scored 0% only because the verifier sits behind a `CALL`.
+
+### Railgun: 55% on RelayAdapt
+- **Governance** <https://governance.railgun.org>. Posting needs staked RAIL, so find a delegate.
+- **Telegram** `@railgunproject`, **GitHub** <https://github.com/Railgun-Community>. No email.
+- Railgun already measured 78.72% on direct `transact` calls. This adds the RelayAdapt path,
+  which used to score 0%.
+
+### Linea: 54% on the second proof path
+- **Contact:** "Speak to an expert" form at <https://linea.build/contact/inquiries> ✅
+- Linea's direct path already measured 54.54%. Nested settlement brings its other verify path,
+  which sends the proof to `PlonkVerifierFull`, up to the same level.
+
+### Privacy Pools (0xbow): 17–51% across relays, deposits and `ragequit`
+- **Who:** 0xbow <https://0xbow.io>. GitHub <https://github.com/0xbow-io/privacy-pools-core> ✅,
+  docs <https://docs.privacypools.com> ✅.
+- **X** `@0xbowio` ⚠️. 0xbow.io has a "Contact Us" item that needs a browser.
+- **Pitch:** the Entrypoint relay used to score 0% and now saves 32–46%. Combined with the
+  59.59% already measured on the pool, every main path now saves. The USDT relay and the
+  PPRouter deposit are still blocked by the analyzer bug in the failures report.
+
+### Chainlink: 6–7% (low priority)
+- **Contact page** <https://chain.link/contact> ✅ (loads; form contents not checked).
+- Only 2 of 6 price updates save, and only slightly. Not worth leading with.
