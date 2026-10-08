@@ -2759,3 +2759,41 @@ Present in measured transactions but never matched. Labels in the table come fro
 - `0xeb7499cf` — 9-market reallocation (from events)
 - `0xed48907e` — Pendle router action
 
+
+## Derive V3 — ZK settlement on Ethereum, measured two days after launch
+
+Added 2026-10-08. Derive (formerly Lyra) moved from Derive Chain to Ethereum mainnet on
+2026-10-06. Its matching engine runs in a zkVM, and each batch is settled by a proof verified on L1.
+
+**Contracts:**
+
+| contract | address | role |
+|---|---|---|
+| VerifiableApp | `0xd330145c17fb6ef2a21acf1275ce683a305f58bb` | proof submission, `0xcaf85453` |
+| OnchainActionManager | `0xe366cca474968e33b777e13905829a3b800cfad3` | deposits and withdrawals |
+| WithdrawalOutbox | `0x7c743d79c9c595ce332314503d84cbbb4e85fa63` | payouts |
+| proof verifier | `0x3b6041173b80e77f038f3f2c0f9744f04837185e` | called with `STATICCALL`, ~291–298k gas |
+
+**Proof submissions:**
+- 281 in ~46.6 hours (blocks 26,135,150–26,149,120), about **145 a day**.
+- All come from one sender, `0x000000c8…`, and all succeeded.
+- Median 448k gas, max 842k.
+- The verifier is a read-only call, so its gas is removable. Each submission makes only one small
+  regular `CALL` (~8.7k, to the outbox).
+
+| tx | gas used | saved (Schnorr) | % | BLS % |
+|---|---:|---:|---:|---:|
+| [`0xf83f7406…`](https://etherscan.io/tx/0xf83f74064b25f3a5b0533d1f1e02a891eca4c91b5d4363b5e4dffed26eb22ebb) | 442,743 | 288,710 | **65.21%** | 20.04% |
+| [`0x60ff3054…`](https://etherscan.io/tx/0x60ff3054b8337ce75a7e6995c81bb877e6831cfc61e6ad56fe24d65b1e598af2) | 448,335 | 290,698 | **64.84%** | 20.23% |
+| [`0xe66eaac6…`](https://etherscan.io/tx/0xe66eaac6d541a0e548e35ddc543edcdb5b650fa3ce872ff8a3ed752a4dc3b4c3) | 448,395 | 290,722 | **64.84%** | 20.23% |
+| [`0x333c2069…`](https://etherscan.io/tx/0x333c2069a02734879b6dd07c6444f778ba2373db7f089e5cab9692424d652cc8) | 573,819 | 292,750 | **51.02%** | 16.16% |
+| [`0x8a320a2a…`](https://etherscan.io/tx/0x8a320a2a28bc2292c66817374e77889aef59662996702e52731c5db7e30ecfc0) | 842,171 | 298,986 | **35.50%** | 11.75% |
+
+All five rows are measured replays with the plain analyzer, not the heuristic fallback.
+- **The saving is flat at ~290k gas per submission:** the proof check is removable, while the
+  rest of the transaction (applying the batch) grows with batch size.
+- **Volume:** ~145 submissions a day × ~290k is about **42M gas a day**, roughly 1.3B gas a month.
+  That is the highest recurring volume of any proof-verification target in this survey; Starknet
+  is ~375M gas a month.
+- **Not measured:** deposits and withdrawals through `OnchainActionManager` (~145k gas each).
+  These are mostly token transfers, so little is expected.
