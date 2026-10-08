@@ -79,6 +79,54 @@ both failed on `HTTP 429` (QuickNode's 50 req/s limit) while replaying the earli
 - **Nested mode makes the limit easier to hit,** because it replays the earlier transactions in the block for every frame.
 - **Possible improvements:** cache the replayed state across frames, or retry on 429.
 
+## Added after the full run (2026-10-08)
+
+The full batch over 127 call-blocked transactions (`NESTED_SETTLEMENT_RESULTS.md`) found more
+cases of the same isolation problem as cases 1 and 2. It also found two new failure types.
+
+### More "priced in isolation" reverts
+
+**Ondo instant mint** ([`0x10fdab16…`](https://etherscan.io/tx/0x10fdab165e),
+[`0x089be390…`](https://etherscan.io/tx/0x089be390aa))
+- **fails at:** op 1, `USDY.burn`, with `"ERC20: burn amount exceeds balance"`.
+- **This is a regression.** The old analyzer measured both transactions (0%, under the floor). Now they produce nothing.
+
+**Grove** ([`0x0ce6843c…`](https://etherscan.io/tx/0x0ce6843c42))
+- **fails at:** op 1, a `CALL` to `MainnetController`, with `"ERC20: transfer amount exceeds balance"`.
+
+**Morpho Bundler3** ([`0xdc74e020…`](https://etherscan.io/tx/0xdc74e020e2))
+- **fails at:** op 0, a `CALL` to `GeneralAdapter1`, with `"ERC20: transfer amount exceeds allowance"`.
+- The old analyzer also failed on this one; the survey used its heuristic fallback (`heur`).
+
+### Doppler `create`: the token factory's CREATE fails
+
+Seven `Airlock.create` transactions fail.
+- **fails at:** op 0, the `CALL` to the token factory (`0xb5d97103`), which reverts with
+  `0x30116425`. That is probably Solady's `DeploymentFailed()`, raised when a CREATE/CREATE2 fails.
+- **Not diagnosed further.**
+- The survey had these as `heur` too, so the old analyzer never measured them either.
+
+### Performance: earlier transactions in the block are replayed once per frame
+
+`estimate_state_changes_gas_with_preceding` builds a fresh `CacheDB` and replays every earlier
+transaction in the block on each call.
+- The `--owned` path calls it once per frame, for the root-only baseline and again for the nested tree.
+- For a transaction late in a busy block, that is thousands of `eth_getProof` /
+  `eth_getStorageAt` calls repeated 3–5 times, all fired concurrently.
+- **Effect on our run:** it hit our RPC's 50 req/s limit constantly (HTTP 429), and one
+  transaction took over 10 minutes.
+
+**What I did, locally only (not pushed):** cached the `CacheDB.cache` after the first replay
+and reused it for every later frame of the same transaction. Results were identical, and the
+Privacy Pools relay went from minutes to 27 seconds.
+
+**Suggestions:**
+- replay once per transaction and clone the state for each frame;
+- bound the concurrency of the prefetch `JoinSet`, or retry on 429.
+
+Five transactions still timed out at 15 minutes even with the cache (Centrifuge, ENS, Grove,
+Morpho and Securitize, one each).
+
 ## Reproduce
 
 ```bash
