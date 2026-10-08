@@ -86,15 +86,15 @@ cases of the same isolation problem as cases 1 and 2. It also found two new fail
 
 ### More "priced in isolation" reverts
 
-**Ondo instant mint** ([`0x10fdab16…`](https://etherscan.io/tx/0x10fdab165e),
-[`0x089be390…`](https://etherscan.io/tx/0x089be390aa))
+**Ondo instant mint** ([`0x10fdab16…`](https://etherscan.io/tx/0x10fdab165e2a37d70223b9546f80e9f7a248e1a0ccacd6638bbc66d565de8c35),
+[`0x089be390…`](https://etherscan.io/tx/0x089be390aab1f47562520e714e3d96b270c279b0c2a7b2876c933ee390a264b0))
 - **fails at:** op 1, `USDY.burn`, with `"ERC20: burn amount exceeds balance"`.
 - **This is a regression.** The old analyzer measured both transactions (0%, under the floor). Now they produce nothing.
 
-**Grove** ([`0x0ce6843c…`](https://etherscan.io/tx/0x0ce6843c42))
+**Grove** ([`0x0ce6843c…`](https://etherscan.io/tx/0x0ce6843c42b48bb0589ad6a26afa8d9eee4772b76b7e6b6dbb5146867abd4be4))
 - **fails at:** op 1, a `CALL` to `MainnetController`, with `"ERC20: transfer amount exceeds balance"`.
 
-**Morpho Bundler3** ([`0xdc74e020…`](https://etherscan.io/tx/0xdc74e020e2))
+**Morpho Bundler3** ([`0xdc74e020…`](https://etherscan.io/tx/0xdc74e020e296fbb968edfc2ffd630bad47d557c71dabe901938315be6329c5c9))
 - **fails at:** op 0, a `CALL` to `GeneralAdapter1`, with `"ERC20: transfer amount exceeds allowance"`.
 - The old analyzer also failed on this one; the survey used its heuristic fallback (`heur`).
 
