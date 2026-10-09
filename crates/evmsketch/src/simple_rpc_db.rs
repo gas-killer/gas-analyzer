@@ -587,9 +587,10 @@ mod tests {
         );
     }
 
-    /// A nonexistent account reported with `codeHash: 0x0` must be stored with
-    /// `KECCAK_EMPTY` on both the prefetch and `basic_ref` paths, otherwise revm
-    /// rejects a CREATE/CREATE2 to that address as a collision.
+    /// A nonexistent account reported with `codeHash: 0x0` must reach revm as
+    /// `KECCAK_EMPTY` from `basic_ref`, otherwise revm rejects a CREATE/CREATE2 to
+    /// that address as a collision. The prefetch assertion is only a consistency
+    /// check: `CacheDB::insert_account_info` already maps a zero hash to `KECCAK_EMPTY`.
     #[tokio::test(flavor = "current_thread")]
     async fn test_zero_proof_code_hash_is_empty() {
         use alloy_provider::RootProvider;
