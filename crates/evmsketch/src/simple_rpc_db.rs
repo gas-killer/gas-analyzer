@@ -59,6 +59,17 @@ fn is_method_not_found(err: &TransportError) -> bool {
     msg.contains("method not found") || msg.contains("eth_getproof is not supported")
 }
 
+/// Some nodes report a nonexistent account's `codeHash` as zero rather than `keccak256("")`;
+/// revm treats any hash other than `KECCAK_EMPTY` as deployed code, so a CREATE to that
+/// address would collide.
+fn proof_code_hash(code_hash: B256) -> B256 {
+    if code_hash.is_zero() {
+        KECCAK_EMPTY
+    } else {
+        code_hash
+    }
+}
+
 /// A minimal revm database backed by standard RPC calls.
 ///
 /// `basic_ref` attempts `eth_getProof` + `eth_getCode` concurrently (2 RPCs per
@@ -187,7 +198,8 @@ impl SimpleRpcDb {
             }
         };
 
-        let bytecode = if proof.code_hash != KECCAK_EMPTY {
+        let code_hash = proof_code_hash(proof.code_hash);
+        let bytecode = if code_hash != KECCAK_EMPTY {
             match code_res {
                 Ok(code_bytes) => Bytecode::new_raw(code_bytes),
                 Err(e) => {
@@ -203,7 +215,7 @@ impl SimpleRpcDb {
         GetProofOutcome::Ok(AccountInfo {
             balance: proof.balance,
             nonce: proof.nonce,
-            code_hash: proof.code_hash,
+            code_hash,
             code: Some(bytecode),
         })
     }
@@ -329,7 +341,8 @@ pub async fn prefetch_slots_into_cache(
             }
         };
 
-        let bytecode = if proof.code_hash != KECCAK_EMPTY {
+        let code_hash = proof_code_hash(proof.code_hash);
+        let bytecode = if code_hash != KECCAK_EMPTY {
             match code_res {
                 Ok(b) => Bytecode::new_raw(b),
                 Err(e) => {
@@ -350,7 +363,7 @@ pub async fn prefetch_slots_into_cache(
             AccountInfo {
                 balance: proof.balance,
                 nonce: proof.nonce,
-                code_hash: proof.code_hash,
+                code_hash,
                 code: Some(bytecode),
             },
         );
@@ -571,6 +584,63 @@ mod tests {
         assert!(
             asserter.pop_response().is_none(),
             "unexpected extra RPC call after prefetch"
+        );
+    }
+
+    /// A nonexistent account reported with `codeHash: 0x0` must reach revm as
+    /// `KECCAK_EMPTY` from `basic_ref`, otherwise revm rejects a CREATE/CREATE2 to
+    /// that address as a collision. The prefetch assertion is only a consistency
+    /// check: `CacheDB::insert_account_info` already maps a zero hash to `KECCAK_EMPTY`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_zero_proof_code_hash_is_empty() {
+        use alloy_provider::RootProvider;
+        use alloy_provider::network::AnyNetwork;
+        use alloy_rpc_client::RpcClient;
+        use alloy_transport::mock::{Asserter, MockTransport};
+        use std::collections::HashMap;
+
+        use alloy::primitives::address;
+
+        let addr = address!("0000000000000000000000000000000000000def");
+        let zero_hash_proof = serde_json::json!({
+            "address": format!("{addr:#x}"),
+            "balance": "0x0",
+            "codeHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "nonce": "0x0",
+            "storageHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "accountProof": [],
+            "storageProof": []
+        });
+
+        let asserter = Asserter::new();
+        for _ in 0..2 {
+            asserter.push_success(&zero_hash_proof);
+            asserter.push_success(&"0x");
+        }
+
+        let transport = MockTransport::new(asserter.clone());
+        let client = RpcClient::new(transport, true);
+        let provider: RootProvider<AnyNetwork> = RootProvider::new(client);
+
+        let db = SimpleRpcDb::new(provider, 42);
+        let fetched = db
+            .fetch_account(addr)
+            .await
+            .expect("fetch should succeed")
+            .expect("account info should be returned");
+        assert_eq!(fetched.code_hash, KECCAK_EMPTY);
+
+        let mut cache_db = CacheDB::new(db);
+        let mut hints = HashMap::new();
+        hints.insert(addr, vec![]);
+        prefetch_slots_into_cache(&mut cache_db, &hints)
+            .await
+            .expect("prefetch should succeed");
+        assert_eq!(cache_db.cache.accounts[&addr].info.code_hash, KECCAK_EMPTY);
+
+        assert!(
+            asserter.pop_response().is_none(),
+            "unexpected extra RPC call"
         );
     }
 
