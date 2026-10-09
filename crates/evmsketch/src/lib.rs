@@ -589,6 +589,43 @@ impl DefaultEvmSketchExecutor {
         ))
     }
 
+    /// Like [`Self::estimate_state_changes_gas_with_hints_timed`] for a nested tree: the frames
+    /// run in execution order on one state (see [`gas_analyzer_estimator::estimate_frame_tree_gas`]),
+    /// returning each frame's gas in frame order.
+    pub async fn estimate_frame_tree_gas_with_hints_timed(
+        &self,
+        frames: &[FrameProgram],
+        caller_address: Address,
+        storage_hints: &HashMap<Address, Vec<B256>>,
+    ) -> Result<(Vec<u64>, EstimateTimings)> {
+        let state_block = self.anchor_block_number().saturating_sub(1);
+        let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
+        let mut cache_db = CacheDB::new(simple_db);
+
+        let prefetch_started = Instant::now();
+        prefetch_slots_into_cache(&mut cache_db, storage_hints)
+            .await
+            .context("storage slot prefetch failed")?;
+        let prefetch = prefetch_started.elapsed();
+
+        let sim_env = self.sim_env();
+        let execute_started = Instant::now();
+        let frame_gas = gas_analyzer_estimator::estimate_frame_tree_gas(
+            &mut cache_db,
+            frames,
+            caller_address,
+            sim_env.value,
+            &sim_env,
+        )?;
+        Ok((
+            frame_gas,
+            EstimateTimings {
+                prefetch,
+                execute: execute_started.elapsed(),
+            },
+        ))
+    }
+
     /// Build a `SimEnv` from the anchored block header.
     ///
     /// `gas_price` defaults to 0 since it is a transaction-level field;
@@ -730,6 +767,22 @@ impl GasKillerEvmSketchDefault {
         preceding_txs: &[PrecedingTx],
         tx_value: U256,
     ) -> Result<u64> {
+        let (mut cache_db, mut sim_env) = self.state_after_preceding(preceding_txs)?;
+        sim_env.value = tx_value;
+        gas_analyzer_estimator::estimate_state_changes_gas(
+            &mut cache_db,
+            contract_address,
+            caller_address,
+            state_updates,
+            &sim_env,
+        )
+    }
+
+    /// The mid-block state `preceding_txs` leave, and the block's simulation environment.
+    fn state_after_preceding(
+        &self,
+        preceding_txs: &[PrecedingTx],
+    ) -> Result<(CacheDB<SimpleRpcDb>, SimEnvOpts)> {
         // Source storage from block N-1 (pre-block state). Anchoring to
         // `block_number` itself makes RPC reads return state at the *end* of
         // block N — after every tx in that block (including the one we're
@@ -748,7 +801,7 @@ impl GasKillerEvmSketchDefault {
         let state_block = self.executor.anchor_block_number().saturating_sub(1);
         let simple_db = SimpleRpcDb::new(self.executor.sketch.provider.clone(), state_block);
         let mut cache_db = CacheDB::new(simple_db);
-        let mut sim_env = self.executor.sim_env();
+        let sim_env = self.executor.sim_env();
 
         if !preceding_txs.is_empty() {
             // Prefetch storage slots declared in preceding-tx access lists so
@@ -781,15 +834,7 @@ impl GasKillerEvmSketchDefault {
                 &sim_env,
             )?;
         }
-
-        sim_env.value = tx_value;
-        gas_analyzer_estimator::estimate_state_changes_gas(
-            &mut cache_db,
-            contract_address,
-            caller_address,
-            state_updates,
-            &sim_env,
-        )
+        Ok((cache_db, sim_env))
     }
 
     /// Estimate gas using a fallback heuristic based on the original transaction trace.
@@ -904,21 +949,30 @@ enum StructLogEncoder {
 /// What settling a historical transaction as a nested tree would have cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameTreeGas {
-    /// Measured gas to apply each frame's program on its own, in frame order.
+    /// Measured gas to apply each frame's own program, in frame order, with the tree run in
+    /// execution order (see [`gas_analyzer_estimator::estimate_frame_tree_gas`]).
     pub frame_gas: Vec<u64>,
-    /// The tree in one transaction: every frame's gas, less the base transaction cost each
-    /// child frame was measured with, plus the nesting overhead of each child.
+    /// The tree in one transaction: see [`frame_tree_total`].
     pub total: u64,
+}
+
+/// The tree in one transaction: the root's gas, plus every child's less the base transaction cost
+/// it was measured with, plus the nesting overhead of each child.
+pub fn frame_tree_total(frame_gas: &[u64], cost: &NestingCostModel) -> u64 {
+    frame_gas.iter().enumerate().fold(0u64, |total, (i, &gas)| {
+        total.saturating_add(if i == 0 {
+            gas
+        } else {
+            gas.saturating_sub(BASE_TX_COST)
+                .saturating_add(cost.frame_overhead_gas)
+        })
+    })
 }
 
 impl GasKillerEvmSketchDefault {
     /// Prices `frames` (root first) against the mid-block state `preceding_txs` leave, the way
-    /// [`call_to_frame_tree_with_evmsketch`] prices a live tree: each frame measured on its own
-    /// and the per-frame nesting overhead added for every frame past the root.
-    ///
-    /// Each frame starts from the state before the transaction rather than the state its
-    /// parent's earlier writes leave, so a frame whose program depends on that ordering is
-    /// priced approximately.
+    /// [`call_to_frame_tree_with_evmsketch`] prices a live tree: the frames run in execution order
+    /// on one state, and the per-frame nesting overhead is added for every frame past the root.
     pub fn estimate_frame_tree_gas_with_preceding(
         &self,
         frames: &[FrameProgram],
@@ -927,27 +981,15 @@ impl GasKillerEvmSketchDefault {
         tx_value: U256,
         cost: &NestingCostModel,
     ) -> Result<FrameTreeGas> {
-        let mut frame_gas = Vec::with_capacity(frames.len());
-        let mut total = 0u64;
-        for (i, frame) in frames.iter().enumerate() {
-            let value = if i == 0 { tx_value } else { frame.value };
-            let gas = self
-                .estimate_state_changes_gas_with_preceding(
-                    frame.target,
-                    sender,
-                    &without_nested_ops(&frame.updates),
-                    preceding_txs,
-                    value,
-                )
-                .with_context(|| format!("pricing frame {i} ({})", frame.target))?;
-            frame_gas.push(gas);
-            total = total.saturating_add(if i == 0 {
-                gas
-            } else {
-                gas.saturating_sub(BASE_TX_COST)
-                    .saturating_add(cost.frame_overhead_gas)
-            });
-        }
+        let (mut cache_db, sim_env) = self.state_after_preceding(preceding_txs)?;
+        let frame_gas = gas_analyzer_estimator::estimate_frame_tree_gas(
+            &mut cache_db,
+            frames,
+            sender,
+            tx_value,
+            &sim_env,
+        )?;
+        let total = frame_tree_total(&frame_gas, cost);
         Ok(FrameTreeGas { frame_gas, total })
     }
 }
@@ -1389,8 +1431,8 @@ pub struct EncodedFrameTree {
     pub frames: Vec<FrameProgram>,
     /// Every contract whose transition counter the call moves.
     pub counter_moves: std::collections::BTreeSet<Address>,
-    /// Gas to apply every frame's program, plus the nesting overhead of the frames beyond the
-    /// root. An estimate for reporting savings; which frames nest is decided by the cost model.
+    /// The tree priced in execution order and totalled by [`frame_tree_total`]. An estimate for
+    /// reporting savings; which frames nest is decided by the cost model.
     pub gas_estimate: u64,
     pub skipped_opcodes: HashSet<Opcode>,
     pub extraction: Extraction,
@@ -1509,31 +1551,19 @@ pub async fn call_to_frame_tree_with_evmsketch(
         )?;
     }
 
-    let mut gas_estimate = 0u64;
-    let mut prefetch = Duration::ZERO;
-    let mut revm_estimate = Duration::ZERO;
-    for (i, frame) in tree.frames.iter().enumerate() {
-        // The estimator replays programs through a handler that predates NESTED; each frame is
-        // priced on its own and the nesting overhead added per frame instead.
-        let updates = without_nested_ops(&frame.updates);
-        let hints = hints_from_state_updates(frame.target, &updates);
-        // Programs never read `msg.sender`, and a frame's real caller is a contract, which
-        // revm refuses as a transaction sender (EIP-3607); price every frame from the root's.
-        let (gas, estimate) = executor
-            .estimate_state_changes_gas_with_hints_timed(
-                frame.target,
-                caller_address,
-                &updates,
-                &hints,
-            )
-            .await?;
-        gas_estimate = gas_estimate.saturating_add(gas);
-        if i > 0 {
-            gas_estimate = gas_estimate.saturating_add(cost.frame_overhead_gas);
+    let mut hints: HashMap<Address, Vec<B256>> = HashMap::new();
+    for frame in &tree.frames {
+        for (address, slots) in
+            hints_from_state_updates(frame.target, &without_nested_ops(&frame.updates))
+        {
+            hints.entry(address).or_default().extend(slots);
         }
-        prefetch += estimate.prefetch;
-        revm_estimate += estimate.execute;
     }
+    let (frame_gas, estimate) = executor
+        .estimate_frame_tree_gas_with_hints_timed(&tree.frames, caller_address, &hints)
+        .await?;
+    let gas_estimate = frame_tree_total(&frame_gas, cost);
+    let (prefetch, revm_estimate) = (estimate.prefetch, estimate.execute);
 
     Ok(EncodedFrameTree {
         frames: tree.frames,
