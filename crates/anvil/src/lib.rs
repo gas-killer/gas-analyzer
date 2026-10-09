@@ -258,18 +258,12 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
             .wallet(signer)
             .connect_http(anvil.endpoint_url());
 
-        let contract = StateChangeHandlerGasEstimator::deploy(
-            provider.clone(),
-            alloy::primitives::Address::ZERO,
-        )
-        .await?;
-        let address = *contract.address();
-        let code = provider.get_code_at(address).await?;
-
+        // Injected from the artifact rather than deployed: a deploy runs out of gas on a
+        // Glamsterdam fork and leaves empty code, so every estimate would measure intrinsic gas only.
         Ok(Self {
             _anvil: anvil,
             provider,
-            code,
+            code: StateChangeHandlerGasEstimator::DEPLOYED_BYTECODE.clone(),
         })
     }
 
