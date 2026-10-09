@@ -124,7 +124,7 @@ fn warn_if_unsupported_hardfork(chain_id: u64, hardforks: &EthereumChainHardfork
         tracing::warn!(
             chain_id,
             "chain runs Glamsterdam but this revm predates it; pricing under Osaka, so gas \
-             estimates and gas-sensitive execution may differ from the chain (#217)"
+             estimates and gas-sensitive execution may differ from the chain"
         );
     }
 }
