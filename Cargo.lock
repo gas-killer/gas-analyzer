@@ -3859,6 +3859,7 @@ dependencies = [
  "anyhow",
  "criterion",
  "dhat",
+ "futures",
  "gas-analyzer-core",
  "gas-analyzer-estimator",
  "gas-analyzer-rpc",

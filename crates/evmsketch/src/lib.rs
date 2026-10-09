@@ -18,6 +18,7 @@ use alloy_provider::RootProvider;
 use alloy_provider::ext::DebugApi;
 use alloy_provider::network::{AnyNetwork, Ethereum};
 use anyhow::{Context as _, Result, anyhow, bail};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use lru::LruCache;
 use reth_primitives::EthPrimitives;
 use revm::database::CacheDB;
@@ -1585,16 +1586,28 @@ async fn nestable_callees<P: Provider>(
                 .map(|v| Address::from_word((*v).into()))
         })
         .collect();
-    for callee in callees {
-        if nested_registry(provider, callee, block).await? == Some(registry) {
-            nestable.insert(callee);
-        }
-    }
+    let probes: Vec<(Address, Option<Address>)> = stream::iter(callees)
+        .map(|callee| async move {
+            Ok::<_, anyhow::Error>((callee, nested_registry(provider, callee, block).await?))
+        })
+        .buffer_unordered(NESTABILITY_PROBE_CONCURRENCY)
+        .try_collect()
+        .await?;
+    nestable.extend(
+        probes
+            .into_iter()
+            .filter(|(_, r)| *r == Some(registry))
+            .map(|(callee, _)| callee),
+    );
     Ok(nestable)
 }
 
+/// Callees probed at once: a trace can call hundreds of contracts, and rate-limited RPCs fail
+/// a burst rather than queue it.
+const NESTABILITY_PROBE_CONCURRENCY: usize = 8;
+
 /// `Some(registry)` when `contract` reports `IGasKillerNested` at `block`, `None` when it does
-/// not or the read reverts. Transport failures are errors.
+/// not or the read fails in the EVM. Node and transport failures are errors.
 async fn nested_registry<P: Provider>(
     provider: &P,
     contract: Address,
@@ -1626,7 +1639,8 @@ async fn nested_registry<P: Provider>(
     Ok(Some(Address::from_slice(&registry[12..])))
 }
 
-/// `eth_call` at `block`: `Ok(None)` when the call reverts, `Err` when the node could not answer.
+/// `eth_call` at `block`: `Ok(None)` when the call fails in the EVM, `Err` when the node could
+/// not answer.
 async fn static_read<P: Provider>(
     provider: &P,
     to: Address,
@@ -1636,13 +1650,36 @@ async fn static_read<P: Provider>(
     let request = TransactionRequest::default().to(to).input(data.into());
     match provider.call(request).block(block).await {
         Ok(out) => Ok(Some(out)),
-        Err(alloy::transports::RpcError::ErrorResp(payload))
-            if payload.code == 3 || payload.message.to_lowercase().contains("revert") =>
-        {
+        Err(alloy::transports::RpcError::ErrorResp(payload)) if is_evm_failure(&payload) => {
             Ok(None)
         }
         Err(e) => Err(anyhow!("eth_call to {to} failed: {e}")),
     }
+}
+
+/// Whether an `eth_call` error response reports the call failing in the EVM, which at a pinned
+/// block is a property of the state, so every operator sees it.
+///
+/// Not every error response qualifies: a lagging node's "header not found", a pruned node's
+/// "missing trie node", an RPC timeout or a rate limit say nothing about the callee, and
+/// reading those as "not nestable" would let one operator's node change the signed tree.
+/// Anything unrecognised therefore stays an error and fails the run.
+fn is_evm_failure(payload: &alloy_json_rpc::ErrorPayload) -> bool {
+    // 3: execution reverted (geth, Erigon, reth). -32015: Nethermind's VM execution error.
+    const EVM_FAILURE_CODES: [i64; 2] = [3, -32015];
+    // geth/Erigon name the halt; reth reports halts as "EVM error: <reason>".
+    const EVM_FAILURE_MESSAGES: [&str; 7] = [
+        "revert",
+        "out of gas",
+        "invalid opcode",
+        "stack underflow",
+        "stack overflow",
+        "invalid jump destination",
+        "evm error",
+    ];
+    let message = payload.message.to_lowercase();
+    EVM_FAILURE_CODES.contains(&payload.code)
+        || EVM_FAILURE_MESSAGES.iter().any(|m| message.contains(m))
 }
 
 // ============================================================================
@@ -1663,6 +1700,43 @@ mod tests {
         assert_eq!(Extraction::PrestateNet.as_str(), "prestate_net");
         assert_eq!(Extraction::StructLog.as_str(), "struct_log");
         assert_eq!(Extraction::PrestateFallback.as_str(), "prestate_fallback");
+    }
+
+    /// Every client's way of saying the call failed in the EVM reads as "not nestable"; node-side
+    /// failures, which differ between operators, stay errors.
+    #[test]
+    fn test_is_evm_failure_separates_execution_from_node_errors() {
+        let payload = |code: i64, message: &str| alloy_json_rpc::ErrorPayload {
+            code,
+            message: message.to_string().into(),
+            data: None,
+        };
+        for (code, message) in [
+            (3, "execution reverted"),
+            (-32000, "invalid opcode: INVALID"),
+            (-32000, "out of gas"),
+            (-32000, "stack underflow (0 <=> 1)"),
+            (-32000, "invalid jump destination"),
+            (-32003, "EVM error: OpcodeNotFound"),
+            (-32000, "out of gas: gas required exceeds: 30000000"),
+            (-32603, "EVM error InvalidFEOpcode"),
+            (-32015, "VM execution error."),
+        ] {
+            assert!(is_evm_failure(&payload(code, message)), "{code} {message}");
+        }
+        for (code, message) in [
+            (-32000, "header not found"),
+            (
+                -32000,
+                "missing trie node 0f3a (path ) state 0xab is not available",
+            ),
+            (-32000, "execution aborted (timeout = 5s)"),
+            (-32005, "limit exceeded"),
+            (429, "Too Many Requests"),
+            (-32603, "internal error"),
+        ] {
+            assert!(!is_evm_failure(&payload(code, message)), "{code} {message}");
+        }
     }
 
     /// A default timing set is all zeros, so a phase that did not run reads as no cost rather
@@ -2518,6 +2592,27 @@ mod tests {
                 1,
                 "nesting a near-empty frame costs more than running it"
             );
+        }
+
+        /// Probing every callee reaches arbitrary contracts; one that halts outside a revert
+        /// (`INVALID`, an out-of-gas loop, a stack underflow) is simply not a nestable consumer.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; run with --ignored"]
+        async fn test_a_callee_that_halts_is_not_nestable() {
+            let anvil = LocalAnvil::spawn().await;
+            let provider = anvil.provider();
+            let block = BlockId::Number(BlockNumberOrTag::Latest);
+            for (i, code) in [bytes!("fe"), bytes!("5b600056"), bytes!("01")]
+                .into_iter()
+                .enumerate()
+            {
+                let callee = Address::with_last_byte(0xe0 + i as u8);
+                set_code(&provider, callee, code.clone()).await;
+                let registry = nested_registry(&provider, callee, block)
+                    .await
+                    .unwrap_or_else(|e| panic!("probing {code} failed the run: {e:#}"));
+                assert_eq!(registry, None, "{code}");
+            }
         }
 
         /// A local anvil instance on an OS-assigned free port, killed on drop.
