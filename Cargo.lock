@@ -271,7 +271,7 @@ checksum = "527b47dc39850c6168002ddc1f7a2063e15d26137c1bb5330f6065a7524c1aa9"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
- "alloy-hardforks 0.4.7",
+ "alloy-hardforks 0.4.9",
  "alloy-primitives",
  "alloy-rpc-types-engine",
  "alloy-rpc-types-eth",
@@ -293,7 +293,7 @@ checksum = "e6ccc4c702c840148af1ce784cc5c6ed9274a020ef32417c5b1dbeab8c317673"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
- "alloy-hardforks 0.4.7",
+ "alloy-hardforks 0.4.9",
  "alloy-op-hardforks",
  "alloy-primitives",
  "alloy-rpc-types-engine",
@@ -337,9 +337,9 @@ dependencies = [
 
 [[package]]
 name = "alloy-hardforks"
-version = "0.4.7"
+version = "0.4.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83ba208044232d14d4adbfa77e57d6329f51bc1acc21f5667bb7db72d88a0831"
+checksum = "09d5ff0394d9547798fa4b666c46e356d09a113f33d45fb3d75175681c1e2652"
 dependencies = [
  "alloy-chains",
  "alloy-eip2124",
@@ -460,7 +460,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6472c610150c4c4c15be9e1b964c9b78068f933bda25fb9cdf09b9ac2bb66f36"
 dependencies = [
  "alloy-chains",
- "alloy-hardforks 0.4.7",
+ "alloy-hardforks 0.4.9",
  "alloy-primitives",
  "auto_impl",
 ]
@@ -3498,7 +3498,7 @@ dependencies = [
  "alloy-dyn-abi",
  "alloy-evm 0.25.2",
  "alloy-genesis",
- "alloy-hardforks 0.4.7",
+ "alloy-hardforks 0.4.9",
  "alloy-json-abi",
  "alloy-network",
  "alloy-op-evm",
@@ -3585,7 +3585,7 @@ checksum = "8df2fd495cf7337b247d960f90355329cc625fe27fe7da9fe5e598c42df21526"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
- "alloy-hardforks 0.4.7",
+ "alloy-hardforks 0.4.9",
  "alloy-primitives",
  "alloy-provider",
  "alloy-rpc-types",
@@ -3849,7 +3849,7 @@ dependencies = [
  "alloy-eips",
  "alloy-evm 0.25.2",
  "alloy-genesis",
- "alloy-hardforks 0.4.7",
+ "alloy-hardforks 0.4.9",
  "alloy-json-rpc",
  "alloy-provider",
  "alloy-rpc-client",
@@ -7170,7 +7170,7 @@ version = "1.9.1"
 source = "git+https://github.com/paradigmxyz/reth?tag=v1.9.1#3afe69a5738459a7cb5f46c598c7f541a1510f32"
 dependencies = [
  "alloy-eip2124",
- "alloy-hardforks 0.4.7",
+ "alloy-hardforks 0.4.9",
  "alloy-primitives",
  "auto_impl",
  "once_cell",

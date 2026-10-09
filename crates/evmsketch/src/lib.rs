@@ -12,7 +12,7 @@ use alloy::rpc::types::eth::TransactionRequest;
 use alloy_eips::BlockId;
 use alloy_eips::BlockNumberOrTag;
 use alloy_genesis::ChainConfig;
-use alloy_hardforks::{EthereumChainHardforks, EthereumHardfork, ForkCondition};
+use alloy_hardforks::{EthereumChainHardforks, EthereumHardfork, EthereumHardforks, ForkCondition};
 use alloy_provider::Provider;
 use alloy_provider::RootProvider;
 use alloy_provider::ext::DebugApi;
@@ -106,6 +106,28 @@ fn gnosis_hardforks() -> EthereumChainHardforks {
             ForkCondition::Timestamp(1_746_021_820),
         ),
     ])
+}
+
+/// Whether the chain runs Glamsterdam at `timestamp`. This revm predates it, so such blocks are
+/// priced under Osaka: the state-update program is unaffected, but gas figures and gas-sensitive
+/// execution can differ from the chain (#217). Glamsterdam's execution fork is `Amsterdam`, which
+/// only Sepolia schedules today; mainnet and `gnosis_hardforks()` don't.
+fn runs_unsupported_hardfork(hardforks: &EthereumChainHardforks, timestamp: u64) -> bool {
+    hardforks.is_amsterdam_active_at_timestamp(timestamp)
+}
+
+fn warn_if_unsupported_hardfork(chain_id: u64, hardforks: &EthereumChainHardforks, timestamp: u64) {
+    // Once per process, not per chain: every build on a post-fork chain would otherwise repeat it.
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if runs_unsupported_hardfork(hardforks, timestamp)
+        && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(
+            chain_id,
+            "chain runs Glamsterdam but this revm predates it; pricing under Osaka, so gas \
+             estimates and gas-sensitive execution may differ from the chain"
+        );
+    }
 }
 
 pub mod simple_rpc_db;
@@ -450,7 +472,9 @@ impl EvmSketchExecutorBuilder {
             .await
             .map_err(|e| anyhow!("Failed to build EvmSketch: {}", e))?;
 
-        let spec = alloy_evm::spec(&hardforks, sketch.anchor.header());
+        let header = sketch.anchor.header();
+        let spec = alloy_evm::spec(&hardforks, header);
+        warn_if_unsupported_hardfork(chain_id, &hardforks, header.timestamp);
 
         Ok(EvmSketchExecutor {
             sketch,
@@ -1724,6 +1748,22 @@ mod tests {
             "specs must differ across chains in the inter-activation window — \
              a hardcoded mainnet EthSpec would silently break Sepolia analysis here",
         );
+    }
+
+    /// Sepolia's first Glamsterdam block (11_856_337) has timestamp 1_791_294_816. Mainnet has no
+    /// activation scheduled, so the warning must stay silent there until one is.
+    #[test]
+    fn test_unsupported_hardfork_detects_sepolia_glamsterdam() {
+        const SEPOLIA_GLAMSTERDAM: u64 = 1_791_294_816;
+        let (_, sepolia) = chain_id_to_genesis_and_spec(SEPOLIA_CHAIN_ID).unwrap();
+        let (_, mainnet) = chain_id_to_genesis_and_spec(MAINNET_CHAIN_ID).unwrap();
+
+        assert!(!runs_unsupported_hardfork(
+            &sepolia,
+            SEPOLIA_GLAMSTERDAM - 1
+        ));
+        assert!(runs_unsupported_hardfork(&sepolia, SEPOLIA_GLAMSTERDAM));
+        assert!(!runs_unsupported_hardfork(&mainnet, SEPOLIA_GLAMSTERDAM));
     }
 
     /// Gnosis Cancun activated at 1_710_181_820 — ~156 s before mainnet
