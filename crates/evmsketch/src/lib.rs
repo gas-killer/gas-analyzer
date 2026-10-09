@@ -110,13 +110,14 @@ fn gnosis_hardforks() -> EthereumChainHardforks {
 
 /// Whether the chain runs Glamsterdam at `timestamp`. This revm predates it, so such blocks are
 /// priced under Osaka: the state-update program is unaffected, but gas figures and gas-sensitive
-/// execution can differ from the chain (#217).
+/// execution can differ from the chain (#217). Glamsterdam's execution fork is `Amsterdam`, which
+/// only Sepolia schedules today; mainnet and `gnosis_hardforks()` don't.
 fn runs_unsupported_hardfork(hardforks: &EthereumChainHardforks, timestamp: u64) -> bool {
     hardforks.is_amsterdam_active_at_timestamp(timestamp)
 }
 
 fn warn_if_unsupported_hardfork(chain_id: u64, hardforks: &EthereumChainHardforks, timestamp: u64) {
-    // Once per process: every build on a post-fork chain would otherwise repeat it.
+    // Once per process, not per chain: every build on a post-fork chain would otherwise repeat it.
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if runs_unsupported_hardfork(hardforks, timestamp)
         && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
