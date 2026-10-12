@@ -211,34 +211,36 @@ impl Seeds {
 /// Each account `updates` calls that existed before the transaction, from its prestate diff.
 ///
 /// Every callee is missing from the empty state, so a `CALL` that sends it ETH pays the 25,000-gas
-/// new-account charge, which on chain only a recipient that didn't exist pays. An ETH transfer
-/// changes the recipient's balance, so the diff lists it in `pre` exactly when it existed.
+/// new-account charge, which on chain only a recipient that was empty (EIP-161) pays. An ETH
+/// transfer changes the recipient's balance, so the diff lists it in `pre`, where an empty one has
+/// no nonce or code and a zero or absent balance.
 fn called_accounts<'a>(
     diff: &DiffMode,
     updates: impl IntoIterator<Item = &'a StateUpdate>,
 ) -> BTreeMap<Address, AccountInfo> {
     updates
         .into_iter()
-        .filter_map(|update| match update {
-            StateUpdate::Call(call) => diff.pre.get(&call.target).map(|pre| {
-                let balance = pre.balance.unwrap_or_default();
-                // Callees run without code here, so an account the diff lists without a balance
-                // or nonce needs one to not be empty (EIP-161).
-                let nonce = match pre.nonce {
-                    Some(nonce) => nonce,
-                    None if balance.is_zero() => 1,
-                    None => 0,
-                };
-                (
-                    call.target,
-                    AccountInfo {
-                        balance,
-                        nonce,
-                        ..AccountInfo::default()
-                    },
-                )
-            }),
-            _ => None,
+        .filter_map(|update| {
+            let StateUpdate::Call(call) = update else {
+                return None;
+            };
+            let pre = diff.pre.get(&call.target)?;
+            let balance = pre.balance.unwrap_or_default();
+            let nonce = pre.nonce.unwrap_or_default();
+            let has_code = pre.code.as_ref().is_some_and(|code| !code.is_empty());
+            if balance.is_zero() && nonce == 0 && !has_code {
+                return None;
+            }
+            Some((
+                call.target,
+                AccountInfo {
+                    balance,
+                    // Callees run without code here, so a contract deployed before Spurious Dragon
+                    // with nonce 0 needs one to not be empty.
+                    nonce: if has_code { nonce.max(1) } else { nonce },
+                    ..AccountInfo::default()
+                },
+            ))
         })
         .collect()
 }
@@ -2112,34 +2114,43 @@ mod tests {
             "post": { recipient: { "balance": "0xde0b6b3a7640005" } },
         })
         .to_string();
-        // An account the transaction created has only a `post`, and paid the charge on chain too.
-        let created = serde_json::json!({
-            "pre": {},
-            "post": { recipient: { "balance": "0xde0b6b3a7640000" } },
-        })
-        .to_string();
+        // A recipient that was empty paid the charge on chain too, whether the diff omits it from
+        // `pre` or lists it there with a zero balance.
+        let created = |pre: serde_json::Value| {
+            serde_json::json!({
+                "pre": pre,
+                "post": { recipient: { "balance": "0xde0b6b3a7640000" } },
+            })
+            .to_string()
+        };
         assert_eq!(analyze(None) - analyze(Some(&existing)), NEW_ACCOUNT);
-        assert_eq!(analyze(None), analyze(Some(&created)));
+        assert_eq!(
+            analyze(None),
+            analyze(Some(&created(serde_json::json!({}))))
+        );
+        let zero_balance = serde_json::json!({ recipient: { "balance": "0x0" } });
+        assert_eq!(analyze(None), analyze(Some(&created(zero_balance))));
     }
 
     #[test]
-    fn test_called_accounts_keep_an_account_the_diff_lists_without_balance_or_nonce() {
+    fn test_called_accounts_are_only_those_that_were_not_empty() {
         let recipient: Address = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
             .parse()
             .unwrap();
-        let diff: DiffMode =
-            serde_json::from_str(&format!(r#"{{"pre":{{"{recipient}":{{}}}},"post":{{}}}}"#))
-                .unwrap();
         let call = StateUpdate::Call(gas_analyzer_core::types::IStateUpdateTypes::Call {
             target: recipient,
             value: U256::from(1),
             callargs: Default::default(),
         });
-        let accounts = called_accounts(&diff, [&call]);
-        assert!(
-            !accounts[&recipient].is_empty(),
-            "it existed, so it isn't empty"
-        );
+        let accounts = |pre: serde_json::Value| {
+            let diff = serde_json::json!({ "pre": { recipient.to_string(): pre }, "post": {} });
+            called_accounts(&serde_json::from_value(diff).unwrap(), [&call])
+        };
+        assert!(accounts(serde_json::json!({})).is_empty());
+        assert!(accounts(serde_json::json!({ "balance": "0x0" })).is_empty());
+        assert!(!accounts(serde_json::json!({ "nonce": 3 }))[&recipient].is_empty());
+        // A contract from before Spurious Dragon can have nonce 0; its code makes it exist.
+        assert!(!accounts(serde_json::json!({ "code": "0x60006000" }))[&recipient].is_empty());
     }
 
     #[test]
