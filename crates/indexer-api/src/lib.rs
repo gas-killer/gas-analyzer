@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use gas_analyzer_core::{TURETZKY_UPPER_GAS_LIMIT_BLS, estimate_gas_from_state_updates};
-use gas_analyzer_evmsketch::GasKillerEvmSketchDefault;
+use gas_analyzer_evmsketch::{GasKillerEvmSketchDefault, OriginalTx};
 use gas_analyzer_rpc::{compute_state_updates_from_tx, get_preceding_transactions};
 use indexer_rpc::{RetryConfig, is_transient_rpc_error, with_retry};
 
@@ -212,7 +212,11 @@ impl Analyzer for EvmSketchAnalyzer {
 
         // The original msg.value must be forwarded into the simulation — a
         // value-dependent contract path otherwise diverges from the real tx.
-        let tx_value = tx.as_ref().map(|tx| tx.value()).unwrap_or(U256::ZERO);
+        // Likewise its gas price, for contracts that check `tx.gasprice`.
+        let original_tx = OriginalTx {
+            value: tx.as_ref().map(|tx| tx.value()).unwrap_or(U256::ZERO),
+            gas_price: effective_gas_price_wei,
+        };
 
         // 4. Compute state updates from the actual historical trace.
         // A trace failure is a real error (worker retries / dead-letters), not
@@ -263,7 +267,7 @@ impl Analyzer for EvmSketchAnalyzer {
                 tx_sender,
                 &extract.state_updates,
                 &preceding_txs,
-                tx_value,
+                original_tx,
             ) {
                 Ok(g) => (g + TURETZKY_UPPER_GAS_LIMIT_BLS, false, None),
                 Err(e) => {
