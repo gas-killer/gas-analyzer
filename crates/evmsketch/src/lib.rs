@@ -1722,6 +1722,11 @@ async fn nested_registry<P: Provider>(
     Ok(Some(Address::from_slice(&registry[12..])))
 }
 
+/// Gas for each probe read. Left unset, `eth_call` runs with the node's configured gas cap, so a
+/// read that runs out of gas would be "not nestable" on one operator's node and nestable on
+/// another's. Far above what an ERC-165 read needs, far below any client's default cap.
+const NESTABILITY_PROBE_GAS: u64 = 1_000_000;
+
 /// `eth_call` at `block`: `Ok(None)` when the call fails in the EVM, `Err` when the node could
 /// not answer.
 async fn static_read<P: Provider>(
@@ -1730,7 +1735,10 @@ async fn static_read<P: Provider>(
     data: Vec<u8>,
     block: BlockId,
 ) -> Result<Option<Bytes>> {
-    let request = TransactionRequest::default().to(to).input(data.into());
+    let request = TransactionRequest::default()
+        .to(to)
+        .input(data.into())
+        .gas_limit(NESTABILITY_PROBE_GAS);
     match provider.call(request).block(block).await {
         Ok(out) => Ok(Some(out)),
         Err(alloy::transports::RpcError::ErrorResp(payload)) if is_evm_failure(&payload) => {
@@ -1750,18 +1758,24 @@ async fn static_read<P: Provider>(
 fn is_evm_failure(payload: &alloy_json_rpc::ErrorPayload) -> bool {
     // 3: execution reverted (geth, Erigon, reth). -32015: Nethermind's VM execution error.
     const EVM_FAILURE_CODES: [i64; 2] = [3, -32015];
-    // geth/Erigon name the halt; reth reports halts as "EVM error: <reason>".
-    const EVM_FAILURE_MESSAGES: [&str; 7] = [
+    // geth/Erigon name the halt.
+    const EVM_FAILURE_MESSAGES: [&str; 6] = [
         "revert",
         "out of gas",
         "invalid opcode",
         "stack underflow",
         "stack overflow",
         "invalid jump destination",
-        "evm error",
     ];
     let message = payload.message.to_lowercase();
+    // reth wraps database and other internal failures as "Revm error: <reason>", whatever the
+    // reason's text says.
+    if message.starts_with("revm error") {
+        return false;
+    }
+    // reth reports a halt as "EVM error: <reason>", only ever at the start.
     EVM_FAILURE_CODES.contains(&payload.code)
+        || message.starts_with("evm error")
         || EVM_FAILURE_MESSAGES.iter().any(|m| message.contains(m))
 }
 
@@ -1817,6 +1831,13 @@ mod tests {
             (-32005, "limit exceeded"),
             (429, "Too Many Requests"),
             (-32603, "internal error"),
+            (-32603, "Revm error: database error"),
+            (
+                -32603,
+                "Revm error: state for block 0xab reverted by a reorg",
+            ),
+            (-32603, "Revm error: provider out of gas budget"),
+            (-32603, "internal: evm error in node"),
         ] {
             assert!(!is_evm_failure(&payload(code, message)), "{code} {message}");
         }
@@ -2770,6 +2791,22 @@ mod tests {
                     .unwrap_or_else(|e| panic!("probing {code} failed the run: {e:#}"));
                 assert_eq!(registry, None, "{code}");
             }
+        }
+
+        /// The probe runs with its own gas, not the node's cap, so every operator reads the same.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; run with --ignored"]
+        async fn test_the_probe_runs_with_fixed_gas() {
+            let anvil = LocalAnvil::spawn().await;
+            let provider = anvil.provider();
+            let callee = Address::with_last_byte(0xe9);
+            // Returns `gasleft() < NESTABILITY_PROBE_GAS` for any call.
+            set_code(&provider, callee, bytes!("5a620f42401160005260206000f3")).await;
+            assert_eq!(NESTABILITY_PROBE_GAS, 1_000_000);
+            let registry = nested_registry(&provider, callee, BlockId::latest())
+                .await
+                .unwrap();
+            assert_eq!(registry, Some(Address::with_last_byte(1)));
         }
 
         /// A local anvil instance on an OS-assigned free port, killed on drop.
