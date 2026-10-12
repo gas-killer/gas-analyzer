@@ -31,7 +31,7 @@ const result = analyze_trace(JSON.stringify(trace), estimator, receipt.from, Big
 // { gas_estimate, is_heuristic, encoded_updates, state_update_count, skipped_opcodes, reentered, native_call_gas }
 ```
 
-The estimate is measured against an empty state, where the contracts the transaction calls have no code. Each external `CALL` the program replays is charged its gas from the trace instead, reported as `native_call_gas` and included in `gas_estimate`.
+The estimate is measured against an empty state, where the contracts the transaction calls have no code. The simulation charges each external `CALL` the program replays for the opcode itself, and what its callee spent comes from the trace instead, reported as `native_call_gas` and included in `gas_estimate`.
 
 `gas_estimate` covers applying the state updates. Settling also verifies the operators' aggregate signature, which costs up to `signature_verification_gas` (50,000 gas for Schnorr). Add the two for the transaction's total cost with Gas Killer.
 
@@ -77,7 +77,7 @@ A `CALL` from a frame into an owned contract becomes that contract's own frame w
 const tree = analyze_frame_tree_bytes(response, receipt.to, [vault, ledger], receipt.from, block, tx.value.toString())
 // {
 //   root_only_gas, nested_gas,                          // the two settlements' totals
-//   root_only_native_call_gas, nested_native_call_gas,  // trace gas of the CALLs each replays natively
+//   root_only_native_call_gas, nested_native_call_gas,  // trace gas of the callees each replays natively
 //   frame_overhead_gas,                                 // the fixed charge per nested frame
 //   signature_verification_gas,                         // paid once per tree, in neither total
 //   frames: [{ target, caller, op_count, gas }],        // root first, in execution order
@@ -88,7 +88,7 @@ const tree = analyze_frame_tree_bytes(response, receipt.to, [vault, ledger], rec
 
 Both totals are measured against an empty state, so:
 
-- A natively replayed `CALL` runs into an address with no code. Its gas comes from the trace instead.
+- A natively replayed `CALL` runs into an address with no code. The simulation charges the opcode, and what its callee spent comes from the trace.
 - Every storage write is priced as a write to an empty slot. Against real state many are cheaper, so `nested_gas` tends to run high and the savings shown are conservative.
 
 There's no heuristic fallback: a simulation failure throws. `analyze_frame_tree(trace, …)` takes the trace as a JSON string instead.

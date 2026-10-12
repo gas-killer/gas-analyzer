@@ -40,7 +40,8 @@ pub struct AnalyzeTraceResult {
     /// execution; the estimate counts that callback gas as external and may
     /// overshoot. Only detected when an origin address was supplied.
     pub reentered: bool,
-    /// The trace's gas for the `CALL`s the program replays natively, included in `gas_estimate`.
+    /// What the callees of the `CALL`s the program replays spent in the trace, included in
+    /// `gas_estimate`: the simulation runs those `CALL`s into accounts without code.
     pub native_call_gas: u64,
     /// See [`SIGNATURE_VERIFICATION_GAS`]; not included in `gas_estimate`.
     pub signature_verification_gas: u64,
@@ -80,8 +81,9 @@ pub struct FrameTreeAnalysis {
     /// from `nested_gas` is the nesting alone.
     pub root_only_gas: u64,
     pub nested_gas: u64,
-    /// The trace's gas for the `CALL`s each settlement replays natively, included in its total:
-    /// against an empty state those callees have no code, so the simulation alone misses it.
+    /// What the callees of the `CALL`s each settlement replays natively spent in the trace,
+    /// included in its total: against an empty state those callees have no code, so the
+    /// simulation charges only the `CALL` opcodes.
     pub root_only_native_call_gas: u64,
     pub nested_native_call_gas: u64,
     /// The cost model's fixed charge per nested frame, included in `nested_gas`.
@@ -296,6 +298,7 @@ pub fn analyze_prestate_inner(
         skipped_opcodes: HashSet::new(),
         // Eligibility rules out regular CALLs at target depth, and with them re-entry.
         call_gas_total: 0,
+        callee_gas_total: 0,
         sstore_gas_total,
         refund_counter,
         reentered: false,
@@ -377,8 +380,8 @@ fn analyze_extract(
 
     let (gas_estimate, is_heuristic) =
         match estimate_state_changes_gas(&mut cache_db, addr, caller, state_updates, &sim_env) {
-            // The callees have no code in `EmptyDB`; the heuristic adds the same gas.
-            Ok(gas) => (gas.saturating_add(extract.call_gas_total), false),
+            // The callees have no code in `EmptyDB`, so the simulation charges only the `CALL`s.
+            Ok(gas) => (gas.saturating_add(extract.callee_gas_total), false),
             Err(_) => (estimate_gas_from_state_updates(extract), true),
         };
 
@@ -392,7 +395,7 @@ fn analyze_extract(
         state_update_count: state_updates.len(),
         skipped_opcodes: skipped,
         reentered: extract.reentered,
-        native_call_gas: extract.call_gas_total,
+        native_call_gas: extract.callee_gas_total,
         signature_verification_gas: SIGNATURE_VERIFICATION_GAS,
     })
 }
@@ -471,16 +474,16 @@ fn analyze_frame_tree_trace(
         .map_err(|e| format!("Gas estimation failed: {}", e))
     };
     let root_only_gas = frame_tree_total(&price(&root_only.frames)?, &cost)
-        .saturating_add(root_only.call_gas_total);
+        .saturating_add(root_only.callee_gas_total);
     let frame_gas = price(&nested.frames)?;
 
     let mut skipped = nested.skipped_opcodes.into_iter().collect::<Vec<_>>();
     skipped.sort();
     Ok(FrameTreeAnalysis {
         root_only_gas,
-        nested_gas: frame_tree_total(&frame_gas, &cost).saturating_add(nested.call_gas_total),
-        root_only_native_call_gas: root_only.call_gas_total,
-        nested_native_call_gas: nested.call_gas_total,
+        nested_gas: frame_tree_total(&frame_gas, &cost).saturating_add(nested.callee_gas_total),
+        root_only_native_call_gas: root_only.callee_gas_total,
+        nested_native_call_gas: nested.callee_gas_total,
         frame_overhead_gas: cost.frame_overhead_gas,
         signature_verification_gas: SIGNATURE_VERIFICATION_GAS,
         frames: nested
@@ -718,8 +721,8 @@ pub fn analyze_prestate(
 /// owned contract becomes that contract's own frame where nesting is cheaper under the cost model.
 /// Both the nested tree and the root-only settlement are split from the same trace and priced in
 /// execution order on one empty state, so their difference is the nesting alone. A `CALL` either
-/// settlement replays natively is charged its gas from the trace, since its callee has no code in
-/// that state. There is no heuristic fallback: a simulation failure throws.
+/// settlement replays natively is charged what its callee spent in the trace, since that callee
+/// has no code in that state. There is no heuristic fallback: a simulation failure throws.
 ///
 /// `caller_address`, `estimate_state_changes_block_number` and `value` are as for
 /// [`analyze_trace`].
@@ -1666,27 +1669,35 @@ mod tests {
 
     // ===== Native call gas =====
 
-    /// A root that calls an empty address, which spends `call_gas - resume_gas` natively.
-    fn call_spending(call_gas: u64, resume_gas: u64) -> String {
-        let call = make_call_log(
+    /// A root whose callee spends `callee_gas`, with Geth's `gasCost` for the `CALL`: a cold
+    /// account access plus the 400,000 gas forwarded.
+    fn call_spending(callee_gas: u64) -> String {
+        let (gas, forwarded, access) = (500_000, 400_000, 2_600);
+        let mut call = make_call_log(
             "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
             "0",
             "aabbccdd",
-            call_gas,
+            gas,
         );
+        call["gasCost"] = (access + forwarded).into();
         let entry = serde_json::json!({
-            "pc": 0, "op": "STOP", "gas": call_gas - 1000, "gasCost": 0, "depth": 2,
+            "pc": 0, "op": "JUMPDEST", "gas": forwarded, "gasCost": 1, "depth": 2,
+            "stack": [], "memory": [],
+        });
+        let stop = serde_json::json!({
+            "pc": 1, "op": "STOP", "gas": forwarded - callee_gas, "gasCost": 0, "depth": 2,
             "stack": [], "memory": [],
         });
         let resume = serde_json::json!({
-            "pc": 201, "op": "POP", "gas": resume_gas, "gasCost": 2, "depth": 1,
+            "pc": 201, "op": "POP", "gas": gas - access - callee_gas, "gasCost": 2, "depth": 1,
             "stack": ["0x0000000000000000000000000000000000000000000000000000000000000001"],
             "memory": [],
         });
-        make_trace(vec![call, entry, resume])
+        make_trace(vec![call, entry, stop, resume])
     }
 
-    /// The callee has no code in `EmptyDB`, so what it spent natively comes from the trace.
+    /// The callee has no code in `EmptyDB`, so what it spent comes from the trace; the simulation
+    /// already charges the `CALL` opcode itself.
     #[test]
     fn test_measured_estimate_charges_the_callees_native_gas() {
         let analyze = |trace: &str| {
@@ -1700,16 +1711,22 @@ mod tests {
             )
             .unwrap()
         };
-        let cheap = analyze(&call_spending(500_000, 498_000));
-        let costly = analyze(&call_spending(500_000, 100_000));
-        assert!(!cheap.is_heuristic && !costly.is_heuristic);
+        let idle = analyze(&call_spending(0));
+        let cheap = analyze(&call_spending(2_000));
+        let costly = analyze(&call_spending(300_000));
+        assert!(!idle.is_heuristic && !cheap.is_heuristic && !costly.is_heuristic);
+        assert_eq!(
+            idle.native_call_gas, 0,
+            "the access cost is the simulation's"
+        );
         assert_eq!(cheap.native_call_gas, 2_000);
         assert_eq!(
             cheap.signature_verification_gas, 50_000,
             "the Schnorr limit"
         );
-        assert_eq!(costly.native_call_gas, 400_000);
-        assert_eq!(costly.gas_estimate - cheap.gas_estimate, 398_000);
+        assert_eq!(costly.native_call_gas, 300_000);
+        assert_eq!(cheap.gas_estimate - idle.gas_estimate, 2_000);
+        assert_eq!(costly.gas_estimate - idle.gas_estimate, 300_000);
     }
 
     // ===== Transaction value =====
@@ -1783,20 +1800,22 @@ mod tests {
     }
 
     /// The root writes a slot and calls the vault, which writes its own; the call costs
-    /// `call_gas - resume_gas` natively.
+    /// `call_gas - resume_gas` natively, of which the cold access to the vault is `VAULT_ACCESS`.
     fn root_calls_vault(call_gas: u64, resume_gas: u64) -> String {
+        let forwarded = call_gas - VAULT_ACCESS;
+        let mut call = make_call_log(VAULT, "0", "aabbccdd", call_gas);
+        call["gasCost"] = (VAULT_ACCESS + forwarded).into();
+        let mut entry = sstore_at(2, "5", "32");
+        entry["gas"] = forwarded.into();
         let resume = serde_json::json!({
             "pc": 201, "op": "POP", "gas": resume_gas, "gasCost": 2, "depth": 1,
             "stack": ["0x0000000000000000000000000000000000000000000000000000000000000001"],
             "memory": [],
         });
-        make_trace(vec![
-            sstore_at(1, "1", "a"),
-            make_call_log(VAULT, "0", "aabbccdd", call_gas),
-            sstore_at(2, "5", "32"),
-            resume,
-        ])
+        make_trace(vec![sstore_at(1, "1", "a"), call, entry, resume])
     }
+
+    const VAULT_ACCESS: u64 = 2_600;
 
     fn frame_tree(trace: &str, owned: &[&str]) -> FrameTreeAnalysis {
         let owned: Vec<String> = owned.iter().map(|a| a.to_string()).collect();
@@ -1816,7 +1835,11 @@ mod tests {
         let children: u64 = out.frames[1..].iter().map(|f| f.gas - 21_000).sum();
         assert_eq!(out.nested_native_call_gas, 0, "the vault's call is nested");
         assert_eq!(out.signature_verification_gas, 50_000);
-        assert_eq!(out.root_only_native_call_gas, 900_000);
+        assert_eq!(
+            out.root_only_native_call_gas,
+            900_000 - VAULT_ACCESS,
+            "the simulation charges the CALL itself"
+        );
         assert_eq!(
             out.nested_gas,
             out.frames[0].gas + children + out.frame_overhead_gas,
@@ -1830,7 +1853,7 @@ mod tests {
 
     #[test]
     fn test_a_cheap_owned_callee_stays_a_call() {
-        let out = frame_tree(&root_calls_vault(30_000, 29_000), &[VAULT]);
+        let out = frame_tree(&root_calls_vault(30_000, 25_000), &[VAULT]);
 
         assert_eq!(out.frames.len(), 1);
         assert_eq!(out.nested_gas, out.root_only_gas);
