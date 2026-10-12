@@ -60,4 +60,4 @@ We would like a 30-minute call to walk through these numbers with your engineeri
 2. Together we pick one contract path for a testnet pilot.
 3. You see the gas difference on your own transactions before committing to anything.
 
-Contact: [gaskiller.xyz](https://gaskiller.xyz)
+Contact: [contact@gaskiller.xyz](mailto:contact@gaskiller.xyz)
