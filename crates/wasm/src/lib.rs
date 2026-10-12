@@ -1824,6 +1824,16 @@ mod tests {
     }
 
     #[test]
+    fn test_a_depth_zero_log_is_an_error_not_a_hang() {
+        let trace = make_trace(vec![sstore_at(1, "1", "a"), sstore_at(0, "2", "b")]);
+        let owned = vec![VAULT.to_string()];
+        let err =
+            analyze_frame_tree_inner(&trace, ROOT, &owned, &test_caller_address(), None, None)
+                .unwrap_err();
+        assert!(err.contains("depth 0"), "{err}");
+    }
+
+    #[test]
     fn test_an_expensive_owned_callee_becomes_its_own_frame() {
         let out = frame_tree(&root_calls_vault(1_000_000, 100_000), &[VAULT, UNREACHED]);
 

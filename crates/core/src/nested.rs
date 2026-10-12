@@ -286,6 +286,11 @@ fn scan_candidates(
 
     for (i, log) in logs.iter().enumerate() {
         let depth = log.depth;
+        // Both walkers pop back to the log's depth, so a depth below the root's would pop it
+        // and never stop. Rejecting it here also covers split_frame_tree, which runs this first.
+        if depth == 0 {
+            bail!("struct log at {i} has depth 0; the root frame is depth 1");
+        }
         if let Some(p) = pending.take() {
             if depth == p.parent_depth + 1 {
                 frames.push(ScanFrame {
