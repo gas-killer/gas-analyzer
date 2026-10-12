@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types::trace::geth::{CallFrame, DefaultFrame, DiffMode};
 use gas_analyzer_core::nested::{
-    NESTING_COST_MODEL_V1, compute_frame_tree_hypothetical, frame_tree_total, unnested_owned,
+    FrameProgram, NESTING_COST_MODEL_V1, compute_frame_tree_hypothetical, frame_tree_total,
+    unnested_owned,
 };
 use gas_analyzer_core::{
     PrestateEligibility, StateUpdate, TURETZKY_UPPER_GAS_LIMIT_SCHNORR, TraceExtract,
@@ -178,6 +179,62 @@ fn parse_origin(origin_address: Option<&str>) -> Result<Option<Address>, String>
         .transpose()
 }
 
+fn parse_diff(diff_json: &str) -> Result<DiffMode, String> {
+    serde_json::from_str(diff_json).map_err(|e| format!("Failed to parse prestate diff: {}", e))
+}
+
+/// Storage to seed into the empty state before simulating, by account.
+type Seeds = BTreeMap<Address, BTreeMap<B256, B256>>;
+
+/// The value before the transaction of each slot `updates` stores to in `account`, from its
+/// prestate diff. Without it every slot starts at zero, and each write is priced as a fresh 22.1k
+/// one where the chain charged ~2.9k to change a set slot or ~100 to rewrite it.
+///
+/// A slot only in `post` started at zero. A slot in neither half of the diff ended where it
+/// started, so the value last stored to it is its original.
+fn original_storage<'a>(
+    diff: &DiffMode,
+    account: Address,
+    updates: impl IntoIterator<Item = &'a StateUpdate>,
+) -> BTreeMap<B256, B256> {
+    let pre = diff.pre.get(&account).map(|a| &a.storage);
+    let post = diff.post.get(&account).map(|a| &a.storage);
+    let mut last = BTreeMap::new();
+    for update in updates {
+        if let StateUpdate::Store(store) = update {
+            last.insert(store.slot, store.value);
+        }
+    }
+    last.into_iter()
+        .map(|(slot, last)| {
+            let original = match pre.and_then(|p| p.get(&slot)) {
+                Some(value) => *value,
+                None if post.is_some_and(|p| p.contains_key(&slot)) => B256::ZERO,
+                None => last,
+            };
+            (slot, original)
+        })
+        .collect()
+}
+
+/// A fresh empty state holding `seeds`. The estimator injected into a seeded account later keeps
+/// its storage.
+fn seeded_db(seeds: &Seeds) -> Result<CacheDB<EmptyDB>, String> {
+    let mut cache_db = CacheDB::new(EmptyDB::default());
+    for (account, slots) in seeds {
+        for (slot, value) in slots.iter().filter(|(_, v)| !v.is_zero()) {
+            cache_db
+                .insert_account_storage(
+                    *account,
+                    U256::from_be_bytes(slot.0),
+                    U256::from_be_bytes(value.0),
+                )
+                .map_err(|e| format!("Failed to seed storage: {:?}", e))?;
+        }
+    }
+    Ok(cache_db)
+}
+
 fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsError> {
     let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
     value
@@ -196,15 +253,38 @@ pub fn analyze_trace_inner(
     estimate_state_changes_block_number: Option<u64>,
     origin_address: Option<&str>,
     value: Option<&str>,
+    prestate_diff_json: Option<&str>,
 ) -> Result<AnalyzeTraceResult, String> {
-    let extract = parse_and_compute(trace_json, parse_origin(origin_address)?)?;
+    let origin = parse_origin(origin_address)?;
+    let extract = parse_and_compute(trace_json, origin)?;
+    let original = trace_original_storage(&extract, origin, prestate_diff_json)?;
     analyze_extract(
         &extract,
         estimator_address,
         caller_address,
         estimate_state_changes_block_number,
         value,
+        original,
     )
+}
+
+/// What [`original_storage`] gives for a struct-log extraction, whose program writes `origin`'s
+/// slots; nothing without a diff.
+fn trace_original_storage(
+    extract: &TraceExtract,
+    origin: Option<Address>,
+    prestate_diff_json: Option<&str>,
+) -> Result<BTreeMap<B256, B256>, String> {
+    let Some(diff_json) = prestate_diff_json else {
+        return Ok(BTreeMap::new());
+    };
+    let origin =
+        origin.ok_or("a prestate diff needs origin_address, the account whose slots it seeds")?;
+    Ok(original_storage(
+        &parse_diff(diff_json)?,
+        origin,
+        &extract.state_updates,
+    ))
 }
 
 /// [`analyze_trace_inner`] on a whole `debug_traceTransaction` JSON-RPC response, undecoded.
@@ -215,17 +295,21 @@ pub fn analyze_trace_bytes_inner(
     estimate_state_changes_block_number: Option<u64>,
     origin_address: Option<&str>,
     value: Option<&str>,
+    prestate_diff_json: Option<&str>,
 ) -> Result<AnalyzeTraceResult, AnalyzeTraceBytesError> {
     use AnalyzeTraceBytesError::Analysis;
     let origin = parse_origin(origin_address).map_err(Analysis)?;
     let trace = parse_trace_response(response)?;
     let extract = compute(trace, origin).map_err(Analysis)?;
+    let original =
+        trace_original_storage(&extract, origin, prestate_diff_json).map_err(Analysis)?;
     analyze_extract(
         &extract,
         estimator_address,
         caller_address,
         estimate_state_changes_block_number,
         value,
+        original,
     )
     .map_err(Analysis)
 }
@@ -266,8 +350,7 @@ pub fn analyze_prestate_inner(
     estimate_state_changes_block_number: Option<u64>,
     value: Option<&str>,
 ) -> Result<PrestateAnalysis, String> {
-    let diff: DiffMode = serde_json::from_str(diff_json)
-        .map_err(|e| format!("Failed to parse prestate diff: {}", e))?;
+    let diff = parse_diff(diff_json)?;
     let frame: CallFrame = serde_json::from_str(call_frame_json)
         .map_err(|e| format!("Failed to parse call frame: {}", e))?;
     let consumer: Address = consumer_address
@@ -303,6 +386,7 @@ pub fn analyze_prestate_inner(
         refund_counter,
         reentered: false,
     };
+    let original = original_storage(&diff, consumer, &extract.state_updates);
     Ok(PrestateAnalysis {
         eligible: true,
         reason: None,
@@ -312,6 +396,7 @@ pub fn analyze_prestate_inner(
             caller_address,
             estimate_state_changes_block_number,
             value,
+            original,
         )?),
     })
 }
@@ -364,6 +449,7 @@ fn analyze_extract(
     caller_address: &str,
     estimate_state_changes_block_number: Option<u64>,
     value: Option<&str>,
+    original: BTreeMap<B256, B256>,
 ) -> Result<AnalyzeTraceResult, String> {
     let state_updates: &[StateUpdate] = &extract.state_updates;
 
@@ -375,7 +461,8 @@ fn analyze_extract(
 
     let caller = parse_caller(caller_address)?;
 
-    let mut cache_db = CacheDB::new(EmptyDB::default());
+    // The program writes the consumer's slots, here into the estimator's storage.
+    let mut cache_db = seeded_db(&Seeds::from([(addr, original)]))?;
     let sim_env = sim_env(estimate_state_changes_block_number, parse_value(value)?);
 
     let (gas_estimate, is_heuristic) =
@@ -433,6 +520,41 @@ fn sim_env(block_number: Option<u64>, value: U256) -> SimEnvOpts {
     }
 }
 
+/// [`original_storage`] for every contract a frame tree writes, where the estimator is injected
+/// at each frame's own target.
+///
+/// A contract with several frames (sibling calls, or a cycle) has its writes ordered by when each
+/// frame returns, since a frame's final slice is its last write to its target.
+fn frame_tree_original_storage(diff: &DiffMode, frames: &[FrameProgram]) -> Seeds {
+    let mut by_target: BTreeMap<Address, Vec<&StateUpdate>> = BTreeMap::new();
+    for id in return_order(frames) {
+        let frame = &frames[id];
+        by_target
+            .entry(frame.target)
+            .or_default()
+            .extend(&frame.updates);
+    }
+    by_target
+        .into_iter()
+        .map(|(target, updates)| (target, original_storage(diff, target, updates)))
+        .collect()
+}
+
+/// Frame ids in the order the frames return: each one after its children, siblings in call order.
+fn return_order(frames: &[FrameProgram]) -> Vec<usize> {
+    fn visit(frames: &[FrameProgram], id: usize, order: &mut Vec<usize>) {
+        for &child in &frames[id].children {
+            visit(frames, child, order);
+        }
+        order.push(id);
+    }
+    let mut order = Vec::with_capacity(frames.len());
+    if !frames.is_empty() {
+        visit(frames, 0, &mut order);
+    }
+    order
+}
+
 /// Price `trace` as a nested settlement rooted at `root` with `owned` as consumers, against the
 /// root-only settlement of the same trace.
 fn analyze_frame_tree_trace(
@@ -442,7 +564,9 @@ fn analyze_frame_tree_trace(
     caller_address: &str,
     estimate_state_changes_block_number: Option<u64>,
     value: Option<&str>,
+    prestate_diff_json: Option<&str>,
 ) -> Result<FrameTreeAnalysis, String> {
+    let diff = prestate_diff_json.map(parse_diff).transpose()?;
     let root: Address = root_address
         .parse()
         .map_err(|e| format!("Invalid root address: {}", e))?;
@@ -463,15 +587,13 @@ fn analyze_frame_tree_trace(
         .map_err(|e| format!("Failed to split trace: {}", e))?;
     let nested = compute_frame_tree_hypothetical(trace, root, &owned, &cost)
         .map_err(|e| format!("Failed to split trace: {}", e))?;
-    let price = |frames| {
-        estimate_frame_tree_gas(
-            &mut CacheDB::new(EmptyDB::default()),
-            frames,
-            caller,
-            value,
-            &sim_env,
-        )
-        .map_err(|e| format!("Gas estimation failed: {}", e))
+    let price = |frames: &[FrameProgram]| {
+        let seeds = match &diff {
+            Some(diff) => frame_tree_original_storage(diff, frames),
+            None => Seeds::new(),
+        };
+        estimate_frame_tree_gas(&mut seeded_db(&seeds)?, frames, caller, value, &sim_env)
+            .map_err(|e| format!("Gas estimation failed: {}", e))
     };
     let root_only_gas = frame_tree_total(&price(&root_only.frames)?, &cost)
         .saturating_add(root_only.callee_gas_total);
@@ -517,6 +639,7 @@ pub fn analyze_frame_tree_inner(
     caller_address: &str,
     estimate_state_changes_block_number: Option<u64>,
     value: Option<&str>,
+    prestate_diff_json: Option<&str>,
 ) -> Result<FrameTreeAnalysis, String> {
     let trace: LeanFrame =
         serde_json::from_str(trace_json).map_err(|e| format!("Failed to parse trace: {}", e))?;
@@ -527,6 +650,7 @@ pub fn analyze_frame_tree_inner(
         caller_address,
         estimate_state_changes_block_number,
         value,
+        prestate_diff_json,
     )
 }
 
@@ -538,6 +662,7 @@ pub fn analyze_frame_tree_bytes_inner(
     caller_address: &str,
     estimate_state_changes_block_number: Option<u64>,
     value: Option<&str>,
+    prestate_diff_json: Option<&str>,
 ) -> Result<FrameTreeAnalysis, AnalyzeTraceBytesError> {
     let trace = parse_trace_response(response)?;
     analyze_frame_tree_trace(
@@ -547,6 +672,7 @@ pub fn analyze_frame_tree_bytes_inner(
         caller_address,
         estimate_state_changes_block_number,
         value,
+        prestate_diff_json,
     )
     .map_err(AnalyzeTraceBytesError::Analysis)
 }
@@ -610,6 +736,10 @@ pub fn encode_trace_inner(trace_json: &str) -> Result<EncodeTraceResult, String>
 /// `value` is the transaction's `msg.value` in wei, as a decimal or `0x` hex string. A payload
 /// whose `CALL`s forward that ETH is otherwise unfunded, and falls back to the heuristic.
 ///
+/// `prestate_diff_json` is the transaction's `prestateTracer` diff (see [`analyze_prestate`]). It
+/// seeds the slots the program writes in `origin_address`, which it requires, with their values
+/// before the transaction; without it every write is priced as one to an empty slot.
+///
 /// Returns a JS object with: `encoded_updates`, `gas_estimate`, `is_heuristic`,
 /// `state_update_count`, `skipped_opcodes`, `reentered`.
 #[wasm_bindgen]
@@ -620,6 +750,7 @@ pub fn analyze_trace(
     estimate_state_changes_block_number: Option<u64>,
     origin_address: Option<String>,
     value: Option<String>,
+    prestate_diff_json: Option<String>,
 ) -> Result<JsValue, JsError> {
     let result = analyze_trace_inner(
         trace_json,
@@ -628,6 +759,7 @@ pub fn analyze_trace(
         estimate_state_changes_block_number,
         origin_address.as_deref(),
         value.as_deref(),
+        prestate_diff_json.as_deref(),
     )
     .map_err(|e| JsError::new(&e))?;
     to_js(&result)
@@ -647,6 +779,7 @@ pub fn analyze_trace_bytes(
     estimate_state_changes_block_number: Option<u64>,
     origin_address: Option<String>,
     value: Option<String>,
+    prestate_diff_json: Option<String>,
 ) -> Result<JsValue, JsValue> {
     let result = analyze_trace_bytes_inner(
         response,
@@ -655,6 +788,7 @@ pub fn analyze_trace_bytes(
         estimate_state_changes_block_number,
         origin_address.as_deref(),
         value.as_deref(),
+        prestate_diff_json.as_deref(),
     )
     .map_err(bytes_error_to_js)?;
     Ok(to_js(&result)?)
@@ -720,12 +854,13 @@ pub fn analyze_prestate(
 /// `trace_json` is the struct-log trace, as for [`analyze_trace`]. A `CALL` from a frame into an
 /// owned contract becomes that contract's own frame where nesting is cheaper under the cost model.
 /// Both the nested tree and the root-only settlement are split from the same trace and priced in
-/// execution order on one empty state, so their difference is the nesting alone. A `CALL` either
+/// execution order on one empty state, so their difference is the nesting alone. That state holds
+/// each frame target's original values from `prestate_diff_json`, as for [`analyze_trace`]. A `CALL` either
 /// settlement replays natively is charged what its callee spent in the trace, since that callee
 /// has no code in that state. There is no heuristic fallback: a simulation failure throws.
 ///
-/// `caller_address`, `estimate_state_changes_block_number` and `value` are as for
-/// [`analyze_trace`].
+/// `caller_address`, `estimate_state_changes_block_number`, `value` and `prestate_diff_json` are as
+/// for [`analyze_trace`].
 ///
 /// Returns a JS object with `root_only_gas`, `nested_gas`, `frame_overhead_gas`, `frames`,
 /// `not_nested` and `skipped_opcodes`.
@@ -737,6 +872,7 @@ pub fn analyze_frame_tree(
     caller_address: &str,
     estimate_state_changes_block_number: Option<u64>,
     value: Option<String>,
+    prestate_diff_json: Option<String>,
 ) -> Result<JsValue, JsError> {
     let result = analyze_frame_tree_inner(
         trace_json,
@@ -745,6 +881,7 @@ pub fn analyze_frame_tree(
         caller_address,
         estimate_state_changes_block_number,
         value.as_deref(),
+        prestate_diff_json.as_deref(),
     )
     .map_err(|e| JsError::new(&e))?;
     to_js(&result)
@@ -760,6 +897,7 @@ pub fn analyze_frame_tree_bytes(
     caller_address: &str,
     estimate_state_changes_block_number: Option<u64>,
     value: Option<String>,
+    prestate_diff_json: Option<String>,
 ) -> Result<JsValue, JsValue> {
     let result = analyze_frame_tree_bytes_inner(
         response,
@@ -768,6 +906,7 @@ pub fn analyze_frame_tree_bytes(
         caller_address,
         estimate_state_changes_block_number,
         value.as_deref(),
+        prestate_diff_json.as_deref(),
     )
     .map_err(bytes_error_to_js)?;
     Ok(to_js(&result)?)
@@ -1035,6 +1174,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(result.is_ok());
     }
@@ -1049,6 +1189,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid estimator address"));
@@ -1057,8 +1198,15 @@ mod tests {
     #[test]
     fn test_parse_address_too_short() {
         let trace = make_trace(vec![]);
-        let result =
-            analyze_trace_inner(&trace, "0x1234", &test_caller_address(), None, None, None);
+        let result = analyze_trace_inner(
+            &trace,
+            "0x1234",
+            &test_caller_address(),
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid estimator address"));
     }
@@ -1139,6 +1287,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(!result.is_heuristic);
@@ -1159,6 +1308,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(!result.is_heuristic);
@@ -1168,6 +1318,7 @@ mod tests {
             &single_trace,
             &test_estimator_address(),
             &test_caller_address(),
+            None,
             None,
             None,
             None,
@@ -1190,6 +1341,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(!result.is_heuristic);
@@ -1203,6 +1355,7 @@ mod tests {
             &trace,
             &test_estimator_address(),
             &test_caller_address(),
+            None,
             None,
             None,
             None,
@@ -1289,6 +1442,7 @@ mod tests {
             &trace_json,
             &test_estimator_address(),
             &test_caller_address(),
+            None,
             None,
             None,
             None,
@@ -1428,8 +1582,8 @@ mod tests {
         ]);
         let addr = test_estimator_address();
         let caller = test_caller_address();
-        let result1 = analyze_trace_inner(&trace1, &addr, &caller, None, None, None).unwrap();
-        let result2 = analyze_trace_inner(&trace2, &addr, &caller, None, None, None).unwrap();
+        let result1 = analyze_trace_inner(&trace1, &addr, &caller, None, None, None, None).unwrap();
+        let result2 = analyze_trace_inner(&trace2, &addr, &caller, None, None, None, None).unwrap();
         // Each call uses a fresh CacheDB, so results should differ
         assert_eq!(result1.state_update_count, 1);
         assert_eq!(result2.state_update_count, 2);
@@ -1558,6 +1712,101 @@ mod tests {
         assert!(analyze_prestate_inner(&diff, &frame, "0x12", &addr, &caller, None, None).is_err());
     }
 
+    /// Cold-slot SSTORE prices (EIP-2929/2200) the seeded original turns one write into another.
+    const SET_FROM_ZERO: u64 = 22_100;
+    const CHANGE_SET_SLOT: u64 = 5_000;
+    const REWRITE_SAME_VALUE: u64 = 2_200;
+
+    fn store(slot_n: u64, value: u64) -> StateUpdate {
+        StateUpdate::Store(gas_analyzer_core::types::IStateUpdateTypes::Store {
+            slot: B256::from(U256::from(slot_n)),
+            value: B256::from(U256::from(value)),
+        })
+    }
+
+    #[test]
+    fn test_original_storage_reads_each_slot_from_the_diff_or_its_last_write() {
+        // Slot 1 changes, 2 is set from zero, 4 is cleared, and 5 is in neither half: unchanged.
+        let diff: DiffMode =
+            serde_json::from_str(&make_diff(&[(1, 1), (4, 9)], &[(1, 2), (2, 3)])).unwrap();
+        let updates = [
+            store(1, 2),
+            store(2, 3),
+            store(5, 7),
+            store(5, 8),
+            store(4, 0),
+        ];
+        let consumer: Address = CONSUMER.parse().unwrap();
+        let word = |n: u64| B256::from(U256::from(n));
+        assert_eq!(
+            original_storage(&diff, consumer, &updates),
+            BTreeMap::from([
+                (word(1), word(1)),
+                (word(2), word(0)),
+                (word(4), word(9)),
+                (word(5), word(8)),
+            ])
+        );
+        assert!(original_storage(&diff, Address::ZERO, &updates)[&word(1)] == word(2));
+    }
+
+    #[test]
+    fn test_a_prestate_diff_prices_struct_log_writes_against_their_original_values() {
+        let trace = make_trace(vec![
+            make_sstore_log("1", "2", 90_000),
+            make_sstore_log("5", "7", 80_000),
+        ]);
+        let analyze = |diff: Option<&str>| {
+            let out = analyze_trace_inner(
+                &trace,
+                &test_estimator_address(),
+                &test_caller_address(),
+                None,
+                Some(CONSUMER),
+                None,
+                diff,
+            )
+            .unwrap();
+            assert!(!out.is_heuristic);
+            out.gas_estimate
+        };
+        // Slot 1 goes from 1 to 2; slot 5 isn't in the diff, so it already held 7.
+        let diff = make_diff(&[(1, 1)], &[(1, 2)]);
+        assert_eq!(
+            analyze(None) - analyze(Some(&diff)),
+            (SET_FROM_ZERO - CHANGE_SET_SLOT) + (SET_FROM_ZERO - REWRITE_SAME_VALUE)
+        );
+    }
+
+    #[test]
+    fn test_a_prestate_diff_needs_the_origin_it_seeds() {
+        let trace = make_trace(vec![make_sstore_log("1", "2", 90_000)]);
+        let diff = make_diff(&[(1, 1)], &[(1, 2)]);
+        let err = analyze_trace_inner(
+            &trace,
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+            None,
+            None,
+            Some(&diff),
+        )
+        .unwrap_err();
+        assert!(err.contains("origin_address"), "{err}");
+    }
+
+    #[test]
+    fn test_prestate_writes_are_priced_against_their_original_values() {
+        let frame = make_frame("CALL", vec![], vec![]);
+        let gas = |pre: &[(u64, u64)]| {
+            analyze_prestate_fixture(&make_diff(pre, &[(1, 2)]), &frame)
+                .result
+                .unwrap()
+                .gas_estimate
+        };
+        assert_eq!(gas(&[]) - gas(&[(1, 1)]), SET_FROM_ZERO - CHANGE_SET_SLOT);
+    }
+
     #[test]
     fn test_net_sstore_costs_price_each_changed_slot_once() {
         // Set from zero, reset, cleared (refunded), and unchanged.
@@ -1584,6 +1833,7 @@ mod tests {
             Some(1),
             None,
             None,
+            None,
         )
     }
 
@@ -1604,6 +1854,7 @@ mod tests {
             &test_estimator_address(),
             &test_caller_address(),
             Some(1),
+            None,
             None,
             None,
         )
@@ -1708,6 +1959,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         };
@@ -1762,6 +2014,7 @@ mod tests {
                 None,
                 None,
                 value,
+                None,
             )
             .unwrap()
         };
@@ -1783,6 +2036,7 @@ mod tests {
             None,
             None,
             Some("one ether"),
+            None,
         );
         assert!(result.unwrap_err().contains("Invalid value"));
     }
@@ -1819,17 +2073,114 @@ mod tests {
 
     fn frame_tree(trace: &str, owned: &[&str]) -> FrameTreeAnalysis {
         let owned: Vec<String> = owned.iter().map(|a| a.to_string()).collect();
-        analyze_frame_tree_inner(trace, ROOT, &owned, &test_caller_address(), None, None)
-            .expect("frame tree")
+        analyze_frame_tree_inner(
+            trace,
+            ROOT,
+            &owned,
+            &test_caller_address(),
+            None,
+            None,
+            None,
+        )
+        .expect("frame tree")
+    }
+
+    #[test]
+    fn test_a_prestate_diff_prices_each_frames_writes_against_their_original_values() {
+        let trace = root_calls_vault(1_000_000, 100_000);
+        let owned = vec![VAULT.to_string()];
+        let word = |n: u64| format!("0x{n:064x}");
+        // The root changes slot 1 from 9 to 0xa, the vault slot 5 from 0x31 to 0x32.
+        let diff = serde_json::json!({
+            "pre": {
+                ROOT: { "storage": { word(1): word(9) } },
+                VAULT: { "storage": { word(5): word(0x31) } },
+            },
+            "post": {
+                ROOT: { "storage": { word(1): word(0xa) } },
+                VAULT: { "storage": { word(5): word(0x32) } },
+            },
+        })
+        .to_string();
+        let analyze = |diff: Option<&str>| {
+            analyze_frame_tree_inner(
+                &trace,
+                ROOT,
+                &owned,
+                &test_caller_address(),
+                None,
+                None,
+                diff,
+            )
+            .unwrap()
+        };
+        let (empty, seeded) = (analyze(None), analyze(Some(&diff)));
+        let saved = SET_FROM_ZERO - CHANGE_SET_SLOT;
+        // Root-only, the vault's write runs natively inside its CALL, charged from the trace.
+        assert_eq!(empty.root_only_gas - seeded.root_only_gas, saved);
+        assert_eq!(empty.nested_gas - seeded.nested_gas, 2 * saved);
+    }
+
+    /// The root calls the vault twice: the first call sets its slot 5 from 3 to 7, the second back
+    /// to 3, so the slot is in neither half of the diff and its original is the last value written.
+    #[test]
+    fn test_sibling_frames_seed_a_slot_from_the_frame_that_returned_last() {
+        let call = |gas: u64| {
+            let mut call = make_call_log(VAULT, "0", "aabbccdd", gas);
+            call["gasCost"] = gas.into();
+            call
+        };
+        let entry = |value: &str, gas: u64| {
+            let mut entry = sstore_at(2, "5", value);
+            entry["gas"] = (gas - VAULT_ACCESS).into();
+            entry
+        };
+        let resume = |gas: u64| {
+            serde_json::json!({
+                "pc": 201, "op": "POP", "gas": gas, "gasCost": 2, "depth": 1,
+                "stack": ["0x0000000000000000000000000000000000000000000000000000000000000001"],
+                "memory": [],
+            })
+        };
+        let trace: LeanFrame = serde_json::from_str(&make_trace(vec![
+            call(1_000_000),
+            entry("7", 1_000_000),
+            resume(600_000),
+            call(600_000),
+            entry("3", 600_000),
+            resume(100_000),
+        ]))
+        .unwrap();
+        let vault: Address = VAULT.parse().unwrap();
+        let tree = compute_frame_tree_hypothetical(
+            trace.into(),
+            ROOT.parse().unwrap(),
+            &BTreeSet::from([vault]),
+            &NESTING_COST_MODEL_V1,
+        )
+        .unwrap();
+        assert_eq!(tree.frames.len(), 3, "one frame per call");
+
+        let diff: DiffMode = serde_json::from_str(r#"{"pre":{},"post":{}}"#).unwrap();
+        let seeds = frame_tree_original_storage(&diff, &tree.frames);
+        let word = |n: u64| B256::from(U256::from(n));
+        assert_eq!(seeds[&vault][&word(5)], word(3));
     }
 
     #[test]
     fn test_a_depth_zero_log_is_an_error_not_a_hang() {
         let trace = make_trace(vec![sstore_at(1, "1", "a"), sstore_at(0, "2", "b")]);
         let owned = vec![VAULT.to_string()];
-        let err =
-            analyze_frame_tree_inner(&trace, ROOT, &owned, &test_caller_address(), None, None)
-                .unwrap_err();
+        let err = analyze_frame_tree_inner(
+            &trace,
+            ROOT,
+            &owned,
+            &test_caller_address(),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(err.contains("depth 0"), "{err}");
     }
 
@@ -1891,14 +2242,23 @@ mod tests {
             &test_caller_address(),
             None,
             None,
+            None,
         )
         .expect("frame tree");
         assert_eq!(out.frames.len(), 2);
 
         let error = br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"response size exceeds limit"}}"#;
         assert_eq!(
-            analyze_frame_tree_bytes_inner(error, ROOT, &owned, &test_caller_address(), None, None)
-                .unwrap_err(),
+            analyze_frame_tree_bytes_inner(
+                error,
+                ROOT,
+                &owned,
+                &test_caller_address(),
+                None,
+                None,
+                None
+            )
+            .unwrap_err(),
             AnalyzeTraceBytesError::Rpc {
                 message: "response size exceeds limit".to_string(),
                 too_large: true,

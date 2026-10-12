@@ -16,7 +16,7 @@ import init, { analyze_trace_bytes, analyze_prestate } from "@gas-killer/analyze
 await init() // in Node: initSync({ module: fs.readFileSync(".../gas_killer_wasm_bg.wasm") })
 ```
 
-### `analyze_trace(trace, estimator, caller, block?, origin?, value?)`
+### `analyze_trace(trace, estimator, caller, block?, origin?, value?, prestateDiff?)`
 
 Analyzes the `result` of `debug_traceTransaction` with the default struct-log tracer (`{ enableMemory: true }`), passed as a JSON string.
 
@@ -25,17 +25,18 @@ Analyzes the `result` of `debug_traceTransaction` with the default struct-log tr
 - `block`: block number, as a `bigint`.
 - `origin`: the transaction's target contract, for detecting re-entrant callbacks.
 - `value`: the transaction's `msg.value` in wei, as a decimal or `0x` hex string. Pass it for transactions that send ETH: without it, a payload that forwards that ETH in a `CALL` can't be simulated and falls back to the heuristic.
+- `prestateDiff`: the transaction's `prestateTracer` diff, as a JSON string (see `analyze_prestate`). It gives each slot the program writes its value before the transaction, so writes are priced as on chain, and it needs `origin`. Without it every slot starts empty, and each write is priced as a fresh 22,100-gas one where changing a set slot costs 5,000 and rewriting its value 2,200.
 
 ```js
 const result = analyze_trace(JSON.stringify(trace), estimator, receipt.from, BigInt(receipt.blockNumber), receipt.to)
 // { gas_estimate, is_heuristic, encoded_updates, state_update_count, skipped_opcodes, reentered, native_call_gas }
 ```
 
-The estimate is measured against an empty state, where the contracts the transaction calls have no code. The simulation charges each external `CALL` the program replays for the opcode itself, and what its callee spent comes from the trace instead, reported as `native_call_gas` and included in `gas_estimate`.
+The estimate is measured against an empty state, holding only the original values from `prestateDiff`, where the contracts the transaction calls have no code. The simulation charges each external `CALL` the program replays for the opcode itself, and what its callee spent comes from the trace instead, reported as `native_call_gas` and included in `gas_estimate`.
 
 `gas_estimate` covers applying the state updates. Settling also verifies the operators' aggregate signature, which costs up to `signature_verification_gas` (50,000 gas for Schnorr). Add the two for the transaction's total cost with Gas Killer.
 
-### `analyze_trace_bytes(response, estimator, caller, block?, origin?, value?)`
+### `analyze_trace_bytes(response, estimator, caller, block?, origin?, value?, prestateDiff?)`
 
 Takes the same arguments as `analyze_trace`, except that it accepts the whole JSON-RPC response body as a `Uint8Array`. Use it for large traces:
 
@@ -59,7 +60,7 @@ Analyzes the same transaction from two much smaller traces:
 - `diff`: `debug_traceTransaction` with `{ tracer: "prestateTracer", tracerConfig: { diffMode: true } }`;
 - `callFrame`: `debug_traceTransaction` with `{ tracer: "callTracer", tracerConfig: { withLog: true } }`.
 
-`consumer` is the transaction's target contract. It only works for calls that change only that contract's storage and make no external `CALL`, `CREATE` or `SELFDESTRUCT`:
+`consumer` is the transaction's target contract. It only works for calls that change only that contract's storage and make no external `CALL`, `CREATE` or `SELFDESTRUCT`. Writes are priced against their original values from `diff`:
 
 ```js
 const out = analyze_prestate(JSON.stringify(diff), JSON.stringify(frame), receipt.to, estimator, receipt.from, block)
@@ -67,7 +68,7 @@ if (out.eligible) use(out.result) // same shape as analyze_trace's result
 else console.log(out.reason) // fall back to analyze_trace
 ```
 
-### `analyze_frame_tree_bytes(response, root, owned, caller, block?, value?)`
+### `analyze_frame_tree_bytes(response, root, owned, caller, block?, value?, prestateDiff?)`
 
 Prices the transaction as a nested settlement, as if its target `root` and the contracts in `owned` had integrated the SDK. `response` is the struct-log trace's JSON-RPC response, as for `analyze_trace_bytes`, and it throws the same named errors.
 
@@ -89,7 +90,7 @@ const tree = analyze_frame_tree_bytes(response, receipt.to, [vault, ledger], rec
 Both totals are measured against an empty state, so:
 
 - A natively replayed `CALL` runs into an address with no code. The simulation charges the opcode, and what its callee spent comes from the trace.
-- Every storage write is priced as a write to an empty slot. Against real state many are cheaper, so `nested_gas` tends to run high and the savings shown are conservative.
+- Storage holds only what `prestateDiff` gives each frame's target, as for `analyze_trace`. Without it every write is priced as a write to an empty slot, so both totals run high.
 
 There's no heuristic fallback: a simulation failure throws. `analyze_frame_tree(trace, …)` takes the trace as a JSON string instead.
 
