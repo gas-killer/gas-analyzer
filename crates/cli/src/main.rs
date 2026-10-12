@@ -726,7 +726,7 @@ mod what_if {
                 format!("called by {}", frame.caller)
             };
             println!(
-                "  #{i} {} ({role}): {} ops, {} gas measured alone",
+                "  #{i} {} ({role}): {} ops, {} gas measured",
                 frame.target,
                 frame.updates.len(),
                 gas
@@ -757,8 +757,8 @@ mod what_if {
         }
         println!(
             "\n{}",
-            "Each frame is measured from the state before the transaction, and the cost model's \
-             fixed overhead stands in for the per-frame proof and witness cost."
+            "Frames run in execution order on one state, so each sees everything that ran before it; \
+             the cost model's fixed overhead stands in for the per-frame proof and witness cost."
                 .dimmed()
         );
         Ok(())
