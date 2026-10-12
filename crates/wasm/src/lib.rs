@@ -6,9 +6,9 @@ use gas_analyzer_core::nested::{
     NESTING_COST_MODEL_V1, compute_frame_tree_hypothetical, frame_tree_total, unnested_owned,
 };
 use gas_analyzer_core::{
-    PrestateEligibility, StateUpdate, TraceExtract, build_state_updates_from_prestate,
-    classify_prestate_eligibility, compute_state_updates, encode_state_updates_to_abi,
-    estimate_gas_from_state_updates,
+    PrestateEligibility, StateUpdate, TURETZKY_UPPER_GAS_LIMIT_SCHNORR, TraceExtract,
+    build_state_updates_from_prestate, classify_prestate_eligibility, compute_state_updates,
+    encode_state_updates_to_abi, estimate_gas_from_state_updates,
 };
 use gas_analyzer_estimator::{SimEnvOpts, estimate_frame_tree_gas, estimate_state_changes_gas};
 use revm::database::{CacheDB, EmptyDB};
@@ -42,6 +42,8 @@ pub struct AnalyzeTraceResult {
     pub reentered: bool,
     /// The trace's gas for the `CALL`s the program replays natively, included in `gas_estimate`.
     pub native_call_gas: u64,
+    /// See [`SIGNATURE_VERIFICATION_GAS`]; not included in `gas_estimate`.
+    pub signature_verification_gas: u64,
 }
 
 /// The outcome of [`analyze_prestate`]: a result when the call has a prestate net form, otherwise
@@ -84,6 +86,9 @@ pub struct FrameTreeAnalysis {
     pub nested_native_call_gas: u64,
     /// The cost model's fixed charge per nested frame, included in `nested_gas`.
     pub frame_overhead_gas: u64,
+    /// See [`SIGNATURE_VERIFICATION_GAS`]; one signature covers the whole tree, and neither total
+    /// includes it.
+    pub signature_verification_gas: u64,
     /// Root first, in execution order.
     pub frames: Vec<FrameGas>,
     pub not_nested: Vec<NotNested>,
@@ -106,6 +111,11 @@ pub struct NotNested {
     pub address: String,
     pub reason: String,
 }
+
+/// Gas to verify the operators' aggregate signature, which every settlement pays on top of its
+/// program. The service signs with Schnorr only, so this is its upper limit; add it to an estimate
+/// for the transaction's total with Gas Killer.
+pub const SIGNATURE_VERIFICATION_GAS: u64 = TURETZKY_UPPER_GAS_LIMIT_SCHNORR;
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -383,6 +393,7 @@ fn analyze_extract(
         skipped_opcodes: skipped,
         reentered: extract.reentered,
         native_call_gas: extract.call_gas_total,
+        signature_verification_gas: SIGNATURE_VERIFICATION_GAS,
     })
 }
 
@@ -471,6 +482,7 @@ fn analyze_frame_tree_trace(
         root_only_native_call_gas: root_only.call_gas_total,
         nested_native_call_gas: nested.call_gas_total,
         frame_overhead_gas: cost.frame_overhead_gas,
+        signature_verification_gas: SIGNATURE_VERIFICATION_GAS,
         frames: nested
             .frames
             .iter()
@@ -792,6 +804,7 @@ export interface AnalyzeTraceResult {
     skipped_opcodes: string[];
     reentered: boolean;
     native_call_gas: number;
+    signature_verification_gas: number;
 }
 
 export interface PrestateAnalysis {
@@ -820,6 +833,7 @@ export interface FrameTreeAnalysis {
     root_only_native_call_gas: number;
     nested_native_call_gas: number;
     frame_overhead_gas: number;
+    signature_verification_gas: number;
     frames: FrameGas[];
     not_nested: NotNested[];
     skipped_opcodes: string[];
@@ -1690,6 +1704,10 @@ mod tests {
         let costly = analyze(&call_spending(500_000, 100_000));
         assert!(!cheap.is_heuristic && !costly.is_heuristic);
         assert_eq!(cheap.native_call_gas, 2_000);
+        assert_eq!(
+            cheap.signature_verification_gas, 50_000,
+            "the Schnorr limit"
+        );
         assert_eq!(costly.native_call_gas, 400_000);
         assert_eq!(costly.gas_estimate - cheap.gas_estimate, 398_000);
     }
@@ -1797,6 +1815,7 @@ mod tests {
         assert!(out.frames[1].caller.eq_ignore_ascii_case(ROOT));
         let children: u64 = out.frames[1..].iter().map(|f| f.gas - 21_000).sum();
         assert_eq!(out.nested_native_call_gas, 0, "the vault's call is nested");
+        assert_eq!(out.signature_verification_gas, 50_000);
         assert_eq!(out.root_only_native_call_gas, 900_000);
         assert_eq!(
             out.nested_gas,

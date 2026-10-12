@@ -33,6 +33,8 @@ const result = analyze_trace(JSON.stringify(trace), estimator, receipt.from, Big
 
 The estimate is measured against an empty state, where the contracts the transaction calls have no code. Each external `CALL` the program replays is charged its gas from the trace instead, reported as `native_call_gas` and included in `gas_estimate`.
 
+`gas_estimate` covers applying the state updates. Settling also verifies the operators' aggregate signature, which costs up to `signature_verification_gas` (50,000 gas for Schnorr). Add the two for the transaction's total cost with Gas Killer.
+
 ### `analyze_trace_bytes(response, estimator, caller, block?, origin?, value?)`
 
 Takes the same arguments as `analyze_trace`, except that it accepts the whole JSON-RPC response body as a `Uint8Array`. Use it for large traces:
@@ -77,6 +79,7 @@ const tree = analyze_frame_tree_bytes(response, receipt.to, [vault, ledger], rec
 //   root_only_gas, nested_gas,                          // the two settlements' totals
 //   root_only_native_call_gas, nested_native_call_gas,  // trace gas of the CALLs each replays natively
 //   frame_overhead_gas,                                 // the fixed charge per nested frame
+//   signature_verification_gas,                         // paid once per tree, in neither total
 //   frames: [{ target, caller, op_count, gas }],        // root first, in execution order
 //   not_nested: [{ address, reason }],                  // owned contracts that got no frame, and why
 //   skipped_opcodes,
