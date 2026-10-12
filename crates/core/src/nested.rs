@@ -19,8 +19,9 @@ use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 
 pub use crate::encoding::encode_state_updates_to_abi as encoded_program;
+use crate::heuristic::BASE_TX_COST;
 use crate::sim_profile::STATE_TRACKER_SLOT;
-use crate::trace::append_state_update_from_struct_log;
+use crate::trace::{append_state_update_from_struct_log, callee_gas};
 use crate::types::Opcode;
 pub use crate::types::{IStateUpdateTypes, StateUpdate};
 
@@ -192,6 +193,9 @@ pub struct FrameTreeExtract {
     pub skipped_opcodes: HashSet<Opcode>,
     /// Gas of every `CALL` op that replays natively, across all frames.
     pub call_gas_total: u64,
+    /// The part of `call_gas_total` spent inside the callees, without the `CALL` opcodes' own
+    /// cost: what a simulation that runs those `CALL`s into code-less accounts misses.
+    pub callee_gas_total: u64,
     /// Every contract whose transition counter the trace moves: the contracts a settlement
     /// pins, whether they are nested frames or run natively inside a `CALL`.
     pub counter_moves: BTreeSet<Address>,
@@ -415,6 +419,9 @@ struct ProgramState {
     child_call_gas: u64,
     /// Native gas of the `CALL` ops in this frame's own program.
     direct_call_gas: u64,
+    /// What `native_gas` and `direct_call_gas` spent inside the callees.
+    native_callee_gas: u64,
+    direct_callee_gas: u64,
     /// Turned back into a `CALL` for not paying its nesting overhead.
     pruned: bool,
 }
@@ -430,6 +437,11 @@ struct WalkFrame {
     out: Vec<StateUpdate>,
     /// Native gas of the `CALL` ops in `out`; travels with it, so a revert drops both.
     call_gas: u64,
+    /// What `call_gas` spent inside the callees.
+    callee_gas: u64,
+    /// The gas at this frame's first step, and the `gasCost` of the `CALL` that opened it.
+    entry_gas: u64,
+    call_gas_cost: u64,
     emitted_view: BTreeMap<B256, B256>,
     emitted_call_gas: Option<u64>,
     /// Set on the first frame of a nested program: gas at the `CALL` that opened it.
@@ -446,6 +458,7 @@ struct PendingFrame {
     emitted_view: BTreeMap<B256, B256>,
     emitted_call_gas: Option<u64>,
     nested_start_gas: Option<u64>,
+    call_gas_cost: u64,
 }
 
 /// The canonical storage image of `target` visible right now: every open frame's journal
@@ -527,6 +540,71 @@ pub fn without_nested_ops(updates: &[StateUpdate]) -> Vec<StateUpdate> {
         .collect()
 }
 
+/// The tree in one transaction: the root's gas, plus every child's less the base transaction cost
+/// it was measured with, plus the nesting overhead of each child.
+pub fn frame_tree_total(frame_gas: &[u64], cost: &NestingCostModel) -> u64 {
+    frame_gas.iter().enumerate().fold(0u64, |total, (i, &gas)| {
+        total.saturating_add(if i == 0 {
+            gas
+        } else {
+            gas.saturating_sub(BASE_TX_COST)
+                .saturating_add(cost.frame_overhead_gas)
+        })
+    })
+}
+
+/// Why a contract in a hypothetical split's owned set got no frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotNestedReason {
+    /// A frame calls it, but the split kept that call a `CALL`.
+    KeptAsCall,
+    /// No frame calls it: it ran inside a native `CALL`, or not at all.
+    NotReached,
+}
+
+impl NotNestedReason {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::KeptAsCall => {
+                "called directly, but cheaper as a plain CALL (or it reverted, or uses transient \
+                 storage or selfdestruct)"
+            }
+            Self::NotReached => {
+                "not called from a nested frame: its caller is outside the owned set or was \
+                 itself kept as a CALL, so it ran inside that call"
+            }
+        }
+    }
+}
+
+/// Each contract in `owned` that [`compute_frame_tree_hypothetical`] gave no frame, and why.
+pub fn unnested_owned(
+    owned: &BTreeSet<Address>,
+    frames: &[FrameProgram],
+) -> Vec<(Address, NotNestedReason)> {
+    let framed: BTreeSet<Address> = frames.iter().map(|f| f.target).collect();
+    let called: BTreeSet<Address> = frames
+        .iter()
+        .flat_map(|f| &f.updates)
+        .filter_map(|u| match u {
+            StateUpdate::Call(call) => Some(call.target),
+            _ => None,
+        })
+        .collect();
+    owned
+        .iter()
+        .filter(|a| !framed.contains(*a))
+        .map(|a| {
+            let reason = if called.contains(a) {
+                NotNestedReason::KeptAsCall
+            } else {
+                NotNestedReason::NotReached
+            };
+            (*a, reason)
+        })
+        .collect()
+}
+
 /// Which callees a split may turn into frames.
 #[derive(Clone, Copy)]
 enum Eligibility<'a> {
@@ -579,6 +657,8 @@ fn split_frame_tree(
         effect_gas: 0,
         child_call_gas: 0,
         direct_call_gas: 0,
+        native_callee_gas: 0,
+        direct_callee_gas: 0,
         pruned: false,
     }];
     let mut frames = vec![WalkFrame {
@@ -588,6 +668,9 @@ fn split_frame_tree(
         journal: BTreeMap::new(),
         out: Vec::new(),
         call_gas: 0,
+        callee_gas: 0,
+        entry_gas: 0,
+        call_gas_cost: 0,
         emitted_view: BTreeMap::new(),
         emitted_call_gas: None,
         nested_start_gas: None,
@@ -612,6 +695,9 @@ fn split_frame_tree(
                     journal: BTreeMap::new(),
                     out: Vec::new(),
                     call_gas: 0,
+                    callee_gas: 0,
+                    entry_gas: struct_log.gas,
+                    call_gas_cost: p.call_gas_cost,
                     emitted_view: p.emitted_view,
                     emitted_call_gas: p.emitted_call_gas,
                     nested_start_gas: p.nested_start_gas,
@@ -669,7 +755,9 @@ fn split_frame_tree(
 
             if let Some(gas_after_opcode) = frame.emitted_call_gas {
                 let gas = gas_after_opcode.saturating_sub(struct_log.gas);
-                frames.last_mut().expect("root frame must remain").call_gas += gas;
+                let caller = frames.last_mut().expect("root frame must remain");
+                caller.call_gas += gas;
+                caller.callee_gas += callee_gas(gas, frame.call_gas_cost, Some(frame.entry_gas));
                 if let Some(parent) = parent_program {
                     programs[parent].child_call_gas += gas;
                 }
@@ -680,8 +768,11 @@ fn split_frame_tree(
                 if success {
                     let native = start_gas.saturating_sub(struct_log.gas);
                     programs[id].native_gas = native;
+                    programs[id].native_callee_gas =
+                        callee_gas(native, frame.call_gas_cost, Some(frame.entry_gas));
                     programs[id].updates = Some(frame.out);
                     programs[id].direct_call_gas = frame.call_gas;
+                    programs[id].direct_callee_gas = frame.callee_gas;
                     if let Some(parent) = parent_program {
                         programs[parent].child_call_gas += native;
                     }
@@ -711,6 +802,7 @@ fn split_frame_tree(
                 }
                 parent.out.extend(frame.out);
                 parent.call_gas += frame.call_gas;
+                parent.callee_gas += frame.callee_gas;
                 // An emitting child ran while the parent was suspended, so its emitted view
                 // is a superset of the parent's — adopt it.
                 if child_emitting {
@@ -770,6 +862,7 @@ fn split_frame_tree(
                         emitted_view,
                         emitted_call_gas: None,
                         nested_start_gas: None,
+                        call_gas_cost: 0,
                     });
                 }
             }
@@ -789,6 +882,7 @@ fn split_frame_tree(
                         emitted_view: BTreeMap::new(),
                         emitted_call_gas: None,
                         nested_start_gas: None,
+                        call_gas_cost: 0,
                     });
                 }
             }
@@ -808,6 +902,7 @@ fn split_frame_tree(
                     emitted_view: BTreeMap::new(),
                     emitted_call_gas: None,
                     nested_start_gas: None,
+                    call_gas_cost: struct_log.gas_cost,
                 };
                 if cur_emitting && !op_errored {
                     // Boundary: external code is about to observe the current target's
@@ -837,6 +932,8 @@ fn split_frame_tree(
                                 effect_gas: 0,
                                 child_call_gas: 0,
                                 direct_call_gas: 0,
+                                native_callee_gas: 0,
+                                direct_callee_gas: 0,
                                 pruned: false,
                             });
                             programs[parent].children.push(id);
@@ -881,6 +978,7 @@ fn split_frame_tree(
                         emitted_view: BTreeMap::new(),
                         emitted_call_gas: None,
                         nested_start_gas: None,
+                        call_gas_cost: 0,
                     });
                 }
             }
@@ -908,6 +1006,7 @@ fn split_frame_tree(
     let root_frame = frames.pop().expect("root frame present");
     programs[0].updates = Some(root_frame.out);
     programs[0].direct_call_gas = root_frame.call_gas;
+    programs[0].direct_callee_gas = root_frame.callee_gas;
 
     let counter_moves = root_frame
         .journal
@@ -922,7 +1021,9 @@ fn split_frame_tree(
         program.children.retain(|c| !dropped[*c]);
     }
     prune_unprofitable(&mut programs, cost);
-    let call_gas_total = native_call_gas(&programs);
+    let call_gas_total = native_call_gas(&programs, |p| (p.direct_call_gas, p.native_gas));
+    let callee_gas_total =
+        native_call_gas(&programs, |p| (p.direct_callee_gas, p.native_callee_gas));
     let frames = compact(programs)?;
     tracing::Span::current().record("frame_count", frames.len());
 
@@ -930,6 +1031,7 @@ fn split_frame_tree(
         frames,
         skipped_opcodes,
         call_gas_total,
+        callee_gas_total,
         counter_moves,
     })
 }
@@ -1029,14 +1131,15 @@ fn prune_unprofitable(programs: &mut [ProgramState], cost: &NestingCostModel) {
 
 /// Native gas of every `CALL` the kept programs replay: their own `CALL` ops, plus each pruned
 /// frame whose parent is kept, which now runs as one call with its whole subtree inside.
-fn native_call_gas(programs: &[ProgramState]) -> u64 {
+/// `gas` picks a program's (direct, native) figures to sum.
+fn native_call_gas(programs: &[ProgramState], gas: impl Fn(&ProgramState) -> (u64, u64)) -> u64 {
     programs
         .iter()
         .map(|p| {
             if !p.dropped {
-                p.direct_call_gas
+                gas(p).0
             } else if p.pruned && p.parent.is_some_and(|parent| !programs[parent].dropped) {
-                p.native_gas
+                gas(p).1
             } else {
                 0
             }
@@ -1488,6 +1591,27 @@ mod tests {
             tree.call_gas_total, 5_000,
             "the restored call replays natively"
         );
+    }
+
+    /// A pruned frame replays as one native call; what its callee spent leaves out the `CALL`
+    /// opcode's own cost.
+    #[test]
+    fn pruned_frame_counts_its_callee_gas_without_the_call_opcode() {
+        let mut call = call(1, 1_000_000, B);
+        call.gas_cost = 902_600;
+        let mut entry = bump(2, 1);
+        entry.gas = 900_000;
+        let logs = vec![
+            bump(1, 1),
+            call,
+            entry,
+            stop(2, 895_000),
+            resume(1, 1_000_000 - 902_600 + 895_000, true),
+        ];
+        let tree = split(logs, &[B]);
+        assert_eq!(tree.frames.len(), 1, "B is too cheap to nest");
+        assert_eq!(tree.call_gas_total, 7_600);
+        assert_eq!(tree.callee_gas_total, 5_000);
     }
 
     fn stop(depth: u64, gas: u64) -> StructLog {

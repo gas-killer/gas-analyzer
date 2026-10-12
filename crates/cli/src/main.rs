@@ -629,9 +629,8 @@ mod what_if {
     use colored::Colorize;
     use gas_analyzer_core::SignatureType;
     use gas_analyzer_core::nested::{
-        FrameProgram, NESTING_COST_MODEL_V1, compute_frame_tree_hypothetical,
+        NESTING_COST_MODEL_V1, compute_frame_tree_hypothetical, unnested_owned,
     };
-    use gas_analyzer_core::types::StateUpdate;
     use gas_analyzer_evmsketch::{GasKillerEvmSketchDefault, OriginalTx};
     use std::collections::BTreeSet;
 
@@ -732,8 +731,12 @@ mod what_if {
                 gas
             );
         }
-        for (contract, reason) in not_nested(&owned, &nested.frames) {
-            println!("  {} {contract}: {reason}", "not nested".yellow());
+        for (contract, reason) in unnested_owned(&owned, &nested.frames) {
+            println!(
+                "  {} {contract}: {}",
+                "not nested".yellow(),
+                reason.describe()
+            );
         }
 
         println!(
@@ -762,35 +765,5 @@ mod what_if {
                 .dimmed()
         );
         Ok(())
-    }
-
-    /// Why each owned contract did not get a frame.
-    fn not_nested(
-        owned: &BTreeSet<Address>,
-        frames: &[FrameProgram],
-    ) -> Vec<(Address, &'static str)> {
-        let framed: BTreeSet<Address> = frames.iter().map(|f| f.target).collect();
-        let called: BTreeSet<Address> = frames
-            .iter()
-            .flat_map(|f| &f.updates)
-            .filter_map(|u| match u {
-                StateUpdate::Call(call) => Some(call.target),
-                _ => None,
-            })
-            .collect();
-        owned
-            .iter()
-            .filter(|a| !framed.contains(*a))
-            .map(|a| {
-                let reason = if called.contains(a) {
-                    "called directly, but cheaper as a plain CALL (or it reverted, or uses \
-                     transient storage or selfdestruct)"
-                } else {
-                    "not called from a nested frame: its caller is outside the owned set or \
-                     was itself kept as a CALL, so it ran inside that call"
-                };
-                (*a, reason)
-            })
-            .collect()
     }
 }

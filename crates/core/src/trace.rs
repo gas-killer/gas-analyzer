@@ -55,6 +55,15 @@ pub fn parse_trace_memory(memory: Vec<String>) -> Vec<u8> {
 // State Update Extraction
 // ============================================================================
 
+/// Opcodes whose memory [`append_state_update_from_struct_log`] reads; it must cover every
+/// `copy_memory` there, since the wasm crate's lean trace parser drops memory for every other opcode.
+pub fn reads_memory(op: &str) -> bool {
+    matches!(
+        op,
+        "CREATE" | "CREATE2" | "CALL" | "LOG0" | "LOG1" | "LOG2" | "LOG3" | "LOG4"
+    )
+}
+
 /// Extract a state update from a Geth StructLog entry.
 ///
 /// Returns `Ok(Some(opcode))` if the opcode is unsupported and was skipped (SELFDESTRUCT, TSTORE),
@@ -200,6 +209,9 @@ pub struct TraceExtract {
     pub skipped_opcodes: HashSet<Opcode>,
     /// Total gas consumed by the extracted depth-1 CALLs (gross, pre-refund).
     pub call_gas_total: u64,
+    /// The part of `call_gas_total` spent inside the callees, without the `CALL` opcodes' own
+    /// cost: what a simulation that runs those `CALL`s into code-less accounts misses.
+    pub callee_gas_total: u64,
     /// Total gas actually charged for the extracted SSTOREs (from struct-log
     /// `gasCost`), reflecting cold/warm/dirty pricing per write.
     pub sstore_gas_total: u64,
@@ -213,6 +225,27 @@ pub struct TraceExtract {
     /// extraction are qualified, not corrected. Always `false` when no origin
     /// address was supplied.
     pub reentered: bool,
+}
+
+/// What a `CALL`'s callee spent of `gas_used`, the call's whole cost in the trace: its gas
+/// before the `CALL` less its gas on resuming.
+///
+/// `gas_cost` is Geth's `gasCost` for the `CALL`, the opcode's own cost plus the gas forwarded,
+/// and `entry_gas` the gas at the callee's first step, the gas forwarded plus any stipend. Their
+/// difference is the opcode's cost less the stipend, which `gas_used` also carries; a tracer whose
+/// `gasCost` leaves out the forwarded gas makes it zero, and the result `gas_used`. `None` is a
+/// call that opened no frame (an account without code, a precompile, a failed call).
+pub(crate) fn callee_gas(gas_used: u64, gas_cost: u64, entry_gas: Option<u64>) -> u64 {
+    entry_gas.map_or(0, |entry| {
+        gas_used.saturating_sub(gas_cost.saturating_sub(entry))
+    })
+}
+
+/// An extracted `CALL`'s struct log, and its callee's first step.
+struct CallGas {
+    gas: u64,
+    gas_cost: u64,
+    entry_gas: Option<u64>,
 }
 
 /// Compute state updates from a Geth DefaultFrame trace (see [`TraceExtract`]).
@@ -237,15 +270,24 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
     // Track what type of call brought us to each depth (for filtering nested CALLs)
     // "CALL" = regular CALL, "DELEGATECALL" = DELEGATECALL/CALLCODE
     let mut call_type_at_depth: HashMap<u64, &str> = HashMap::new();
-    // Track gas for each CALL we extract: map from call_index to gas_after_call_opcode
-    let mut call_gas_tracking: HashMap<usize, u64> = HashMap::new();
+    let mut call_gas_tracking: HashMap<usize, CallGas> = HashMap::new();
+    // An extracted CALL whose callee's first step, if it has one, is the next log.
+    let mut awaiting_entry: Option<(u64, usize)> = None;
     let mut total_call_gas = 0u64;
+    let mut callee_gas_total = 0u64;
     let mut sstore_gas_total = 0u64;
     let mut reentered = false;
 
     for struct_log in trace.struct_logs {
         let depth = struct_log.depth;
         let op = struct_log.op.as_ref().to_string();
+
+        if let Some((call_depth, idx)) = awaiting_entry.take()
+            && depth == call_depth + 1
+            && let Some(call) = call_gas_tracking.get_mut(&idx)
+        {
+            call.entry_gas = Some(struct_log.gas);
+        }
 
         // Re-entry detection: any CALL-family opcode below depth 1 whose
         // target (second stack item from the top) is the origin contract.
@@ -268,12 +310,10 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
             while let Some(&(d, idx)) = call_stack.last() {
                 if d >= depth {
                     // We're exiting this CALL. Calculate its gas cost.
-                    if let Some(gas_after_opcode) = call_gas_tracking.remove(&idx) {
-                        // Gas remaining after the CALL returns
-                        let gas_after_call = struct_log.gas;
-                        // Gas used by the CALL = gas after CALL opcode - gas after CALL returns
-                        let gas_used = gas_after_opcode.saturating_sub(gas_after_call);
+                    if let Some(call) = call_gas_tracking.remove(&idx) {
+                        let gas_used = call.gas.saturating_sub(struct_log.gas);
                         total_call_gas += gas_used;
+                        callee_gas_total += callee_gas(gas_used, call.gas_cost, call.entry_gas);
                     }
                     call_stack.pop();
                 } else {
@@ -328,9 +368,15 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
                     if op == "CALL" {
                         let call_index_1based = state_updates.len();
                         call_stack.push((depth, call_index_1based));
-                        // Track the gas remaining after the CALL opcode executes
-                        // This will be used to calculate gas used when the CALL exits
-                        call_gas_tracking.insert(call_index_1based, gas_after_opcode);
+                        call_gas_tracking.insert(
+                            call_index_1based,
+                            CallGas {
+                                gas: gas_after_opcode,
+                                gas_cost,
+                                entry_gas: None,
+                            },
+                        );
+                        awaiting_entry = Some((depth, call_index_1based));
                         // Increase target_depth to track when we exit this CALL
                         // This allows us to detect when the CALL returns and pop from call_stack
                         target_depth = depth + 1;
@@ -355,6 +401,7 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
         state_updates,
         skipped_opcodes,
         call_gas_total: total_call_gas,
+        callee_gas_total,
         sstore_gas_total,
         refund_counter,
         reentered,
@@ -914,6 +961,80 @@ mod tests {
             !updates.iter().any(|u| matches!(u, StateUpdate::Call(_))),
             "no call emitted"
         );
+    }
+
+    /// The legacy and the frame-tree walk, as (call gas, callee gas).
+    fn call_and_callee_gas(logs: Vec<StructLog>) -> [(u64, u64); 2] {
+        let trace = || DefaultFrame {
+            failed: false,
+            gas: 0,
+            return_value: Default::default(),
+            struct_logs: logs.clone(),
+        };
+        let legacy = compute_state_updates(trace(), None).expect("legacy");
+        let tree = crate::nested::compute_frame_tree_canonical(
+            trace(),
+            TARGET_ADDR,
+            &|_| false,
+            &crate::nested::NESTING_COST_MODEL_V1,
+        )
+        .expect("frame tree");
+        [
+            (legacy.call_gas_total, legacy.callee_gas_total),
+            (tree.call_gas_total, tree.callee_gas_total),
+        ]
+    }
+
+    /// Geth's `gasCost` for a `CALL` is the opcode's cost plus the gas it forwards.
+    fn call_costing(depth: u64, gas: u64, callee: Address, gas_cost: u64) -> StructLog {
+        let mut call = call(depth, gas, callee);
+        call.gas_cost = gas_cost;
+        call
+    }
+
+    #[test]
+    fn callee_gas_leaves_out_the_call_opcodes_own_cost() {
+        let y = Address::new([0x44; 20]);
+        // 2,600 for the cold account plus 900,000 forwarded; the callee spends 30,000 of it.
+        let logs = vec![
+            call_costing(1, 1_000_000, y, 902_600),
+            log("JUMPDEST", 2, 900_000, &[], &[], None),
+            log("STOP", 2, 870_000, &[], &[], None),
+            resume(1, 1_000_000 - 902_600 + 870_000, true),
+        ];
+        for gas in call_and_callee_gas(logs) {
+            assert_eq!(gas, (32_600, 30_000));
+        }
+    }
+
+    #[test]
+    fn a_call_that_opens_no_frame_spends_nothing_in_its_callee() {
+        let eoa = Address::new([0x44; 20]);
+        let logs = vec![
+            call_costing(1, 1_000_000, eoa, 902_600),
+            resume(1, 997_400, true),
+        ];
+        for gas in call_and_callee_gas(logs) {
+            assert_eq!(gas, (2_600, 0));
+        }
+    }
+
+    /// The stipend reaches the callee on top of the forwarded gas, and what it leaves of the
+    /// stipend comes back to the caller.
+    #[test]
+    fn callee_gas_counts_the_stipend_the_callee_spends() {
+        let y = Address::new([0x44; 20]);
+        // 9,000 for the value transfer plus 50,000 forwarded; the callee enters with the 2,300
+        // stipend on top and spends 1,000.
+        let logs = vec![
+            call_costing(1, 1_000_000, y, 59_000),
+            log("JUMPDEST", 2, 52_300, &[], &[], None),
+            log("STOP", 2, 51_300, &[], &[], None),
+            resume(1, 1_000_000 - 59_000 + 51_300, true),
+        ];
+        for gas in call_and_callee_gas(logs) {
+            assert_eq!(gas, (7_700, 1_000));
+        }
     }
 
     #[test]

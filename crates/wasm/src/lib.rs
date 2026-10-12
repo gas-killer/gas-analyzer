@@ -2,16 +2,22 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types::trace::geth::{CallFrame, DefaultFrame, DiffMode};
-use gas_analyzer_core::{
-    PrestateEligibility, StateUpdate, TraceExtract, build_state_updates_from_prestate,
-    classify_prestate_eligibility, compute_state_updates, encode_state_updates_to_abi,
-    estimate_gas_from_state_updates,
+use gas_analyzer_core::nested::{
+    NESTING_COST_MODEL_V1, compute_frame_tree_hypothetical, frame_tree_total, unnested_owned,
 };
-use gas_analyzer_estimator::{SimEnvOpts, estimate_state_changes_gas};
+use gas_analyzer_core::{
+    PrestateEligibility, StateUpdate, TURETZKY_UPPER_GAS_LIMIT_SCHNORR, TraceExtract,
+    build_state_updates_from_prestate, classify_prestate_eligibility, compute_state_updates,
+    encode_state_updates_to_abi, estimate_gas_from_state_updates,
+};
+use gas_analyzer_estimator::{SimEnvOpts, estimate_frame_tree_gas, estimate_state_changes_gas};
 use revm::database::{CacheDB, EmptyDB};
 use revm::primitives::hardfork::SpecId;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
+
+mod lean_trace;
+use lean_trace::LeanFrame;
 
 /// Initialize panic hook for better error messages in browser console.
 #[wasm_bindgen(start)]
@@ -34,6 +40,11 @@ pub struct AnalyzeTraceResult {
     /// execution; the estimate counts that callback gas as external and may
     /// overshoot. Only detected when an origin address was supplied.
     pub reentered: bool,
+    /// What the callees of the `CALL`s the program replays spent in the trace, included in
+    /// `gas_estimate`: the simulation runs those `CALL`s into accounts without code.
+    pub native_call_gas: u64,
+    /// See [`SIGNATURE_VERIFICATION_GAS`]; not included in `gas_estimate`.
+    pub signature_verification_gas: u64,
 }
 
 /// The outcome of [`analyze_prestate`]: a result when the call has a prestate net form, otherwise
@@ -62,15 +73,99 @@ pub struct EstimateGasResult {
     pub reentered: bool,
 }
 
+/// What a transaction would have cost settled as a nested tree, had its target and the `owned`
+/// contracts integrated the SDK.
+#[derive(Debug, serde::Serialize)]
+pub struct FrameTreeAnalysis {
+    /// The whole call settled by its target alone, split by the same walker, so the difference
+    /// from `nested_gas` is the nesting alone.
+    pub root_only_gas: u64,
+    pub nested_gas: u64,
+    /// What the callees of the `CALL`s each settlement replays natively spent in the trace,
+    /// included in its total: against an empty state those callees have no code, so the
+    /// simulation charges only the `CALL` opcodes.
+    pub root_only_native_call_gas: u64,
+    pub nested_native_call_gas: u64,
+    /// The cost model's fixed charge per nested frame, included in `nested_gas`.
+    pub frame_overhead_gas: u64,
+    /// See [`SIGNATURE_VERIFICATION_GAS`]; one signature covers the whole tree, and neither total
+    /// includes it.
+    pub signature_verification_gas: u64,
+    /// Root first, in execution order.
+    pub frames: Vec<FrameGas>,
+    pub not_nested: Vec<NotNested>,
+    pub skipped_opcodes: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct FrameGas {
+    pub target: String,
+    /// Zero for the root.
+    pub caller: String,
+    pub op_count: usize,
+    /// Measured with one base transaction cost, as if the frame were its own transaction.
+    pub gas: u64,
+}
+
+/// An owned contract that got no frame.
+#[derive(Debug, serde::Serialize)]
+pub struct NotNested {
+    pub address: String,
+    pub reason: String,
+}
+
+/// Gas to verify the operators' aggregate signature, which every settlement pays on top of its
+/// program. The service signs with Schnorr only, so this is its upper limit; add it to an estimate
+/// for the transaction's total with Gas Killer.
+pub const SIGNATURE_VERIFICATION_GAS: u64 = TURETZKY_UPPER_GAS_LIMIT_SCHNORR;
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
 fn parse_and_compute(trace_json: &str, origin: Option<Address>) -> Result<TraceExtract, String> {
-    let trace: DefaultFrame =
+    let trace: LeanFrame =
         serde_json::from_str(trace_json).map_err(|e| format!("Failed to parse trace: {}", e))?;
-    compute_state_updates(trace, origin)
+    compute(trace, origin)
+}
+
+fn compute(trace: LeanFrame, origin: Option<Address>) -> Result<TraceExtract, String> {
+    compute_state_updates(DefaultFrame::from(trace), origin)
         .map_err(|e| format!("Failed to compute state updates: {}", e))
+}
+
+/// A `debug_traceTransaction` JSON-RPC response; `jsonrpc` and `id` are ignored.
+#[derive(Deserialize)]
+struct TraceResponse {
+    result: Option<LeanFrame>,
+    error: Option<RpcErrorBody>,
+}
+
+#[derive(Deserialize)]
+struct RpcErrorBody {
+    #[serde(default)]
+    message: String,
+}
+
+/// Why [`analyze_trace_bytes_inner`] produced no result.
+#[derive(Debug, PartialEq)]
+pub enum AnalyzeTraceBytesError {
+    /// The node answered with an error instead of a trace. `too_large` marks a provider refusing
+    /// to send a trace over its response size limit.
+    Rpc { message: String, too_large: bool },
+    /// The response couldn't be parsed or analyzed.
+    Analysis(String),
+}
+
+/// Whether an RPC error message is a provider's response size limit, as worded by geth, Erigon,
+/// Alchemy, QuickNode and others.
+fn is_too_large(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("too big")
+        || m.contains("too large")
+        || m.contains("size exceeds")
+        || m.contains("larger than")
+        || m.find("exceeds").is_some_and(|i| m[i..].contains("limit"))
 }
 
 /// Parse an optional hex origin address for re-entry detection.
@@ -100,6 +195,7 @@ pub fn analyze_trace_inner(
     caller_address: &str,
     estimate_state_changes_block_number: Option<u64>,
     origin_address: Option<&str>,
+    value: Option<&str>,
 ) -> Result<AnalyzeTraceResult, String> {
     let extract = parse_and_compute(trace_json, parse_origin(origin_address)?)?;
     analyze_extract(
@@ -107,7 +203,51 @@ pub fn analyze_trace_inner(
         estimator_address,
         caller_address,
         estimate_state_changes_block_number,
+        value,
     )
+}
+
+/// [`analyze_trace_inner`] on a whole `debug_traceTransaction` JSON-RPC response, undecoded.
+pub fn analyze_trace_bytes_inner(
+    response: &[u8],
+    estimator_address: &str,
+    caller_address: &str,
+    estimate_state_changes_block_number: Option<u64>,
+    origin_address: Option<&str>,
+    value: Option<&str>,
+) -> Result<AnalyzeTraceResult, AnalyzeTraceBytesError> {
+    use AnalyzeTraceBytesError::Analysis;
+    let origin = parse_origin(origin_address).map_err(Analysis)?;
+    let trace = parse_trace_response(response)?;
+    let extract = compute(trace, origin).map_err(Analysis)?;
+    analyze_extract(
+        &extract,
+        estimator_address,
+        caller_address,
+        estimate_state_changes_block_number,
+        value,
+    )
+    .map_err(Analysis)
+}
+
+/// The trace in a `debug_traceTransaction` JSON-RPC response, or the node's error.
+fn parse_trace_response(response: &[u8]) -> Result<LeanFrame, AnalyzeTraceBytesError> {
+    use AnalyzeTraceBytesError::{Analysis, Rpc};
+    let response: TraceResponse = serde_json::from_slice(response)
+        .map_err(|e| Analysis(format!("Failed to parse trace: {}", e)))?;
+    match (response.result, response.error) {
+        (_, Some(error)) => {
+            let too_large = is_too_large(&error.message);
+            Err(Rpc {
+                message: error.message,
+                too_large,
+            })
+        }
+        (Some(trace), None) => Ok(trace),
+        (None, None) => Err(Analysis(
+            "RPC response has neither a result nor an error".to_string(),
+        )),
+    }
 }
 
 /// Analyze a call from its `prestateTracer` (`diffMode`) diff and `callTracer` (`withLog`) frame,
@@ -124,6 +264,7 @@ pub fn analyze_prestate_inner(
     estimator_address: &str,
     caller_address: &str,
     estimate_state_changes_block_number: Option<u64>,
+    value: Option<&str>,
 ) -> Result<PrestateAnalysis, String> {
     let diff: DiffMode = serde_json::from_str(diff_json)
         .map_err(|e| format!("Failed to parse prestate diff: {}", e))?;
@@ -157,6 +298,7 @@ pub fn analyze_prestate_inner(
         skipped_opcodes: HashSet::new(),
         // Eligibility rules out regular CALLs at target depth, and with them re-entry.
         call_gas_total: 0,
+        callee_gas_total: 0,
         sstore_gas_total,
         refund_counter,
         reentered: false,
@@ -169,6 +311,7 @@ pub fn analyze_prestate_inner(
             estimator_address,
             caller_address,
             estimate_state_changes_block_number,
+            value,
         )?),
     })
 }
@@ -220,6 +363,7 @@ fn analyze_extract(
     estimator_address: &str,
     caller_address: &str,
     estimate_state_changes_block_number: Option<u64>,
+    value: Option<&str>,
 ) -> Result<AnalyzeTraceResult, String> {
     let state_updates: &[StateUpdate] = &extract.state_updates;
 
@@ -229,29 +373,15 @@ fn analyze_extract(
         .parse()
         .map_err(|e| format!("Invalid estimator address: {}", e))?;
 
-    let caller: Address = caller_address
-        .parse()
-        .map_err(|e| format!("Invalid caller address: {}", e))?;
+    let caller = parse_caller(caller_address)?;
 
     let mut cache_db = CacheDB::new(EmptyDB::default());
-    let sim_env = SimEnvOpts {
-        number: estimate_state_changes_block_number.unwrap_or(0),
-        timestamp: 0,
-        gas_limit: 30_000_000,
-        coinbase: Address::ZERO,
-        prevrandao: B256::ZERO,
-        gas_price: 0,
-        basefee: 0,
-        difficulty: U256::ZERO,
-        // WASM runs against EmptyDB with no real chain state; pick the newest
-        // spec so post-Pectra opcodes don't halt with `NotActivated`.
-        spec: SpecId::OSAKA,
-        value: U256::ZERO,
-    };
+    let sim_env = sim_env(estimate_state_changes_block_number, parse_value(value)?);
 
     let (gas_estimate, is_heuristic) =
         match estimate_state_changes_gas(&mut cache_db, addr, caller, state_updates, &sim_env) {
-            Ok(gas) => (gas, false),
+            // The callees have no code in `EmptyDB`, so the simulation charges only the `CALL`s.
+            Ok(gas) => (gas.saturating_add(extract.callee_gas_total), false),
             Err(_) => (estimate_gas_from_state_updates(extract), true),
         };
 
@@ -265,7 +395,160 @@ fn analyze_extract(
         state_update_count: state_updates.len(),
         skipped_opcodes: skipped,
         reentered: extract.reentered,
+        native_call_gas: extract.callee_gas_total,
+        signature_verification_gas: SIGNATURE_VERIFICATION_GAS,
     })
+}
+
+fn parse_caller(caller_address: &str) -> Result<Address, String> {
+    caller_address
+        .parse()
+        .map_err(|e| format!("Invalid caller address: {}", e))
+}
+
+/// A `msg.value` in wei, decimal or `0x` hex; zero when absent.
+fn parse_value(value: Option<&str>) -> Result<U256, String> {
+    value.map_or(Ok(U256::ZERO), |v| {
+        v.parse().map_err(|e| format!("Invalid value {v:?}: {e}"))
+    })
+}
+
+/// The simulation environment for an analysis against `EmptyDB`. `value` is the transaction's
+/// `msg.value`: a payload that forwards it in a `CALL` halts unfunded without it.
+fn sim_env(block_number: Option<u64>, value: U256) -> SimEnvOpts {
+    SimEnvOpts {
+        number: block_number.unwrap_or(0),
+        timestamp: 0,
+        gas_limit: 30_000_000,
+        coinbase: Address::ZERO,
+        prevrandao: B256::ZERO,
+        // No contract code exists in `EmptyDB`, so nothing can read `tx.gasprice`.
+        gas_price: 0,
+        basefee: 0,
+        difficulty: U256::ZERO,
+        // WASM runs against EmptyDB with no real chain state; pick the newest
+        // spec so post-Pectra opcodes don't halt with `NotActivated`.
+        spec: SpecId::OSAKA,
+        value,
+    }
+}
+
+/// Price `trace` as a nested settlement rooted at `root` with `owned` as consumers, against the
+/// root-only settlement of the same trace.
+fn analyze_frame_tree_trace(
+    trace: DefaultFrame,
+    root_address: &str,
+    owned: &[String],
+    caller_address: &str,
+    estimate_state_changes_block_number: Option<u64>,
+    value: Option<&str>,
+) -> Result<FrameTreeAnalysis, String> {
+    let root: Address = root_address
+        .parse()
+        .map_err(|e| format!("Invalid root address: {}", e))?;
+    let owned = owned
+        .iter()
+        .map(|a| {
+            a.parse()
+                .map_err(|e| format!("Invalid owned address {a:?}: {e}"))
+        })
+        .filter(|a| a.as_ref() != Ok(&root))
+        .collect::<Result<BTreeSet<Address>, String>>()?;
+    let caller = parse_caller(caller_address)?;
+    let value = parse_value(value)?;
+    let sim_env = sim_env(estimate_state_changes_block_number, value);
+    let cost = NESTING_COST_MODEL_V1;
+
+    let root_only = compute_frame_tree_hypothetical(trace.clone(), root, &BTreeSet::new(), &cost)
+        .map_err(|e| format!("Failed to split trace: {}", e))?;
+    let nested = compute_frame_tree_hypothetical(trace, root, &owned, &cost)
+        .map_err(|e| format!("Failed to split trace: {}", e))?;
+    let price = |frames| {
+        estimate_frame_tree_gas(
+            &mut CacheDB::new(EmptyDB::default()),
+            frames,
+            caller,
+            value,
+            &sim_env,
+        )
+        .map_err(|e| format!("Gas estimation failed: {}", e))
+    };
+    let root_only_gas = frame_tree_total(&price(&root_only.frames)?, &cost)
+        .saturating_add(root_only.callee_gas_total);
+    let frame_gas = price(&nested.frames)?;
+
+    let mut skipped = nested.skipped_opcodes.into_iter().collect::<Vec<_>>();
+    skipped.sort();
+    Ok(FrameTreeAnalysis {
+        root_only_gas,
+        nested_gas: frame_tree_total(&frame_gas, &cost).saturating_add(nested.callee_gas_total),
+        root_only_native_call_gas: root_only.callee_gas_total,
+        nested_native_call_gas: nested.callee_gas_total,
+        frame_overhead_gas: cost.frame_overhead_gas,
+        signature_verification_gas: SIGNATURE_VERIFICATION_GAS,
+        frames: nested
+            .frames
+            .iter()
+            .zip(frame_gas)
+            .map(|(frame, gas)| FrameGas {
+                target: frame.target.to_string(),
+                caller: frame.caller.to_string(),
+                op_count: frame.updates.len(),
+                gas,
+            })
+            .collect(),
+        not_nested: unnested_owned(&owned, &nested.frames)
+            .into_iter()
+            .map(|(address, reason)| NotNested {
+                address: address.to_string(),
+                reason: reason.describe().to_string(),
+            })
+            .collect(),
+        skipped_opcodes: skipped,
+    })
+}
+
+/// What `trace_json`, a struct-log trace, would have cost as a nested settlement; see
+/// [`analyze_frame_tree`].
+pub fn analyze_frame_tree_inner(
+    trace_json: &str,
+    root_address: &str,
+    owned: &[String],
+    caller_address: &str,
+    estimate_state_changes_block_number: Option<u64>,
+    value: Option<&str>,
+) -> Result<FrameTreeAnalysis, String> {
+    let trace: LeanFrame =
+        serde_json::from_str(trace_json).map_err(|e| format!("Failed to parse trace: {}", e))?;
+    analyze_frame_tree_trace(
+        trace.into(),
+        root_address,
+        owned,
+        caller_address,
+        estimate_state_changes_block_number,
+        value,
+    )
+}
+
+/// [`analyze_frame_tree_inner`] on a whole `debug_traceTransaction` JSON-RPC response, undecoded.
+pub fn analyze_frame_tree_bytes_inner(
+    response: &[u8],
+    root_address: &str,
+    owned: &[String],
+    caller_address: &str,
+    estimate_state_changes_block_number: Option<u64>,
+    value: Option<&str>,
+) -> Result<FrameTreeAnalysis, AnalyzeTraceBytesError> {
+    let trace = parse_trace_response(response)?;
+    analyze_frame_tree_trace(
+        trace.into(),
+        root_address,
+        owned,
+        caller_address,
+        estimate_state_changes_block_number,
+        value,
+    )
+    .map_err(AnalyzeTraceBytesError::Analysis)
 }
 
 pub fn estimate_gas_heuristic_inner(
@@ -324,6 +607,9 @@ pub fn encode_trace_inner(trace_json: &str) -> Result<EncodeTraceResult, String>
 /// `origin_address` is the traced transaction's target contract; when supplied,
 /// callbacks re-entering it are detected and reported via `reentered`.
 ///
+/// `value` is the transaction's `msg.value` in wei, as a decimal or `0x` hex string. A payload
+/// whose `CALL`s forward that ETH is otherwise unfunded, and falls back to the heuristic.
+///
 /// Returns a JS object with: `encoded_updates`, `gas_estimate`, `is_heuristic`,
 /// `state_update_count`, `skipped_opcodes`, `reentered`.
 #[wasm_bindgen]
@@ -333,6 +619,7 @@ pub fn analyze_trace(
     caller_address: &str,
     estimate_state_changes_block_number: Option<u64>,
     origin_address: Option<String>,
+    value: Option<String>,
 ) -> Result<JsValue, JsError> {
     let result = analyze_trace_inner(
         trace_json,
@@ -340,9 +627,55 @@ pub fn analyze_trace(
         caller_address,
         estimate_state_changes_block_number,
         origin_address.as_deref(),
+        value.as_deref(),
     )
     .map_err(|e| JsError::new(&e))?;
     to_js(&result)
+}
+
+/// [`analyze_trace`] on the raw bytes of a whole `debug_traceTransaction` JSON-RPC response, so a
+/// large trace never has to be decoded into a JS string or unwrapped from its envelope in JS.
+///
+/// When the node answered with an error, throws an `Error` named `RpcError` with the node's
+/// message, or `TraceTooLargeError` when the message is the provider's response size limit.
+/// Other failures throw a plain `Error`, as [`analyze_trace`] does.
+#[wasm_bindgen]
+pub fn analyze_trace_bytes(
+    response: &[u8],
+    estimator_address: &str,
+    caller_address: &str,
+    estimate_state_changes_block_number: Option<u64>,
+    origin_address: Option<String>,
+    value: Option<String>,
+) -> Result<JsValue, JsValue> {
+    let result = analyze_trace_bytes_inner(
+        response,
+        estimator_address,
+        caller_address,
+        estimate_state_changes_block_number,
+        origin_address.as_deref(),
+        value.as_deref(),
+    )
+    .map_err(bytes_error_to_js)?;
+    Ok(to_js(&result)?)
+}
+
+/// A JS `Error` named for what went wrong; see [`analyze_trace_bytes`].
+fn bytes_error_to_js(e: AnalyzeTraceBytesError) -> JsValue {
+    let (name, message) = match e {
+        AnalyzeTraceBytesError::Rpc { message, too_large } => (
+            if too_large {
+                "TraceTooLargeError"
+            } else {
+                "RpcError"
+            },
+            message,
+        ),
+        AnalyzeTraceBytesError::Analysis(message) => ("Error", message),
+    };
+    let error = js_sys::Error::new(&message);
+    error.set_name(name);
+    JsValue::from(error)
 }
 
 /// Analyze a transaction from its `prestateTracer` diff and `callTracer` frame instead of its
@@ -365,6 +698,7 @@ pub fn analyze_prestate(
     estimator_address: &str,
     caller_address: &str,
     estimate_state_changes_block_number: Option<u64>,
+    value: Option<String>,
 ) -> Result<JsValue, JsError> {
     let result = analyze_prestate_inner(
         diff_json,
@@ -373,9 +707,70 @@ pub fn analyze_prestate(
         estimator_address,
         caller_address,
         estimate_state_changes_block_number,
+        value.as_deref(),
     )
     .map_err(|e| JsError::new(&e))?;
     to_js(&result)
+}
+
+/// What a transaction would have cost settled as a nested tree, had its target `root_address`
+/// and the contracts in `owned` integrated the SDK: the browser counterpart of the CLI's
+/// `t <tx> --owned`.
+///
+/// `trace_json` is the struct-log trace, as for [`analyze_trace`]. A `CALL` from a frame into an
+/// owned contract becomes that contract's own frame where nesting is cheaper under the cost model.
+/// Both the nested tree and the root-only settlement are split from the same trace and priced in
+/// execution order on one empty state, so their difference is the nesting alone. A `CALL` either
+/// settlement replays natively is charged what its callee spent in the trace, since that callee
+/// has no code in that state. There is no heuristic fallback: a simulation failure throws.
+///
+/// `caller_address`, `estimate_state_changes_block_number` and `value` are as for
+/// [`analyze_trace`].
+///
+/// Returns a JS object with `root_only_gas`, `nested_gas`, `frame_overhead_gas`, `frames`,
+/// `not_nested` and `skipped_opcodes`.
+#[wasm_bindgen]
+pub fn analyze_frame_tree(
+    trace_json: &str,
+    root_address: &str,
+    owned: Vec<String>,
+    caller_address: &str,
+    estimate_state_changes_block_number: Option<u64>,
+    value: Option<String>,
+) -> Result<JsValue, JsError> {
+    let result = analyze_frame_tree_inner(
+        trace_json,
+        root_address,
+        &owned,
+        caller_address,
+        estimate_state_changes_block_number,
+        value.as_deref(),
+    )
+    .map_err(|e| JsError::new(&e))?;
+    to_js(&result)
+}
+
+/// [`analyze_frame_tree`] on the raw bytes of a whole `debug_traceTransaction` JSON-RPC response,
+/// throwing as [`analyze_trace_bytes`] does.
+#[wasm_bindgen]
+pub fn analyze_frame_tree_bytes(
+    response: &[u8],
+    root_address: &str,
+    owned: Vec<String>,
+    caller_address: &str,
+    estimate_state_changes_block_number: Option<u64>,
+    value: Option<String>,
+) -> Result<JsValue, JsValue> {
+    let result = analyze_frame_tree_bytes_inner(
+        response,
+        root_address,
+        &owned,
+        caller_address,
+        estimate_state_changes_block_number,
+        value.as_deref(),
+    )
+    .map_err(bytes_error_to_js)?;
+    Ok(to_js(&result)?)
 }
 
 /// Heuristic-only gas estimation (no revm, faster, less accurate).
@@ -411,6 +806,8 @@ export interface AnalyzeTraceResult {
     state_update_count: number;
     skipped_opcodes: string[];
     reentered: boolean;
+    native_call_gas: number;
+    signature_verification_gas: number;
 }
 
 export interface PrestateAnalysis {
@@ -431,6 +828,30 @@ export interface EstimateGasResult {
     state_update_count: number;
     skipped_opcodes: string[];
     reentered: boolean;
+}
+
+export interface FrameTreeAnalysis {
+    root_only_gas: number;
+    nested_gas: number;
+    root_only_native_call_gas: number;
+    nested_native_call_gas: number;
+    frame_overhead_gas: number;
+    signature_verification_gas: number;
+    frames: FrameGas[];
+    not_nested: NotNested[];
+    skipped_opcodes: string[];
+}
+
+export interface FrameGas {
+    target: string;
+    caller: string;
+    op_count: number;
+    gas: number;
+}
+
+export interface NotNested {
+    address: string;
+    reason: string;
 }
 "#;
 
@@ -613,6 +1034,7 @@ mod tests {
             &test_caller_address(),
             None,
             None,
+            None,
         );
         assert!(result.is_ok());
     }
@@ -620,8 +1042,14 @@ mod tests {
     #[test]
     fn test_parse_invalid_address() {
         let trace = make_trace(vec![]);
-        let result =
-            analyze_trace_inner(&trace, "not-an-address", &test_caller_address(), None, None);
+        let result = analyze_trace_inner(
+            &trace,
+            "not-an-address",
+            &test_caller_address(),
+            None,
+            None,
+            None,
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid estimator address"));
     }
@@ -629,7 +1057,8 @@ mod tests {
     #[test]
     fn test_parse_address_too_short() {
         let trace = make_trace(vec![]);
-        let result = analyze_trace_inner(&trace, "0x1234", &test_caller_address(), None, None);
+        let result =
+            analyze_trace_inner(&trace, "0x1234", &test_caller_address(), None, None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid estimator address"));
     }
@@ -709,6 +1138,7 @@ mod tests {
             &test_caller_address(),
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(!result.is_heuristic);
@@ -728,6 +1158,7 @@ mod tests {
             &test_caller_address(),
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(!result.is_heuristic);
@@ -737,6 +1168,7 @@ mod tests {
             &single_trace,
             &test_estimator_address(),
             &test_caller_address(),
+            None,
             None,
             None,
         )
@@ -757,6 +1189,7 @@ mod tests {
             &test_caller_address(),
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(!result.is_heuristic);
@@ -770,6 +1203,7 @@ mod tests {
             &trace,
             &test_estimator_address(),
             &test_caller_address(),
+            None,
             None,
             None,
         )
@@ -855,6 +1289,7 @@ mod tests {
             &trace_json,
             &test_estimator_address(),
             &test_caller_address(),
+            None,
             None,
             None,
         )
@@ -993,8 +1428,8 @@ mod tests {
         ]);
         let addr = test_estimator_address();
         let caller = test_caller_address();
-        let result1 = analyze_trace_inner(&trace1, &addr, &caller, None, None).unwrap();
-        let result2 = analyze_trace_inner(&trace2, &addr, &caller, None, None).unwrap();
+        let result1 = analyze_trace_inner(&trace1, &addr, &caller, None, None, None).unwrap();
+        let result2 = analyze_trace_inner(&trace2, &addr, &caller, None, None, None).unwrap();
         // Each call uses a fresh CacheDB, so results should differ
         assert_eq!(result1.state_update_count, 1);
         assert_eq!(result2.state_update_count, 2);
@@ -1048,6 +1483,7 @@ mod tests {
             CONSUMER,
             &test_estimator_address(),
             &test_caller_address(),
+            None,
             None,
         )
         .unwrap()
@@ -1116,10 +1552,10 @@ mod tests {
         let frame = make_frame("CALL", vec![], vec![]).to_string();
         let addr = test_estimator_address();
         let caller = test_caller_address();
-        assert!(analyze_prestate_inner("{", &frame, CONSUMER, &addr, &caller, None).is_err());
+        assert!(analyze_prestate_inner("{", &frame, CONSUMER, &addr, &caller, None, None).is_err());
         let diff = make_diff(&[], &[]);
-        assert!(analyze_prestate_inner(&diff, "[]", CONSUMER, &addr, &caller, None).is_err());
-        assert!(analyze_prestate_inner(&diff, &frame, "0x12", &addr, &caller, None).is_err());
+        assert!(analyze_prestate_inner(&diff, "[]", CONSUMER, &addr, &caller, None, None).is_err());
+        assert!(analyze_prestate_inner(&diff, &frame, "0x12", &addr, &caller, None, None).is_err());
     }
 
     #[test]
@@ -1136,5 +1572,327 @@ mod tests {
             SSTORE_COLD_SET_COST + SSTORE_COLD_RESET_COST + SSTORE_COLD_RESET_COST
         );
         assert_eq!(refund, SSTORE_CLEARS_REFUND);
+    }
+
+    // ===== analyze_trace_bytes =====
+
+    fn analyze_bytes(response: &str) -> Result<AnalyzeTraceResult, AnalyzeTraceBytesError> {
+        analyze_trace_bytes_inner(
+            response.as_bytes(),
+            &test_estimator_address(),
+            &test_caller_address(),
+            Some(1),
+            None,
+            None,
+        )
+    }
+
+    fn mixed_trace() -> String {
+        let data_hex = "00000000000000000000000000000000000000000000000000000000000000ff";
+        let topic = "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+        make_trace(vec![
+            make_sstore_log("1", "2a", 90000),
+            make_log1_log(data_hex, topic, 80000),
+        ])
+    }
+
+    #[test]
+    fn test_bytes_matches_analyze_trace_on_its_result() {
+        let trace = mixed_trace();
+        let expected = analyze_trace_inner(
+            &trace,
+            &test_estimator_address(),
+            &test_caller_address(),
+            Some(1),
+            None,
+            None,
+        )
+        .unwrap();
+        for response in [
+            format!(r#"{{"jsonrpc":"2.0","id":1,"result":{trace}}}"#),
+            format!(r#"{{"jsonrpc":"2.0","result":{trace},"id":1}}"#),
+        ] {
+            let got = analyze_bytes(&response).unwrap();
+            assert_eq!(got.encoded_updates, expected.encoded_updates);
+            assert_eq!(got.gas_estimate, expected.gas_estimate);
+            assert_eq!(got.state_update_count, 2);
+        }
+    }
+
+    #[test]
+    fn test_bytes_rpc_error_is_typed() {
+        let err = analyze_bytes(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"execution timeout"}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            AnalyzeTraceBytesError::Rpc {
+                message: "execution timeout".to_string(),
+                too_large: false
+            }
+        );
+    }
+
+    #[test]
+    fn test_bytes_size_limit_error_is_too_large() {
+        for message in [
+            "response too large",
+            "Response size exceeds the limit",
+            "trace exceeds the 150MB response limit",
+            "Response is larger than 10MB",
+            "Response body too big",
+        ] {
+            let response =
+                serde_json::json!({ "id": 1, "error": { "code": -32000, "message": message } });
+            match analyze_bytes(&response.to_string()) {
+                Err(AnalyzeTraceBytesError::Rpc { too_large, .. }) => {
+                    assert!(too_large, "{message}")
+                }
+                other => panic!("{message}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_bytes_malformed_response_is_an_analysis_error() {
+        for response in [r#"{"jsonrpc":"2.0","id":1}"#, r#"{"result":"#, "not json"] {
+            assert!(
+                matches!(
+                    analyze_bytes(response),
+                    Err(AnalyzeTraceBytesError::Analysis(_))
+                ),
+                "{response}"
+            );
+        }
+    }
+
+    // ===== Native call gas =====
+
+    /// A root whose callee spends `callee_gas`, with Geth's `gasCost` for the `CALL`: a cold
+    /// account access plus the 400,000 gas forwarded.
+    fn call_spending(callee_gas: u64) -> String {
+        let (gas, forwarded, access) = (500_000, 400_000, 2_600);
+        let mut call = make_call_log(
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "0",
+            "aabbccdd",
+            gas,
+        );
+        call["gasCost"] = (access + forwarded).into();
+        let entry = serde_json::json!({
+            "pc": 0, "op": "JUMPDEST", "gas": forwarded, "gasCost": 1, "depth": 2,
+            "stack": [], "memory": [],
+        });
+        let stop = serde_json::json!({
+            "pc": 1, "op": "STOP", "gas": forwarded - callee_gas, "gasCost": 0, "depth": 2,
+            "stack": [], "memory": [],
+        });
+        let resume = serde_json::json!({
+            "pc": 201, "op": "POP", "gas": gas - access - callee_gas, "gasCost": 2, "depth": 1,
+            "stack": ["0x0000000000000000000000000000000000000000000000000000000000000001"],
+            "memory": [],
+        });
+        make_trace(vec![call, entry, stop, resume])
+    }
+
+    /// The callee has no code in `EmptyDB`, so what it spent comes from the trace; the simulation
+    /// already charges the `CALL` opcode itself.
+    #[test]
+    fn test_measured_estimate_charges_the_callees_native_gas() {
+        let analyze = |trace: &str| {
+            analyze_trace_inner(
+                trace,
+                &test_estimator_address(),
+                &test_caller_address(),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let idle = analyze(&call_spending(0));
+        let cheap = analyze(&call_spending(2_000));
+        let costly = analyze(&call_spending(300_000));
+        assert!(!idle.is_heuristic && !cheap.is_heuristic && !costly.is_heuristic);
+        assert_eq!(
+            idle.native_call_gas, 0,
+            "the access cost is the simulation's"
+        );
+        assert_eq!(cheap.native_call_gas, 2_000);
+        assert_eq!(
+            cheap.signature_verification_gas, 50_000,
+            "the Schnorr limit"
+        );
+        assert_eq!(costly.native_call_gas, 300_000);
+        assert_eq!(cheap.gas_estimate - idle.gas_estimate, 2_000);
+        assert_eq!(costly.gas_estimate - idle.gas_estimate, 300_000);
+    }
+
+    // ===== Transaction value =====
+
+    /// A trace whose root forwards `call_value` wei to an empty address.
+    fn value_call_trace(call_value: &str) -> String {
+        let call = make_call_log(
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            call_value,
+            "",
+            50000,
+        );
+        let entry = serde_json::json!({
+            "pc": 0, "op": "STOP", "gas": 49000, "gasCost": 0, "depth": 2,
+            "stack": [], "memory": [],
+        });
+        let resume = serde_json::json!({
+            "pc": 201, "op": "POP", "gas": 40000, "gasCost": 2, "depth": 1,
+            "stack": ["0x0000000000000000000000000000000000000000000000000000000000000001"],
+            "memory": [],
+        });
+        make_trace(vec![call, entry, resume])
+    }
+
+    #[test]
+    fn test_forwarded_value_is_measured_only_when_the_transaction_brings_it() {
+        let trace = value_call_trace("de0b6b3a7640000"); // 1 ETH
+        let analyze = |value| {
+            analyze_trace_inner(
+                &trace,
+                &test_estimator_address(),
+                &test_caller_address(),
+                None,
+                None,
+                value,
+            )
+            .unwrap()
+        };
+        assert!(
+            analyze(None).is_heuristic,
+            "the estimator has no ETH to forward"
+        );
+        assert!(!analyze(Some("1000000000000000000")).is_heuristic);
+        assert!(!analyze(Some("0xde0b6b3a7640000")).is_heuristic);
+    }
+
+    #[test]
+    fn test_invalid_value_is_an_error() {
+        let trace = make_trace(vec![]);
+        let result = analyze_trace_inner(
+            &trace,
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+            None,
+            Some("one ether"),
+        );
+        assert!(result.unwrap_err().contains("Invalid value"));
+    }
+
+    // ===== Frame trees =====
+
+    const ROOT: &str = "0x00000000000000000000000000000000000000aa";
+    const VAULT: &str = "0x00000000000000000000000000000000000000bb";
+    const UNREACHED: &str = "0x00000000000000000000000000000000000000cc";
+
+    fn sstore_at(depth: u64, slot: &str, value: &str) -> serde_json::Value {
+        let mut log = make_sstore_log(slot, value, 5_000_000);
+        log["depth"] = depth.into();
+        log
+    }
+
+    /// The root writes a slot and calls the vault, which writes its own; the call costs
+    /// `call_gas - resume_gas` natively, of which the cold access to the vault is `VAULT_ACCESS`.
+    fn root_calls_vault(call_gas: u64, resume_gas: u64) -> String {
+        let forwarded = call_gas - VAULT_ACCESS;
+        let mut call = make_call_log(VAULT, "0", "aabbccdd", call_gas);
+        call["gasCost"] = (VAULT_ACCESS + forwarded).into();
+        let mut entry = sstore_at(2, "5", "32");
+        entry["gas"] = forwarded.into();
+        let resume = serde_json::json!({
+            "pc": 201, "op": "POP", "gas": resume_gas, "gasCost": 2, "depth": 1,
+            "stack": ["0x0000000000000000000000000000000000000000000000000000000000000001"],
+            "memory": [],
+        });
+        make_trace(vec![sstore_at(1, "1", "a"), call, entry, resume])
+    }
+
+    const VAULT_ACCESS: u64 = 2_600;
+
+    fn frame_tree(trace: &str, owned: &[&str]) -> FrameTreeAnalysis {
+        let owned: Vec<String> = owned.iter().map(|a| a.to_string()).collect();
+        analyze_frame_tree_inner(trace, ROOT, &owned, &test_caller_address(), None, None)
+            .expect("frame tree")
+    }
+
+    #[test]
+    fn test_an_expensive_owned_callee_becomes_its_own_frame() {
+        let out = frame_tree(&root_calls_vault(1_000_000, 100_000), &[VAULT, UNREACHED]);
+
+        let targets: Vec<&str> = out.frames.iter().map(|f| f.target.as_str()).collect();
+        assert_eq!(targets.len(), 2);
+        assert!(targets[0].eq_ignore_ascii_case(ROOT));
+        assert!(targets[1].eq_ignore_ascii_case(VAULT));
+        assert!(out.frames[1].caller.eq_ignore_ascii_case(ROOT));
+        let children: u64 = out.frames[1..].iter().map(|f| f.gas - 21_000).sum();
+        assert_eq!(out.nested_native_call_gas, 0, "the vault's call is nested");
+        assert_eq!(out.signature_verification_gas, 50_000);
+        assert_eq!(
+            out.root_only_native_call_gas,
+            900_000 - VAULT_ACCESS,
+            "the simulation charges the CALL itself"
+        );
+        assert_eq!(
+            out.nested_gas,
+            out.frames[0].gas + children + out.frame_overhead_gas,
+            "one base cost for the tree, plus the overhead of each nested frame"
+        );
+        assert!(out.nested_gas < out.root_only_gas);
+        assert_eq!(out.not_nested.len(), 1);
+        assert!(out.not_nested[0].address.eq_ignore_ascii_case(UNREACHED));
+        assert!(out.not_nested[0].reason.starts_with("not called"));
+    }
+
+    #[test]
+    fn test_a_cheap_owned_callee_stays_a_call() {
+        let out = frame_tree(&root_calls_vault(30_000, 25_000), &[VAULT]);
+
+        assert_eq!(out.frames.len(), 1);
+        assert_eq!(out.nested_gas, out.root_only_gas);
+        assert_eq!(out.not_nested.len(), 1);
+        assert!(out.not_nested[0].reason.starts_with("called directly"));
+    }
+
+    #[test]
+    fn test_with_nothing_owned_the_tree_is_the_root_alone() {
+        let out = frame_tree(&root_calls_vault(1_000_000, 100_000), &[]);
+        assert_eq!(out.frames.len(), 1);
+        assert_eq!(out.nested_gas, out.root_only_gas);
+        assert!(out.not_nested.is_empty());
+    }
+
+    #[test]
+    fn test_frame_tree_bytes_unwraps_the_response_and_reports_rpc_errors() {
+        let trace = root_calls_vault(1_000_000, 100_000);
+        let response = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{trace}}}"#);
+        let owned = vec![VAULT.to_string()];
+        let out = analyze_frame_tree_bytes_inner(
+            response.as_bytes(),
+            ROOT,
+            &owned,
+            &test_caller_address(),
+            None,
+            None,
+        )
+        .expect("frame tree");
+        assert_eq!(out.frames.len(), 2);
+
+        let error = br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"response size exceeds limit"}}"#;
+        assert_eq!(
+            analyze_frame_tree_bytes_inner(error, ROOT, &owned, &test_caller_address(), None, None)
+                .unwrap_err(),
+            AnalyzeTraceBytesError::Rpc {
+                message: "response size exceeds limit".to_string(),
+                too_large: true,
+            }
+        );
     }
 }

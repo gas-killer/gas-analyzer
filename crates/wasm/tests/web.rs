@@ -1,6 +1,8 @@
 use wasm_bindgen_test::*;
 
-use gas_killer_wasm::{analyze_trace, encode_trace, estimate_gas_heuristic};
+use gas_killer_wasm::{
+    analyze_frame_tree, analyze_trace, analyze_trace_bytes, encode_trace, estimate_gas_heuristic,
+};
 
 mod common;
 use common::{test_caller_address, test_estimator_address, valid_sstore_trace};
@@ -15,6 +17,7 @@ fn test_wasm_analyze_trace_returns_jsvalue() {
         &valid_sstore_trace(),
         &test_estimator_address(),
         &test_caller_address(),
+        None,
         None,
         None,
     );
@@ -36,6 +39,7 @@ fn test_wasm_analyze_trace_invalid_json_returns_error() {
         &test_caller_address(),
         None,
         None,
+        None,
     );
     assert!(result.is_err());
 }
@@ -46,6 +50,7 @@ fn test_wasm_analyze_trace_invalid_address_returns_error() {
         &valid_sstore_trace(),
         "not-an-address",
         &test_caller_address(),
+        None,
         None,
         None,
     );
@@ -96,6 +101,7 @@ fn test_wasm_analyze_trace_response_fields() {
         &test_caller_address(),
         None,
         None,
+        None,
     )
     .unwrap();
     let json: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
@@ -120,4 +126,64 @@ fn test_wasm_analyze_trace_response_fields() {
     assert!(obj["encoded_updates"].as_str().unwrap().starts_with("0x"));
     assert!(obj["gas_estimate"].as_u64().unwrap() > 0);
     assert_eq!(obj["state_update_count"], 1);
+}
+
+#[wasm_bindgen_test]
+fn test_wasm_analyze_trace_bytes_unwraps_the_envelope() {
+    let response = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"result":{}}}"#,
+        valid_sstore_trace()
+    );
+    let result = analyze_trace_bytes(
+        response.as_bytes(),
+        &test_estimator_address(),
+        &test_caller_address(),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let json: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
+    assert_eq!(json["state_update_count"], 1);
+}
+
+#[wasm_bindgen_test]
+fn test_wasm_analyze_trace_bytes_names_rpc_errors() {
+    let name = |message: &str| {
+        let response =
+            serde_json::json!({ "id": 1, "error": { "code": -32000, "message": message } });
+        let err = analyze_trace_bytes(
+            response.to_string().as_bytes(),
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        let err: js_sys::Error = err.into();
+        (String::from(err.name()), String::from(err.message()))
+    };
+    assert_eq!(
+        name("execution timeout"),
+        ("RpcError".into(), "execution timeout".into())
+    );
+    assert_eq!(name("response too large").0, "TraceTooLargeError");
+}
+
+#[wasm_bindgen_test]
+fn test_wasm_analyze_frame_tree_returns_both_totals() {
+    let result = analyze_frame_tree(
+        &valid_sstore_trace(),
+        "0x00000000000000000000000000000000000000aa",
+        vec!["0x00000000000000000000000000000000000000bb".to_string()],
+        &test_caller_address(),
+        None,
+        Some("0".to_string()),
+    )
+    .expect("analyze_frame_tree should succeed");
+    for field in ["root_only_gas", "nested_gas", "frames", "not_nested"] {
+        let value = js_sys::Reflect::get(&result, &field.into()).expect("readable");
+        assert!(!value.is_undefined(), "{field} is missing");
+    }
 }
