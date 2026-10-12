@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use gas_analyzer_core::{TURETZKY_UPPER_GAS_LIMIT_BLS, estimate_gas_from_state_updates};
+use gas_analyzer_core::{TURETZKY_UPPER_GAS_LIMIT_SCHNORR, estimate_gas_from_state_updates};
 use gas_analyzer_evmsketch::{GasKillerEvmSketchDefault, OriginalTx};
 use gas_analyzer_rpc::{compute_state_updates_from_tx, get_preceding_transactions};
 use indexer_rpc::{RetryConfig, is_transient_rpc_error, with_retry};
@@ -240,7 +240,7 @@ impl Analyzer for EvmSketchAnalyzer {
         let (gaskiller_gas_estimate, is_heuristic, failure_reason) = if self.config.heuristic_only {
             let heuristic = estimate_gas_from_state_updates(&extract);
             // Not a failure: the measured path was never attempted.
-            (heuristic + TURETZKY_UPPER_GAS_LIMIT_BLS, true, None)
+            (heuristic + TURETZKY_UPPER_GAS_LIMIT_SCHNORR, true, None)
         } else {
             // 5. Mid-block state — fetch preceding transactions.
             let preceding_txs =
@@ -259,9 +259,8 @@ impl Analyzer for EvmSketchAnalyzer {
                 .await
                 .map_err(|e| AnalyzerError::Estimation(format!("builder.build: {e}")))?;
 
-            // Single-estimate schema: report the conservative BLS floor (250k).
-            // Surfacing the lower Schnorr floor (27k) alongside it needs a schema
-            // change — `gaskiller_gas_estimate` is one column.
+            // The service settles with Schnorr signatures only, so that is the
+            // verification cost a settlement pays.
             match gk.estimate_state_changes_gas_with_preceding(
                 to,
                 tx_sender,
@@ -269,13 +268,13 @@ impl Analyzer for EvmSketchAnalyzer {
                 &preceding_txs,
                 original_tx,
             ) {
-                Ok(g) => (g + TURETZKY_UPPER_GAS_LIMIT_BLS, false, None),
+                Ok(g) => (g + TURETZKY_UPPER_GAS_LIMIT_SCHNORR, false, None),
                 Err(e) => {
                     let heuristic = estimate_gas_from_state_updates(&extract);
                     let reason = format!("{e}");
                     let truncated = reason.lines().next().unwrap_or("unknown").to_string();
                     (
-                        heuristic + TURETZKY_UPPER_GAS_LIMIT_BLS,
+                        heuristic + TURETZKY_UPPER_GAS_LIMIT_SCHNORR,
                         true,
                         Some(truncated),
                     )
