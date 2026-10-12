@@ -101,6 +101,7 @@ pub fn encode_state_updates_to_sol(
             StateUpdate::Log4(_) => StateUpdateType::LOG4,
             StateUpdate::Create(_) => StateUpdateType::CREATE,
             StateUpdate::Create2(_) => StateUpdateType::CREATE2,
+            StateUpdate::Nested(_) => StateUpdateType::NESTED,
         })
         .collect::<Vec<_>>();
 
@@ -118,6 +119,7 @@ pub fn encode_state_updates_to_sol(
                 StateUpdate::Log4(x) => x.abi_encode_sequence(),
                 StateUpdate::Create(x) => x.abi_encode_sequence(),
                 StateUpdate::Create2(x) => x.abi_encode_sequence(),
+                StateUpdate::Nested(x) => x.abi_encode_sequence(),
             })
         })
         .collect::<Vec<_>>();

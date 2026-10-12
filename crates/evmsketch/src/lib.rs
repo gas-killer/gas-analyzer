@@ -17,7 +17,8 @@ use alloy_provider::Provider;
 use alloy_provider::RootProvider;
 use alloy_provider::ext::DebugApi;
 use alloy_provider::network::{AnyNetwork, Ethereum};
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use lru::LruCache;
 use reth_primitives::EthPrimitives;
 use revm::database::CacheDB;
@@ -136,7 +137,13 @@ use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 // Re-exported so downstream consumers (e.g. the Gas Killer service) can name
 // the profile without a direct gas-analyzer-core dependency.
 pub use gas_analyzer_core::SimProfile;
+pub use gas_analyzer_core::nested;
 
+pub use gas_analyzer_core::nested::frame_tree_total;
+use gas_analyzer_core::nested::{
+    FrameProgram, NestingCostModel, compute_frame_tree_canonical, without_nested_ops,
+};
+use gas_analyzer_core::sim_profile::STATE_TRACKER_SLOT;
 use gas_analyzer_core::{
     Opcode, PrestateEligibility, SignatureType, StateUpdate, build_state_updates_from_prestate,
     classify_prestate_eligibility, compute_state_updates, compute_state_updates_canonical,
@@ -549,18 +556,23 @@ impl DefaultEvmSketchExecutor {
     ///
     /// Cold-miss slots not present in `storage_hints` still fall back to
     /// `eth_getStorageAt` during execution — an incomplete hint set is safe.
+    ///
+    /// `value` is the `msg.value` of the call the state updates were extracted from; see
+    /// [`Self::estimate_state_changes_gas_with_hints_timed`].
     pub async fn estimate_state_changes_gas_with_hints(
         &self,
         contract_address: Address,
         caller_address: Address,
         state_updates: &[gas_analyzer_core::StateUpdate],
         storage_hints: &HashMap<Address, Vec<B256>>,
+        value: U256,
     ) -> Result<u64> {
         self.estimate_state_changes_gas_with_hints_timed(
             contract_address,
             caller_address,
             state_updates,
             storage_hints,
+            value,
         )
         .await
         .map(|(gas, _)| gas)
@@ -572,12 +584,18 @@ impl DefaultEvmSketchExecutor {
     /// The two are very different work behind one `await`: the prefetch is network round-trips,
     /// while the execution is local revm plus whatever cold-miss reads the hints failed to cover.
     /// A caller deciding between more bandwidth and more cores needs them apart.
+    ///
+    /// `value` is the `msg.value` of the call the state updates were extracted from. It is sent
+    /// with the replay, as in [`Self::estimate_state_changes_gas_with_preceding`], so a payload
+    /// whose updates spend or check the ETH that call brought in prices as it will land instead of
+    /// reverting for want of it.
     pub async fn estimate_state_changes_gas_with_hints_timed(
         &self,
         contract_address: Address,
         caller_address: Address,
         state_updates: &[gas_analyzer_core::StateUpdate],
         storage_hints: &HashMap<Address, Vec<B256>>,
+        value: U256,
     ) -> Result<(u64, EstimateTimings)> {
         let state_block = self.anchor_block_number().saturating_sub(1);
         let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
@@ -589,7 +607,8 @@ impl DefaultEvmSketchExecutor {
             .context("storage slot prefetch failed")?;
         let prefetch = prefetch_started.elapsed();
 
-        let sim_env = self.sim_env();
+        let mut sim_env = self.sim_env();
+        sim_env.value = value;
         let execute_started = Instant::now();
         let gas = gas_analyzer_estimator::estimate_state_changes_gas(
             &mut cache_db,
@@ -600,6 +619,47 @@ impl DefaultEvmSketchExecutor {
         )?;
         Ok((
             gas,
+            EstimateTimings {
+                prefetch,
+                execute: execute_started.elapsed(),
+            },
+        ))
+    }
+
+    /// Like [`Self::estimate_state_changes_gas_with_hints_timed`] for a nested tree: the frames
+    /// run in execution order on one state (see [`gas_analyzer_estimator::estimate_frame_tree_gas`]),
+    /// returning each frame's gas in frame order. `value` is the root call's `msg.value`.
+    pub async fn estimate_frame_tree_gas_with_hints_timed(
+        &self,
+        frames: &[FrameProgram],
+        caller_address: Address,
+        storage_hints: &HashMap<Address, Vec<B256>>,
+        value: U256,
+    ) -> Result<(Vec<u64>, EstimateTimings)> {
+        let state_block = self.anchor_block_number().saturating_sub(1);
+        let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
+        let mut cache_db = CacheDB::new(simple_db);
+
+        let prefetch_started = Instant::now();
+        prefetch_slots_into_cache(&mut cache_db, storage_hints)
+            .await
+            .context("storage slot prefetch failed")?;
+        let prefetch = prefetch_started.elapsed();
+
+        let sim_env = SimEnvOpts {
+            value,
+            ..self.sim_env()
+        };
+        let execute_started = Instant::now();
+        let frame_gas = gas_analyzer_estimator::estimate_frame_tree_gas(
+            &mut cache_db,
+            frames,
+            caller_address,
+            value,
+            &sim_env,
+        )?;
+        Ok((
+            frame_gas,
             EstimateTimings {
                 prefetch,
                 execute: execute_started.elapsed(),
@@ -746,8 +806,24 @@ impl GasKillerEvmSketchDefault {
         caller_address: Address,
         state_updates: &[StateUpdate],
         preceding_txs: &[PrecedingTx],
-        tx_value: U256,
+        original: OriginalTx,
     ) -> Result<u64> {
+        let (mut cache_db, sim_env) = self.state_after_preceding(preceding_txs, original)?;
+        gas_analyzer_estimator::estimate_state_changes_gas(
+            &mut cache_db,
+            contract_address,
+            caller_address,
+            state_updates,
+            &sim_env,
+        )
+    }
+
+    /// The mid-block state `preceding_txs` leave, and the environment `original` ran in.
+    fn state_after_preceding(
+        &self,
+        preceding_txs: &[PrecedingTx],
+        original: OriginalTx,
+    ) -> Result<(CacheDB<SimpleRpcDb>, SimEnvOpts)> {
         // Source storage from block N-1 (pre-block state). Anchoring to
         // `block_number` itself makes RPC reads return state at the *end* of
         // block N — after every tx in that block (including the one we're
@@ -766,7 +842,11 @@ impl GasKillerEvmSketchDefault {
         let state_block = self.executor.anchor_block_number().saturating_sub(1);
         let simple_db = SimpleRpcDb::new(self.executor.sketch.provider.clone(), state_block);
         let mut cache_db = CacheDB::new(simple_db);
-        let mut sim_env = self.executor.sim_env();
+        let sim_env = SimEnvOpts {
+            value: original.value,
+            gas_price: original.gas_price,
+            ..self.executor.sim_env()
+        };
 
         if !preceding_txs.is_empty() {
             // Prefetch storage slots declared in preceding-tx access lists so
@@ -799,15 +879,7 @@ impl GasKillerEvmSketchDefault {
                 &sim_env,
             )?;
         }
-
-        sim_env.value = tx_value;
-        gas_analyzer_estimator::estimate_state_changes_gas(
-            &mut cache_db,
-            contract_address,
-            caller_address,
-            state_updates,
-            &sim_env,
-        )
+        Ok((cache_db, sim_env))
     }
 
     /// Estimate gas using a fallback heuristic based on the original transaction trace.
@@ -917,6 +989,50 @@ pub enum StateEncoding {
 enum StructLogEncoder {
     Legacy,
     Canonical,
+}
+
+/// The analyzed transaction's own fields a historical replay mirrors, so code that reads
+/// `msg.value` or `tx.gasprice` sees what it saw on-chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OriginalTx {
+    pub value: U256,
+    /// Effective per-gas price, as in the receipt's `effective_gas_price`.
+    pub gas_price: u128,
+}
+
+/// What settling a historical transaction as a nested tree would have cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameTreeGas {
+    /// Measured gas to apply each frame's own program, in frame order, with the tree run in
+    /// execution order (see [`gas_analyzer_estimator::estimate_frame_tree_gas`]).
+    pub frame_gas: Vec<u64>,
+    /// The tree in one transaction: see [`frame_tree_total`].
+    pub total: u64,
+}
+
+impl GasKillerEvmSketchDefault {
+    /// Prices `frames` (root first) against the mid-block state `preceding_txs` leave, the way
+    /// [`call_to_frame_tree_with_evmsketch`] prices a live tree: the frames run in execution order
+    /// on one state, and the per-frame nesting overhead is added for every frame past the root.
+    pub fn estimate_frame_tree_gas_with_preceding(
+        &self,
+        frames: &[FrameProgram],
+        sender: Address,
+        preceding_txs: &[PrecedingTx],
+        original: OriginalTx,
+        cost: &NestingCostModel,
+    ) -> Result<FrameTreeGas> {
+        let (mut cache_db, sim_env) = self.state_after_preceding(preceding_txs, original)?;
+        let frame_gas = gas_analyzer_estimator::estimate_frame_tree_gas(
+            &mut cache_db,
+            frames,
+            sender,
+            sim_env.value,
+            &sim_env,
+        )?;
+        let total = frame_tree_total(&frame_gas, cost);
+        Ok(FrameTreeGas { frame_gas, total })
+    }
 }
 
 impl StateEncoding {
@@ -1112,6 +1228,10 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
         .ok_or_else(|| anyhow!("Transaction must have a 'to' address"))?;
 
     let caller_address = tx_request.from.unwrap_or_default();
+    // The call's `msg.value`, kept for the gas estimate below: `tx_request` is consumed by
+    // extraction, and a payload whose updates spend or check that ETH reverts if it is replayed
+    // without it.
+    let tx_value = tx_request.value.unwrap_or_default();
 
     // Collect storage hints from the EIP-2930 access list before tx_request
     // is consumed by get_trace_from_call. Address-only entries (no storage keys)
@@ -1195,6 +1315,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
             caller_address,
             &state_updates,
             &all_hints,
+            tx_value,
         )
         .await?;
 
@@ -1337,6 +1458,328 @@ async fn try_prestate_net<P: Provider + DebugApi>(
 }
 
 // ============================================================================
+// Nested settlement
+// ============================================================================
+
+/// `type(IGasKillerNested).interfaceId` in solidity-sdk.
+pub const GAS_KILLER_NESTED_INTERFACE_ID: [u8; 4] = [0x78, 0x48, 0x18, 0x74];
+/// `supportsInterface(bytes4)`
+const SUPPORTS_INTERFACE_SELECTOR: [u8; 4] = [0x01, 0xff, 0xc9, 0xa7];
+/// `schnorrRegistry()`
+const SCHNORR_REGISTRY_SELECTOR: [u8; 4] = [0x5c, 0xc3, 0x74, 0x50];
+
+/// A call split into per-frame programs for nested settlement.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct EncodedFrameTree {
+    /// Frames in execution order, root first. A single frame means nothing was nested and the
+    /// call settles through `verifyAndUpdate` exactly as without nesting.
+    pub frames: Vec<FrameProgram>,
+    /// Every contract whose transition counter the call moves.
+    pub counter_moves: std::collections::BTreeSet<Address>,
+    /// The tree priced in execution order and totalled by [`frame_tree_total`]. An estimate for
+    /// reporting savings; which frames nest is decided by the cost model.
+    pub gas_estimate: u64,
+    pub skipped_opcodes: HashSet<Opcode>,
+    pub extraction: Extraction,
+    pub executor_cache_hit: bool,
+    pub timings: EncodePhaseTimings,
+}
+
+/// Like [`call_to_encoded_state_updates_with_evmsketch_profiled`], but a `CALL` into another
+/// SDK consumer that shares the root's registry becomes its own frame.
+///
+/// Whether a callee can be nested is read at `block_number`, the state the call is traced
+/// against, so every operator answers the same way. A read that reverts means the callee is not
+/// a nestable consumer; any other RPC failure fails the run rather than guessing, since a guess
+/// could split operators across two different trees.
+///
+/// Only the canonical encoder splits a trace: the legacy encoder drops callee writes, and the
+/// prestate net form never applies to a call that makes a regular `CALL`. Under
+/// [`StateEncoding::PrestateNet`] a call the net form represents is returned as a single frame.
+#[tracing::instrument(name = "evmsketch.encode_frame_tree", skip_all, fields(block_number, encoding = ?encoding, profile = ?profile, frame_count = tracing::field::Empty))]
+pub async fn call_to_frame_tree_with_evmsketch(
+    cache: &EvmSketchExecutorCache,
+    rpc_url: impl AsRef<str>,
+    tx_request: TransactionRequest,
+    block_number: u64,
+    encoding: StateEncoding,
+    profile: SimProfile,
+    cost: &NestingCostModel,
+) -> Result<EncodedFrameTree> {
+    if encoding == StateEncoding::Legacy {
+        bail!(
+            "nested settlement needs the canonical encoder; the legacy encoding cannot split a trace"
+        );
+    }
+    let rpc_url = rpc_url.as_ref();
+    let provider = cache.get_or_create_trace_provider(rpc_url)?;
+    let root = tx_request
+        .to
+        .and_then(|t| match t {
+            TxKind::Call(addr) => Some(addr),
+            TxKind::Create => None,
+        })
+        .ok_or_else(|| anyhow!("Transaction must have a 'to' address"))?;
+    let caller_address = tx_request.from.unwrap_or_default();
+    let tx_value = tx_request.value.unwrap_or_default();
+    let block = BlockId::Number(BlockNumberOrTag::Number(block_number));
+
+    let mut trace_fetch = Duration::ZERO;
+    let mut extraction = Extraction::StructLog;
+    if encoding.signs_prestate_net() {
+        let started = Instant::now();
+        let net = try_prestate_net(&provider, &tx_request, block, root, profile).await?;
+        trace_fetch += started.elapsed();
+        extraction = Extraction::PrestateFallback;
+        if let Some(updates) = net {
+            let (executor, lookup) = cache.get_or_build_timed(rpc_url, block_number).await?;
+            let hints = hints_from_state_updates(root, &updates);
+            let (gas_estimate, estimate) = executor
+                .estimate_state_changes_gas_with_hints_timed(
+                    root,
+                    caller_address,
+                    &updates,
+                    &hints,
+                    tx_value,
+                )
+                .await?;
+            let frame = FrameProgram {
+                target: root,
+                caller: Address::ZERO,
+                value: U256::ZERO,
+                calldata_hash: B256::ZERO,
+                transition_index: tracker_index(&updates),
+                updates,
+                children: Vec::new(),
+            };
+            return Ok(EncodedFrameTree {
+                counter_moves: std::iter::once(root).collect(),
+                frames: vec![frame],
+                gas_estimate,
+                skipped_opcodes: HashSet::new(),
+                extraction: Extraction::PrestateNet,
+                executor_cache_hit: lookup.cache_hit,
+                timings: EncodePhaseTimings {
+                    trace_fetch,
+                    parse: Duration::ZERO,
+                    executor_build: lookup.build,
+                    prefetch: estimate.prefetch,
+                    revm_estimate: estimate.execute,
+                },
+            });
+        }
+    }
+
+    let started = Instant::now();
+    let ((trace, nestable), (executor, executor_lookup)) = tokio::try_join!(
+        async {
+            let trace =
+                get_trace_from_call_with_profile(&provider, tx_request, block, profile).await?;
+            let nestable = nestable_callees(&provider, &trace, root, block).await?;
+            Ok::<_, anyhow::Error>((trace, nestable))
+        },
+        cache.get_or_build_timed(rpc_url, block_number),
+    )?;
+    trace_fetch += started.elapsed();
+
+    let started = Instant::now();
+    let tree = compute_frame_tree_canonical(trace, root, &|a| nestable.contains(&a), cost)?;
+    let parse = started.elapsed();
+    tracing::Span::current().record("frame_count", tree.frames.len());
+
+    // The whole tree lands in one transaction, so the unbounded profile's payload budget covers
+    // every frame together.
+    if let Some(budget) = profile.payload_gas_budget() {
+        let all: Vec<StateUpdate> = tree
+            .frames
+            .iter()
+            .flat_map(|f| without_nested_ops(&f.updates))
+            .collect();
+        let signature_floor = SignatureType::Bls.turetzky_upper_gas_limit();
+        validate_unbounded_cost(&all, tree.call_gas_total, signature_floor, budget).map_err(
+            |violation| {
+                anyhow!("unbounded-profile payload rejected for consumer {root}: {violation}")
+            },
+        )?;
+    }
+
+    let mut hints: HashMap<Address, Vec<B256>> = HashMap::new();
+    for frame in &tree.frames {
+        for (address, slots) in
+            hints_from_state_updates(frame.target, &without_nested_ops(&frame.updates))
+        {
+            hints.entry(address).or_default().extend(slots);
+        }
+    }
+    let (frame_gas, estimate) = executor
+        .estimate_frame_tree_gas_with_hints_timed(&tree.frames, caller_address, &hints, tx_value)
+        .await?;
+    let gas_estimate = frame_tree_total(&frame_gas, cost);
+    let (prefetch, revm_estimate) = (estimate.prefetch, estimate.execute);
+
+    Ok(EncodedFrameTree {
+        frames: tree.frames,
+        counter_moves: tree.counter_moves,
+        gas_estimate,
+        skipped_opcodes: tree.skipped_opcodes,
+        extraction,
+        executor_cache_hit: executor_lookup.cache_hit,
+        timings: EncodePhaseTimings {
+            trace_fetch,
+            parse,
+            executor_build: executor_lookup.build,
+            prefetch,
+            revm_estimate,
+        },
+    })
+}
+
+/// The transition index a program's tracker store implies, for programs not built from a
+/// struct-log trace.
+fn tracker_index(updates: &[StateUpdate]) -> Option<U256> {
+    updates.iter().find_map(|u| match u {
+        StateUpdate::Store(s) if s.slot == STATE_TRACKER_SLOT => {
+            Some(U256::from_be_bytes(s.value.0).saturating_sub(U256::from(1)))
+        }
+        _ => None,
+    })
+}
+
+/// The `CALL` targets in `trace` that are nestable consumers: they report `IGasKillerNested`
+/// and share the root's registry. Empty when the root itself cannot settle a tree.
+async fn nestable_callees<P: Provider>(
+    provider: &P,
+    trace: &alloy::rpc::types::trace::geth::DefaultFrame,
+    root: Address,
+    block: BlockId,
+) -> Result<HashSet<Address>> {
+    let mut nestable = HashSet::new();
+    let Some(registry) = nested_registry(provider, root, block).await? else {
+        return Ok(nestable);
+    };
+    let callees: std::collections::BTreeSet<Address> = trace
+        .struct_logs
+        .iter()
+        .filter(|l| l.op.as_ref() == "CALL" && l.error.is_none())
+        .filter_map(|l| {
+            let stack = l.stack.as_ref()?;
+            stack
+                .get(stack.len().wrapping_sub(2))
+                .map(|v| Address::from_word((*v).into()))
+        })
+        .collect();
+    let probes: Vec<(Address, Option<Address>)> = stream::iter(callees)
+        .map(|callee| async move {
+            Ok::<_, anyhow::Error>((callee, nested_registry(provider, callee, block).await?))
+        })
+        .buffer_unordered(NESTABILITY_PROBE_CONCURRENCY)
+        .try_collect()
+        .await?;
+    nestable.extend(
+        probes
+            .into_iter()
+            .filter(|(_, r)| *r == Some(registry))
+            .map(|(callee, _)| callee),
+    );
+    Ok(nestable)
+}
+
+/// Callees probed at once: a trace can call hundreds of contracts, and rate-limited RPCs fail
+/// a burst rather than queue it.
+const NESTABILITY_PROBE_CONCURRENCY: usize = 8;
+
+/// `Some(registry)` when `contract` reports `IGasKillerNested` at `block`, `None` when it does
+/// not or the read fails in the EVM. Node and transport failures are errors.
+async fn nested_registry<P: Provider>(
+    provider: &P,
+    contract: Address,
+    block: BlockId,
+) -> Result<Option<Address>> {
+    let mut probe = SUPPORTS_INTERFACE_SELECTOR.to_vec();
+    let mut word = [0u8; 32];
+    word[..4].copy_from_slice(&GAS_KILLER_NESTED_INTERFACE_ID);
+    probe.extend_from_slice(&word);
+    let Some(supports) = static_read(provider, contract, probe, block).await? else {
+        return Ok(None);
+    };
+    if supports.len() != 32 || U256::from_be_slice(&supports).is_zero() {
+        return Ok(None);
+    }
+    let Some(registry) = static_read(
+        provider,
+        contract,
+        SCHNORR_REGISTRY_SELECTOR.to_vec(),
+        block,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    if registry.len() != 32 {
+        return Ok(None);
+    }
+    Ok(Some(Address::from_slice(&registry[12..])))
+}
+
+/// Gas for each probe read. Left unset, `eth_call` runs with the node's configured gas cap, so a
+/// read that runs out of gas would be "not nestable" on one operator's node and nestable on
+/// another's. Far above what an ERC-165 read needs, far below any client's default cap.
+const NESTABILITY_PROBE_GAS: u64 = 1_000_000;
+
+/// `eth_call` at `block`: `Ok(None)` when the call fails in the EVM, `Err` when the node could
+/// not answer.
+async fn static_read<P: Provider>(
+    provider: &P,
+    to: Address,
+    data: Vec<u8>,
+    block: BlockId,
+) -> Result<Option<Bytes>> {
+    let request = TransactionRequest::default()
+        .to(to)
+        .input(data.into())
+        .gas_limit(NESTABILITY_PROBE_GAS);
+    match provider.call(request).block(block).await {
+        Ok(out) => Ok(Some(out)),
+        Err(alloy::transports::RpcError::ErrorResp(payload)) if is_evm_failure(&payload) => {
+            Ok(None)
+        }
+        Err(e) => Err(anyhow!("eth_call to {to} failed: {e}")),
+    }
+}
+
+/// Whether an `eth_call` error response reports the call failing in the EVM, which at a pinned
+/// block is a property of the state, so every operator sees it.
+///
+/// Not every error response qualifies: a lagging node's "header not found", a pruned node's
+/// "missing trie node", an RPC timeout or a rate limit say nothing about the callee, and
+/// reading those as "not nestable" would let one operator's node change the signed tree.
+/// Anything unrecognised therefore stays an error and fails the run.
+fn is_evm_failure(payload: &alloy_json_rpc::ErrorPayload) -> bool {
+    // 3: execution reverted (geth, Erigon, reth). -32015: Nethermind's VM execution error.
+    const EVM_FAILURE_CODES: [i64; 2] = [3, -32015];
+    // geth/Erigon name the halt.
+    const EVM_FAILURE_MESSAGES: [&str; 6] = [
+        "revert",
+        "out of gas",
+        "invalid opcode",
+        "stack underflow",
+        "stack overflow",
+        "invalid jump destination",
+    ];
+    let message = payload.message.to_lowercase();
+    // reth wraps database and other internal failures as "Revm error: <reason>", whatever the
+    // reason's text says.
+    if message.starts_with("revm error") {
+        return false;
+    }
+    // reth reports a halt as "EVM error: <reason>", only ever at the start.
+    EVM_FAILURE_CODES.contains(&payload.code)
+        || message.starts_with("evm error")
+        || EVM_FAILURE_MESSAGES.iter().any(|m| message.contains(m))
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1354,6 +1797,50 @@ mod tests {
         assert_eq!(Extraction::PrestateNet.as_str(), "prestate_net");
         assert_eq!(Extraction::StructLog.as_str(), "struct_log");
         assert_eq!(Extraction::PrestateFallback.as_str(), "prestate_fallback");
+    }
+
+    /// Every client's way of saying the call failed in the EVM reads as "not nestable"; node-side
+    /// failures, which differ between operators, stay errors.
+    #[test]
+    fn test_is_evm_failure_separates_execution_from_node_errors() {
+        let payload = |code: i64, message: &str| alloy_json_rpc::ErrorPayload {
+            code,
+            message: message.to_string().into(),
+            data: None,
+        };
+        for (code, message) in [
+            (3, "execution reverted"),
+            (-32000, "invalid opcode: INVALID"),
+            (-32000, "out of gas"),
+            (-32000, "stack underflow (0 <=> 1)"),
+            (-32000, "invalid jump destination"),
+            (-32003, "EVM error: OpcodeNotFound"),
+            (-32000, "out of gas: gas required exceeds: 30000000"),
+            (-32603, "EVM error InvalidFEOpcode"),
+            (-32015, "VM execution error."),
+        ] {
+            assert!(is_evm_failure(&payload(code, message)), "{code} {message}");
+        }
+        for (code, message) in [
+            (-32000, "header not found"),
+            (
+                -32000,
+                "missing trie node 0f3a (path ) state 0xab is not available",
+            ),
+            (-32000, "execution aborted (timeout = 5s)"),
+            (-32005, "limit exceeded"),
+            (429, "Too Many Requests"),
+            (-32603, "internal error"),
+            (-32603, "Revm error: database error"),
+            (
+                -32603,
+                "Revm error: state for block 0xab reverted by a reorg",
+            ),
+            (-32603, "Revm error: provider out of gas budget"),
+            (-32603, "internal: evm error in node"),
+        ] {
+            assert!(!is_evm_failure(&payload(code, message)), "{code} {message}");
+        }
     }
 
     /// A default timing set is all zeros, so a phase that did not run reads as no cost rather
@@ -1891,6 +2378,437 @@ mod tests {
         // `anvil_setCode` — no solc/forge build step.
         // ========================================================================
 
+        // ========================================================================
+        // Nested settlement — the nested-chain example contracts from solidity-sdk
+        // (`NestedRouter` → `NestedVault` → `NestedLedger`), deployed from their
+        // creation bytecode (`tests/fixtures/nested/*.hex`, `forge inspect <C> bytecode`).
+        // ========================================================================
+
+        const DEV: Address = address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+        const AVS: Address = address!("0x0000000000000000000000000000000000000a75");
+
+        fn word_u(v: u64) -> [u8; 32] {
+            U256::from(v).to_be_bytes()
+        }
+
+        fn word_a(a: Address) -> [u8; 32] {
+            let mut w = [0u8; 32];
+            w[12..].copy_from_slice(a.as_slice());
+            w
+        }
+
+        async fn deploy(
+            provider: &RootProvider<Ethereum>,
+            creation_hex: &str,
+            args: &[[u8; 32]],
+        ) -> Address {
+            let mut data = alloy::hex::decode(creation_hex.trim()).expect("valid creation hex");
+            for word in args {
+                data.extend_from_slice(word);
+            }
+            let tx = serde_json::json!({
+                "from": DEV,
+                "data": format!("0x{}", alloy::hex::encode(data)),
+                "gas": "0x1c9c380",
+            });
+            let hash: B256 = provider
+                .raw_request("eth_sendTransaction".into(), (tx,))
+                .await
+                .expect("eth_sendTransaction");
+            let mut receipt = serde_json::Value::Null;
+            for _ in 0..100 {
+                receipt = provider
+                    .raw_request("eth_getTransactionReceipt".into(), (hash,))
+                    .await
+                    .expect("eth_getTransactionReceipt");
+                if !receipt.is_null() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(receipt["status"], "0x1", "deployment reverted: {receipt}");
+            receipt["contractAddress"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no contract address in {receipt}"))
+                .parse()
+                .expect("an address")
+        }
+
+        struct NestedChain {
+            registry: Address,
+            ledger: Address,
+            vault: Address,
+            router: Address,
+        }
+
+        async fn deploy_registry(provider: &RootProvider<Ethereum>) -> Address {
+            deploy(
+                provider,
+                include_str!("../tests/fixtures/nested/SchnorrStakeRegistry.hex"),
+                &[word_u(2), word_u(3), word_a(DEV), word_u(0)],
+            )
+            .await
+        }
+
+        /// `vault_registry` lets a test give the vault a different registry from the router.
+        async fn deploy_chain(
+            provider: &RootProvider<Ethereum>,
+            rounds: u64,
+            vault_registry: Option<Address>,
+        ) -> NestedChain {
+            let registry = deploy_registry(provider).await;
+            let ledger = deploy(
+                provider,
+                include_str!("../tests/fixtures/nested/NestedLedger.hex"),
+                &[word_a(AVS), word_a(registry), word_u(rounds)],
+            )
+            .await;
+            let vault = deploy(
+                provider,
+                include_str!("../tests/fixtures/nested/NestedVault.hex"),
+                &[
+                    word_a(AVS),
+                    word_a(vault_registry.unwrap_or(registry)),
+                    word_a(ledger),
+                ],
+            )
+            .await;
+            let router = deploy(
+                provider,
+                include_str!("../tests/fixtures/nested/NestedRouter.hex"),
+                &[word_a(AVS), word_a(registry), word_a(vault)],
+            )
+            .await;
+            NestedChain {
+                registry,
+                ledger,
+                vault,
+                router,
+            }
+        }
+
+        /// `NestedRouter.process(user, weights)`.
+        fn process_request(router: Address, weights: u64) -> TransactionRequest {
+            let mut data = vec![0x9c, 0x6e, 0xfc, 0x5a];
+            data.extend_from_slice(&word_a(address!(
+                "0x000000000000000000000000000000000000beef"
+            )));
+            data.extend_from_slice(&word_u(0x40));
+            data.extend_from_slice(&word_u(weights));
+            for i in 0..weights {
+                data.extend_from_slice(&word_u(i * 7 + 3));
+            }
+            call_request(router).input(Bytes::from(data).into())
+        }
+
+        /// Nests every eligible callee, so the splitting tests can use a small, fast workload;
+        /// the cost model is exercised by `test_cheap_callees_stay_calls` and the core tests.
+        const FREE_NESTING: NestingCostModel = NestingCostModel {
+            frame_overhead_gas: 0,
+            witness_byte_gas: 0,
+            witness_byte_gas_per_level: 0,
+        };
+
+        async fn frame_tree(
+            anvil: &LocalAnvil,
+            request: TransactionRequest,
+            cost: &NestingCostModel,
+        ) -> EncodedFrameTree {
+            let block = anvil
+                .provider()
+                .get_block_number()
+                .await
+                .expect("block number");
+            call_to_frame_tree_with_evmsketch(
+                &EvmSketchExecutorCache::new(1),
+                &anvil.url,
+                request,
+                block,
+                StateEncoding::Canonical,
+                SimProfile::Chain,
+                cost,
+            )
+            .await
+            .expect("frame tree")
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; run with --ignored"]
+        async fn test_nested_chain_splits_into_one_frame_per_consumer() {
+            let anvil =
+                LocalAnvil::spawn_with(&["--chain-id", &SEPOLIA_CHAIN_ID.to_string()]).await;
+            let chain = deploy_chain(&anvil.provider(), 5, None).await;
+            let tree = frame_tree(&anvil, process_request(chain.router, 5), &FREE_NESTING).await;
+
+            let targets: Vec<Address> = tree.frames.iter().map(|f| f.target).collect();
+            assert_eq!(targets, vec![chain.router, chain.vault, chain.ledger]);
+            assert_eq!(tree.frames[0].children, vec![1]);
+            assert_eq!(tree.frames[1].children, vec![2]);
+            assert_eq!(tree.frames[1].caller, chain.router);
+            assert_eq!(tree.frames[2].caller, chain.vault);
+            for frame in &tree.frames {
+                assert_eq!(frame.transition_index, Some(U256::ZERO));
+            }
+            assert_eq!(
+                tree.counter_moves,
+                [chain.router, chain.vault, chain.ledger]
+                    .into_iter()
+                    .collect()
+            );
+            assert!(
+                tree.frames[0]
+                    .updates
+                    .iter()
+                    .any(|u| matches!(u, StateUpdate::Nested(n) if n.target == chain.vault))
+            );
+
+            let encoded = gas_analyzer_core::nested::encode_frame_tree(
+                &tree.frames,
+                [0x9c, 0x6e, 0xfc, 0x5a].into(),
+                SEPOLIA_CHAIN_ID,
+                1_000,
+            )
+            .expect("encodable tree");
+            assert_eq!(encoded.leaves.len(), 4);
+            assert_eq!(encoded.root_children.len(), 1);
+            let _ = chain.registry;
+        }
+
+        /// A mined transaction's hash, for the historical (`debug_traceTransaction`) path.
+        async fn send(provider: &RootProvider<Ethereum>, request: TransactionRequest) -> B256 {
+            let to = match request.to {
+                Some(TxKind::Call(to)) => to,
+                _ => panic!("a call request"),
+            };
+            let data = request.input.input().cloned().unwrap_or_default();
+            let tx = serde_json::json!({
+                "from": DEV,
+                "to": to,
+                "data": data,
+                "gas": "0x1c9c380",
+            });
+            let hash: B256 = provider
+                .raw_request("eth_sendTransaction".into(), (tx,))
+                .await
+                .expect("eth_sendTransaction");
+            for _ in 0..100 {
+                if provider
+                    .get_transaction_receipt(hash)
+                    .await
+                    .expect("receipt")
+                    .is_some()
+                {
+                    return hash;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!("{hash} was never mined");
+        }
+
+        /// A mined transaction priced as if some of the contracts it calls had integrated the SDK.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; run with --ignored"]
+        async fn test_historical_transaction_priced_with_an_owned_set() {
+            let anvil = LocalAnvil::spawn_with(&[
+                "--chain-id",
+                &SEPOLIA_CHAIN_ID.to_string(),
+                "--steps-tracing",
+            ])
+            .await;
+            let provider = anvil.provider();
+            let chain = deploy_chain(&provider, 5, None).await;
+            let hash = send(&provider, process_request(chain.router, 5)).await;
+            let receipt = provider
+                .get_transaction_receipt(hash)
+                .await
+                .expect("receipt")
+                .expect("mined");
+            let trace = gas_analyzer_rpc::get_tx_trace(&provider, hash, receipt.status())
+                .await
+                .expect("historical trace");
+            let split = |owned: &[Address]| {
+                gas_analyzer_core::nested::compute_frame_tree_hypothetical(
+                    trace.clone(),
+                    chain.router,
+                    &owned.iter().copied().collect(),
+                    &FREE_NESTING,
+                )
+                .expect("frame tree")
+            };
+
+            let behind_a_foreign_vault = split(&[chain.ledger]);
+            assert_eq!(
+                behind_a_foreign_vault.frames.len(),
+                1,
+                "the ledger runs inside the vault's call"
+            );
+
+            let tree = split(&[chain.vault, chain.ledger]);
+            let targets: Vec<Address> = tree.frames.iter().map(|f| f.target).collect();
+            assert_eq!(targets, vec![chain.router, chain.vault, chain.ledger]);
+
+            let block = receipt.block_number.expect("block");
+            let gk = GasKillerEvmSketchDefault::builder(anvil.url.parse().expect("url"))
+                .at_block(BlockNumberOrTag::Number(block))
+                .build()
+                .await
+                .expect("estimator");
+            let gas = gk
+                .estimate_frame_tree_gas_with_preceding(
+                    &tree.frames,
+                    DEV,
+                    &[],
+                    OriginalTx::default(),
+                    &FREE_NESTING,
+                )
+                .expect("priced");
+            assert_eq!(gas.frame_gas.len(), 3);
+            assert!(
+                gas.frame_gas
+                    .iter()
+                    .all(|g| *g > gas_analyzer_core::BASE_TX_COST)
+            );
+            let children: u64 = gas.frame_gas[1..]
+                .iter()
+                .map(|g| g - gas_analyzer_core::BASE_TX_COST)
+                .sum();
+            assert_eq!(
+                gas.total,
+                gas.frame_gas[0] + children,
+                "one base cost for the whole tree"
+            );
+        }
+
+        /// Railgun's relay reverts below a minimum `tx.gasprice`, so a replay at the default of 0
+        /// fails where the original succeeded.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; run with --ignored"]
+        async fn test_historical_replay_runs_at_the_original_gas_price() {
+            let anvil =
+                LocalAnvil::spawn_with(&["--chain-id", &SEPOLIA_CHAIN_ID.to_string()]).await;
+            let provider = anvil.provider();
+            let gate = Address::repeat_byte(0x6a);
+            // if GASPRICE < 1 gwei: REVERT
+            set_code(
+                &provider,
+                gate,
+                hex_code("63 3b9aca00 3a 10 600b 57 00 5b 6000 80 fd"),
+            )
+            .await;
+            // The estimator reads state at the block before its anchor.
+            for _ in 0..2 {
+                let _: serde_json::Value = provider
+                    .raw_request("evm_mine".into(), ())
+                    .await
+                    .expect("evm_mine");
+            }
+            let block = provider.get_block_number().await.expect("block number");
+            let gk = GasKillerEvmSketchDefault::builder(anvil.url.parse().expect("url"))
+                .at_block(BlockNumberOrTag::Number(block))
+                .build()
+                .await
+                .expect("estimator");
+            let updates = [StateUpdate::Call(IStateUpdateTypes::Call {
+                target: gate,
+                value: U256::ZERO,
+                callargs: Bytes::new(),
+            })];
+            let replay_at = |gas_price| {
+                gk.estimate_state_changes_gas_with_preceding(
+                    Address::repeat_byte(0xc0),
+                    DEV,
+                    &updates,
+                    &[],
+                    OriginalTx {
+                        value: U256::ZERO,
+                        gas_price,
+                    },
+                )
+            };
+
+            assert!(replay_at(0).is_err(), "the gate rejects a zero gas price");
+            replay_at(1_000_000_000).expect("the gate admits the original gas price");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; run with --ignored"]
+        async fn test_callee_on_another_registry_stays_a_call() {
+            let anvil =
+                LocalAnvil::spawn_with(&["--chain-id", &SEPOLIA_CHAIN_ID.to_string()]).await;
+            let other_registry = deploy_registry(&anvil.provider()).await;
+            let chain = deploy_chain(&anvil.provider(), 5, Some(other_registry)).await;
+            let tree = frame_tree(&anvil, process_request(chain.router, 5), &FREE_NESTING).await;
+
+            assert_eq!(tree.frames.len(), 1);
+            assert!(
+                tree.frames[0]
+                    .updates
+                    .iter()
+                    .any(|u| matches!(u, StateUpdate::Call(c) if c.target == chain.vault))
+            );
+            assert!(tree.counter_moves.contains(&chain.vault));
+            assert!(
+                tree.counter_moves.contains(&chain.ledger),
+                "pinned even though it runs natively"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; run with --ignored"]
+        async fn test_cheap_callees_stay_calls() {
+            let anvil =
+                LocalAnvil::spawn_with(&["--chain-id", &SEPOLIA_CHAIN_ID.to_string()]).await;
+            let chain = deploy_chain(&anvil.provider(), 1, None).await;
+            let tree = frame_tree(
+                &anvil,
+                process_request(chain.router, 1),
+                &gas_analyzer_core::nested::NESTING_COST_MODEL_V1,
+            )
+            .await;
+            assert_eq!(
+                tree.frames.len(),
+                1,
+                "nesting a near-empty frame costs more than running it"
+            );
+        }
+
+        /// Probing every callee reaches arbitrary contracts; one that halts outside a revert
+        /// (`INVALID`, an out-of-gas loop, a stack underflow) is simply not a nestable consumer.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; run with --ignored"]
+        async fn test_a_callee_that_halts_is_not_nestable() {
+            let anvil = LocalAnvil::spawn().await;
+            let provider = anvil.provider();
+            let block = BlockId::Number(BlockNumberOrTag::Latest);
+            for (i, code) in [bytes!("fe"), bytes!("5b600056"), bytes!("01")]
+                .into_iter()
+                .enumerate()
+            {
+                let callee = Address::with_last_byte(0xe0 + i as u8);
+                set_code(&provider, callee, code.clone()).await;
+                let registry = nested_registry(&provider, callee, block)
+                    .await
+                    .unwrap_or_else(|e| panic!("probing {code} failed the run: {e:#}"));
+                assert_eq!(registry, None, "{code}");
+            }
+        }
+
+        /// The probe runs with its own gas, not the node's cap, so every operator reads the same.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; run with --ignored"]
+        async fn test_the_probe_runs_with_fixed_gas() {
+            let anvil = LocalAnvil::spawn().await;
+            let provider = anvil.provider();
+            let callee = Address::with_last_byte(0xe9);
+            // Returns `gasleft() < NESTABILITY_PROBE_GAS` for any call.
+            set_code(&provider, callee, bytes!("5a620f42401160005260206000f3")).await;
+            assert_eq!(NESTABILITY_PROBE_GAS, 1_000_000);
+            let registry = nested_registry(&provider, callee, BlockId::latest())
+                .await
+                .unwrap();
+            assert_eq!(registry, Some(Address::with_last_byte(1)));
+        }
+
         /// A local anvil instance on an OS-assigned free port, killed on drop.
         struct LocalAnvil {
             child: std::process::Child,
@@ -2114,6 +3032,72 @@ mod tests {
             )
             .await
             .expect("encode failed")
+        }
+
+        /// A consumer that takes ETH in and checks, at settlement, that it arrived — the shape of
+        /// a deposit into a pool that must stay backed.
+        ///
+        /// With no calldata: `SSTORE(0, CALLVALUE)`, then `CALL(self, value 0, data 0x01)`, reverting
+        /// if that call fails. With calldata (the self-call): revert unless
+        /// `SELFBALANCE >= SLOAD(0)`. The diff is `[Store(0, value), Call(self, 0, 0x01)]`, and the
+        /// call re-runs the balance check when the payload is applied, so it only lands when the
+        /// settlement carries the ETH.
+        fn backed_deposit_code() -> Bytes {
+            hex_code(
+                "36 601f 57 34 6000 55 6001 6000 53 6000 6000 6001 6000 6000 30 5a f1 15 6029 57 00 \
+                 5b 6000 54 47 10 6029 57 00 5b 6000 6000 fd",
+            )
+        }
+
+        /// The gas estimate must replay the payload with the call's `msg.value`. A consumer that
+        /// checks the ETH a call brought in (a deposit that must stay backed) otherwise reverts in
+        /// the estimate — an analysis failure for a call that settles fine when sent with its value.
+        // `SimpleRpcDb` reads uncached state through `block_in_place`, which panics on a
+        // current-thread runtime.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
+        async fn test_estimate_replays_with_the_calls_value() {
+            let anvil = spawn_as_sepolia().await;
+            let provider = anvil.provider();
+            let consumer = address!("0x0000000000000000000000000000000000001007");
+            set_code(&provider, consumer, backed_deposit_code()).await;
+            let block = provider.get_block_number().await.expect("block number");
+            let cache = EvmSketchExecutorCache::new(4);
+            let value = U256::from(10u64).pow(U256::from(16u64)); // 0.01 ETH
+
+            let encoded = call_to_encoded_state_updates_with_evmsketch_profiled(
+                &cache,
+                &anvil.url,
+                call_request(consumer).value(value),
+                block,
+                StateEncoding::Legacy,
+                SimProfile::Chain,
+            )
+            .await
+            .expect(
+                "a deposit that brings its ETH must analyze and price, not revert in the estimate",
+            );
+
+            assert_eq!(
+                encoded.update_count, 2,
+                "Store(0, value) and the backing self-call"
+            );
+            assert!(encoded.gas_estimate > 0, "the payload is priced");
+        }
+
+        /// As [`test_estimate_replays_with_the_calls_value`], through the frame-tree entry point.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
+        async fn test_frame_tree_estimate_replays_with_the_calls_value() {
+            let anvil = spawn_as_sepolia().await;
+            let consumer = address!("0x0000000000000000000000000000000000001007");
+            set_code(&anvil.provider(), consumer, backed_deposit_code()).await;
+            let value = U256::from(10u64).pow(U256::from(16u64)); // 0.01 ETH
+
+            let tree = frame_tree(&anvil, call_request(consumer).value(value), &FREE_NESTING).await;
+
+            assert_eq!(tree.frames.len(), 1);
+            assert!(tree.gas_estimate > 0, "the payload is priced");
         }
 
         /// The struct-log path must attribute cost to both a fetch and a parse. This is the

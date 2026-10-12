@@ -117,6 +117,11 @@ fn print_report(report: &StateUpdateReport) {
                 println!("  Salt: {:?}", c.salt);
                 println!("  Initcode length: {} bytes", c.initcode.len());
             }
+            StateUpdate::Nested(n) => {
+                println!("  Type: NESTED");
+                println!("  Target: {:?}", n.target);
+                println!("  Child leaf: {:?}", n.childLeaf);
+            }
         }
     }
 }

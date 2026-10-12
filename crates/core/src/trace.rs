@@ -4,9 +4,9 @@
 //! Geth-format transaction traces (`DefaultFrame`). Contains only
 //! pure computation functions - no async, no I/O, no RPC calls.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::Address;
 use alloy_rpc_types::trace::geth::{DefaultFrame, StructLog};
 use anyhow::{Result, bail};
 
@@ -209,6 +209,9 @@ pub struct TraceExtract {
     pub skipped_opcodes: HashSet<Opcode>,
     /// Total gas consumed by the extracted depth-1 CALLs (gross, pre-refund).
     pub call_gas_total: u64,
+    /// The part of `call_gas_total` spent inside the callees, without the `CALL` opcodes' own
+    /// cost: what a simulation that runs those `CALL`s into code-less accounts misses.
+    pub callee_gas_total: u64,
     /// Total gas actually charged for the extracted SSTOREs (from struct-log
     /// `gasCost`), reflecting cold/warm/dirty pricing per write.
     pub sstore_gas_total: u64,
@@ -222,6 +225,27 @@ pub struct TraceExtract {
     /// extraction are qualified, not corrected. Always `false` when no origin
     /// address was supplied.
     pub reentered: bool,
+}
+
+/// What a `CALL`'s callee spent of `gas_used`, the call's whole cost in the trace: its gas
+/// before the `CALL` less its gas on resuming.
+///
+/// `gas_cost` is Geth's `gasCost` for the `CALL`, the opcode's own cost plus the gas forwarded,
+/// and `entry_gas` the gas at the callee's first step, the gas forwarded plus any stipend. Their
+/// difference is the opcode's cost less the stipend, which `gas_used` also carries; a tracer whose
+/// `gasCost` leaves out the forwarded gas makes it zero, and the result `gas_used`. `None` is a
+/// call that opened no frame (an account without code, a precompile, a failed call).
+pub(crate) fn callee_gas(gas_used: u64, gas_cost: u64, entry_gas: Option<u64>) -> u64 {
+    entry_gas.map_or(0, |entry| {
+        gas_used.saturating_sub(gas_cost.saturating_sub(entry))
+    })
+}
+
+/// An extracted `CALL`'s struct log, and its callee's first step.
+struct CallGas {
+    gas: u64,
+    gas_cost: u64,
+    entry_gas: Option<u64>,
 }
 
 /// Compute state updates from a Geth DefaultFrame trace (see [`TraceExtract`]).
@@ -246,15 +270,24 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
     // Track what type of call brought us to each depth (for filtering nested CALLs)
     // "CALL" = regular CALL, "DELEGATECALL" = DELEGATECALL/CALLCODE
     let mut call_type_at_depth: HashMap<u64, &str> = HashMap::new();
-    // Track gas for each CALL we extract: map from call_index to gas_after_call_opcode
-    let mut call_gas_tracking: HashMap<usize, u64> = HashMap::new();
+    let mut call_gas_tracking: HashMap<usize, CallGas> = HashMap::new();
+    // An extracted CALL whose callee's first step, if it has one, is the next log.
+    let mut awaiting_entry: Option<(u64, usize)> = None;
     let mut total_call_gas = 0u64;
+    let mut callee_gas_total = 0u64;
     let mut sstore_gas_total = 0u64;
     let mut reentered = false;
 
     for struct_log in trace.struct_logs {
         let depth = struct_log.depth;
         let op = struct_log.op.as_ref().to_string();
+
+        if let Some((call_depth, idx)) = awaiting_entry.take()
+            && depth == call_depth + 1
+            && let Some(call) = call_gas_tracking.get_mut(&idx)
+        {
+            call.entry_gas = Some(struct_log.gas);
+        }
 
         // Re-entry detection: any CALL-family opcode below depth 1 whose
         // target (second stack item from the top) is the origin contract.
@@ -277,12 +310,10 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
             while let Some(&(d, idx)) = call_stack.last() {
                 if d >= depth {
                     // We're exiting this CALL. Calculate its gas cost.
-                    if let Some(gas_after_opcode) = call_gas_tracking.remove(&idx) {
-                        // Gas remaining after the CALL returns
-                        let gas_after_call = struct_log.gas;
-                        // Gas used by the CALL = gas after CALL opcode - gas after CALL returns
-                        let gas_used = gas_after_opcode.saturating_sub(gas_after_call);
+                    if let Some(call) = call_gas_tracking.remove(&idx) {
+                        let gas_used = call.gas.saturating_sub(struct_log.gas);
                         total_call_gas += gas_used;
+                        callee_gas_total += callee_gas(gas_used, call.gas_cost, call.entry_gas);
                     }
                     call_stack.pop();
                 } else {
@@ -337,9 +368,15 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
                     if op == "CALL" {
                         let call_index_1based = state_updates.len();
                         call_stack.push((depth, call_index_1based));
-                        // Track the gas remaining after the CALL opcode executes
-                        // This will be used to calculate gas used when the CALL exits
-                        call_gas_tracking.insert(call_index_1based, gas_after_opcode);
+                        call_gas_tracking.insert(
+                            call_index_1based,
+                            CallGas {
+                                gas: gas_after_opcode,
+                                gas_cost,
+                                entry_gas: None,
+                            },
+                        );
+                        awaiting_entry = Some((depth, call_index_1based));
                         // Increase target_depth to track when we exit this CALL
                         // This allows us to detect when the CALL returns and pop from call_stack
                         target_depth = depth + 1;
@@ -364,6 +401,7 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
         state_updates,
         skipped_opcodes,
         call_gas_total: total_call_gas,
+        callee_gas_total,
         sstore_gas_total,
         refund_counter,
         reentered,
@@ -373,63 +411,6 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
 // ============================================================================
 // Canonical-checkpoint extraction
 // ============================================================================
-
-/// An execution frame observed while walking the trace.
-struct CanonFrame {
-    /// Depth of the code executing *inside* this frame (root = 1).
-    depth: u64,
-    /// Whose storage `SSTORE`s in this frame write to. `None` for frames whose
-    /// storage can never be the target (CREATE initcode — the target already
-    /// has code, so a fresh deployment cannot alias it).
-    storage_ctx: Option<Address>,
-    /// Whether state-changing ops in this frame are emitted as updates. True for
-    /// the root frame and for DELEGATECALL/CALLCODE frames entered from an
-    /// emitting frame (their writes hit the target's storage directly); false
-    /// inside any CALL/STATICCALL/CREATE frame — those replay natively on-chain
-    /// as part of the emitted parent update.
-    emitting: bool,
-    /// Writes to the *target's* storage made inside this frame (and merged from
-    /// successfully-completed child frames). Committed into the parent only if
-    /// this frame completes successfully; discarded on revert — exactly
-    /// mirroring EVM journaling.
-    journal: BTreeMap<B256, B256>,
-    /// Emitted updates buffered in this frame, in order. Appended to the parent
-    /// on success, dropped on revert (so a reverted emitting frame's writes/logs
-    /// never reach the signed program). The root frame's buffer *is* the program.
-    out: Vec<StateUpdate>,
-    /// Replay-side view of the target's storage as of this frame's emissions —
-    /// only meaningful in emitting frames. Used to suppress re-emitting a slot
-    /// whose canonical value a prior slice already set (same-value writes).
-    emitted_view: BTreeMap<B256, B256>,
-    /// For frames entered via an *emitted* CALL update: the gas remaining right
-    /// after the CALL opcode, used to account the call's gas on exit.
-    emitted_call_gas: Option<u64>,
-}
-
-/// A frame-creating opcode was just executed; whether a frame actually opens is
-/// only known from the next log's depth (calls to EOAs/precompiles run inline).
-struct PendingFrame {
-    parent_depth: u64,
-    storage_ctx: Option<Address>,
-    emitting: bool,
-    /// Snapshot of the parent's replay-side view, inherited by an emitting child.
-    emitted_view: BTreeMap<B256, B256>,
-    emitted_call_gas: Option<u64>,
-}
-
-/// The target's canonical storage image visible right now = every open frame's
-/// journal merged bottom-up (deeper frames override shallower ones). At an
-/// emitting boundary every open frame is emitting and target-scoped, so this is
-/// exactly what native execution would have in the target's storage.
-fn canonical_visible_image(frames: &[CanonFrame]) -> BTreeMap<B256, B256> {
-    let mut image = BTreeMap::new();
-    for f in frames {
-        for (slot, value) in &f.journal {
-            image.insert(*slot, *value);
-        }
-    }
-    image
-}
 
 /// Compute state updates with **canonical state checkpointing**.
 ///
@@ -465,243 +446,24 @@ pub fn compute_state_updates_canonical(
     trace: DefaultFrame,
     target: Address,
 ) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64)> {
-    let mut skipped_opcodes = HashSet::new();
-    let mut total_call_gas = 0u64;
-
-    let mut frames: Vec<CanonFrame> = vec![CanonFrame {
-        depth: 1,
-        storage_ctx: Some(target),
-        emitting: true,
-        journal: BTreeMap::new(),
-        out: Vec::new(),
-        emitted_view: BTreeMap::new(),
-        emitted_call_gas: None,
-    }];
-    let mut pending: Option<PendingFrame> = None;
-
-    // Emit a canonical state slice into the current (emitting) frame: for every
-    // slot in the target's currently-visible image whose value differs from what
-    // this frame has already emitted, push a Store and advance the emitted view.
-    // Must be called only when the current frame is emitting.
-    fn flush_slice(frames: &mut [CanonFrame]) {
-        let visible = canonical_visible_image(frames);
-        let cur = frames.last_mut().expect("root frame must remain");
-        for (slot, value) in visible {
-            if cur.emitted_view.get(&slot) != Some(&value) {
-                cur.out
-                    .push(StateUpdate::Store(IStateUpdateTypes::Store { slot, value }));
-                cur.emitted_view.insert(slot, value);
-            }
-        }
-    }
-
-    for struct_log in trace.struct_logs {
-        let depth = struct_log.depth;
-        let op = struct_log.op.as_ref().to_string();
-
-        // Resolve a pending frame from the previous log's frame-creating op.
-        if let Some(p) = pending.take() {
-            if depth == p.parent_depth + 1 {
-                frames.push(CanonFrame {
-                    depth,
-                    storage_ctx: p.storage_ctx,
-                    emitting: p.emitting,
-                    journal: BTreeMap::new(),
-                    out: Vec::new(),
-                    emitted_view: p.emitted_view,
-                    emitted_call_gas: p.emitted_call_gas,
-                });
-            } else {
-                // No frame was entered (EOA / precompile / failed call): the
-                // call completed inline. Account its gas now if it was emitted.
-                if let Some(gas_after_opcode) = p.emitted_call_gas {
-                    total_call_gas += gas_after_opcode.saturating_sub(struct_log.gas);
-                }
-            }
-        }
-
-        // Pop frames we have stepped out of. The resume log (this one) carries
-        // the child's success flag on top of the parent's stack.
-        while frames.last().map(|f| f.depth).unwrap_or(1) > depth {
-            let frame = frames.pop().expect("frame stack underflow");
-            if frame.depth != depth + 1 {
-                bail!(
-                    "trace depth jumped from {} to {} without resume logs — cannot attribute frame outcomes",
-                    frame.depth,
-                    depth
-                );
-            }
-            let stack = struct_log
-                .stack
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("resume log at depth {depth} has no stack"))?;
-            let success = stack
-                .last()
-                .map(|v| !v.is_zero())
-                .ok_or_else(|| anyhow::anyhow!("resume log at depth {depth} has empty stack"))?;
-            if let Some(gas_after_opcode) = frame.emitted_call_gas {
-                total_call_gas += gas_after_opcode.saturating_sub(struct_log.gas);
-            }
-            if success {
-                let child_emitting = frame.emitting;
-                let child_view = frame.emitted_view;
-                let parent = frames.last_mut().expect("root frame must remain");
-                // Commit the child's target writes and buffered emissions.
-                for (slot, value) in frame.journal {
-                    parent.journal.insert(slot, value);
-                }
-                parent.out.extend(frame.out);
-                // An emitting child ran while the parent was suspended, so its
-                // emitted view is a superset of the parent's — adopt it.
-                if child_emitting {
-                    parent.emitted_view = child_view;
-                }
-            }
-            // On failure everything (journal, out, view) is dropped — the EVM
-            // rolled the whole sub-frame back.
-        }
-
-        let idx = frames.len() - 1;
-        let cur_emitting = frames[idx].emitting;
-        let cur_ctx = frames[idx].storage_ctx;
-        let op_errored = struct_log.error.is_some();
-
-        match op.as_str() {
-            "SSTORE" => {
-                if cur_ctx == Some(target) && !op_errored {
-                    let mut stack = struct_log
-                        .stack
-                        .clone()
-                        .ok_or_else(|| anyhow::anyhow!("SSTORE log has no stack"))?;
-                    stack.reverse();
-                    let slot: B256 = stack[0].into();
-                    let value: B256 = stack[1].into();
-                    frames[idx].journal.insert(slot, value);
-                }
-            }
-            "TSTORE" | "SELFDESTRUCT" => {
-                if cur_emitting {
-                    skipped_opcodes.insert(op.clone());
-                }
-            }
-            "DELEGATECALL" | "CALLCODE" => {
-                if !op_errored {
-                    // Runs with the target's storage: inherits ctx and emitting.
-                    let emitted_view = if cur_emitting {
-                        frames[idx].emitted_view.clone()
-                    } else {
-                        BTreeMap::new()
-                    };
-                    pending = Some(PendingFrame {
-                        parent_depth: depth,
-                        storage_ctx: cur_ctx,
-                        emitting: cur_emitting,
-                        emitted_view,
-                        emitted_call_gas: None,
-                    });
-                }
-            }
-            "STATICCALL" => {
-                if !op_errored {
-                    // Read-only: never writes, never emitted. Track only for depth.
-                    let stack = struct_log
-                        .stack
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("STATICCALL log has no stack"))?;
-                    let callee = stack
-                        .get(stack.len().wrapping_sub(2))
-                        .map(|v| Address::from_word((*v).into()));
-                    pending = Some(PendingFrame {
-                        parent_depth: depth,
-                        storage_ctx: callee,
-                        emitting: false,
-                        emitted_view: BTreeMap::new(),
-                        emitted_call_gas: None,
-                    });
-                }
-            }
-            "CALL" => {
-                let stack = struct_log
-                    .stack
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("CALL log has no stack"))?;
-                let callee = stack
-                    .get(stack.len().wrapping_sub(2))
-                    .map(|v| Address::from_word((*v).into()));
-                let gas_after_opcode = struct_log.gas;
-                let mut emitted_call_gas = None;
-                if cur_emitting && !op_errored {
-                    // Boundary: external code is about to observe the target's
-                    // storage — bring it to the canonical image first, then emit
-                    // the CALL so on-chain the same external code runs against it.
-                    flush_slice(&mut frames);
-                    if append_state_update_from_struct_log(&mut frames[idx].out, struct_log)?
-                        .is_some()
-                    {
-                        unreachable!("CALL is never a skipped opcode");
-                    }
-                    emitted_call_gas = Some(gas_after_opcode);
-                }
-                if !op_errored {
-                    pending = Some(PendingFrame {
-                        parent_depth: depth,
-                        storage_ctx: callee,
-                        emitting: false,
-                        emitted_view: BTreeMap::new(),
-                        emitted_call_gas,
-                    });
-                }
-            }
-            "CREATE" | "CREATE2" => {
-                if cur_emitting && !op_errored {
-                    // Initcode can call back into the target: boundary here too.
-                    flush_slice(&mut frames);
-                    if append_state_update_from_struct_log(&mut frames[idx].out, struct_log)?
-                        .is_some()
-                    {
-                        unreachable!("CREATE/CREATE2 are never skipped opcodes");
-                    }
-                }
-                if !op_errored {
-                    pending = Some(PendingFrame {
-                        parent_depth: depth,
-                        // A fresh deployment can never alias the target (the
-                        // target already has code), so its writes are never ours.
-                        storage_ctx: None,
-                        emitting: false,
-                        emitted_view: BTreeMap::new(),
-                        emitted_call_gas: None,
-                    });
-                }
-            }
-            "LOG0" | "LOG1" | "LOG2" | "LOG3" | "LOG4" if cur_emitting && !op_errored => {
-                let skipped =
-                    append_state_update_from_struct_log(&mut frames[idx].out, struct_log)?;
-                debug_assert!(skipped.is_none(), "LOG* is never a skipped opcode");
-            }
-            _ => {}
-        }
-    }
-
-    if frames.len() != 1 {
-        bail!(
-            "trace ended with {} unclosed frame(s) — malformed trace",
-            frames.len() - 1
-        );
-    }
-
-    // Final slice: the signed program must fully determine the target's end
-    // state, even if a re-entrant call's on-chain replay diverged.
-    flush_slice(&mut frames);
-
-    let root = frames.pop().expect("root frame present");
-    tracing::Span::current().record("state_update_count", root.out.len());
-    Ok((root.out, skipped_opcodes, total_call_gas))
+    let tree = crate::nested::compute_frame_tree_canonical(
+        trace,
+        target,
+        &|_| false,
+        &crate::nested::NESTING_COST_MODEL_V1,
+    )?;
+    let root = tree
+        .frames
+        .into_iter()
+        .next()
+        .expect("a frame tree always has its root frame");
+    tracing::Span::current().record("state_update_count", root.updates.len());
+    Ok((root.updates, tree.skipped_opcodes, tree.call_gas_total))
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::U256;
+    use alloy_primitives::{B256, U256};
 
     use super::*;
 
@@ -1199,6 +961,80 @@ mod tests {
             !updates.iter().any(|u| matches!(u, StateUpdate::Call(_))),
             "no call emitted"
         );
+    }
+
+    /// The legacy and the frame-tree walk, as (call gas, callee gas).
+    fn call_and_callee_gas(logs: Vec<StructLog>) -> [(u64, u64); 2] {
+        let trace = || DefaultFrame {
+            failed: false,
+            gas: 0,
+            return_value: Default::default(),
+            struct_logs: logs.clone(),
+        };
+        let legacy = compute_state_updates(trace(), None).expect("legacy");
+        let tree = crate::nested::compute_frame_tree_canonical(
+            trace(),
+            TARGET_ADDR,
+            &|_| false,
+            &crate::nested::NESTING_COST_MODEL_V1,
+        )
+        .expect("frame tree");
+        [
+            (legacy.call_gas_total, legacy.callee_gas_total),
+            (tree.call_gas_total, tree.callee_gas_total),
+        ]
+    }
+
+    /// Geth's `gasCost` for a `CALL` is the opcode's cost plus the gas it forwards.
+    fn call_costing(depth: u64, gas: u64, callee: Address, gas_cost: u64) -> StructLog {
+        let mut call = call(depth, gas, callee);
+        call.gas_cost = gas_cost;
+        call
+    }
+
+    #[test]
+    fn callee_gas_leaves_out_the_call_opcodes_own_cost() {
+        let y = Address::new([0x44; 20]);
+        // 2,600 for the cold account plus 900,000 forwarded; the callee spends 30,000 of it.
+        let logs = vec![
+            call_costing(1, 1_000_000, y, 902_600),
+            log("JUMPDEST", 2, 900_000, &[], &[], None),
+            log("STOP", 2, 870_000, &[], &[], None),
+            resume(1, 1_000_000 - 902_600 + 870_000, true),
+        ];
+        for gas in call_and_callee_gas(logs) {
+            assert_eq!(gas, (32_600, 30_000));
+        }
+    }
+
+    #[test]
+    fn a_call_that_opens_no_frame_spends_nothing_in_its_callee() {
+        let eoa = Address::new([0x44; 20]);
+        let logs = vec![
+            call_costing(1, 1_000_000, eoa, 902_600),
+            resume(1, 997_400, true),
+        ];
+        for gas in call_and_callee_gas(logs) {
+            assert_eq!(gas, (2_600, 0));
+        }
+    }
+
+    /// The stipend reaches the callee on top of the forwarded gas, and what it leaves of the
+    /// stipend comes back to the caller.
+    #[test]
+    fn callee_gas_counts_the_stipend_the_callee_spends() {
+        let y = Address::new([0x44; 20]);
+        // 9,000 for the value transfer plus 50,000 forwarded; the callee enters with the 2,300
+        // stipend on top and spends 1,000.
+        let logs = vec![
+            call_costing(1, 1_000_000, y, 59_000),
+            log("JUMPDEST", 2, 52_300, &[], &[], None),
+            log("STOP", 2, 51_300, &[], &[], None),
+            resume(1, 1_000_000 - 59_000 + 51_300, true),
+        ];
+        for gas in call_and_callee_gas(logs) {
+            assert_eq!(gas, (7_700, 1_000));
+        }
     }
 
     #[test]

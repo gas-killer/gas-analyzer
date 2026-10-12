@@ -3818,6 +3818,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sp1-cc-client-executor",
  "tracing",
 ]
@@ -3858,6 +3859,7 @@ dependencies = [
  "anyhow",
  "criterion",
  "dhat",
+ "futures",
  "gas-analyzer-core",
  "gas-analyzer-estimator",
  "gas-analyzer-rpc",
@@ -3893,7 +3895,7 @@ dependencies = [
 
 [[package]]
 name = "gas-killer-wasm"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "alloy-primitives",
  "alloy-rpc-types",

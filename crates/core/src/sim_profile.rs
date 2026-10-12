@@ -339,8 +339,9 @@ pub fn estimate_applied_payload_gas(
     for update in updates {
         gas = gas.saturating_add(match update {
             StateUpdate::Store(_) => UNBOUNDED_COLD_SSTORE_COST,
-            // Charged through `external_call_gas` from the trace.
-            StateUpdate::Call(_) => 0,
+            // Charged through `external_call_gas` from the trace; a nested frame's own program
+            // is validated as part of the same transaction by the caller.
+            StateUpdate::Call(_) | StateUpdate::Nested(_) => 0,
             StateUpdate::Log0(l) => LOG_BASE + l.data.len() as u64 * LOG_BYTE,
             StateUpdate::Log1(l) => LOG_BASE + LOG_TOPIC + l.data.len() as u64 * LOG_BYTE,
             StateUpdate::Log2(l) => LOG_BASE + LOG_TOPIC * 2 + l.data.len() as u64 * LOG_BYTE,
@@ -401,7 +402,7 @@ pub fn validate_unbounded_cost(
                 cost.tracker_stores += 1
             }
             StateUpdate::Store(_) => cost.stores += 1,
-            StateUpdate::Call(_) => cost.calls += 1,
+            StateUpdate::Call(_) | StateUpdate::Nested(_) => cost.calls += 1,
             StateUpdate::Log0(_)
             | StateUpdate::Log1(_)
             | StateUpdate::Log2(_)

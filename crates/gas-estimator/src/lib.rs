@@ -8,6 +8,7 @@
 //!
 //! No reth-evm, no sp1-contract-call, no async, no I/O.
 
+use std::collections::HashSet;
 use std::sync::{LazyLock, OnceLock};
 
 use alloy_dyn_abi::DynSolValue;
@@ -21,6 +22,8 @@ use revm::primitives::hardfork::SpecId;
 use revm::state::AccountInfo;
 
 use gas_analyzer_core::encoding::encode_state_updates_to_sol;
+use gas_analyzer_core::heuristic::BASE_TX_COST;
+use gas_analyzer_core::nested::FrameProgram;
 use gas_analyzer_core::types::StateUpdate;
 
 /// EIP-7825 per-tx gas cap, activated in Osaka (Fusaka). The block gas limit
@@ -156,25 +159,41 @@ where
     DB: revm::database_interface::DatabaseRef,
     <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
 {
-    // Build and execute via revm directly
-    use revm::context::{Context, TxEnv};
-    use revm::database_interface::DatabaseRef;
-    use revm::{ExecuteEvm, MainBuilder, MainContext};
+    inject_estimator(cache_db, contract_address)?;
+    run_estimator(
+        cache_db,
+        contract_address,
+        caller_address,
+        calldata,
+        sim_env.value,
+        sim_env,
+        false,
+    )
+}
 
-    // ── Inject the proxy at contract_address ────────────────────────────────
-    //
-    // StateChangeHandlerGasEstimator routes:
-    //   runStateUpdatesCall → own logic
-    //   anything else       → DELEGATECALL to `implementation` (= backup_addr)
-    //
-    // We stash the original contract bytecode at a synthetic backup_addr so
-    // that external protocols (e.g. oracles) can callback into contract_address
-    // during a state-update CALL and get valid responses through the fallback().
-    //
-    // The implementation address is stored in an EIP-1967-style isolated storage
-    // slot (keccak256("gas.estimator.implementation") - 1), written directly via
-    // insert_account_storage — no constructor execution needed.
-    let backup_addr = Address::from([0xba; 20]);
+/// Where `contract_address`'s original code is kept once the estimator replaces it. Distinct per
+/// contract, so several contracts can be injected into one state without overwriting each other's.
+fn backup_address(contract_address: Address) -> Address {
+    let mut preimage = b"gas.estimator.backup".to_vec();
+    preimage.extend_from_slice(contract_address.as_slice());
+    Address::from_slice(&alloy_primitives::keccak256(preimage)[12..])
+}
+
+/// Replace `contract_address`'s code with the estimator, keeping the original reachable.
+///
+/// StateChangeHandlerGasEstimator routes `runStateUpdatesCall` to its own logic and anything else
+/// to a DELEGATECALL into the address in IMPL_SLOT, an EIP-1967-style isolated slot
+/// (keccak256("gas.estimator.implementation") - 1). Stashing the original code there lets external
+/// protocols (e.g. oracles) call back into `contract_address` during a state-update CALL and get
+/// valid responses. The slot is written directly, so no constructor runs.
+fn inject_estimator<DB>(cache_db: &mut CacheDB<DB>, contract_address: Address) -> Result<()>
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+{
+    use revm::database_interface::DatabaseRef;
+
+    let backup_addr = backup_address(contract_address);
 
     let original_account = cache_db
         .basic_ref(contract_address)
@@ -207,14 +226,33 @@ where
     let backup_addr_u256 = U256::from_be_slice(backup_addr.as_slice());
     cache_db
         .insert_account_storage(contract_address, *IMPL_SLOT, backup_addr_u256)
-        .map_err(|e| anyhow!("Failed to write IMPL_SLOT: {:?}", e))?;
+        .map_err(|e| anyhow!("Failed to write IMPL_SLOT: {:?}", e))
+}
+
+/// Call the estimator at `contract_address` with `calldata`, committing its writes when `commit`.
+fn run_estimator<DB>(
+    cache_db: &mut CacheDB<DB>,
+    contract_address: Address,
+    caller_address: Address,
+    calldata: Bytes,
+    value: U256,
+    sim_env: &SimEnvOpts,
+    commit: bool,
+) -> Result<u64>
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+{
+    use revm::context::{Context, TxEnv};
+    use revm::database_interface::DatabaseRef;
+    use revm::{ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext};
 
     // disable_balance_check skips the *pre-flight* check on the caller, but
     // revm still debits the caller during the call's value transfer. If the
-    // caller's balance can't cover `sim_env.value`, the proxy ends up
+    // caller's balance can't cover `value`, the proxy ends up
     // under-credited and any pass-through CALL with `value > 0` halts with
     // OutOfFunds. Top up the caller so the transfer is always well-defined.
-    if !sim_env.value.is_zero() {
+    if !value.is_zero() {
         let caller_account = cache_db
             .basic_ref(caller_address)
             .ok()
@@ -223,7 +261,7 @@ where
         cache_db.insert_account_info(
             caller_address,
             AccountInfo {
-                balance: caller_account.balance.saturating_add(sim_env.value),
+                balance: caller_account.balance.saturating_add(value),
                 ..caller_account
             },
         );
@@ -256,17 +294,20 @@ where
         .caller(caller_address)
         .kind(revm::primitives::TxKind::Call(contract_address))
         .data(calldata)
-        .value(sim_env.value)
+        .value(value)
         .gas_limit(tx_gas_limit)
         .gas_price(sim_env.gas_price)
         .build()
         .map_err(|e| anyhow!("Failed to build tx env: {:?}", e))?;
 
-    let result = evm
-        .transact(tx)
-        .map_err(|e| anyhow!("Gas estimation failed: {:?}", e))?;
+    let result = if commit {
+        evm.transact_commit(tx)
+    } else {
+        evm.transact(tx).map(|r| r.result)
+    }
+    .map_err(|e| anyhow!("Gas estimation failed: {:?}", e))?;
 
-    match result.result {
+    match result {
         ExecutionResult::Success { gas_used, .. } => Ok(gas_used),
         ExecutionResult::Revert {
             output, gas_used, ..
@@ -317,6 +358,152 @@ where
         calldata,
         sim_env,
     )
+}
+
+// ============================================================================
+// Nested Frame Trees
+// ============================================================================
+
+/// Gas to apply each frame of a nested tree, in frame order, run in the order the transaction
+/// executed them on one shared state.
+///
+/// Each program is split at its `NESTED` ops and the pieces run depth-first, the child's pieces
+/// at the op that applies it, every piece committed so later ones see its writes. A frame's gas is
+/// its pieces' gas, less the base transaction cost of every piece after the first. Separate pieces
+/// pay cold access again, so a frame with children is priced slightly high.
+///
+/// Every piece is sent by `caller_address`: programs never read `msg.sender`, and a frame's real
+/// caller is a contract, which revm refuses as a transaction sender (EIP-3607). The root's first
+/// piece carries `root_value` and each child's first piece its own `value`, funded by the caller
+/// rather than the parent frame.
+pub fn estimate_frame_tree_gas<DB>(
+    cache_db: &mut CacheDB<DB>,
+    frames: &[FrameProgram],
+    caller_address: Address,
+    root_value: U256,
+    sim_env: &SimEnvOpts,
+) -> Result<Vec<u64>>
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+{
+    if frames.is_empty() {
+        return Err(anyhow!("a frame tree needs a root frame"));
+    }
+    // Once per contract: injecting again would stash the estimator itself as the original code.
+    let mut injected = HashSet::new();
+    for frame in frames {
+        if injected.insert(frame.target) {
+            inject_estimator(cache_db, frame.target)?;
+        }
+    }
+
+    let mut frame_gas = vec![0; frames.len()];
+    let tree = FrameTreeRun {
+        frames,
+        caller_address,
+        sim_env,
+    };
+    tree.run(cache_db, 0, root_value, &mut frame_gas)?;
+    Ok(frame_gas)
+}
+
+struct FrameTreeRun<'a> {
+    frames: &'a [FrameProgram],
+    caller_address: Address,
+    sim_env: &'a SimEnvOpts,
+}
+
+impl FrameTreeRun<'_> {
+    fn run<DB>(
+        &self,
+        cache_db: &mut CacheDB<DB>,
+        index: usize,
+        value: U256,
+        frame_gas: &mut [u64],
+    ) -> Result<()>
+    where
+        DB: revm::database_interface::DatabaseRef,
+        <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+    {
+        let frame = self
+            .frames
+            .get(index)
+            .ok_or_else(|| anyhow!("frame {index} does not exist"))?;
+        let mut children = frame.children.iter();
+        let mut piece = Vec::new();
+        let mut pieces = 0usize;
+        let mut gas = 0u64;
+
+        for update in &frame.updates {
+            if !matches!(update, StateUpdate::Nested(_)) {
+                piece.push(update.clone());
+                continue;
+            }
+            // The first piece runs even when empty: it carries the frame's value and its base cost.
+            if pieces == 0 || !piece.is_empty() {
+                gas = gas.saturating_add(self.piece(cache_db, index, pieces, &piece, value)?);
+                pieces += 1;
+                piece.clear();
+            }
+            let child = *children
+                .next()
+                .ok_or_else(|| anyhow!("frame {index} has more NESTED ops than children"))?;
+            if child <= index {
+                return Err(anyhow!(
+                    "frame {index} names child {child}, which does not follow it"
+                ));
+            }
+            self.run(cache_db, child, self.frames[child].value, frame_gas)?;
+        }
+        if pieces == 0 || !piece.is_empty() {
+            gas = gas.saturating_add(self.piece(cache_db, index, pieces, &piece, value)?);
+        }
+        if children.next().is_some() {
+            return Err(anyhow!("frame {index} has more children than NESTED ops"));
+        }
+
+        frame_gas[index] = gas;
+        Ok(())
+    }
+
+    /// Run one piece of frame `index`, returning its gas less the base cost after the first piece.
+    fn piece<DB>(
+        &self,
+        cache_db: &mut CacheDB<DB>,
+        index: usize,
+        piece_index: usize,
+        updates: &[StateUpdate],
+        value: U256,
+    ) -> Result<u64>
+    where
+        DB: revm::database_interface::DatabaseRef,
+        <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+    {
+        let frame = &self.frames[index];
+        let calldata = build_gas_estimation_calldata(updates)?;
+        let value = if piece_index == 0 { value } else { U256::ZERO };
+        let gas = run_estimator(
+            cache_db,
+            frame.target,
+            self.caller_address,
+            calldata,
+            value,
+            self.sim_env,
+            true,
+        )
+        .map_err(|e| {
+            e.context(format!(
+                "frame {index} ({}), piece {piece_index}",
+                frame.target
+            ))
+        })?;
+        Ok(if piece_index == 0 {
+            gas
+        } else {
+            gas.saturating_sub(BASE_TX_COST)
+        })
+    }
 }
 
 // ============================================================================
@@ -1217,5 +1404,169 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Nested frame trees ───────────────────────────────────────────────
+
+    /// Reverts unless storage slot 0 is set; run at a frame target, it is reached through the
+    /// estimator's fallback and reads that target's storage.
+    const REQUIRE_SLOT0: [u8; 13] = [
+        0x60, 0x00, 0x54, 0x15, 0x60, 0x08, 0x57, 0x00, 0x5b, 0x60, 0x00, 0x80, 0xfd,
+    ];
+    const ALWAYS_REVERT: [u8; 4] = [0x60, 0x00, 0x80, 0xfd];
+
+    fn with_code(cache_db: &mut CacheDB<EmptyDB>, addr: Address, code: &[u8]) {
+        let code = revm::state::Bytecode::new_raw(Bytes::copy_from_slice(code));
+        cache_db.insert_account_info(
+            addr,
+            AccountInfo {
+                balance: U256::ZERO,
+                nonce: 1,
+                code_hash: code.hash_slow(),
+                code: Some(code),
+            },
+        );
+    }
+
+    fn frame(target: Address, updates: Vec<StateUpdate>, children: Vec<usize>) -> FrameProgram {
+        FrameProgram {
+            target,
+            caller: Address::ZERO,
+            value: U256::ZERO,
+            calldata_hash: B256::ZERO,
+            transition_index: None,
+            updates,
+            children,
+        }
+    }
+
+    fn store_slot0() -> StateUpdate {
+        StateUpdate::Store(IStateUpdateTypes::Store {
+            slot: B256::ZERO,
+            value: B256::from(U256::from(1u64)),
+        })
+    }
+
+    /// Non-empty callargs: the estimator answers empty calldata itself instead of falling back.
+    fn call(target: Address) -> StateUpdate {
+        StateUpdate::Call(IStateUpdateTypes::Call {
+            target,
+            value: U256::ZERO,
+            callargs: Bytes::from_static(&[0x01]),
+        })
+    }
+
+    fn nested(target: Address) -> StateUpdate {
+        StateUpdate::Nested(IStateUpdateTypes::Nested {
+            target,
+            value: U256::ZERO,
+            childLeaf: B256::ZERO,
+        })
+    }
+
+    /// A parent that reads what its child wrote succeeds only when the child runs first, at its
+    /// `NESTED` op; priced from the state before the transaction, the parent reverts.
+    #[test]
+    fn test_frame_tree_parent_reads_child_write() {
+        let root = address!("0x00000000000000000000000000000000000a0000");
+        let child = address!("0x00000000000000000000000000000000000b0000");
+        let caller = address!("0x000000000000000000000000000000000000beef");
+        let sim_env = sim_env_with_spec(SpecId::CANCUN);
+        let frames = [
+            frame(root, vec![nested(child), call(child)], vec![1]),
+            frame(child, vec![store_slot0()], vec![]),
+        ];
+
+        let mut isolated = CacheDB::new(EmptyDB::default());
+        with_code(&mut isolated, child, &REQUIRE_SLOT0);
+        let root_alone = gas_analyzer_core::nested::without_nested_ops(&frames[0].updates);
+        assert!(
+            estimate_state_changes_gas(&mut isolated, root, caller, &root_alone, &sim_env).is_err(),
+            "the parent must depend on the child's write for this test to mean anything"
+        );
+
+        let mut cache_db = CacheDB::new(EmptyDB::default());
+        with_code(&mut cache_db, child, &REQUIRE_SLOT0);
+        let frame_gas =
+            estimate_frame_tree_gas(&mut cache_db, &frames, caller, U256::ZERO, &sim_env)
+                .expect("the child's write is visible to the parent's later piece");
+        assert_eq!(frame_gas.len(), 2);
+        assert!(frame_gas.iter().all(|&g| g > 0));
+    }
+
+    /// A child that calls back into its parent sees the parent's earlier writes, through the
+    /// parent's own original code even after the child's target was injected too.
+    #[test]
+    fn test_frame_tree_child_reads_parent_write_through_its_own_backup() {
+        let root = address!("0x00000000000000000000000000000000000a0000");
+        let child = address!("0x00000000000000000000000000000000000b0000");
+        let caller = address!("0x000000000000000000000000000000000000beef");
+        let sim_env = sim_env_with_spec(SpecId::CANCUN);
+        let frames = [
+            frame(root, vec![store_slot0(), nested(child)], vec![1]),
+            frame(child, vec![call(root)], vec![]),
+        ];
+
+        let mut cache_db = CacheDB::new(EmptyDB::default());
+        with_code(&mut cache_db, root, &REQUIRE_SLOT0);
+        with_code(&mut cache_db, child, &ALWAYS_REVERT);
+        estimate_frame_tree_gas(&mut cache_db, &frames, caller, U256::ZERO, &sim_env)
+            .expect("the callback reaches the root's own code and its earlier write");
+    }
+
+    /// A trailing empty piece is skipped, so a frame whose writes all precede its `NESTED` op
+    /// costs what the same program costs alone.
+    #[test]
+    fn test_frame_tree_skips_empty_trailing_piece() {
+        let root = address!("0x00000000000000000000000000000000000a0000");
+        let child = address!("0x00000000000000000000000000000000000b0000");
+        let caller = address!("0x000000000000000000000000000000000000beef");
+        let sim_env = sim_env_with_spec(SpecId::CANCUN);
+        let frames = [
+            frame(root, vec![store_slot0(), nested(child)], vec![1]),
+            frame(child, vec![store_slot0()], vec![]),
+        ];
+
+        let mut cache_db = CacheDB::new(EmptyDB::default());
+        let frame_gas =
+            estimate_frame_tree_gas(&mut cache_db, &frames, caller, U256::ZERO, &sim_env).unwrap();
+
+        let mut alone = CacheDB::new(EmptyDB::default());
+        let root_alone =
+            estimate_state_changes_gas(&mut alone, root, caller, &[store_slot0()], &sim_env)
+                .unwrap();
+        assert_eq!(frame_gas[0], root_alone);
+    }
+
+    #[test]
+    fn test_frame_tree_rejects_mismatched_children() {
+        let root = address!("0x00000000000000000000000000000000000a0000");
+        let caller = address!("0x000000000000000000000000000000000000beef");
+        let sim_env = sim_env_with_spec(SpecId::CANCUN);
+
+        let too_few = [frame(root, vec![nested(root)], vec![])];
+        let err = estimate_frame_tree_gas(
+            &mut CacheDB::new(EmptyDB::default()),
+            &too_few,
+            caller,
+            U256::ZERO,
+            &sim_env,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("more NESTED ops than children"));
+
+        let too_many = [
+            frame(root, vec![store_slot0()], vec![1]),
+            frame(root, vec![], vec![]),
+        ];
+        let err = estimate_frame_tree_gas(
+            &mut CacheDB::new(EmptyDB::default()),
+            &too_many,
+            caller,
+            U256::ZERO,
+            &sim_env,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("more children than NESTED ops"));
     }
 }
