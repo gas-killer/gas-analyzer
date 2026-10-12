@@ -25,14 +25,18 @@ Analyzes the `result` of `debug_traceTransaction` with the default struct-log tr
 - `block`: block number, as a `bigint`.
 - `origin`: the transaction's target contract, for detecting re-entrant callbacks.
 - `value`: the transaction's `msg.value` in wei, as a decimal or `0x` hex string. Pass it for transactions that send ETH: without it, a payload that forwards that ETH in a `CALL` can't be simulated and falls back to the heuristic.
-- `prestateDiff`: the transaction's `prestateTracer` diff, as a JSON string (see `analyze_prestate`). It gives each slot the program writes its value before the transaction, so writes are priced as on chain, and it needs `origin`. Without it every slot starts empty, and each write is priced as a fresh 22,100-gas one where changing a set slot costs 5,000 and rewriting its value 2,200.
+- `prestateDiff`: the transaction's `prestateTracer` diff, as a JSON string (see `analyze_prestate`). It needs `origin`. Without it the simulation starts from an empty state, so:
+  - every write is priced as a fresh 22,100-gas one, where changing a set slot costs 5,000 and rewriting its value 2,200;
+  - every `CALL` that sends ETH pays the 25,000-gas charge for creating its recipient, which on chain only a new account pays.
+
+  The diff supplies each written slot's value before the transaction and the called accounts that already existed.
 
 ```js
 const result = analyze_trace(JSON.stringify(trace), estimator, receipt.from, BigInt(receipt.blockNumber), receipt.to)
 // { gas_estimate, is_heuristic, encoded_updates, state_update_count, skipped_opcodes, reentered, native_call_gas }
 ```
 
-The estimate is measured against an empty state, holding only the original values from `prestateDiff`, where the contracts the transaction calls have no code. The simulation charges each external `CALL` the program replays for the opcode itself, and what its callee spent comes from the trace instead, reported as `native_call_gas` and included in `gas_estimate`.
+The estimate is measured against an empty state, holding only what `prestateDiff` supplies, where the contracts the transaction calls have no code. The simulation charges each external `CALL` the program replays for the opcode itself, and what its callee spent comes from the trace instead, reported as `native_call_gas` and included in `gas_estimate`.
 
 `gas_estimate` covers applying the state updates. Settling also verifies the operators' aggregate signature, which costs up to `signature_verification_gas` (50,000 gas for Schnorr). Add the two for the transaction's total cost with Gas Killer.
 
@@ -90,7 +94,7 @@ const tree = analyze_frame_tree_bytes(response, receipt.to, [vault, ledger], rec
 Both totals are measured against an empty state, so:
 
 - A natively replayed `CALL` runs into an address with no code. The simulation charges the opcode, and what its callee spent comes from the trace.
-- Storage holds only what `prestateDiff` gives each frame's target, as for `analyze_trace`. Without it every write is priced as a write to an empty slot, so both totals run high.
+- The state holds only what `prestateDiff` supplies, as for `analyze_trace`. Without it every write is priced as a write to an empty slot and every ETH transfer as one to a new account, so both totals run high.
 
 There's no heuristic fallback: a simulation failure throws. `analyze_frame_tree(trace, …)` takes the trace as a JSON string instead.
 
