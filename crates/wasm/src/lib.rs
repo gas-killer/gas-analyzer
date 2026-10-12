@@ -40,6 +40,8 @@ pub struct AnalyzeTraceResult {
     /// execution; the estimate counts that callback gas as external and may
     /// overshoot. Only detected when an origin address was supplied.
     pub reentered: bool,
+    /// The trace's gas for the `CALL`s the program replays natively, included in `gas_estimate`.
+    pub native_call_gas: u64,
 }
 
 /// The outcome of [`analyze_prestate`]: a result when the call has a prestate net form, otherwise
@@ -365,7 +367,8 @@ fn analyze_extract(
 
     let (gas_estimate, is_heuristic) =
         match estimate_state_changes_gas(&mut cache_db, addr, caller, state_updates, &sim_env) {
-            Ok(gas) => (gas, false),
+            // The callees have no code in `EmptyDB`; the heuristic adds the same gas.
+            Ok(gas) => (gas.saturating_add(extract.call_gas_total), false),
             Err(_) => (estimate_gas_from_state_updates(extract), true),
         };
 
@@ -379,6 +382,7 @@ fn analyze_extract(
         state_update_count: state_updates.len(),
         skipped_opcodes: skipped,
         reentered: extract.reentered,
+        native_call_gas: extract.call_gas_total,
     })
 }
 
@@ -787,6 +791,7 @@ export interface AnalyzeTraceResult {
     state_update_count: number;
     skipped_opcodes: string[];
     reentered: boolean;
+    native_call_gas: number;
 }
 
 export interface PrestateAnalysis {
@@ -1643,6 +1648,50 @@ mod tests {
                 "{response}"
             );
         }
+    }
+
+    // ===== Native call gas =====
+
+    /// A root that calls an empty address, which spends `call_gas - resume_gas` natively.
+    fn call_spending(call_gas: u64, resume_gas: u64) -> String {
+        let call = make_call_log(
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "0",
+            "aabbccdd",
+            call_gas,
+        );
+        let entry = serde_json::json!({
+            "pc": 0, "op": "STOP", "gas": call_gas - 1000, "gasCost": 0, "depth": 2,
+            "stack": [], "memory": [],
+        });
+        let resume = serde_json::json!({
+            "pc": 201, "op": "POP", "gas": resume_gas, "gasCost": 2, "depth": 1,
+            "stack": ["0x0000000000000000000000000000000000000000000000000000000000000001"],
+            "memory": [],
+        });
+        make_trace(vec![call, entry, resume])
+    }
+
+    /// The callee has no code in `EmptyDB`, so what it spent natively comes from the trace.
+    #[test]
+    fn test_measured_estimate_charges_the_callees_native_gas() {
+        let analyze = |trace: &str| {
+            analyze_trace_inner(
+                trace,
+                &test_estimator_address(),
+                &test_caller_address(),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let cheap = analyze(&call_spending(500_000, 498_000));
+        let costly = analyze(&call_spending(500_000, 100_000));
+        assert!(!cheap.is_heuristic && !costly.is_heuristic);
+        assert_eq!(cheap.native_call_gas, 2_000);
+        assert_eq!(costly.native_call_gas, 400_000);
+        assert_eq!(costly.gas_estimate - cheap.gas_estimate, 398_000);
     }
 
     // ===== Transaction value =====

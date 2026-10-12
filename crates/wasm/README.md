@@ -28,8 +28,10 @@ Analyzes the `result` of `debug_traceTransaction` with the default struct-log tr
 
 ```js
 const result = analyze_trace(JSON.stringify(trace), estimator, receipt.from, BigInt(receipt.blockNumber), receipt.to)
-// { gas_estimate, is_heuristic, encoded_updates, state_update_count, skipped_opcodes, reentered }
+// { gas_estimate, is_heuristic, encoded_updates, state_update_count, skipped_opcodes, reentered, native_call_gas }
 ```
+
+The estimate is measured against an empty state, where the contracts the transaction calls have no code. Each external `CALL` the program replays is charged its gas from the trace instead, reported as `native_call_gas` and included in `gas_estimate`.
 
 ### `analyze_trace_bytes(response, estimator, caller, block?, origin?, value?)`
 
