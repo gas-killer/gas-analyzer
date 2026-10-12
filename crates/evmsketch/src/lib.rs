@@ -531,19 +531,23 @@ impl DefaultEvmSketchExecutor {
     ///
     /// Cold-miss slots not present in `storage_hints` still fall back to
     /// `eth_getStorageAt` during execution — an incomplete hint set is safe.
+    ///
+    /// `value` is the `msg.value` of the call the state updates were extracted from; see
+    /// [`Self::estimate_state_changes_gas_with_hints_timed`].
     pub async fn estimate_state_changes_gas_with_hints(
         &self,
         contract_address: Address,
         caller_address: Address,
         state_updates: &[gas_analyzer_core::StateUpdate],
         storage_hints: &HashMap<Address, Vec<B256>>,
+        value: U256,
     ) -> Result<u64> {
         self.estimate_state_changes_gas_with_hints_timed(
             contract_address,
             caller_address,
             state_updates,
             storage_hints,
-            U256::ZERO,
+            value,
         )
         .await
         .map(|(gas, _)| gas)
