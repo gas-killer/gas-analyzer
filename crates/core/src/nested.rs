@@ -1846,6 +1846,19 @@ mod tests {
         stores(&updates[boundary + 1..])
     }
 
+    /// The log that closes a nested frame is the parent's next opcode, which can itself be an
+    /// effect: `PUSH slot; CALL; SSTORE` stores the success flag straight off the stack.
+    #[test]
+    fn an_effect_resuming_the_parent_after_a_nested_frame_is_kept() {
+        let mut store_flag = sstore(1, slot(9), 0);
+        store_flag.stack = Some(vec![U256::from(1), slot(9).into()]);
+        store_flag.gas = 100_000;
+        let logs = vec![bump(1, 1), call(1, 3_000_000, B), bump(2, 1), store_flag];
+        let tree = split(logs, &[B]);
+        assert_eq!(tree.frames.len(), 2);
+        assert_eq!(root_stores_after_boundary(&tree), vec![(slot(9), slot(1))]);
+    }
+
     #[test]
     fn root_restoring_a_slot_its_nested_frame_overwrote_is_reasserted() {
         let logs = vec![
