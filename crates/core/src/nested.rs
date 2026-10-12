@@ -495,6 +495,24 @@ fn flush_slice(frames: &mut [WalkFrame], programs: &[ProgramState]) {
     }
 }
 
+/// Forget what each open frame emitted for slots another program's frame, or natively replayed
+/// code, has since written: on-chain those slots now hold that frame's values, so the next
+/// flush must re-assert them even where the trace shows them back at the emitted value.
+fn forget_overwritten(
+    frames: &mut [WalkFrame],
+    programs: &[ProgramState],
+    journal: &BTreeMap<Address, BTreeMap<B256, B256>>,
+) {
+    for f in frames {
+        let Some(slots) = f.program.and_then(|p| journal.get(&programs[p].target)) else {
+            continue;
+        };
+        for slot in slots.keys() {
+            f.emitted_view.remove(slot);
+        }
+    }
+}
+
 /// Split a trace into per-frame programs with canonical state checkpointing.
 ///
 /// The root frame's program is exactly what [`crate::compute_state_updates_canonical`]
@@ -781,6 +799,7 @@ fn split_frame_tree(
                     if let Some(parent) = parent_program {
                         programs[parent].child_call_gas += native;
                     }
+                    forget_overwritten(&mut frames, &programs, &frame.journal);
                     let parent = frames.last_mut().expect("root frame must remain");
                     for (addr, slots) in frame.journal {
                         parent.journal.entry(addr).or_default().extend(slots);
@@ -801,6 +820,11 @@ fn split_frame_tree(
 
             if success {
                 let child_emitting = frame.program.is_some();
+                // An emitting child here shares its parent's program, so its writes are that
+                // program's own.
+                if !child_emitting {
+                    forget_overwritten(&mut frames, &programs, &frame.journal);
+                }
                 let parent = frames.last_mut().expect("root frame must remain");
                 for (addr, slots) in frame.journal {
                     parent.journal.entry(addr).or_default().extend(slots);
@@ -1810,6 +1834,53 @@ mod tests {
             .cloned()
             .collect();
         assert!(!stores(&before_nested).contains(&(slot(2), slot(20))));
+    }
+
+    /// The root's stores after its last boundary op: what it leaves once its callees have run.
+    fn root_stores_after_boundary(tree: &FrameTreeExtract) -> Vec<(B256, B256)> {
+        let updates = &tree.frames[0].updates;
+        let boundary = updates
+            .iter()
+            .rposition(|u| matches!(u, StateUpdate::Nested(_) | StateUpdate::Call(_)))
+            .expect("a boundary op");
+        stores(&updates[boundary + 1..])
+    }
+
+    #[test]
+    fn root_restoring_a_slot_its_nested_frame_overwrote_is_reasserted() {
+        let logs = vec![
+            bump(1, 1),
+            sstore(1, slot(1), 5),
+            call(1, 3_000_000, B),
+            bump(2, 1),
+            call(2, 2_000_000, ROOT),
+            bump(3, 2),
+            sstore(3, slot(1), 7),
+            resume(2, 1_000_000, true),
+            resume(1, 100_000, true),
+            sstore(1, slot(1), 5),
+        ];
+        let tree = split(logs, &[B, ROOT]);
+        assert_eq!(tree.frames.len(), 3);
+        assert!(stores(&tree.frames[2].updates).contains(&(slot(1), slot(7))));
+        assert!(root_stores_after_boundary(&tree).contains(&(slot(1), slot(5))));
+    }
+
+    #[test]
+    fn root_restoring_a_slot_a_native_reentrant_call_overwrote_is_reasserted() {
+        let logs = vec![
+            bump(1, 1),
+            sstore(1, slot(1), 5),
+            call(1, 3_000_000, C),
+            call(2, 2_000_000, ROOT),
+            sstore(3, slot(1), 7),
+            resume(2, 1_000_000, true),
+            resume(1, 100_000, true),
+            sstore(1, slot(1), 5),
+        ];
+        let tree = split(logs, &[]);
+        assert_eq!(tree.frames.len(), 1);
+        assert!(root_stores_after_boundary(&tree).contains(&(slot(1), slot(5))));
     }
 
     #[test]
