@@ -765,10 +765,9 @@ impl GasKillerEvmSketchDefault {
         caller_address: Address,
         state_updates: &[StateUpdate],
         preceding_txs: &[PrecedingTx],
-        tx_value: U256,
+        original: OriginalTx,
     ) -> Result<u64> {
-        let (mut cache_db, mut sim_env) = self.state_after_preceding(preceding_txs)?;
-        sim_env.value = tx_value;
+        let (mut cache_db, sim_env) = self.state_after_preceding(preceding_txs, original)?;
         gas_analyzer_estimator::estimate_state_changes_gas(
             &mut cache_db,
             contract_address,
@@ -778,10 +777,11 @@ impl GasKillerEvmSketchDefault {
         )
     }
 
-    /// The mid-block state `preceding_txs` leave, and the block's simulation environment.
+    /// The mid-block state `preceding_txs` leave, and the environment `original` ran in.
     fn state_after_preceding(
         &self,
         preceding_txs: &[PrecedingTx],
+        original: OriginalTx,
     ) -> Result<(CacheDB<SimpleRpcDb>, SimEnvOpts)> {
         // Source storage from block N-1 (pre-block state). Anchoring to
         // `block_number` itself makes RPC reads return state at the *end* of
@@ -801,7 +801,11 @@ impl GasKillerEvmSketchDefault {
         let state_block = self.executor.anchor_block_number().saturating_sub(1);
         let simple_db = SimpleRpcDb::new(self.executor.sketch.provider.clone(), state_block);
         let mut cache_db = CacheDB::new(simple_db);
-        let sim_env = self.executor.sim_env();
+        let sim_env = SimEnvOpts {
+            value: original.value,
+            gas_price: original.gas_price,
+            ..self.executor.sim_env()
+        };
 
         if !preceding_txs.is_empty() {
             // Prefetch storage slots declared in preceding-tx access lists so
@@ -946,6 +950,15 @@ enum StructLogEncoder {
     Canonical,
 }
 
+/// The analyzed transaction's own fields a historical replay mirrors, so code that reads
+/// `msg.value` or `tx.gasprice` sees what it saw on-chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OriginalTx {
+    pub value: U256,
+    /// Effective per-gas price, as in the receipt's `effective_gas_price`.
+    pub gas_price: u128,
+}
+
 /// What settling a historical transaction as a nested tree would have cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameTreeGas {
@@ -978,15 +991,15 @@ impl GasKillerEvmSketchDefault {
         frames: &[FrameProgram],
         sender: Address,
         preceding_txs: &[PrecedingTx],
-        tx_value: U256,
+        original: OriginalTx,
         cost: &NestingCostModel,
     ) -> Result<FrameTreeGas> {
-        let (mut cache_db, sim_env) = self.state_after_preceding(preceding_txs)?;
+        let (mut cache_db, sim_env) = self.state_after_preceding(preceding_txs, original)?;
         let frame_gas = gas_analyzer_estimator::estimate_frame_tree_gas(
             &mut cache_db,
             frames,
             sender,
-            tx_value,
+            sim_env.value,
             &sim_env,
         )?;
         let total = frame_tree_total(&frame_gas, cost);
@@ -2568,7 +2581,7 @@ mod tests {
                     &tree.frames,
                     DEV,
                     &[],
-                    U256::ZERO,
+                    OriginalTx::default(),
                     &FREE_NESTING,
                 )
                 .expect("priced");
@@ -2580,6 +2593,57 @@ mod tests {
                 gas.frame_gas[0] + children,
                 "one base cost for the whole tree"
             );
+        }
+
+        /// Railgun's relay reverts below a minimum `tx.gasprice`, so a replay at the default of 0
+        /// fails where the original succeeded.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; run with --ignored"]
+        async fn test_historical_replay_runs_at_the_original_gas_price() {
+            let anvil =
+                LocalAnvil::spawn_with(&["--chain-id", &SEPOLIA_CHAIN_ID.to_string()]).await;
+            let provider = anvil.provider();
+            let gate = Address::repeat_byte(0x6a);
+            // if GASPRICE < 1 gwei: REVERT
+            set_code(
+                &provider,
+                gate,
+                hex_code("63 3b9aca00 3a 10 600b 57 00 5b 6000 80 fd"),
+            )
+            .await;
+            // The estimator reads state at the block before its anchor.
+            for _ in 0..2 {
+                let _: serde_json::Value = provider
+                    .raw_request("evm_mine".into(), ())
+                    .await
+                    .expect("evm_mine");
+            }
+            let block = provider.get_block_number().await.expect("block number");
+            let gk = GasKillerEvmSketchDefault::builder(anvil.url.parse().expect("url"))
+                .at_block(BlockNumberOrTag::Number(block))
+                .build()
+                .await
+                .expect("estimator");
+            let updates = [StateUpdate::Call(IStateUpdateTypes::Call {
+                target: gate,
+                value: U256::ZERO,
+                callargs: Bytes::new(),
+            })];
+            let replay_at = |gas_price| {
+                gk.estimate_state_changes_gas_with_preceding(
+                    Address::repeat_byte(0xc0),
+                    DEV,
+                    &updates,
+                    &[],
+                    OriginalTx {
+                        value: U256::ZERO,
+                        gas_price,
+                    },
+                )
+            };
+
+            assert!(replay_at(0).is_err(), "the gate rejects a zero gas price");
+            replay_at(1_000_000_000).expect("the gate admits the original gas price");
         }
 
         #[tokio::test(flavor = "multi_thread")]

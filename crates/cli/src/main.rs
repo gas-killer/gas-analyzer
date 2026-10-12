@@ -175,8 +175,13 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                         hex::encode(bytes)
                     )
                 })?;
+            // Its effective gas price too: contracts that check `tx.gasprice`
+            // (Railgun's relay minimum) revert under the default of 0.
             #[cfg(feature = "evmsketch")]
-            let tx_value = tx.value();
+            let original_tx = gas_analyzer_evmsketch::OriginalTx {
+                value: tx.value(),
+                gas_price: receipt.effective_gas_price,
+            };
 
             if !owned.is_empty() {
                 if cli_args.use_anvil {
@@ -192,7 +197,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                         .to
                         .ok_or_else(|| anyhow::anyhow!("Transaction has no 'to' address"))?,
                     sender: tx_sender,
-                    value: tx_value,
+                    original: original_tx,
                     block_number,
                     tx_index,
                     gas_used,
@@ -439,7 +444,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                         tx_sender,
                         &extract.state_updates,
                         &preceding_txs,
-                        tx_value,
+                        original_tx,
                     ) {
                         Ok(gas) => (gas, false),
                         Err(e) => {
@@ -616,7 +621,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
 /// tree, had its root and the owned contracts integrated the SDK.
 #[cfg(feature = "evmsketch")]
 mod what_if {
-    use alloy::primitives::{Address, FixedBytes, U256};
+    use alloy::primitives::{Address, FixedBytes};
     use alloy_eips::BlockNumberOrTag;
     use alloy_provider::Provider;
     use alloy_provider::ext::DebugApi;
@@ -627,7 +632,7 @@ mod what_if {
         FrameProgram, NESTING_COST_MODEL_V1, compute_frame_tree_hypothetical,
     };
     use gas_analyzer_core::types::StateUpdate;
-    use gas_analyzer_evmsketch::GasKillerEvmSketchDefault;
+    use gas_analyzer_evmsketch::{GasKillerEvmSketchDefault, OriginalTx};
     use std::collections::BTreeSet;
 
     pub struct Inputs<'a, P> {
@@ -637,7 +642,7 @@ mod what_if {
         pub status: bool,
         pub root: Address,
         pub sender: Address,
-        pub value: U256,
+        pub original: OriginalTx,
         pub block_number: u64,
         pub tx_index: u64,
         pub gas_used: u64,
@@ -652,7 +657,7 @@ mod what_if {
             status,
             root,
             sender,
-            value,
+            original,
             block_number,
             tx_index,
             gas_used,
@@ -684,14 +689,14 @@ mod what_if {
             &flat.frames,
             sender,
             &preceding,
-            value,
+            original,
             &cost,
         )?;
         let nested_gas = gk.estimate_frame_tree_gas_with_preceding(
             &nested.frames,
             sender,
             &preceding,
-            value,
+            original,
             &cost,
         )?;
 
