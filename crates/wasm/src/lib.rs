@@ -125,15 +125,46 @@ pub const SIGNATURE_VERIFICATION_GAS: u64 = TURETZKY_UPPER_GAS_LIMIT_SCHNORR;
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-fn parse_and_compute(trace_json: &str, origin: Option<Address>) -> Result<TraceExtract, String> {
+fn parse_and_compute(
+    trace_json: &str,
+    origin: Option<Address>,
+) -> Result<(TraceExtract, BTreeSet<Address>), String> {
     let trace: LeanFrame =
         serde_json::from_str(trace_json).map_err(|e| format!("Failed to parse trace: {}", e))?;
     compute(trace, origin)
 }
 
-fn compute(trace: LeanFrame, origin: Option<Address>) -> Result<TraceExtract, String> {
-    compute_state_updates(DefaultFrame::from(trace), origin)
-        .map_err(|e| format!("Failed to compute state updates: {}", e))
+/// The trace's state updates, and [`callees_with_code`].
+fn compute(
+    trace: LeanFrame,
+    origin: Option<Address>,
+) -> Result<(TraceExtract, BTreeSet<Address>), String> {
+    let trace = DefaultFrame::from(trace);
+    let with_code = callees_with_code(&trace);
+    let extract = compute_state_updates(trace, origin)
+        .map_err(|e| format!("Failed to compute state updates: {}", e))?;
+    Ok((extract, with_code))
+}
+
+/// Every account a `CALL` or `CALLCODE` in `trace` entered a frame in. Only code runs a frame, so
+/// each had code when called and wasn't empty (EIP-161).
+fn callees_with_code(trace: &DefaultFrame) -> BTreeSet<Address> {
+    trace
+        .struct_logs
+        .windows(2)
+        .filter_map(|pair| {
+            let [call, next] = pair else { return None };
+            if !matches!(call.op.as_ref(), "CALL" | "CALLCODE")
+                || call.error.is_some()
+                || next.depth != call.depth + 1
+            {
+                return None;
+            }
+            let stack = call.stack.as_ref()?;
+            let target = stack.get(stack.len().checked_sub(2)?)?;
+            Some(Address::from_word((*target).into()))
+        })
+        .collect()
 }
 
 /// A `debug_traceTransaction` JSON-RPC response; `jsonrpc` and `id` are ignored.
@@ -196,27 +227,33 @@ struct Seeds {
 impl Seeds {
     /// Seeds for a program running at `at` whose writes and calls stand in for `consumer`'s.
     fn for_program<'a>(
-        diff: &DiffMode,
-        consumer: Address,
+        diff: Option<(&DiffMode, Address)>,
         at: Address,
         updates: impl IntoIterator<Item = &'a StateUpdate> + Clone,
+        with_code: &BTreeSet<Address>,
     ) -> Seeds {
         Seeds {
-            storage: BTreeMap::from([(at, original_storage(diff, consumer, updates.clone()))]),
-            accounts: called_accounts(diff, updates),
+            storage: diff
+                .map(|(diff, consumer)| {
+                    BTreeMap::from([(at, original_storage(diff, consumer, updates.clone()))])
+                })
+                .unwrap_or_default(),
+            accounts: called_accounts(diff.map(|(diff, _)| diff), updates, with_code),
         }
     }
 }
 
-/// Each account `updates` calls that existed before the transaction, from its prestate diff.
+/// Each account `updates` calls that wasn't empty (EIP-161) when called.
 ///
 /// Every callee is missing from the empty state, so a `CALL` that sends it ETH pays the 25,000-gas
-/// new-account charge, which on chain only a recipient that was empty (EIP-161) pays. An ETH
-/// transfer changes the recipient's balance, so the diff lists it in `pre`, where an empty one has
-/// no nonce or code and a zero or absent balance.
+/// new-account charge, which on chain only an empty recipient pays. A recipient whose balance the
+/// transaction changed is in the prestate diff's `pre`, where an empty one has no nonce or code and
+/// a zero or absent balance. One whose balance ended unchanged sent the ETH on, which takes code,
+/// so the trace shows it in `with_code`; the diff leaves such an account out.
 fn called_accounts<'a>(
-    diff: &DiffMode,
+    diff: Option<&DiffMode>,
     updates: impl IntoIterator<Item = &'a StateUpdate>,
+    with_code: &BTreeSet<Address>,
 ) -> BTreeMap<Address, AccountInfo> {
     updates
         .into_iter()
@@ -224,10 +261,19 @@ fn called_accounts<'a>(
             let StateUpdate::Call(call) = update else {
                 return None;
             };
-            let pre = diff.pre.get(&call.target)?;
+            let existing = AccountInfo {
+                nonce: 1,
+                ..AccountInfo::default()
+            };
+            let Some(pre) = diff.and_then(|diff| diff.pre.get(&call.target)) else {
+                return with_code
+                    .contains(&call.target)
+                    .then_some((call.target, existing));
+            };
             let balance = pre.balance.unwrap_or_default();
             let nonce = pre.nonce.unwrap_or_default();
-            let has_code = pre.code.as_ref().is_some_and(|code| !code.is_empty());
+            let has_code = pre.code.as_ref().is_some_and(|code| !code.is_empty())
+                || with_code.contains(&call.target);
             if balance.is_zero() && nonce == 0 && !has_code {
                 return None;
             }
@@ -318,7 +364,7 @@ pub fn analyze_trace_inner(
     prestate_diff_json: Option<&str>,
 ) -> Result<AnalyzeTraceResult, String> {
     let origin = parse_origin(origin_address)?;
-    let extract = parse_and_compute(trace_json, origin)?;
+    let (extract, with_code) = parse_and_compute(trace_json, origin)?;
     let diff = trace_diff(origin, prestate_diff_json)?;
     analyze_extract(
         &extract,
@@ -327,6 +373,7 @@ pub fn analyze_trace_inner(
         estimate_state_changes_block_number,
         value,
         diff.as_ref().map(|(diff, origin)| (diff, *origin)),
+        &with_code,
     )
 }
 
@@ -356,7 +403,7 @@ pub fn analyze_trace_bytes_inner(
     use AnalyzeTraceBytesError::Analysis;
     let origin = parse_origin(origin_address).map_err(Analysis)?;
     let trace = parse_trace_response(response)?;
-    let extract = compute(trace, origin).map_err(Analysis)?;
+    let (extract, with_code) = compute(trace, origin).map_err(Analysis)?;
     let diff = trace_diff(origin, prestate_diff_json).map_err(Analysis)?;
     analyze_extract(
         &extract,
@@ -365,6 +412,7 @@ pub fn analyze_trace_bytes_inner(
         estimate_state_changes_block_number,
         value,
         diff.as_ref().map(|(diff, origin)| (diff, *origin)),
+        &with_code,
     )
     .map_err(Analysis)
 }
@@ -451,6 +499,7 @@ pub fn analyze_prestate_inner(
             estimate_state_changes_block_number,
             value,
             Some((&diff, consumer)),
+            &BTreeSet::new(),
         )?),
     })
 }
@@ -504,6 +553,7 @@ fn analyze_extract(
     estimate_state_changes_block_number: Option<u64>,
     value: Option<&str>,
     diff: Option<(&DiffMode, Address)>,
+    with_code: &BTreeSet<Address>,
 ) -> Result<AnalyzeTraceResult, String> {
     let state_updates: &[StateUpdate] = &extract.state_updates;
 
@@ -516,10 +566,7 @@ fn analyze_extract(
     let caller = parse_caller(caller_address)?;
 
     // The program writes the consumer's slots, here into the estimator's storage.
-    let seeds = match diff {
-        Some((diff, consumer)) => Seeds::for_program(diff, consumer, addr, state_updates),
-        None => Seeds::default(),
-    };
+    let seeds = Seeds::for_program(diff, addr, state_updates, with_code);
     let mut cache_db = seeded_db(&seeds)?;
     let sim_env = sim_env(estimate_state_changes_block_number, parse_value(value)?);
 
@@ -583,7 +630,18 @@ fn sim_env(block_number: Option<u64>, value: U256) -> SimEnvOpts {
 ///
 /// A contract with several frames (sibling calls, or a cycle) has its writes ordered by when each
 /// frame returns, since a frame's final slice is its last write to its target.
-fn frame_tree_seeds(diff: &DiffMode, frames: &[FrameProgram]) -> Seeds {
+fn frame_tree_seeds(
+    diff: Option<&DiffMode>,
+    frames: &[FrameProgram],
+    with_code: &BTreeSet<Address>,
+) -> Seeds {
+    let accounts = called_accounts(diff, frames.iter().flat_map(|f| &f.updates), with_code);
+    let Some(diff) = diff else {
+        return Seeds {
+            accounts,
+            ..Seeds::default()
+        };
+    };
     let mut by_target: BTreeMap<Address, Vec<&StateUpdate>> = BTreeMap::new();
     for id in return_order(frames) {
         let frame = &frames[id];
@@ -597,7 +655,7 @@ fn frame_tree_seeds(diff: &DiffMode, frames: &[FrameProgram]) -> Seeds {
             .into_iter()
             .map(|(target, updates)| (target, original_storage(diff, target, updates)))
             .collect(),
-        accounts: called_accounts(diff, frames.iter().flat_map(|f| &f.updates)),
+        accounts,
     }
 }
 
@@ -644,15 +702,13 @@ fn analyze_frame_tree_trace(
     let sim_env = sim_env(estimate_state_changes_block_number, value);
     let cost = NESTING_COST_MODEL_V1;
 
+    let with_code = callees_with_code(&trace);
     let root_only = compute_frame_tree_hypothetical(trace.clone(), root, &BTreeSet::new(), &cost)
         .map_err(|e| format!("Failed to split trace: {}", e))?;
     let nested = compute_frame_tree_hypothetical(trace, root, &owned, &cost)
         .map_err(|e| format!("Failed to split trace: {}", e))?;
     let price = |frames: &[FrameProgram]| {
-        let seeds = match &diff {
-            Some(diff) => frame_tree_seeds(diff, frames),
-            None => Seeds::default(),
-        };
+        let seeds = frame_tree_seeds(diff.as_ref(), frames, &with_code);
         estimate_frame_tree_gas(&mut seeded_db(&seeds)?, frames, caller, value, &sim_env)
             .map_err(|e| format!("Gas estimation failed: {}", e))
     };
@@ -742,7 +798,7 @@ pub fn estimate_gas_heuristic_inner(
     trace_json: &str,
     origin_address: Option<&str>,
 ) -> Result<EstimateGasResult, String> {
-    let extract = parse_and_compute(trace_json, parse_origin(origin_address)?)?;
+    let (extract, _) = parse_and_compute(trace_json, parse_origin(origin_address)?)?;
 
     let gas = estimate_gas_from_state_updates(&extract);
 
@@ -763,7 +819,7 @@ pub fn encode_trace_inner(trace_json: &str) -> Result<EncodeTraceResult, String>
         state_updates,
         skipped_opcodes,
         ..
-    } = parse_and_compute(trace_json, None)?;
+    } = parse_and_compute(trace_json, None)?.0;
 
     let encoded = encode_state_updates_to_abi(&state_updates);
     let mut skipped = skipped_opcodes.into_iter().collect::<Vec<_>>();
@@ -2065,6 +2121,22 @@ mod tests {
         make_trace(vec![call, entry, resume])
     }
 
+    /// A trace whose root sends `call_value` wei to an account without code, which runs no frame.
+    fn eoa_value_call_trace(call_value: &str) -> String {
+        let call = make_call_log(
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            call_value,
+            "",
+            50000,
+        );
+        let resume = serde_json::json!({
+            "pc": 201, "op": "POP", "gas": 40000, "gasCost": 2, "depth": 1,
+            "stack": ["0x0000000000000000000000000000000000000000000000000000000000000001"],
+            "memory": [],
+        });
+        make_trace(vec![call, resume])
+    }
+
     #[test]
     fn test_forwarded_value_is_measured_only_when_the_transaction_brings_it() {
         let trace = value_call_trace("de0b6b3a7640000"); // 1 ETH
@@ -2093,7 +2165,7 @@ mod tests {
 
     #[test]
     fn test_a_prestate_diff_spares_an_existing_recipient_the_new_account_charge() {
-        let trace = value_call_trace("de0b6b3a7640000"); // 1 ETH
+        let trace = eoa_value_call_trace("de0b6b3a7640000"); // 1 ETH
         let recipient = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
         let analyze = |diff: Option<&str>| {
             let out = analyze_trace_inner(
@@ -2133,6 +2205,44 @@ mod tests {
     }
 
     #[test]
+    fn test_a_recipient_that_runs_code_is_spared_the_new_account_charge_without_the_diff() {
+        // It forwards what it gets, so its balance ends unchanged and the diff leaves it out.
+        let trace = value_call_trace("de0b6b3a7640000"); // 1 ETH
+        let analyze = |diff: serde_json::Value| {
+            analyze_trace_inner(
+                &trace,
+                &test_estimator_address(),
+                &test_caller_address(),
+                None,
+                Some(CONSUMER),
+                Some("1000000000000000000"),
+                Some(&diff.to_string()),
+            )
+            .unwrap()
+            .gas_estimate
+        };
+        let listed = serde_json::json!({
+            "pre": { "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef": { "nonce": 1 } },
+            "post": {},
+        });
+        let left_out = serde_json::json!({ "pre": {}, "post": {} });
+        assert_eq!(analyze(left_out), analyze(listed));
+    }
+
+    #[test]
+    fn test_callees_with_code_are_those_whose_call_entered_a_frame() {
+        let recipient: Address = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+            .parse()
+            .unwrap();
+        let callees = |trace: String| {
+            let trace: LeanFrame = serde_json::from_str(&trace).unwrap();
+            callees_with_code(&trace.into())
+        };
+        assert_eq!(callees(value_call_trace("1")), BTreeSet::from([recipient]));
+        assert!(callees(eoa_value_call_trace("1")).is_empty());
+    }
+
+    #[test]
     fn test_called_accounts_are_only_those_that_were_not_empty() {
         let recipient: Address = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
             .parse()
@@ -2144,7 +2254,8 @@ mod tests {
         });
         let accounts = |pre: serde_json::Value| {
             let diff = serde_json::json!({ "pre": { recipient.to_string(): pre }, "post": {} });
-            called_accounts(&serde_json::from_value(diff).unwrap(), [&call])
+            let diff: DiffMode = serde_json::from_value(diff).unwrap();
+            called_accounts(Some(&diff), [&call], &BTreeSet::new())
         };
         assert!(accounts(serde_json::json!({})).is_empty());
         assert!(accounts(serde_json::json!({ "balance": "0x0" })).is_empty());
@@ -2289,7 +2400,7 @@ mod tests {
         assert_eq!(tree.frames.len(), 3, "one frame per call");
 
         let diff: DiffMode = serde_json::from_str(r#"{"pre":{},"post":{}}"#).unwrap();
-        let seeds = frame_tree_seeds(&diff, &tree.frames);
+        let seeds = frame_tree_seeds(Some(&diff), &tree.frames, &BTreeSet::new());
         let word = |n: u64| B256::from(U256::from(n));
         assert_eq!(seeds.storage[&vault][&word(5)], word(3));
     }

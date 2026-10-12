@@ -29,7 +29,7 @@ Analyzes the `result` of `debug_traceTransaction` with the default struct-log tr
   - every write is priced as a fresh 22,100-gas one, where changing a set slot costs 5,000 and rewriting its value 2,200;
   - every `CALL` that sends ETH pays the 25,000-gas charge for creating its recipient, which on chain only a new account pays.
 
-  The diff supplies each written slot's value before the transaction and the called accounts that already existed.
+  The diff supplies each written slot's value before the transaction and the called accounts that already existed. A recipient whose call runs code in the trace is treated as existing even without the diff, which leaves it out when its balance ends unchanged.
 
 ```js
 const result = analyze_trace(JSON.stringify(trace), estimator, receipt.from, BigInt(receipt.blockNumber), receipt.to)
