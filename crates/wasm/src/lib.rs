@@ -523,12 +523,12 @@ fn sim_env(block_number: Option<u64>, value: U256) -> SimEnvOpts {
 /// [`original_storage`] for every contract a frame tree writes, where the estimator is injected
 /// at each frame's own target.
 ///
-/// A contract with several frames (a cycle) has its slots' last values taken from its outermost
-/// frame, whose final slice re-asserts everything its inner frames wrote, after them.
+/// A contract with several frames (sibling calls, or a cycle) has its writes ordered by when each
+/// frame returns, since a frame's final slice is its last write to its target.
 fn frame_tree_original_storage(diff: &DiffMode, frames: &[FrameProgram]) -> Seeds {
     let mut by_target: BTreeMap<Address, Vec<&StateUpdate>> = BTreeMap::new();
-    // Pre-order puts the outermost frame first, so walking it backwards stores its writes last.
-    for frame in frames.iter().rev() {
+    for id in return_order(frames) {
+        let frame = &frames[id];
         by_target
             .entry(frame.target)
             .or_default()
@@ -538,6 +538,21 @@ fn frame_tree_original_storage(diff: &DiffMode, frames: &[FrameProgram]) -> Seed
         .into_iter()
         .map(|(target, updates)| (target, original_storage(diff, target, updates)))
         .collect()
+}
+
+/// Frame ids in the order the frames return: each one after its children, siblings in call order.
+fn return_order(frames: &[FrameProgram]) -> Vec<usize> {
+    fn visit(frames: &[FrameProgram], id: usize, order: &mut Vec<usize>) {
+        for &child in &frames[id].children {
+            visit(frames, child, order);
+        }
+        order.push(id);
+    }
+    let mut order = Vec::with_capacity(frames.len());
+    if !frames.is_empty() {
+        visit(frames, 0, &mut order);
+    }
+    order
 }
 
 /// Price `trace` as a nested settlement rooted at `root` with `owned` as consumers, against the
@@ -2104,6 +2119,52 @@ mod tests {
         // Root-only, the vault's write runs natively inside its CALL, charged from the trace.
         assert_eq!(empty.root_only_gas - seeded.root_only_gas, saved);
         assert_eq!(empty.nested_gas - seeded.nested_gas, 2 * saved);
+    }
+
+    /// The root calls the vault twice: the first call sets its slot 5 from 3 to 7, the second back
+    /// to 3, so the slot is in neither half of the diff and its original is the last value written.
+    #[test]
+    fn test_sibling_frames_seed_a_slot_from_the_frame_that_returned_last() {
+        let call = |gas: u64| {
+            let mut call = make_call_log(VAULT, "0", "aabbccdd", gas);
+            call["gasCost"] = gas.into();
+            call
+        };
+        let entry = |value: &str, gas: u64| {
+            let mut entry = sstore_at(2, "5", value);
+            entry["gas"] = (gas - VAULT_ACCESS).into();
+            entry
+        };
+        let resume = |gas: u64| {
+            serde_json::json!({
+                "pc": 201, "op": "POP", "gas": gas, "gasCost": 2, "depth": 1,
+                "stack": ["0x0000000000000000000000000000000000000000000000000000000000000001"],
+                "memory": [],
+            })
+        };
+        let trace: LeanFrame = serde_json::from_str(&make_trace(vec![
+            call(1_000_000),
+            entry("7", 1_000_000),
+            resume(600_000),
+            call(600_000),
+            entry("3", 600_000),
+            resume(100_000),
+        ]))
+        .unwrap();
+        let vault: Address = VAULT.parse().unwrap();
+        let tree = compute_frame_tree_hypothetical(
+            trace.into(),
+            ROOT.parse().unwrap(),
+            &BTreeSet::from([vault]),
+            &NESTING_COST_MODEL_V1,
+        )
+        .unwrap();
+        assert_eq!(tree.frames.len(), 3, "one frame per call");
+
+        let diff: DiffMode = serde_json::from_str(r#"{"pre":{},"post":{}}"#).unwrap();
+        let seeds = frame_tree_original_storage(&diff, &tree.frames);
+        let word = |n: u64| B256::from(U256::from(n));
+        assert_eq!(seeds[&vault][&word(5)], word(3));
     }
 
     #[test]
