@@ -531,18 +531,23 @@ impl DefaultEvmSketchExecutor {
     ///
     /// Cold-miss slots not present in `storage_hints` still fall back to
     /// `eth_getStorageAt` during execution — an incomplete hint set is safe.
+    ///
+    /// `value` is the `msg.value` of the call the state updates were extracted from; see
+    /// [`Self::estimate_state_changes_gas_with_hints_timed`].
     pub async fn estimate_state_changes_gas_with_hints(
         &self,
         contract_address: Address,
         caller_address: Address,
         state_updates: &[gas_analyzer_core::StateUpdate],
         storage_hints: &HashMap<Address, Vec<B256>>,
+        value: U256,
     ) -> Result<u64> {
         self.estimate_state_changes_gas_with_hints_timed(
             contract_address,
             caller_address,
             state_updates,
             storage_hints,
+            value,
         )
         .await
         .map(|(gas, _)| gas)
@@ -554,12 +559,18 @@ impl DefaultEvmSketchExecutor {
     /// The two are very different work behind one `await`: the prefetch is network round-trips,
     /// while the execution is local revm plus whatever cold-miss reads the hints failed to cover.
     /// A caller deciding between more bandwidth and more cores needs them apart.
+    ///
+    /// `value` is the `msg.value` of the call the state updates were extracted from. It is sent
+    /// with the replay, as in [`Self::estimate_state_changes_gas_with_preceding`], so a payload
+    /// whose updates spend or check the ETH that call brought in prices as it will land instead of
+    /// reverting for want of it.
     pub async fn estimate_state_changes_gas_with_hints_timed(
         &self,
         contract_address: Address,
         caller_address: Address,
         state_updates: &[gas_analyzer_core::StateUpdate],
         storage_hints: &HashMap<Address, Vec<B256>>,
+        value: U256,
     ) -> Result<(u64, EstimateTimings)> {
         let state_block = self.anchor_block_number().saturating_sub(1);
         let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
@@ -571,7 +582,8 @@ impl DefaultEvmSketchExecutor {
             .context("storage slot prefetch failed")?;
         let prefetch = prefetch_started.elapsed();
 
-        let sim_env = self.sim_env();
+        let mut sim_env = self.sim_env();
+        sim_env.value = value;
         let execute_started = Instant::now();
         let gas = gas_analyzer_estimator::estimate_state_changes_gas(
             &mut cache_db,
@@ -591,12 +603,13 @@ impl DefaultEvmSketchExecutor {
 
     /// Like [`Self::estimate_state_changes_gas_with_hints_timed`] for a nested tree: the frames
     /// run in execution order on one state (see [`gas_analyzer_estimator::estimate_frame_tree_gas`]),
-    /// returning each frame's gas in frame order.
+    /// returning each frame's gas in frame order. `value` is the root call's `msg.value`.
     pub async fn estimate_frame_tree_gas_with_hints_timed(
         &self,
         frames: &[FrameProgram],
         caller_address: Address,
         storage_hints: &HashMap<Address, Vec<B256>>,
+        value: U256,
     ) -> Result<(Vec<u64>, EstimateTimings)> {
         let state_block = self.anchor_block_number().saturating_sub(1);
         let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
@@ -608,13 +621,16 @@ impl DefaultEvmSketchExecutor {
             .context("storage slot prefetch failed")?;
         let prefetch = prefetch_started.elapsed();
 
-        let sim_env = self.sim_env();
+        let sim_env = SimEnvOpts {
+            value,
+            ..self.sim_env()
+        };
         let execute_started = Instant::now();
         let frame_gas = gas_analyzer_estimator::estimate_frame_tree_gas(
             &mut cache_db,
             frames,
             caller_address,
-            sim_env.value,
+            value,
             &sim_env,
         )?;
         Ok((
@@ -1200,6 +1216,10 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
         .ok_or_else(|| anyhow!("Transaction must have a 'to' address"))?;
 
     let caller_address = tx_request.from.unwrap_or_default();
+    // The call's `msg.value`, kept for the gas estimate below: `tx_request` is consumed by
+    // extraction, and a payload whose updates spend or check that ETH reverts if it is replayed
+    // without it.
+    let tx_value = tx_request.value.unwrap_or_default();
 
     // Collect storage hints from the EIP-2930 access list before tx_request
     // is consumed by get_trace_from_call. Address-only entries (no storage keys)
@@ -1283,6 +1303,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
             caller_address,
             &state_updates,
             &all_hints,
+            tx_value,
         )
         .await?;
 
@@ -1489,6 +1510,7 @@ pub async fn call_to_frame_tree_with_evmsketch(
         })
         .ok_or_else(|| anyhow!("Transaction must have a 'to' address"))?;
     let caller_address = tx_request.from.unwrap_or_default();
+    let tx_value = tx_request.value.unwrap_or_default();
     let block = BlockId::Number(BlockNumberOrTag::Number(block_number));
 
     let mut trace_fetch = Duration::ZERO;
@@ -1502,7 +1524,13 @@ pub async fn call_to_frame_tree_with_evmsketch(
             let (executor, lookup) = cache.get_or_build_timed(rpc_url, block_number).await?;
             let hints = hints_from_state_updates(root, &updates);
             let (gas_estimate, estimate) = executor
-                .estimate_state_changes_gas_with_hints_timed(root, caller_address, &updates, &hints)
+                .estimate_state_changes_gas_with_hints_timed(
+                    root,
+                    caller_address,
+                    &updates,
+                    &hints,
+                    tx_value,
+                )
                 .await?;
             let frame = FrameProgram {
                 target: root,
@@ -1573,7 +1601,7 @@ pub async fn call_to_frame_tree_with_evmsketch(
         }
     }
     let (frame_gas, estimate) = executor
-        .estimate_frame_tree_gas_with_hints_timed(&tree.frames, caller_address, &hints)
+        .estimate_frame_tree_gas_with_hints_timed(&tree.frames, caller_address, &hints, tx_value)
         .await?;
     let gas_estimate = frame_tree_total(&frame_gas, cost);
     let (prefetch, revm_estimate) = (estimate.prefetch, estimate.execute);
@@ -2932,6 +2960,72 @@ mod tests {
             )
             .await
             .expect("encode failed")
+        }
+
+        /// A consumer that takes ETH in and checks, at settlement, that it arrived — the shape of
+        /// a deposit into a pool that must stay backed.
+        ///
+        /// With no calldata: `SSTORE(0, CALLVALUE)`, then `CALL(self, value 0, data 0x01)`, reverting
+        /// if that call fails. With calldata (the self-call): revert unless
+        /// `SELFBALANCE >= SLOAD(0)`. The diff is `[Store(0, value), Call(self, 0, 0x01)]`, and the
+        /// call re-runs the balance check when the payload is applied, so it only lands when the
+        /// settlement carries the ETH.
+        fn backed_deposit_code() -> Bytes {
+            hex_code(
+                "36 601f 57 34 6000 55 6001 6000 53 6000 6000 6001 6000 6000 30 5a f1 15 6029 57 00 \
+                 5b 6000 54 47 10 6029 57 00 5b 6000 6000 fd",
+            )
+        }
+
+        /// The gas estimate must replay the payload with the call's `msg.value`. A consumer that
+        /// checks the ETH a call brought in (a deposit that must stay backed) otherwise reverts in
+        /// the estimate — an analysis failure for a call that settles fine when sent with its value.
+        // `SimpleRpcDb` reads uncached state through `block_in_place`, which panics on a
+        // current-thread runtime.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
+        async fn test_estimate_replays_with_the_calls_value() {
+            let anvil = spawn_as_sepolia().await;
+            let provider = anvil.provider();
+            let consumer = address!("0x0000000000000000000000000000000000001007");
+            set_code(&provider, consumer, backed_deposit_code()).await;
+            let block = provider.get_block_number().await.expect("block number");
+            let cache = EvmSketchExecutorCache::new(4);
+            let value = U256::from(10u64).pow(U256::from(16u64)); // 0.01 ETH
+
+            let encoded = call_to_encoded_state_updates_with_evmsketch_profiled(
+                &cache,
+                &anvil.url,
+                call_request(consumer).value(value),
+                block,
+                StateEncoding::Legacy,
+                SimProfile::Chain,
+            )
+            .await
+            .expect(
+                "a deposit that brings its ETH must analyze and price, not revert in the estimate",
+            );
+
+            assert_eq!(
+                encoded.update_count, 2,
+                "Store(0, value) and the backing self-call"
+            );
+            assert!(encoded.gas_estimate > 0, "the payload is priced");
+        }
+
+        /// As [`test_estimate_replays_with_the_calls_value`], through the frame-tree entry point.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
+        async fn test_frame_tree_estimate_replays_with_the_calls_value() {
+            let anvil = spawn_as_sepolia().await;
+            let consumer = address!("0x0000000000000000000000000000000000001007");
+            set_code(&anvil.provider(), consumer, backed_deposit_code()).await;
+            let value = U256::from(10u64).pow(U256::from(16u64)); // 0.01 ETH
+
+            let tree = frame_tree(&anvil, call_request(consumer).value(value), &FREE_NESTING).await;
+
+            assert_eq!(tree.frames.len(), 1);
+            assert!(tree.gas_estimate > 0, "the payload is priced");
         }
 
         /// The struct-log path must attribute cost to both a fetch and a parse. This is the
