@@ -41,12 +41,14 @@ struct CliArgs {
     use_anvil: bool,
     debug: bool,
     /// `--owned`: contracts priced as if they had integrated the SDK alongside the root.
-    owned: Result<Vec<alloy::primitives::Address>, String>,
+    owned: Result<Option<Vec<alloy::primitives::Address>>, String>,
 }
 
 fn parse_args() -> CliArgs {
-    let args: Vec<String> = env::args().collect();
+    parse_args_from(&env::args().collect::<Vec<_>>())
+}
 
+fn parse_args_from(args: &[String]) -> CliArgs {
     // Check for --anvil flag
     let use_anvil = args.iter().any(|a| a == "--anvil" || a == "--legacy");
 
@@ -55,12 +57,15 @@ fn parse_args() -> CliArgs {
 
     // `--owned A,B` or `--owned=A,B`; its value is not a positional argument.
     let mut owned_raw = Vec::new();
+    let mut owned_given = false;
     let mut positional: Vec<&str> = Vec::new();
-    let mut rest = args.iter().map(|s| s.as_str());
+    let mut rest = args.iter().map(|s| s.as_str()).peekable();
     while let Some(arg) = rest.next() {
         if arg == "--owned" {
-            owned_raw.extend(rest.next());
+            owned_given = true;
+            owned_raw.extend(rest.next_if(|next| !next.starts_with("--")));
         } else if let Some(value) = arg.strip_prefix("--owned=") {
+            owned_given = true;
             owned_raw.push(value);
         } else if !arg.starts_with("--") {
             positional.push(arg);
@@ -75,7 +80,7 @@ fn parse_args() -> CliArgs {
             a.parse()
                 .map_err(|e| format!("--owned: `{a}` is not an address: {e}"))
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>();
 
     let command = if positional.len() < 3 {
         None
@@ -89,6 +94,16 @@ fn parse_args() -> CliArgs {
             "d" | "debug" => Some(Commands::Transaction(value)),
             _ => None,
         }
+    };
+
+    // Without these checks a mistyped `--owned` would silently run the plain analysis instead.
+    let owned = match owned {
+        _ if !owned_given => Ok(None),
+        Ok(list) if list.is_empty() => Err("--owned needs at least one address".to_owned()),
+        _ if !matches!(command, Some(Commands::Transaction(_))) => {
+            Err("--owned only applies to `t <TX_HASH>`".to_owned())
+        }
+        owned => owned.map(Some),
     };
 
     // `debug <hash>` is an alias for `t <hash> --debug`
@@ -132,7 +147,11 @@ async fn main() {
 }
 
 async fn execute_command(cli_args: CliArgs) -> Result<()> {
-    let owned = cli_args.owned.clone().map_err(anyhow::Error::msg)?;
+    let owned = cli_args
+        .owned
+        .clone()
+        .map_err(anyhow::Error::msg)?
+        .unwrap_or_default();
     let rpc_url: Url = std::env::var("RPC_URL")
         .expect("RPC_URL must be set")
         .parse()
@@ -765,5 +784,70 @@ mod what_if {
                 .dimmed()
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HASH: &str = "0x08123c1873f0d9abdda394fdb54ef5b38a6abdf4a322f371923d301c75c3eb61";
+    const ADDR: &str = "0xFA7093CDD9EE6932B4eb2c9e1cde7CE00B1FA4b9";
+
+    fn owned(args: &[&str]) -> Result<Option<usize>, String> {
+        let args: Vec<String> = ["cli"].iter().chain(args).map(|a| a.to_string()).collect();
+        parse_args_from(&args)
+            .owned
+            .map(|o| o.map(|list| list.len()))
+    }
+
+    #[test]
+    fn owned_takes_a_list_in_either_form() {
+        assert_eq!(owned(&["t", HASH]), Ok(None));
+        assert_eq!(owned(&["t", HASH, "--owned", ADDR]), Ok(Some(1)));
+        assert_eq!(
+            owned(&["--owned", &format!("{ADDR},{ADDR}"), "t", HASH]),
+            Ok(Some(2))
+        );
+        assert_eq!(owned(&["t", HASH, &format!("--owned={ADDR}")]), Ok(Some(1)));
+        assert_eq!(owned(&["d", HASH, "--owned", ADDR]), Ok(Some(1)));
+    }
+
+    #[test]
+    fn owned_without_addresses_is_an_error() {
+        for args in [
+            &["t", HASH, "--owned"][..],
+            &["t", HASH, "--owned="],
+            &["t", HASH, "--owned", ","],
+            &["t", HASH, "--owned", "--debug"],
+        ] {
+            assert!(
+                owned(args).unwrap_err().contains("at least one"),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_is_rejected_where_it_does_nothing() {
+        assert!(
+            owned(&["r", "req.json", "--owned", ADDR])
+                .unwrap_err()
+                .contains("only applies")
+        );
+        assert!(
+            owned(&["--owned", ADDR])
+                .unwrap_err()
+                .contains("only applies")
+        );
+    }
+
+    #[test]
+    fn owned_with_a_bad_address_is_an_error() {
+        assert!(
+            owned(&["t", HASH, "--owned", "0x12"])
+                .unwrap_err()
+                .contains("not an address")
+        );
     }
 }
