@@ -71,6 +71,9 @@ jobs:
 
       - name: Install foundry
         uses: foundry-rs/foundry-toolchain@v1
+        # Pinned: gas figures depend on which hardforks anvil knows, so an upgrade must be deliberate.
+        with:
+          version: v1.8.5
 
       - name: cargo test (evmsketch - default)
         run: cargo test

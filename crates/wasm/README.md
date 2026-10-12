@@ -11,7 +11,7 @@ npm install @gas-killer/analyzer-wasm
 The package is built for the web target. Initialize it once before calling anything:
 
 ```js
-import init, { analyze_trace, analyze_prestate } from "@gas-killer/analyzer-wasm"
+import init, { analyze_trace_bytes, analyze_prestate } from "@gas-killer/analyzer-wasm"
 
 await init() // in Node: initSync({ module: fs.readFileSync(".../gas_killer_wasm_bg.wasm") })
 ```
@@ -28,6 +28,23 @@ Analyzes the `result` of `debug_traceTransaction` with the default struct-log tr
 ```js
 const result = analyze_trace(JSON.stringify(trace), estimator, receipt.from, BigInt(receipt.blockNumber), receipt.to)
 // { gas_estimate, is_heuristic, encoded_updates, state_update_count, skipped_opcodes, reentered }
+```
+
+### `analyze_trace_bytes(response, estimator, caller, block?, origin?)`
+
+Takes the same arguments as `analyze_trace`, except that it accepts the whole JSON-RPC response body as a `Uint8Array`. Use it for large traces:
+
+- The trace is never decoded into a JavaScript string, so it isn't held twice and isn't subject to the string length limit.
+- Memory snapshots are skipped for steps that don't need them, so the analysis uses about 1.4× the response's size in wasm memory.
+
+```js
+const response = new Uint8Array(await (await fetch(rpcUrl, { method: "POST", body })).arrayBuffer())
+try {
+  const result = analyze_trace_bytes(response, estimator, receipt.from, BigInt(receipt.blockNumber), receipt.to)
+} catch (e) {
+  // e.name is "RpcError" when the node returned an error, or "TraceTooLargeError" when the error
+  // was the provider's response size limit
+}
 ```
 
 ### `analyze_prestate(diff, callFrame, consumer, estimator, caller, block?)`
