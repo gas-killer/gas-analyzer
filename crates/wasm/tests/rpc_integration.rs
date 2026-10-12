@@ -88,6 +88,7 @@ fn test_simple_storage_set() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -113,6 +114,7 @@ fn test_simple_storage_deposit() {
         &trace,
         &test_estimator_address(),
         &test_caller_address(),
+        None,
         None,
         None,
         None,
@@ -144,6 +146,7 @@ fn test_simple_storage_call_external() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -169,6 +172,7 @@ fn test_delegatecall() {
         &trace,
         &test_estimator_address(),
         &test_caller_address(),
+        None,
         None,
         None,
         None,
@@ -200,6 +204,7 @@ fn test_access_control() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -226,6 +231,7 @@ fn test_all_paths_agree_on_simple_storage_set() {
         &trace,
         &test_estimator_address(),
         &test_caller_address(),
+        None,
         None,
         None,
         None,
