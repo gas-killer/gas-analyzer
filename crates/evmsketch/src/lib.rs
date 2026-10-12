@@ -139,15 +139,16 @@ use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 pub use gas_analyzer_core::SimProfile;
 pub use gas_analyzer_core::nested;
 
+pub use gas_analyzer_core::nested::frame_tree_total;
 use gas_analyzer_core::nested::{
     FrameProgram, NestingCostModel, compute_frame_tree_canonical, without_nested_ops,
 };
 use gas_analyzer_core::sim_profile::STATE_TRACKER_SLOT;
 use gas_analyzer_core::{
-    BASE_TX_COST, Opcode, PrestateEligibility, SignatureType, StateUpdate,
-    build_state_updates_from_prestate, classify_prestate_eligibility, compute_state_updates,
-    compute_state_updates_canonical, encode_state_updates_to_abi, estimate_gas_from_operations,
-    extract_operation_counts_from_trace, validate_unbounded_cost,
+    Opcode, PrestateEligibility, SignatureType, StateUpdate, build_state_updates_from_prestate,
+    classify_prestate_eligibility, compute_state_updates, compute_state_updates_canonical,
+    encode_state_updates_to_abi, estimate_gas_from_operations, extract_operation_counts_from_trace,
+    validate_unbounded_cost,
 };
 use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
 use gas_analyzer_rpc::{
@@ -991,19 +992,6 @@ pub struct FrameTreeGas {
     pub frame_gas: Vec<u64>,
     /// The tree in one transaction: see [`frame_tree_total`].
     pub total: u64,
-}
-
-/// The tree in one transaction: the root's gas, plus every child's less the base transaction cost
-/// it was measured with, plus the nesting overhead of each child.
-pub fn frame_tree_total(frame_gas: &[u64], cost: &NestingCostModel) -> u64 {
-    frame_gas.iter().enumerate().fold(0u64, |total, (i, &gas)| {
-        total.saturating_add(if i == 0 {
-            gas
-        } else {
-            gas.saturating_sub(BASE_TX_COST)
-                .saturating_add(cost.frame_overhead_gas)
-        })
-    })
 }
 
 impl GasKillerEvmSketchDefault {
@@ -2626,8 +2614,15 @@ mod tests {
                 )
                 .expect("priced");
             assert_eq!(gas.frame_gas.len(), 3);
-            assert!(gas.frame_gas.iter().all(|g| *g > BASE_TX_COST));
-            let children: u64 = gas.frame_gas[1..].iter().map(|g| g - BASE_TX_COST).sum();
+            assert!(
+                gas.frame_gas
+                    .iter()
+                    .all(|g| *g > gas_analyzer_core::BASE_TX_COST)
+            );
+            let children: u64 = gas.frame_gas[1..]
+                .iter()
+                .map(|g| g - gas_analyzer_core::BASE_TX_COST)
+                .sum();
             assert_eq!(
                 gas.total,
                 gas.frame_gas[0] + children,

@@ -19,6 +19,7 @@ use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 
 pub use crate::encoding::encode_state_updates_to_abi as encoded_program;
+use crate::heuristic::BASE_TX_COST;
 use crate::sim_profile::STATE_TRACKER_SLOT;
 use crate::trace::append_state_update_from_struct_log;
 use crate::types::Opcode;
@@ -524,6 +525,71 @@ pub fn without_nested_ops(updates: &[StateUpdate]) -> Vec<StateUpdate> {
         .iter()
         .filter(|u| !matches!(u, StateUpdate::Nested(_)))
         .cloned()
+        .collect()
+}
+
+/// The tree in one transaction: the root's gas, plus every child's less the base transaction cost
+/// it was measured with, plus the nesting overhead of each child.
+pub fn frame_tree_total(frame_gas: &[u64], cost: &NestingCostModel) -> u64 {
+    frame_gas.iter().enumerate().fold(0u64, |total, (i, &gas)| {
+        total.saturating_add(if i == 0 {
+            gas
+        } else {
+            gas.saturating_sub(BASE_TX_COST)
+                .saturating_add(cost.frame_overhead_gas)
+        })
+    })
+}
+
+/// Why a contract in a hypothetical split's owned set got no frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotNestedReason {
+    /// A frame calls it, but the split kept that call a `CALL`.
+    KeptAsCall,
+    /// No frame calls it: it ran inside a native `CALL`, or not at all.
+    NotReached,
+}
+
+impl NotNestedReason {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::KeptAsCall => {
+                "called directly, but cheaper as a plain CALL (or it reverted, or uses transient \
+                 storage or selfdestruct)"
+            }
+            Self::NotReached => {
+                "not called from a nested frame: its caller is outside the owned set or was \
+                 itself kept as a CALL, so it ran inside that call"
+            }
+        }
+    }
+}
+
+/// Each contract in `owned` that [`compute_frame_tree_hypothetical`] gave no frame, and why.
+pub fn unnested_owned(
+    owned: &BTreeSet<Address>,
+    frames: &[FrameProgram],
+) -> Vec<(Address, NotNestedReason)> {
+    let framed: BTreeSet<Address> = frames.iter().map(|f| f.target).collect();
+    let called: BTreeSet<Address> = frames
+        .iter()
+        .flat_map(|f| &f.updates)
+        .filter_map(|u| match u {
+            StateUpdate::Call(call) => Some(call.target),
+            _ => None,
+        })
+        .collect();
+    owned
+        .iter()
+        .filter(|a| !framed.contains(*a))
+        .map(|a| {
+            let reason = if called.contains(a) {
+                NotNestedReason::KeptAsCall
+            } else {
+                NotNestedReason::NotReached
+            };
+            (*a, reason)
+        })
         .collect()
 }
 
