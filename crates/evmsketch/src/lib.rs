@@ -599,12 +599,13 @@ impl DefaultEvmSketchExecutor {
 
     /// Like [`Self::estimate_state_changes_gas_with_hints_timed`] for a nested tree: the frames
     /// run in execution order on one state (see [`gas_analyzer_estimator::estimate_frame_tree_gas`]),
-    /// returning each frame's gas in frame order.
+    /// returning each frame's gas in frame order. `value` is the root call's `msg.value`.
     pub async fn estimate_frame_tree_gas_with_hints_timed(
         &self,
         frames: &[FrameProgram],
         caller_address: Address,
         storage_hints: &HashMap<Address, Vec<B256>>,
+        value: U256,
     ) -> Result<(Vec<u64>, EstimateTimings)> {
         let state_block = self.anchor_block_number().saturating_sub(1);
         let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
@@ -616,13 +617,16 @@ impl DefaultEvmSketchExecutor {
             .context("storage slot prefetch failed")?;
         let prefetch = prefetch_started.elapsed();
 
-        let sim_env = self.sim_env();
+        let sim_env = SimEnvOpts {
+            value,
+            ..self.sim_env()
+        };
         let execute_started = Instant::now();
         let frame_gas = gas_analyzer_estimator::estimate_frame_tree_gas(
             &mut cache_db,
             frames,
             caller_address,
-            sim_env.value,
+            value,
             &sim_env,
         )?;
         Ok((
@@ -1502,6 +1506,7 @@ pub async fn call_to_frame_tree_with_evmsketch(
         })
         .ok_or_else(|| anyhow!("Transaction must have a 'to' address"))?;
     let caller_address = tx_request.from.unwrap_or_default();
+    let tx_value = tx_request.value.unwrap_or_default();
     let block = BlockId::Number(BlockNumberOrTag::Number(block_number));
 
     let mut trace_fetch = Duration::ZERO;
@@ -1515,7 +1520,13 @@ pub async fn call_to_frame_tree_with_evmsketch(
             let (executor, lookup) = cache.get_or_build_timed(rpc_url, block_number).await?;
             let hints = hints_from_state_updates(root, &updates);
             let (gas_estimate, estimate) = executor
-                .estimate_state_changes_gas_with_hints_timed(root, caller_address, &updates, &hints)
+                .estimate_state_changes_gas_with_hints_timed(
+                    root,
+                    caller_address,
+                    &updates,
+                    &hints,
+                    tx_value,
+                )
                 .await?;
             let frame = FrameProgram {
                 target: root,
@@ -1586,7 +1597,7 @@ pub async fn call_to_frame_tree_with_evmsketch(
         }
     }
     let (frame_gas, estimate) = executor
-        .estimate_frame_tree_gas_with_hints_timed(&tree.frames, caller_address, &hints)
+        .estimate_frame_tree_gas_with_hints_timed(&tree.frames, caller_address, &hints, tx_value)
         .await?;
     let gas_estimate = frame_tree_total(&frame_gas, cost);
     let (prefetch, revm_estimate) = (estimate.prefetch, estimate.execute);
@@ -2996,6 +3007,21 @@ mod tests {
                 "Store(0, value) and the backing self-call"
             );
             assert!(encoded.gas_estimate > 0, "the payload is priced");
+        }
+
+        /// As [`test_estimate_replays_with_the_calls_value`], through the frame-tree entry point.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
+        async fn test_frame_tree_estimate_replays_with_the_calls_value() {
+            let anvil = spawn_as_sepolia().await;
+            let consumer = address!("0x0000000000000000000000000000000000001007");
+            set_code(&anvil.provider(), consumer, backed_deposit_code()).await;
+            let value = U256::from(10u64).pow(U256::from(16u64)); // 0.01 ETH
+
+            let tree = frame_tree(&anvil, call_request(consumer).value(value), &FREE_NESTING).await;
+
+            assert_eq!(tree.frames.len(), 1);
+            assert!(tree.gas_estimate > 0, "the payload is priced");
         }
 
         /// The struct-log path must attribute cost to both a fetch and a parse. This is the
