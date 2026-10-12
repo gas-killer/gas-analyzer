@@ -16,7 +16,7 @@ import init, { analyze_trace_bytes, analyze_prestate } from "@gas-killer/analyze
 await init() // in Node: initSync({ module: fs.readFileSync(".../gas_killer_wasm_bg.wasm") })
 ```
 
-### `analyze_trace(trace, estimator, caller, block?, origin?)`
+### `analyze_trace(trace, estimator, caller, block?, origin?, value?)`
 
 Analyzes the `result` of `debug_traceTransaction` with the default struct-log tracer (`{ enableMemory: true }`), passed as a JSON string.
 
@@ -24,13 +24,14 @@ Analyzes the `result` of `debug_traceTransaction` with the default struct-log tr
 - `caller`: the transaction's sender.
 - `block`: block number, as a `bigint`.
 - `origin`: the transaction's target contract, for detecting re-entrant callbacks.
+- `value`: the transaction's `msg.value` in wei, as a decimal or `0x` hex string. Pass it for transactions that send ETH: without it, a payload that forwards that ETH in a `CALL` can't be simulated and falls back to the heuristic.
 
 ```js
 const result = analyze_trace(JSON.stringify(trace), estimator, receipt.from, BigInt(receipt.blockNumber), receipt.to)
 // { gas_estimate, is_heuristic, encoded_updates, state_update_count, skipped_opcodes, reentered }
 ```
 
-### `analyze_trace_bytes(response, estimator, caller, block?, origin?)`
+### `analyze_trace_bytes(response, estimator, caller, block?, origin?, value?)`
 
 Takes the same arguments as `analyze_trace`, except that it accepts the whole JSON-RPC response body as a `Uint8Array`. Use it for large traces:
 
@@ -47,7 +48,7 @@ try {
 }
 ```
 
-### `analyze_prestate(diff, callFrame, consumer, estimator, caller, block?)`
+### `analyze_prestate(diff, callFrame, consumer, estimator, caller, block?, value?)`
 
 Analyzes the same transaction from two much smaller traces:
 
@@ -61,6 +62,31 @@ const out = analyze_prestate(JSON.stringify(diff), JSON.stringify(frame), receip
 if (out.eligible) use(out.result) // same shape as analyze_trace's result
 else console.log(out.reason) // fall back to analyze_trace
 ```
+
+### `analyze_frame_tree_bytes(response, root, owned, caller, block?, value?)`
+
+Prices the transaction as a nested settlement, as if its target `root` and the contracts in `owned` had integrated the SDK. `response` is the struct-log trace's JSON-RPC response, as for `analyze_trace_bytes`, and it throws the same named errors.
+
+A `CALL` from a frame into an owned contract becomes that contract's own frame wherever nesting is cheaper than running it natively. The result compares this tree with settling the whole transaction through `root` alone:
+
+```js
+const tree = analyze_frame_tree_bytes(response, receipt.to, [vault, ledger], receipt.from, block, tx.value.toString())
+// {
+//   root_only_gas, nested_gas,                          // the two settlements' totals
+//   root_only_native_call_gas, nested_native_call_gas,  // trace gas of the CALLs each replays natively
+//   frame_overhead_gas,                                 // the fixed charge per nested frame
+//   frames: [{ target, caller, op_count, gas }],        // root first, in execution order
+//   not_nested: [{ address, reason }],                  // owned contracts that got no frame, and why
+//   skipped_opcodes,
+// }
+```
+
+Both totals are measured against an empty state, so:
+
+- A natively replayed `CALL` runs into an address with no code. Its gas comes from the trace instead.
+- Every storage write is priced as a write to an empty slot. Against real state many are cheaper, so `nested_gas` tends to run high and the savings shown are conservative.
+
+There's no heuristic fallback: a simulation failure throws. `analyze_frame_tree(trace, …)` takes the trace as a JSON string instead.
 
 ### Also exported
 
