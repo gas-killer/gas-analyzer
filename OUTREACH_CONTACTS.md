@@ -184,8 +184,8 @@ people who would adopt it.
 - **X** [`@derivexyz`](https://x.com/derivexyz) ⚠️ (linked from Derive's own blog post, not seen on the site).
 - **Docs** <https://docs.derive.xyz> ✅, help center <https://help.derive.xyz/en/> ✅.
 - **No email or partnership form found.** The site's "Contact Us" only jumps to its integrations section.
-- **Check first:** in May 2025 Synthetix proposed acquiring Derive (SIP-415). We have not
-  confirmed whether that closed, which would change who to talk to.
+- Synthetix's May 2025 acquisition proposal (SIP-415) was withdrawn and is marked Rejected, so
+  Derive is still independent.
 
 ### USD8
 - Already in contact with the founder. Gas is not their problem. They want off-chain compute
