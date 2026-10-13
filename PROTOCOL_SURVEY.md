@@ -2830,7 +2830,12 @@ About 175k gas of these transactions runs in the diamond's own code. Every one m
 - 25 of the 57 Mayan transactions in the window have this shape, which is about 60 a day. The
   rest of the Mayan path has a median of 63k gas in the diamond and saves nothing.
 - Mayan is 57 of 1,193 LI.FI transactions, about 5%, so this is a small part of LI.FI's volume.
-- Not yet checked: which part of the Mayan facet's code accounts for the ~100k.
+- **Where the ~100k comes from:** `MayanFacet._replaceInputAmount` (facet `0x124aa916…`, verified
+  on Sourcify). On the ERC-20 path it rewrites the amount inside Mayan's `protocolData` by copying
+  the 580-byte buffer **one byte at a time** in a Solidity `for` loop. ERC-20 Mayan transactions
+  spend about 115–235k gas in the diamond. Native-ETH ones skip the rewrite and spend about 60k,
+  with the same 580-byte `protocolData`. LI.FI could remove most of this itself with a word-wise
+  copy or `mcopy`, so it is a code fix, not a Gas Killer case.
 
 **Conclusion:** LI.FI is not a strong candidate overall. It is a router, and the gas belongs to the
 protocols it routes into. The Mayan path is a narrow, real saving of ~100k gas per transaction,
