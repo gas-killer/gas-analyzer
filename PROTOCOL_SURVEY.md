@@ -2791,3 +2791,47 @@ All five rows are measured replays with the plain analyzer, not the heuristic fa
   is ~375M gas a month.
 - **Not measured:** deposits and withdrawals through `OnchainActionManager` (~145k gas each).
   These are mostly token transfers, so little is expected.
+
+## LI.FI — high volume, but almost all of the gas is spent in other protocols
+
+Measured 2026-10-13 on `main` (`8aed5cf`), plain mode, against the LiFiDiamond
+[`0x1231DEB6…`](https://etherscan.io/address/0x1231deb6f5749ef6ce6943a275a1d3e7486f4eae).
+
+**Volume.** The last 3,000 blocks (to 26,183,411, about 10 hours) held 1,220 transactions to the
+diamond, 1,193 of them successful. That is roughly 2,900 a day. Two kinds dominate: swap-and-bridge
+calls (Relay, Across, LayerSwap, Mayan, GasZip, NEAR Intents, Polymer CCTP) and multi-hop
+`swapTokens*V3` swaps.
+
+**Result: 0% on almost everything.** 36 transactions were sampled, three per function across the
+12 most common functions: the median-gas one, the largest, and one at random.
+
+- 33 of the 35 that finished scored 0%. One (`0x42a800ce…`, 3.9M gas) produced no result.
+- The call trees show why. In 33 of 36 transactions, 80–100% of the gas is spent inside
+  `CALL`s to DEX routers and bridge contracts. The analyzer replays those in full, and nested
+  settlement cannot help, because LI.FI does not own them.
+- What runs in the diamond itself (its facets, through `DELEGATECALL`) is about 30k–100k gas,
+  including the 21,000 intrinsic cost. Little of that is left after the 50,000 Schnorr cost.
+
+**The exception: Mayan swap-and-bridge** (`swapAndStartBridgeTokensViaMayan`, `0x80c65808`).
+About 175k gas of these transactions runs in the diamond's own code. Every one measured saves
+95,000–110,000 gas through a real replay:
+
+| tx | gas used | saved (Schnorr) | % |
+|---|---:|---:|---:|
+| [`0x2aa216df…`](https://etherscan.io/tx/0x2aa216df77ec060baeac5413f19cba623ebb28e8b6268ace45f55842a4fb149a) | 393,514 | 97,060 | **24.66%** |
+| [`0xddbe18f5…`](https://etherscan.io/tx/0xddbe18f56f819a846c46ea8eb54006363ca53f57292540c48b91d648e96f44ca) | 393,742 | 97,077 | **24.65%** |
+| [`0xfe87b620…`](https://etherscan.io/tx/0xfe87b620b61d48d0cd0c1997438f01ea693610aef4a1d423f333cd7e7805bfa5) | 392,385 | 95,152 | **24.25%** |
+| [`0xc71d14da…`](https://etherscan.io/tx/0xc71d14da8ff072a1bd27667fdf41e6157cbbfd4f515b23cbcb83d354a1824f6c) | 412,545 | 98,844 | **23.96%** |
+| [`0xc90f170a…`](https://etherscan.io/tx/0xc90f170ac1e990077e7a00cf965859504ca15500b2a8d07cbc612b8e42c154b7) | 947,458 | 94,782 | 10.00% |
+| [`0x387c04e5…`](https://etherscan.io/tx/0x387c04e5b97efc370f364a0dac90a2c8e0c7daf55473b83a05cbb4b41be74821) | 1,127,754 | 109,433 | 9.70% |
+
+- The saving is a nearly fixed ~100k gas. The percentage depends on how much swap routing comes
+  before it.
+- 25 of the 57 Mayan transactions in the window have this shape, which is about 60 a day. The
+  rest of the Mayan path has a median of 63k gas in the diamond and saves nothing.
+- Mayan is 57 of 1,193 LI.FI transactions, about 5%, so this is a small part of LI.FI's volume.
+- Not yet checked: which part of the Mayan facet's code accounts for the ~100k.
+
+**Conclusion:** LI.FI is not a strong candidate overall. It is a router, and the gas belongs to the
+protocols it routes into. The Mayan path is a narrow, real saving of ~100k gas per transaction,
+worth raising only if LI.FI is already in conversation.
