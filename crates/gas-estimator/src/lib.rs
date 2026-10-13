@@ -99,6 +99,14 @@ fn estimator_bytecode() -> Bytes {
         .clone()
 }
 
+/// The estimator's analyzed code and its hash, built once: injection runs per estimate, and
+/// hashing the code there dominated `estimate_gas_raw` against an empty state.
+static ESTIMATOR_CODE: LazyLock<(revm::state::Bytecode, B256)> = LazyLock::new(|| {
+    let code = revm::state::Bytecode::new_raw(estimator_bytecode());
+    let hash = code.hash_slow();
+    (code, hash)
+});
+
 static IMPL_SLOT: LazyLock<U256> = LazyLock::new(|| {
     U256::from_be_bytes(*alloy_primitives::keccak256("gas.estimator.implementation"))
         - U256::from(1)
@@ -201,11 +209,15 @@ where
         .flatten()
         .unwrap_or_default();
 
-    let estimator = revm::state::Bytecode::new_raw(estimator_bytecode());
-    let estimator_hash = estimator.hash_slow();
+    let (estimator, estimator_hash) = ESTIMATOR_CODE.clone();
     let original_hash = match original_account.code {
         Some(code) if !code.is_empty() => {
-            let hash = code.hash_slow();
+            let stored = original_account.code_hash;
+            let hash = if stored.is_zero() || stored == revm::primitives::KECCAK_EMPTY {
+                code.hash_slow()
+            } else {
+                stored
+            };
             // Inserted first, so the original code is what `contracts` keeps under its hash.
             cache_db.insert_account_info(
                 backup_addr,
