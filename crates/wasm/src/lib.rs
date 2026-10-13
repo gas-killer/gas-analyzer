@@ -53,6 +53,9 @@ pub struct AnalyzeTraceResult {
     /// The callees ran their own code over the state from `prestate`, so `gas_estimate` measures
     /// what they cost in the settlement instead of taking it from the trace.
     pub callees_executed: bool,
+    /// Why a replay over `prestate` failed and the estimate fell back, so a missing `timestamp` or
+    /// block can be told from a callee that reverts in the settlement.
+    pub replay_error: Option<String>,
     /// See [`SIGNATURE_VERIFICATION_GAS`]; not included in `gas_estimate`.
     pub signature_verification_gas: u64,
 }
@@ -99,6 +102,8 @@ pub struct FrameTreeAnalysis {
     /// The callees ran their own code over the state from `prestate`, so both totals measure what
     /// they cost in the settlement instead of taking it from the trace.
     pub callees_executed: bool,
+    /// See [`AnalyzeTraceResult::replay_error`]; names the settlement that failed.
+    pub replay_error: Option<String>,
     /// The cost model's fixed charge per nested frame, included in `nested_gas`.
     pub frame_overhead_gas: u64,
     /// See [`SIGNATURE_VERIFICATION_GAS`]; one signature covers the whole tree, and neither total
@@ -655,15 +660,17 @@ fn analyze_extract(
 
     // Injected at the consumer itself, the estimator runs the program over the state the
     // transaction started from, so each callee runs its own code, as the consumer's callee.
-    let replayed = replay.and_then(|(replay, consumer)| {
-        let mut cache_db = seeded_db(&replay.seeds()).ok()?;
+    let replayed = replay.map(|(replay, consumer)| {
+        let mut cache_db = seeded_db(&replay.seeds())?;
         let sim_env = replay.sim_env(estimate_state_changes_block_number, value);
-        estimate_state_changes_gas(&mut cache_db, consumer, caller, state_updates, &sim_env).ok()
+        estimate_state_changes_gas(&mut cache_db, consumer, caller, state_updates, &sim_env)
+            .map_err(|e| e.to_string())
     });
+    let replay_error = replayed.as_ref().and_then(|r| r.as_ref().err().cloned());
 
     let (gas_estimate, is_heuristic, callees_executed) = match replayed {
-        Some(gas) => (gas, false, true),
-        None => {
+        Some(Ok(gas)) => (gas, false, true),
+        _ => {
             // The program writes the consumer's slots, here into the estimator's storage.
             let seeds = Seeds::for_program(diff, addr, state_updates, with_code);
             let mut cache_db = seeded_db(&seeds)?;
@@ -688,6 +695,7 @@ fn analyze_extract(
         reentered: extract.reentered,
         native_call_gas: extract.callee_gas_total,
         callees_executed,
+        replay_error,
         signature_verification_gas: SIGNATURE_VERIFICATION_GAS,
     })
 }
@@ -816,24 +824,30 @@ fn analyze_frame_tree_trace(
     // With the starting state, each frame's target keeps its storage and balance under the injected
     // estimator, and the callees outside the tree run their own code. Both settlements are priced
     // the same way, so their difference stays the nesting alone.
-    let replayed = replay.and_then(|replay| {
+    let replayed = replay.map(|replay| {
         let env = replay.sim_env(estimate_state_changes_block_number, value);
-        let price = |frames: &[FrameProgram]| {
-            let mut cache_db = seeded_db(&replay.seeds()).ok()?;
-            estimate_frame_tree_gas(&mut cache_db, frames, caller, value, &env).ok()
+        let price = |settlement: &str, frames: &[FrameProgram]| {
+            let mut cache_db = seeded_db(&replay.seeds())?;
+            estimate_frame_tree_gas(&mut cache_db, frames, caller, value, &env)
+                .map_err(|e| format!("{settlement}: {e}"))
         };
-        Some((price(&root_only.frames)?, price(&nested.frames)?))
+        Ok::<_, String>((
+            price("root-only", &root_only.frames)?,
+            price("nested", &nested.frames)?,
+        ))
     });
-    let callees_executed = replayed.is_some();
-    let (root_only_gas, frame_gas, root_only_callees, nested_callees) = match replayed {
-        Some((root_only_gas, frame_gas)) => (root_only_gas, frame_gas, 0, 0),
-        None => (
-            price(&root_only.frames)?,
-            price(&nested.frames)?,
-            root_only.callee_gas_total,
-            nested.callee_gas_total,
-        ),
-    };
+    let replay_error = replayed.as_ref().and_then(|r| r.as_ref().err().cloned());
+    let (root_only_gas, frame_gas, root_only_callees, nested_callees, callees_executed) =
+        match replayed {
+            Some(Ok((root_only_gas, frame_gas))) => (root_only_gas, frame_gas, 0, 0, true),
+            _ => (
+                price(&root_only.frames)?,
+                price(&nested.frames)?,
+                root_only.callee_gas_total,
+                nested.callee_gas_total,
+                false,
+            ),
+        };
     let root_only_gas = frame_tree_total(&root_only_gas, &cost).saturating_add(root_only_callees);
 
     let mut skipped = nested.skipped_opcodes.into_iter().collect::<Vec<_>>();
@@ -842,6 +856,7 @@ fn analyze_frame_tree_trace(
         root_only_gas,
         nested_gas: frame_tree_total(&frame_gas, &cost).saturating_add(nested_callees),
         callees_executed,
+        replay_error,
         root_only_native_call_gas: root_only.callee_gas_total,
         nested_native_call_gas: nested.callee_gas_total,
         frame_overhead_gas: cost.frame_overhead_gas,
@@ -989,7 +1004,8 @@ pub fn encode_trace_inner(trace_json: &str) -> Result<EncodeTraceResult, String>
 /// see [`Replay`]. When that reverts, the estimate falls back to the empty state.
 ///
 /// Returns a JS object with: `encoded_updates`, `gas_estimate`, `is_heuristic`,
-/// `state_update_count`, `skipped_opcodes`, `reentered`, `native_call_gas`, `callees_executed`.
+/// `state_update_count`, `skipped_opcodes`, `reentered`, `native_call_gas`, `callees_executed`,
+/// `replay_error`.
 #[wasm_bindgen]
 pub fn analyze_trace(
     trace_json: &str,
@@ -1228,6 +1244,7 @@ export interface AnalyzeTraceResult {
     reentered: boolean;
     native_call_gas: number;
     callees_executed: boolean;
+    replay_error: string | null;
     signature_verification_gas: number;
 }
 
@@ -1257,6 +1274,7 @@ export interface FrameTreeAnalysis {
     root_only_native_call_gas: number;
     nested_native_call_gas: number;
     callees_executed: boolean;
+    replay_error: string | null;
     frame_overhead_gas: number;
     signature_verification_gas: number;
     frames: FrameGas[];
@@ -2506,6 +2524,7 @@ mod tests {
             !free.callees_executed,
             "the callee reverts, so the replay falls back"
         );
+        assert!(paid.replay_error.is_none() && free.replay_error.is_some());
         assert_eq!(free.gas_estimate, analyze_with(None).gas_estimate);
     }
 
@@ -2700,6 +2719,15 @@ mod tests {
         // Root-only, the vault runs its code and reverts, so neither settlement is replayed.
         let reverting = analyze(Some("0xfe"));
         assert!(!reverting.callees_executed);
+        assert!(replayed.replay_error.is_none());
+        assert!(
+            reverting
+                .replay_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("root-only: ")),
+            "{:?}",
+            reverting.replay_error
+        );
         assert_eq!(
             (reverting.root_only_gas, reverting.nested_gas),
             (empty.root_only_gas, empty.nested_gas)

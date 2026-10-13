@@ -36,10 +36,10 @@ Analyzes the `result` of `debug_traceTransaction` with the default struct-log tr
 
 ```js
 const result = analyze_trace(JSON.stringify(trace), estimator, receipt.from, BigInt(receipt.blockNumber), receipt.to)
-// { gas_estimate, is_heuristic, encoded_updates, state_update_count, skipped_opcodes, reentered, native_call_gas, callees_executed }
+// { gas_estimate, is_heuristic, encoded_updates, state_update_count, skipped_opcodes, reentered, native_call_gas, callees_executed, replay_error }
 ```
 
-With `prestate`, the callees run their own code and `callees_executed` is `true`. A callee can still revert in the settlement's context, for instance a swap whose callback into the target checks state its entry point set up. The estimate then falls back to the empty state.
+With `prestate`, the callees run their own code and `callees_executed` is `true`. A callee can still revert in the settlement's context, for instance a swap whose callback into the target checks state its entry point set up. It can also revert because an input is missing: without `block` and `timestamp` both run as 0. The estimate then falls back to the empty state, and `replay_error` says why the replay failed.
 
 Against the empty state, the contracts the transaction calls have no code, and the state holds only what `prestateDiff` supplies. The simulation charges each external `CALL` the program replays for the opcode itself, and what its callee spent comes from the trace instead. That trace gas is reported as `native_call_gas`, and it's part of `gas_estimate` unless `callees_executed`. A callee can cost more or less in the settlement than in the trace, since the target's reads and earlier calls aren't replayed.
 
@@ -96,7 +96,7 @@ const tree = analyze_frame_tree_bytes(response, receipt.to, [vault, ledger], rec
 // }
 ```
 
-With `prestate`, both settlements run over the transaction's starting state, as for `analyze_trace`. Each frame's target keeps its storage and balance, and the contracts outside the tree run their own code. If either settlement fails that way, both fall back to the empty state, so `callees_executed` describes the pair. In the empty state:
+With `prestate`, both settlements run over the transaction's starting state, as for `analyze_trace`. Each frame's target keeps its storage and balance, and the contracts outside the tree run their own code. If either settlement fails that way, both fall back to the empty state, so `callees_executed` describes the pair, and `replay_error` names the settlement that failed and why. In the empty state:
 
 - A natively replayed `CALL` runs into an address with no code. The simulation charges the opcode, and what its callee spent comes from the trace.
 - The state holds only what `prestateDiff` supplies, as for `analyze_trace`. Without it every write is priced as a write to an empty slot and every ETH transfer as one to a new account, so both totals run high.
