@@ -2514,6 +2514,21 @@ mod tests {
     }
 
     #[test]
+    fn test_a_callee_sees_the_consumers_own_code_hash() {
+        // keccak256(0x00), the consumer's code below.
+        let hash = "bc36789e7a1e281436464229828f817d6612f7b477d66591ff96a9e064bcc98a";
+        // Reverts unless EXTCODEHASH(CALLER) is that hash, as a codehash allowlist would.
+        let gate = format!("0x333f7f{hash}14602b57600080fd5b00");
+        let prestate = serde_json::json!({
+            CONSUMER: { "code": "0x00", "nonce": 1 },
+            CALLEE: { "code": gate, "nonce": 1 },
+        });
+        let replay = Replay::parse(&prestate.to_string(), None, None).unwrap();
+        let result = analyze_with(Some(&replay));
+        assert!(result.callees_executed, "{:?}", result.replay_error);
+    }
+
+    #[test]
     fn test_a_callee_checking_the_gas_price_runs_at_the_transactions() {
         // Reverts unless GASPRICE is at least 1 gwei, as Railgun's wallet checks its relayer's.
         let gate = "0x633b9aca003a10600b57005b600080fd";
