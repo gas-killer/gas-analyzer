@@ -16,7 +16,7 @@ import init, { analyze_trace_bytes, analyze_prestate } from "@gas-killer/analyze
 await init() // in Node: initSync({ module: fs.readFileSync(".../gas_killer_wasm_bg.wasm") })
 ```
 
-### `analyze_trace(trace, estimator, caller, block?, origin?, value?, prestateDiff?)`
+### `analyze_trace(trace, estimator, caller, block?, origin?, value?, prestateDiff?, prestate?, gasPrice?, timestamp?)`
 
 Analyzes the `result` of `debug_traceTransaction` with the default struct-log tracer (`{ enableMemory: true }`), passed as a JSON string.
 
@@ -30,17 +30,22 @@ Analyzes the `result` of `debug_traceTransaction` with the default struct-log tr
   - every `CALL` that sends ETH pays the 25,000-gas charge for creating its recipient, which on chain only a new account pays.
 
   The diff supplies each written slot's value before the transaction and the called accounts that already existed. A recipient whose call runs code in the trace is treated as existing even without the diff, which leaves it out when its balance ends unchanged.
+- `prestate`: the transaction's `prestateTracer` output in its default mode (`{ tracer: "prestateTracer" }`, no `diffMode`), as a JSON string. It has the code, balance, nonce and touched slots of every account the transaction touched. With it, the program runs at `origin` itself over that state, so each contract it calls runs its own code and is measured in the settlement's context. It needs `origin`.
+- `gasPrice`: the transaction's effective gas price in wei, as for `value`, for callees that check `tx.gasprice`.
+- `timestamp`: the block's timestamp, as a `bigint`, for callees that check `block.timestamp`.
 
 ```js
 const result = analyze_trace(JSON.stringify(trace), estimator, receipt.from, BigInt(receipt.blockNumber), receipt.to)
-// { gas_estimate, is_heuristic, encoded_updates, state_update_count, skipped_opcodes, reentered, native_call_gas }
+// { gas_estimate, is_heuristic, encoded_updates, state_update_count, skipped_opcodes, reentered, native_call_gas, callees_executed }
 ```
 
-The estimate is measured against an empty state, holding only what `prestateDiff` supplies, where the contracts the transaction calls have no code. The simulation charges each external `CALL` the program replays for the opcode itself, and what its callee spent comes from the trace instead, reported as `native_call_gas` and included in `gas_estimate`.
+With `prestate`, the callees run their own code and `callees_executed` is `true`. A callee can still revert in the settlement's context, for instance a swap whose callback into the target checks state its entry point set up. The estimate then falls back to the empty state.
+
+Against the empty state, the contracts the transaction calls have no code, and the state holds only what `prestateDiff` supplies. The simulation charges each external `CALL` the program replays for the opcode itself, and what its callee spent comes from the trace instead. That trace gas is reported as `native_call_gas`, and it's part of `gas_estimate` unless `callees_executed`. A callee can cost more or less in the settlement than in the trace, since the target's reads and earlier calls aren't replayed.
 
 `gas_estimate` covers applying the state updates. Settling also verifies the operators' aggregate signature, which costs up to `signature_verification_gas` (50,000 gas for Schnorr). Add the two for the transaction's total cost with Gas Killer.
 
-### `analyze_trace_bytes(response, estimator, caller, block?, origin?, value?, prestateDiff?)`
+### `analyze_trace_bytes(response, estimator, caller, block?, origin?, value?, prestateDiff?, prestate?, gasPrice?, timestamp?)`
 
 Takes the same arguments as `analyze_trace`, except that it accepts the whole JSON-RPC response body as a `Uint8Array`. Use it for large traces:
 
@@ -72,7 +77,7 @@ if (out.eligible) use(out.result) // same shape as analyze_trace's result
 else console.log(out.reason) // fall back to analyze_trace
 ```
 
-### `analyze_frame_tree_bytes(response, root, owned, caller, block?, value?, prestateDiff?)`
+### `analyze_frame_tree_bytes(response, root, owned, caller, block?, value?, prestateDiff?, prestate?, gasPrice?, timestamp?)`
 
 Prices the transaction as a nested settlement, as if its target `root` and the contracts in `owned` had integrated the SDK. `response` is the struct-log trace's JSON-RPC response, as for `analyze_trace_bytes`, and it throws the same named errors.
 
@@ -91,7 +96,7 @@ const tree = analyze_frame_tree_bytes(response, receipt.to, [vault, ledger], rec
 // }
 ```
 
-Both totals are measured against an empty state, so:
+With `prestate`, both settlements run over the transaction's starting state, as for `analyze_trace`. Each frame's target keeps its storage and balance, and the contracts outside the tree run their own code. If either settlement fails that way, both fall back to the empty state, so `callees_executed` describes the pair. In the empty state:
 
 - A natively replayed `CALL` runs into an address with no code. The simulation charges the opcode, and what its callee spent comes from the trace.
 - The state holds only what `prestateDiff` supplies, as for `analyze_trace`. Without it every write is priced as a write to an empty slot and every ETH transfer as one to a new account, so both totals run high.

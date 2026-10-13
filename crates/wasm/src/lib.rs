@@ -1,7 +1,11 @@
+// The exports take the JS API's positional arguments, and the `_inner` functions and their helpers
+// mirror them.
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use alloy_primitives::{Address, B256, U256};
-use alloy_rpc_types::trace::geth::{CallFrame, DefaultFrame, DiffMode};
+use alloy_primitives::{Address, B256, U256, keccak256};
+use alloy_rpc_types::trace::geth::{AccountState, CallFrame, DefaultFrame, DiffMode};
 use gas_analyzer_core::nested::{
     FrameProgram, NESTING_COST_MODEL_V1, compute_frame_tree_hypothetical, frame_tree_total,
     unnested_owned,
@@ -13,8 +17,9 @@ use gas_analyzer_core::{
 };
 use gas_analyzer_estimator::{SimEnvOpts, estimate_frame_tree_gas, estimate_state_changes_gas};
 use revm::database::{CacheDB, EmptyDB};
+use revm::primitives::KECCAK_EMPTY;
 use revm::primitives::hardfork::SpecId;
-use revm::state::AccountInfo;
+use revm::state::{AccountInfo, Bytecode};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
@@ -42,9 +47,12 @@ pub struct AnalyzeTraceResult {
     /// execution; the estimate counts that callback gas as external and may
     /// overshoot. Only detected when an origin address was supplied.
     pub reentered: bool,
-    /// What the callees of the `CALL`s the program replays spent in the trace, included in
-    /// `gas_estimate`: the simulation runs those `CALL`s into accounts without code.
+    /// What the callees of the `CALL`s the program replays spent in the trace. Included in
+    /// `gas_estimate` unless `callees_executed`, since the callees then have no code to run.
     pub native_call_gas: u64,
+    /// The callees ran their own code over the state from `prestate`, so `gas_estimate` measures
+    /// what they cost in the settlement instead of taking it from the trace.
+    pub callees_executed: bool,
     /// See [`SIGNATURE_VERIFICATION_GAS`]; not included in `gas_estimate`.
     pub signature_verification_gas: u64,
 }
@@ -83,11 +91,14 @@ pub struct FrameTreeAnalysis {
     /// from `nested_gas` is the nesting alone.
     pub root_only_gas: u64,
     pub nested_gas: u64,
-    /// What the callees of the `CALL`s each settlement replays natively spent in the trace,
-    /// included in its total: against an empty state those callees have no code, so the
-    /// simulation charges only the `CALL` opcodes.
+    /// What the callees of the `CALL`s each settlement replays natively spent in the trace.
+    /// Included in its total unless `callees_executed`: against an empty state those callees have
+    /// no code, so the simulation charges only the `CALL` opcodes.
     pub root_only_native_call_gas: u64,
     pub nested_native_call_gas: u64,
+    /// The callees ran their own code over the state from `prestate`, so both totals measure what
+    /// they cost in the settlement instead of taking it from the trace.
+    pub callees_executed: bool,
     /// The cost model's fixed charge per nested frame, included in `nested_gas`.
     pub frame_overhead_gas: u64,
     /// See [`SIGNATURE_VERIFICATION_GAS`]; one signature covers the whole tree, and neither total
@@ -209,6 +220,62 @@ fn parse_origin(origin_address: Option<&str>) -> Result<Option<Address>, String>
                 .map_err(|e| format!("Invalid origin address: {}", e))
         })
         .transpose()
+}
+
+/// What lets the callees of a replayed `CALL` run their own code: the state the transaction started
+/// from, and the gas price and timestamp they may check.
+pub struct Replay {
+    /// `prestateTracer` in its default mode: every account the transaction touched, with its code,
+    /// balance, nonce and every slot it touched, as they were before the transaction.
+    state: BTreeMap<Address, AccountState>,
+    gas_price: u128,
+    timestamp: u64,
+}
+
+impl Replay {
+    pub fn parse(
+        prestate_json: &str,
+        gas_price: Option<&str>,
+        timestamp: Option<u64>,
+    ) -> Result<Replay, String> {
+        let state = serde_json::from_str(prestate_json)
+            .map_err(|e| format!("Failed to parse prestate: {}", e))?;
+        let gas_price = parse_value(gas_price)?
+            .try_into()
+            .map_err(|_| "gas price is out of range".to_string())?;
+        Ok(Replay {
+            state,
+            gas_price,
+            timestamp: timestamp.unwrap_or_default(),
+        })
+    }
+
+    /// Every touched account as it was before the transaction, code included.
+    fn seeds(&self) -> Seeds {
+        let mut seeds = Seeds::default();
+        for (address, account) in &self.state {
+            let code = account.code.clone().filter(|code| !code.is_empty());
+            seeds.accounts.insert(
+                *address,
+                AccountInfo {
+                    balance: account.balance.unwrap_or_default(),
+                    nonce: account.nonce.unwrap_or_default(),
+                    code_hash: code.as_ref().map_or(KECCAK_EMPTY, keccak256),
+                    code: code.map(Bytecode::new_raw),
+                },
+            );
+            seeds.storage.insert(*address, account.storage.clone());
+        }
+        seeds
+    }
+
+    fn sim_env(&self, block_number: Option<u64>, value: U256) -> SimEnvOpts {
+        SimEnvOpts {
+            gas_price: self.gas_price,
+            timestamp: self.timestamp,
+            ..sim_env(block_number, value)
+        }
+    }
 }
 
 fn parse_diff(diff_json: &str) -> Result<DiffMode, String> {
@@ -362,6 +429,7 @@ pub fn analyze_trace_inner(
     origin_address: Option<&str>,
     value: Option<&str>,
     prestate_diff_json: Option<&str>,
+    replay: Option<&Replay>,
 ) -> Result<AnalyzeTraceResult, String> {
     let origin = parse_origin(origin_address)?;
     let (extract, with_code) = parse_and_compute(trace_json, origin)?;
@@ -374,7 +442,21 @@ pub fn analyze_trace_inner(
         value,
         diff.as_ref().map(|(diff, origin)| (diff, *origin)),
         &with_code,
+        trace_replay(origin, replay)?,
     )
+}
+
+/// The replay for a struct-log extraction, whose program stands in for `origin`.
+fn trace_replay(
+    origin: Option<Address>,
+    replay: Option<&Replay>,
+) -> Result<Option<(&Replay, Address)>, String> {
+    replay
+        .map(|replay| {
+            let origin = origin.ok_or("a prestate needs origin_address, the account it settles")?;
+            Ok((replay, origin))
+        })
+        .transpose()
 }
 
 /// The prestate diff for a struct-log extraction, whose program stands in for `origin`.
@@ -399,6 +481,7 @@ pub fn analyze_trace_bytes_inner(
     origin_address: Option<&str>,
     value: Option<&str>,
     prestate_diff_json: Option<&str>,
+    replay: Option<&Replay>,
 ) -> Result<AnalyzeTraceResult, AnalyzeTraceBytesError> {
     use AnalyzeTraceBytesError::Analysis;
     let origin = parse_origin(origin_address).map_err(Analysis)?;
@@ -413,6 +496,7 @@ pub fn analyze_trace_bytes_inner(
         value,
         diff.as_ref().map(|(diff, origin)| (diff, *origin)),
         &with_code,
+        trace_replay(origin, replay).map_err(Analysis)?,
     )
     .map_err(Analysis)
 }
@@ -500,6 +584,7 @@ pub fn analyze_prestate_inner(
             value,
             Some((&diff, consumer)),
             &BTreeSet::new(),
+            None,
         )?),
     })
 }
@@ -554,6 +639,7 @@ fn analyze_extract(
     value: Option<&str>,
     diff: Option<(&DiffMode, Address)>,
     with_code: &BTreeSet<Address>,
+    replay: Option<(&Replay, Address)>,
 ) -> Result<AnalyzeTraceResult, String> {
     let state_updates: &[StateUpdate] = &extract.state_updates;
 
@@ -565,17 +651,30 @@ fn analyze_extract(
 
     let caller = parse_caller(caller_address)?;
 
-    // The program writes the consumer's slots, here into the estimator's storage.
-    let seeds = Seeds::for_program(diff, addr, state_updates, with_code);
-    let mut cache_db = seeded_db(&seeds)?;
-    let sim_env = sim_env(estimate_state_changes_block_number, parse_value(value)?);
+    let value = parse_value(value)?;
 
-    let (gas_estimate, is_heuristic) =
-        match estimate_state_changes_gas(&mut cache_db, addr, caller, state_updates, &sim_env) {
-            // The callees have no code in `EmptyDB`, so the simulation charges only the `CALL`s.
-            Ok(gas) => (gas.saturating_add(extract.callee_gas_total), false),
-            Err(_) => (estimate_gas_from_state_updates(extract), true),
-        };
+    // Injected at the consumer itself, the estimator runs the program over the state the
+    // transaction started from, so each callee runs its own code, as the consumer's callee.
+    let replayed = replay.and_then(|(replay, consumer)| {
+        let mut cache_db = seeded_db(&replay.seeds()).ok()?;
+        let sim_env = replay.sim_env(estimate_state_changes_block_number, value);
+        estimate_state_changes_gas(&mut cache_db, consumer, caller, state_updates, &sim_env).ok()
+    });
+
+    let (gas_estimate, is_heuristic, callees_executed) = match replayed {
+        Some(gas) => (gas, false, true),
+        None => {
+            // The program writes the consumer's slots, here into the estimator's storage.
+            let seeds = Seeds::for_program(diff, addr, state_updates, with_code);
+            let mut cache_db = seeded_db(&seeds)?;
+            let sim_env = sim_env(estimate_state_changes_block_number, value);
+            match estimate_state_changes_gas(&mut cache_db, addr, caller, state_updates, &sim_env) {
+                // The callees have no code here, so the simulation charges only the `CALL`s.
+                Ok(gas) => (gas.saturating_add(extract.callee_gas_total), false, false),
+                Err(_) => (estimate_gas_from_state_updates(extract), true, false),
+            }
+        }
+    };
 
     let mut skipped = extract.skipped_opcodes.iter().cloned().collect::<Vec<_>>();
     skipped.sort();
@@ -588,6 +687,7 @@ fn analyze_extract(
         skipped_opcodes: skipped,
         reentered: extract.reentered,
         native_call_gas: extract.callee_gas_total,
+        callees_executed,
         signature_verification_gas: SIGNATURE_VERIFICATION_GAS,
     })
 }
@@ -684,6 +784,7 @@ fn analyze_frame_tree_trace(
     estimate_state_changes_block_number: Option<u64>,
     value: Option<&str>,
     prestate_diff_json: Option<&str>,
+    replay: Option<&Replay>,
 ) -> Result<FrameTreeAnalysis, String> {
     let diff = prestate_diff_json.map(parse_diff).transpose()?;
     let root: Address = root_address
@@ -712,15 +813,35 @@ fn analyze_frame_tree_trace(
         estimate_frame_tree_gas(&mut seeded_db(&seeds)?, frames, caller, value, &sim_env)
             .map_err(|e| format!("Gas estimation failed: {}", e))
     };
-    let root_only_gas = frame_tree_total(&price(&root_only.frames)?, &cost)
-        .saturating_add(root_only.callee_gas_total);
-    let frame_gas = price(&nested.frames)?;
+    // With the starting state, each frame's target keeps its storage and balance under the injected
+    // estimator, and the callees outside the tree run their own code. Both settlements are priced
+    // the same way, so their difference stays the nesting alone.
+    let replayed = replay.and_then(|replay| {
+        let env = replay.sim_env(estimate_state_changes_block_number, value);
+        let price = |frames: &[FrameProgram]| {
+            let mut cache_db = seeded_db(&replay.seeds()).ok()?;
+            estimate_frame_tree_gas(&mut cache_db, frames, caller, value, &env).ok()
+        };
+        Some((price(&root_only.frames)?, price(&nested.frames)?))
+    });
+    let callees_executed = replayed.is_some();
+    let (root_only_gas, frame_gas, root_only_callees, nested_callees) = match replayed {
+        Some((root_only_gas, frame_gas)) => (root_only_gas, frame_gas, 0, 0),
+        None => (
+            price(&root_only.frames)?,
+            price(&nested.frames)?,
+            root_only.callee_gas_total,
+            nested.callee_gas_total,
+        ),
+    };
+    let root_only_gas = frame_tree_total(&root_only_gas, &cost).saturating_add(root_only_callees);
 
     let mut skipped = nested.skipped_opcodes.into_iter().collect::<Vec<_>>();
     skipped.sort();
     Ok(FrameTreeAnalysis {
         root_only_gas,
-        nested_gas: frame_tree_total(&frame_gas, &cost).saturating_add(nested.callee_gas_total),
+        nested_gas: frame_tree_total(&frame_gas, &cost).saturating_add(nested_callees),
+        callees_executed,
         root_only_native_call_gas: root_only.callee_gas_total,
         nested_native_call_gas: nested.callee_gas_total,
         frame_overhead_gas: cost.frame_overhead_gas,
@@ -757,6 +878,7 @@ pub fn analyze_frame_tree_inner(
     estimate_state_changes_block_number: Option<u64>,
     value: Option<&str>,
     prestate_diff_json: Option<&str>,
+    replay: Option<&Replay>,
 ) -> Result<FrameTreeAnalysis, String> {
     let trace: LeanFrame =
         serde_json::from_str(trace_json).map_err(|e| format!("Failed to parse trace: {}", e))?;
@@ -768,6 +890,7 @@ pub fn analyze_frame_tree_inner(
         estimate_state_changes_block_number,
         value,
         prestate_diff_json,
+        replay,
     )
 }
 
@@ -780,6 +903,7 @@ pub fn analyze_frame_tree_bytes_inner(
     estimate_state_changes_block_number: Option<u64>,
     value: Option<&str>,
     prestate_diff_json: Option<&str>,
+    replay: Option<&Replay>,
 ) -> Result<FrameTreeAnalysis, AnalyzeTraceBytesError> {
     let trace = parse_trace_response(response)?;
     analyze_frame_tree_trace(
@@ -790,6 +914,7 @@ pub fn analyze_frame_tree_bytes_inner(
         estimate_state_changes_block_number,
         value,
         prestate_diff_json,
+        replay,
     )
     .map_err(AnalyzeTraceBytesError::Analysis)
 }
@@ -858,8 +983,13 @@ pub fn encode_trace_inner(trace_json: &str) -> Result<EncodeTraceResult, String>
 /// before the transaction, and creates the called accounts that already existed. Without it every
 /// write is priced as one to an empty slot, and every ETH transfer as one to a new account.
 ///
+/// `prestate_json` is the transaction's `prestateTracer` output in its default mode, with
+/// `gas_price` (wei, as for `value`) and `block_timestamp`. With it the program runs at
+/// `origin_address` over the state the transaction started from, so each callee runs its own code;
+/// see [`Replay`]. When that reverts, the estimate falls back to the empty state.
+///
 /// Returns a JS object with: `encoded_updates`, `gas_estimate`, `is_heuristic`,
-/// `state_update_count`, `skipped_opcodes`, `reentered`.
+/// `state_update_count`, `skipped_opcodes`, `reentered`, `native_call_gas`, `callees_executed`.
 #[wasm_bindgen]
 pub fn analyze_trace(
     trace_json: &str,
@@ -869,7 +999,14 @@ pub fn analyze_trace(
     origin_address: Option<String>,
     value: Option<String>,
     prestate_diff_json: Option<String>,
+    prestate_json: Option<String>,
+    gas_price: Option<String>,
+    block_timestamp: Option<u64>,
 ) -> Result<JsValue, JsError> {
+    let replay = prestate_json
+        .map(|json| Replay::parse(&json, gas_price.as_deref(), block_timestamp))
+        .transpose()
+        .map_err(|e| JsError::new(&e))?;
     let result = analyze_trace_inner(
         trace_json,
         estimator_address,
@@ -878,6 +1015,7 @@ pub fn analyze_trace(
         origin_address.as_deref(),
         value.as_deref(),
         prestate_diff_json.as_deref(),
+        replay.as_ref(),
     )
     .map_err(|e| JsError::new(&e))?;
     to_js(&result)
@@ -898,7 +1036,14 @@ pub fn analyze_trace_bytes(
     origin_address: Option<String>,
     value: Option<String>,
     prestate_diff_json: Option<String>,
+    prestate_json: Option<String>,
+    gas_price: Option<String>,
+    block_timestamp: Option<u64>,
 ) -> Result<JsValue, JsValue> {
+    let replay = prestate_json
+        .map(|json| Replay::parse(&json, gas_price.as_deref(), block_timestamp))
+        .transpose()
+        .map_err(|e| JsValue::from(JsError::new(&e)))?;
     let result = analyze_trace_bytes_inner(
         response,
         estimator_address,
@@ -907,6 +1052,7 @@ pub fn analyze_trace_bytes(
         origin_address.as_deref(),
         value.as_deref(),
         prestate_diff_json.as_deref(),
+        replay.as_ref(),
     )
     .map_err(bytes_error_to_js)?;
     Ok(to_js(&result)?)
@@ -972,13 +1118,14 @@ pub fn analyze_prestate(
 /// `trace_json` is the struct-log trace, as for [`analyze_trace`]. A `CALL` from a frame into an
 /// owned contract becomes that contract's own frame where nesting is cheaper under the cost model.
 /// Both the nested tree and the root-only settlement are split from the same trace and priced in
-/// execution order on one empty state, so their difference is the nesting alone. That state holds
-/// what `prestate_diff_json` supplies, as for [`analyze_trace`]. A `CALL` either
-/// settlement replays natively is charged what its callee spent in the trace, since that callee
-/// has no code in that state. There is no heuristic fallback: a simulation failure throws.
+/// execution order on one state, so their difference is the nesting alone. With `prestate_json`
+/// that is the transaction's starting state and the callees outside the tree run their own code;
+/// otherwise it's empty but for what `prestate_diff_json` supplies, and a `CALL` either settlement
+/// replays natively is charged what its callee spent in the trace. There is no heuristic fallback:
+/// a simulation failure throws.
 ///
-/// `caller_address`, `estimate_state_changes_block_number`, `value` and `prestate_diff_json` are as
-/// for [`analyze_trace`].
+/// `caller_address`, `estimate_state_changes_block_number`, `value`, `prestate_diff_json`,
+/// `prestate_json`, `gas_price` and `block_timestamp` are as for [`analyze_trace`].
 ///
 /// Returns a JS object with `root_only_gas`, `nested_gas`, `frame_overhead_gas`, `frames`,
 /// `not_nested` and `skipped_opcodes`.
@@ -991,7 +1138,14 @@ pub fn analyze_frame_tree(
     estimate_state_changes_block_number: Option<u64>,
     value: Option<String>,
     prestate_diff_json: Option<String>,
+    prestate_json: Option<String>,
+    gas_price: Option<String>,
+    block_timestamp: Option<u64>,
 ) -> Result<JsValue, JsError> {
+    let replay = prestate_json
+        .map(|json| Replay::parse(&json, gas_price.as_deref(), block_timestamp))
+        .transpose()
+        .map_err(|e| JsError::new(&e))?;
     let result = analyze_frame_tree_inner(
         trace_json,
         root_address,
@@ -1000,6 +1154,7 @@ pub fn analyze_frame_tree(
         estimate_state_changes_block_number,
         value.as_deref(),
         prestate_diff_json.as_deref(),
+        replay.as_ref(),
     )
     .map_err(|e| JsError::new(&e))?;
     to_js(&result)
@@ -1016,7 +1171,14 @@ pub fn analyze_frame_tree_bytes(
     estimate_state_changes_block_number: Option<u64>,
     value: Option<String>,
     prestate_diff_json: Option<String>,
+    prestate_json: Option<String>,
+    gas_price: Option<String>,
+    block_timestamp: Option<u64>,
 ) -> Result<JsValue, JsValue> {
+    let replay = prestate_json
+        .map(|json| Replay::parse(&json, gas_price.as_deref(), block_timestamp))
+        .transpose()
+        .map_err(|e| JsValue::from(JsError::new(&e)))?;
     let result = analyze_frame_tree_bytes_inner(
         response,
         root_address,
@@ -1025,6 +1187,7 @@ pub fn analyze_frame_tree_bytes(
         estimate_state_changes_block_number,
         value.as_deref(),
         prestate_diff_json.as_deref(),
+        replay.as_ref(),
     )
     .map_err(bytes_error_to_js)?;
     Ok(to_js(&result)?)
@@ -1064,6 +1227,7 @@ export interface AnalyzeTraceResult {
     skipped_opcodes: string[];
     reentered: boolean;
     native_call_gas: number;
+    callees_executed: boolean;
     signature_verification_gas: number;
 }
 
@@ -1092,6 +1256,7 @@ export interface FrameTreeAnalysis {
     nested_gas: number;
     root_only_native_call_gas: number;
     nested_native_call_gas: number;
+    callees_executed: boolean;
     frame_overhead_gas: number;
     signature_verification_gas: number;
     frames: FrameGas[];
@@ -1293,6 +1458,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(result.is_ok());
     }
@@ -1304,6 +1470,7 @@ mod tests {
             &trace,
             "not-an-address",
             &test_caller_address(),
+            None,
             None,
             None,
             None,
@@ -1320,6 +1487,7 @@ mod tests {
             &trace,
             "0x1234",
             &test_caller_address(),
+            None,
             None,
             None,
             None,
@@ -1406,6 +1574,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(!result.is_heuristic);
@@ -1427,6 +1596,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(!result.is_heuristic);
@@ -1436,6 +1606,7 @@ mod tests {
             &single_trace,
             &test_estimator_address(),
             &test_caller_address(),
+            None,
             None,
             None,
             None,
@@ -1460,6 +1631,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(!result.is_heuristic);
@@ -1473,6 +1645,7 @@ mod tests {
             &trace,
             &test_estimator_address(),
             &test_caller_address(),
+            None,
             None,
             None,
             None,
@@ -1560,6 +1733,7 @@ mod tests {
             &trace_json,
             &test_estimator_address(),
             &test_caller_address(),
+            None,
             None,
             None,
             None,
@@ -1700,8 +1874,10 @@ mod tests {
         ]);
         let addr = test_estimator_address();
         let caller = test_caller_address();
-        let result1 = analyze_trace_inner(&trace1, &addr, &caller, None, None, None, None).unwrap();
-        let result2 = analyze_trace_inner(&trace2, &addr, &caller, None, None, None, None).unwrap();
+        let result1 =
+            analyze_trace_inner(&trace1, &addr, &caller, None, None, None, None, None).unwrap();
+        let result2 =
+            analyze_trace_inner(&trace2, &addr, &caller, None, None, None, None, None).unwrap();
         // Each call uses a fresh CacheDB, so results should differ
         assert_eq!(result1.state_update_count, 1);
         assert_eq!(result2.state_update_count, 2);
@@ -1883,6 +2059,7 @@ mod tests {
                 Some(CONSUMER),
                 None,
                 diff,
+                None,
             )
             .unwrap();
             assert!(!out.is_heuristic);
@@ -1908,6 +2085,7 @@ mod tests {
             None,
             None,
             Some(&diff),
+            None,
         )
         .unwrap_err();
         assert!(err.contains("origin_address"), "{err}");
@@ -1952,6 +2130,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -1972,6 +2151,7 @@ mod tests {
             &test_estimator_address(),
             &test_caller_address(),
             Some(1),
+            None,
             None,
             None,
             None,
@@ -2078,6 +2258,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         };
@@ -2149,6 +2330,7 @@ mod tests {
                 None,
                 value,
                 None,
+                None,
             )
             .unwrap()
         };
@@ -2176,6 +2358,7 @@ mod tests {
                 Some(CONSUMER),
                 Some("1000000000000000000"),
                 diff,
+                None,
             )
             .unwrap();
             assert!(!out.is_heuristic);
@@ -2217,6 +2400,7 @@ mod tests {
                 Some(CONSUMER),
                 Some("1000000000000000000"),
                 Some(&diff.to_string()),
+                None,
             )
             .unwrap()
             .gas_estimate
@@ -2264,6 +2448,84 @@ mod tests {
         assert!(!accounts(serde_json::json!({ "code": "0x60006000" }))[&recipient].is_empty());
     }
 
+    // ===== Replaying callees =====
+
+    const CALLEE: &str = "0x00000000000000000000000000000000000000ce";
+
+    /// The root calls `CALLEE`, which runs a frame of its own.
+    fn callee_call_trace() -> String {
+        let call = make_call_log(CALLEE, "0", "", 50000);
+        let entry = serde_json::json!({
+            "pc": 0, "op": "STOP", "gas": 47000, "gasCost": 0, "depth": 2,
+            "stack": [], "memory": [],
+        });
+        let resume = serde_json::json!({
+            "pc": 201, "op": "POP", "gas": 46000, "gasCost": 2, "depth": 1,
+            "stack": ["0x0000000000000000000000000000000000000000000000000000000000000001"],
+            "memory": [],
+        });
+        make_trace(vec![call, entry, resume])
+    }
+
+    fn replay_with_code(code: &str, gas_price: Option<&str>) -> Replay {
+        let prestate = serde_json::json!({ CALLEE: { "code": code, "nonce": 1 } }).to_string();
+        Replay::parse(&prestate, gas_price, Some(1_700_000_000)).unwrap()
+    }
+
+    fn analyze_with(replay: Option<&Replay>) -> AnalyzeTraceResult {
+        analyze_trace_inner(
+            &callee_call_trace(),
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+            Some(CONSUMER),
+            None,
+            None,
+            replay,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_a_prestate_runs_each_callees_own_code() {
+        let idle = analyze_with(Some(&replay_with_code("0x00", None)));
+        // PUSH1 1 PUSH1 0 SSTORE STOP: a cold write from zero, 22,100, after two pushes.
+        let writes = analyze_with(Some(&replay_with_code("0x600160005500", None)));
+        assert!(idle.callees_executed && writes.callees_executed);
+        assert_eq!(writes.gas_estimate - idle.gas_estimate, 22_100 + 2 * 3);
+    }
+
+    #[test]
+    fn test_a_callee_checking_the_gas_price_runs_at_the_transactions() {
+        // Reverts unless GASPRICE is at least 1 gwei, as Railgun's wallet checks its relayer's.
+        let gate = "0x633b9aca003a10600b57005b600080fd";
+        let paid = analyze_with(Some(&replay_with_code(gate, Some("2000000000"))));
+        assert!(paid.callees_executed);
+        let free = analyze_with(Some(&replay_with_code(gate, None)));
+        assert!(
+            !free.callees_executed,
+            "the callee reverts, so the replay falls back"
+        );
+        assert_eq!(free.gas_estimate, analyze_with(None).gas_estimate);
+    }
+
+    #[test]
+    fn test_a_prestate_needs_the_origin_it_settles() {
+        let replay = replay_with_code("0x00", None);
+        let err = analyze_trace_inner(
+            &callee_call_trace(),
+            &test_estimator_address(),
+            &test_caller_address(),
+            None,
+            None,
+            None,
+            None,
+            Some(&replay),
+        )
+        .unwrap_err();
+        assert!(err.contains("origin_address"), "{err}");
+    }
+
     #[test]
     fn test_invalid_value_is_an_error() {
         let trace = make_trace(vec![]);
@@ -2274,6 +2536,7 @@ mod tests {
             None,
             None,
             Some("one ether"),
+            None,
             None,
         );
         assert!(result.unwrap_err().contains("Invalid value"));
@@ -2319,6 +2582,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("frame tree")
     }
@@ -2349,6 +2613,7 @@ mod tests {
                 None,
                 None,
                 diff,
+                None,
             )
             .unwrap()
         };
@@ -2406,6 +2671,42 @@ mod tests {
     }
 
     #[test]
+    fn test_a_prestate_replays_both_settlements_or_neither() {
+        let trace = root_calls_vault(1_000_000, 100_000);
+        let owned = vec![VAULT.to_string()];
+        let analyze = |code: Option<&str>| {
+            let replay = code.map(|code| {
+                let prestate = serde_json::json!({ VAULT: { "code": code, "nonce": 1 } });
+                Replay::parse(&prestate.to_string(), None, None).unwrap()
+            });
+            analyze_frame_tree_inner(
+                &trace,
+                ROOT,
+                &owned,
+                &test_caller_address(),
+                None,
+                None,
+                None,
+                replay.as_ref(),
+            )
+            .unwrap()
+        };
+        let empty = analyze(None);
+        // Root-only, the vault's call costs what its code does, not the ~900k the trace charges.
+        let replayed = analyze(Some("0x00"));
+        assert!(replayed.callees_executed);
+        assert!(empty.root_only_gas - replayed.root_only_gas > 800_000);
+
+        // Root-only, the vault runs its code and reverts, so neither settlement is replayed.
+        let reverting = analyze(Some("0xfe"));
+        assert!(!reverting.callees_executed);
+        assert_eq!(
+            (reverting.root_only_gas, reverting.nested_gas),
+            (empty.root_only_gas, empty.nested_gas)
+        );
+    }
+
+    #[test]
     fn test_a_depth_zero_log_is_an_error_not_a_hang() {
         let trace = make_trace(vec![sstore_at(1, "1", "a"), sstore_at(0, "2", "b")]);
         let owned = vec![VAULT.to_string()];
@@ -2414,6 +2715,7 @@ mod tests {
             ROOT,
             &owned,
             &test_caller_address(),
+            None,
             None,
             None,
             None,
@@ -2481,6 +2783,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("frame tree");
         assert_eq!(out.frames.len(), 2);
@@ -2492,6 +2795,7 @@ mod tests {
                 ROOT,
                 &owned,
                 &test_caller_address(),
+                None,
                 None,
                 None,
                 None
