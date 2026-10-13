@@ -74,6 +74,10 @@ Six protocols. Everything else is rounding error at any gas price.
   **Topic dropdown including "Customers/Partner Inquiries"** — use that. Verified.
 - `info@starkware.co` — **not on any StarkWare page checked**; only `legal@` appears (privacy policy). Use the form.
 - GitHub <https://github.com/starkware-libs>, X `@StarkWareLtd`.
+- **2026-10-13:** the StarkWare form returned "There was an error trying to send your message".
+  `developerpartnerships@starknetfoundation.org` (from a March 2023 Foundation post) bounced.
+  The live alternative is `info@starknet.io`, which StarkWare names in the starknet.io terms
+  (updated November 2025). It is a general inbox, not a BD address.
 - Also consider the **Starknet Foundation** separately from StarkWare — the L1 state-update
   transactions are posted by the sequencer operator, so confirm who actually owns that cost.
 
