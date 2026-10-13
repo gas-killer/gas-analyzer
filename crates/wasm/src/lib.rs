@@ -230,9 +230,9 @@ fn parse_origin(origin_address: Option<&str>) -> Result<Option<Address>, String>
 /// What lets the callees of a replayed `CALL` run their own code: the state the transaction started
 /// from, and the gas price and timestamp they may check.
 pub struct Replay {
-    /// `prestateTracer` in its default mode: every account the transaction touched, with its code,
-    /// balance, nonce and every slot it touched, as they were before the transaction.
-    state: BTreeMap<Address, AccountState>,
+    /// From `prestateTracer` in its default mode: every account the transaction touched, with its
+    /// code, balance, nonce and every slot it touched, as they were before the transaction.
+    seeds: Seeds,
     gas_price: u128,
     timestamp: u64,
 }
@@ -243,35 +243,41 @@ impl Replay {
         gas_price: Option<&str>,
         timestamp: Option<u64>,
     ) -> Result<Replay, String> {
-        let state = serde_json::from_str(prestate_json)
+        let state: BTreeMap<Address, AccountState> = serde_json::from_str(prestate_json)
             .map_err(|e| format!("Failed to parse prestate: {}", e))?;
         let gas_price = parse_value(gas_price)?
             .try_into()
             .map_err(|_| "gas price is out of range".to_string())?;
         Ok(Replay {
-            state,
+            seeds: Self::seeds(state)?,
             gas_price,
             timestamp: timestamp.unwrap_or_default(),
         })
     }
 
     /// Every touched account as it was before the transaction, code included.
-    fn seeds(&self) -> Seeds {
+    fn seeds(state: BTreeMap<Address, AccountState>) -> Result<Seeds, String> {
         let mut seeds = Seeds::default();
-        for (address, account) in &self.state {
-            let code = account.code.clone().filter(|code| !code.is_empty());
+        for (address, account) in state {
+            let code = account.code.filter(|code| !code.is_empty());
+            let code_hash = code.as_ref().map_or(KECCAK_EMPTY, keccak256);
+            // `Bytecode::new_raw` panics on a malformed EIP-7702 delegation, trapping the module.
+            let code = code
+                .map(Bytecode::new_raw_checked)
+                .transpose()
+                .map_err(|e| format!("Invalid code for {address} in prestate: {e}"))?;
             seeds.accounts.insert(
-                *address,
+                address,
                 AccountInfo {
                     balance: account.balance.unwrap_or_default(),
                     nonce: account.nonce.unwrap_or_default(),
-                    code_hash: code.as_ref().map_or(KECCAK_EMPTY, keccak256),
-                    code: code.map(Bytecode::new_raw),
+                    code_hash,
+                    code,
                 },
             );
-            seeds.storage.insert(*address, account.storage.clone());
+            seeds.storage.insert(address, account.storage);
         }
-        seeds
+        Ok(seeds)
     }
 
     fn sim_env(&self, block_number: Option<u64>, value: U256) -> SimEnvOpts {
@@ -661,7 +667,7 @@ fn analyze_extract(
     // Injected at the consumer itself, the estimator runs the program over the state the
     // transaction started from, so each callee runs its own code, as the consumer's callee.
     let replayed = replay.map(|(replay, consumer)| {
-        let mut cache_db = seeded_db(&replay.seeds())?;
+        let mut cache_db = seeded_db(&replay.seeds)?;
         let sim_env = replay.sim_env(estimate_state_changes_block_number, value);
         estimate_state_changes_gas(&mut cache_db, consumer, caller, state_updates, &sim_env)
             .map_err(|e| e.to_string())
@@ -827,7 +833,7 @@ fn analyze_frame_tree_trace(
     let replayed = replay.map(|replay| {
         let env = replay.sim_env(estimate_state_changes_block_number, value);
         let price = |settlement: &str, frames: &[FrameProgram]| {
-            let mut cache_db = seeded_db(&replay.seeds())?;
+            let mut cache_db = seeded_db(&replay.seeds)?;
             estimate_frame_tree_gas(&mut cache_db, frames, caller, value, &env)
                 .map_err(|e| format!("{settlement}: {e}"))
         };
@@ -2511,6 +2517,15 @@ mod tests {
         let writes = analyze_with(Some(&replay_with_code("0x600160005500", None)));
         assert!(idle.callees_executed && writes.callees_executed);
         assert_eq!(writes.gas_estimate - idle.gas_estimate, 22_100 + 2 * 3);
+    }
+
+    #[test]
+    fn test_a_prestate_with_a_malformed_delegation_is_an_error_not_a_trap() {
+        let prestate = serde_json::json!({ CALLEE: { "code": "0xef0100", "nonce": 1 } });
+        let err = Replay::parse(&prestate.to_string(), None, None)
+            .err()
+            .unwrap();
+        assert!(err.contains("Invalid code for"), "{err}");
     }
 
     #[test]
