@@ -1,6 +1,6 @@
 [package]
 name = "gas-killer-wasm"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 description = "Gas Killer's WebAssembly gas analyzer: estimates a transaction's gas savings from its Geth trace in the browser"
 license-file = "LICENSE"

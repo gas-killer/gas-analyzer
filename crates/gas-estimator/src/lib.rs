@@ -99,6 +99,14 @@ fn estimator_bytecode() -> Bytes {
         .clone()
 }
 
+/// The estimator's analyzed code and its hash, built once: injection runs per estimate, and
+/// hashing the code there dominated `estimate_gas_raw` against an empty state.
+static ESTIMATOR_CODE: LazyLock<(revm::state::Bytecode, B256)> = LazyLock::new(|| {
+    let code = revm::state::Bytecode::new_raw(estimator_bytecode());
+    let hash = code.hash_slow();
+    (code, hash)
+});
+
 static IMPL_SLOT: LazyLock<U256> = LazyLock::new(|| {
     U256::from_be_bytes(*alloy_primitives::keccak256("gas.estimator.implementation"))
         - U256::from(1)
@@ -201,27 +209,45 @@ where
         .flatten()
         .unwrap_or_default();
 
-    if let Some(code) = original_account.code {
-        cache_db.insert_account_info(
-            backup_addr,
-            AccountInfo {
-                balance: U256::ZERO,
-                nonce: 0,
-                code_hash: B256::ZERO,
-                code: Some(code),
-            },
-        );
-    }
+    let (estimator, estimator_hash) = ESTIMATOR_CODE.clone();
+    let original_hash = match original_account.code {
+        Some(code) if !code.is_empty() => {
+            let stored = original_account.code_hash;
+            let hash = if stored.is_zero() || stored == revm::primitives::KECCAK_EMPTY {
+                code.hash_slow()
+            } else {
+                stored
+            };
+            // Inserted first, so the original code is what `contracts` keeps under its hash.
+            cache_db.insert_account_info(
+                backup_addr,
+                AccountInfo {
+                    balance: U256::ZERO,
+                    nonce: 0,
+                    code_hash: hash,
+                    code: Some(code),
+                },
+            );
+            hash
+        }
+        _ => estimator_hash,
+    };
 
     cache_db.insert_account_info(
         contract_address,
         AccountInfo {
             balance: original_account.balance,
             nonce: original_account.nonce,
-            code_hash: B256::ZERO,
-            code: Some(revm::state::Bytecode::new_raw(estimator_bytecode())),
+            code_hash: estimator_hash,
+            code: Some(estimator),
         },
     );
+    // EXTCODEHASH reads the stored hash, so a callee checking its caller's codehash sees the
+    // original code, as on chain, while the estimator's code still runs. Set after the insert so
+    // `contracts` never maps the original hash to the estimator.
+    if let Some(account) = cache_db.cache.accounts.get_mut(&contract_address) {
+        account.info.code_hash = original_hash;
+    }
 
     let backup_addr_u256 = U256::from_be_slice(backup_addr.as_slice());
     cache_db
