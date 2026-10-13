@@ -104,10 +104,10 @@ The tool reports the callee as "cheaper as a plain CALL" in every one of these. 
 own work is mostly storage writes, logs and token moves, which a settlement has to apply
 anyway. Nesting adds overhead without removing anything.
 
-Aave (Pool → aToken), Aragon (→ DAO), Centrifuge, Chainlink (6 of 8), Doppler (11 of 13),
+Aave (Pool → aToken), Aragon (→ DAO), Centrifuge, Chainlink (6 of 8), Doppler (all 13),
 EigenLayer, ENS, Ether.fi, Euler (EVC → EVaults), Frax (router → pair), Grove, Lido, Maple
-(Pool → PoolManager), Morpho (VaultV2 → adapters, reallocations), Ondo, Panther, Pendle
-(router → markets), Swell.
+(Pool → PoolManager), Morpho (VaultV2 → adapters, reallocations), Null (→ its own adapter),
+Ondo, Panther, Pendle (router → markets), Swell.
 
 ## Did not produce a result
 
@@ -115,7 +115,6 @@ EigenLayer, ENS, Ether.fi, Euler (EVC → EVaults), Frax (router → pair), Grov
 |---|---|
 | Morpho Bundler3: `GeneralAdapter1` reverts with "transfer amount exceeds allowance". Still failing after the execution-order fix. | Morpho [`0xdc74e020…`](https://etherscan.io/tx/0xdc74e020e296fbb968edfc2ffd630bad47d557c71dabe901938315be6329c5c9) |
 | Morpho flash-loan callback (`0x7e5f4b61`) | Morpho [`0x16a0a31c…`](https://etherscan.io/tx/0x16a0a31c0547f2f35018c38f0c2fa3bdcf1320e6a75f998caaa957747e9dc568) |
-| PENDING | Doppler ×2, Null ×1 |
 
 ## Who to contact
 
