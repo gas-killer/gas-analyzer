@@ -129,6 +129,7 @@ heuristic fallback.
 | **Morpho VaultV2** | 40.43% | [`0x2e91acd5…`](https://etherscan.io/tx/0x2e91acd5286eeda304294f8f2c9803b7d140dd0cf7426e16ee285e9f6b1f0fca) | `redeem`/`deposit` on VaultV2; 15 wins across 3 vaults and 3 curators |
 | **Doppler** | 13.73% | [`0x7b08cf0d…`](https://etherscan.io/tx/0x7b08cf0df79aaaf918bc03d62d402bceb70e3ac68e662a18464c3097d02071ff) | only the v4 hook's `collectFees`; `Airlock.create` saves nothing |
 | **USD8** | ~17.5% | Sepolia only | Treasury `0xd2840edb`; approximate (replayed against current state). **Not a gas pitch** — see below |
+| **Derive** | 65.21% | [`0xf83f7406…`](https://etherscan.io/tx/0xf83f74064b25f3a5b0533d1f1e02a891eca4c91b5d4363b5e4dffed26eb22ebb) | V3 proof submissions (`0xcaf85453`) to the VerifiableApp; the ~290k-gas verifier is a `STATICCALL`. About 145 a day. Report: `reports/derive.md` |
 | Null | 0.00% | [`0x36b6116b…`](https://etherscan.io/tx/0x36b6116b621b2cfaa9f082f1f4295c4aca95435a105ed9f2eccce42232c555db) | not a candidate: `depositMarket` is a router, all its gas is in the vault `CALL` |
 
 ### Privacy Pools (0xbow)
@@ -170,6 +171,17 @@ people who would adopt it.
   Telegram <https://doppler.lol/telegram/>, GitHub <https://github.com/whetstoneresearch>,
   docs <https://docs.doppler.lol> — all verified on doppler.lol. No email.
 - Weak pitch on gas alone: only the hook's fee collection saves.
+
+### Derive
+- **Who:** Derive (formerly Lyra), an options and perps exchange. The team page lists
+  Nick Forster (co-founder & CEO) and Josh Kim (head of engineering) ✅.
+- **Discord** <https://discord.com/invite/Derive> ✅ (linked from the governance site).
+- **Governance forum** <https://forums.derive.xyz> ✅, governance site <https://gov.derive.xyz> ✅.
+- **X** [`@derivexyz`](https://x.com/derivexyz) ⚠️ (linked from Derive's own blog post, not seen on the site).
+- **Docs** <https://docs.derive.xyz> ✅, help center <https://help.derive.xyz/en/> ✅.
+- **No email or partnership form found.** The site's "Contact Us" only jumps to its integrations section.
+- **Check first:** in May 2025 Synthetix proposed acquiring Derive (SIP-415). We have not
+  confirmed whether that closed, which would change who to talk to.
 
 ### USD8
 - Already in contact with the founder. Gas is not their problem. They want off-chain compute
