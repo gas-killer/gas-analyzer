@@ -4,6 +4,34 @@ Tested 2026-10-07 against branch `nested-settlement` at `889de30`, with
 `cargo run -- t <tx> --owned <addrs>`. The goal was to retry transactions that scored 0%
 because of external calls.
 
+## Status after the merge to `main` (`8aed5cf`, re-tested 2026-10-12/13)
+
+The dev merged `nested-settlement` into `main` with fixes for most of this report. I re-ran all 128
+transactions on it; full numbers are in `NESTED_SETTLEMENT_RESULTS.md`.
+
+| issue below | fix on `main` | result |
+|---|---|---|
+| 1–2. Frames priced in isolation (Privacy Pools USDT relay, PPRouter deposit, Ondo, Grove) | `4671b5e`, `25091d1`: frames priced in execution order on one shared state | ✅ **Fixed.** USDT relay 30.01%, PPRouter deposit 12.97%. Ondo and Grove now run and measure 0%. |
+| 3. Railgun "Gas price too low" | `71d6008`: replay at the transaction's effective gas price | ✅ **Fixed.** `0x7c731150…` 66.86%, `0x6f534f5a…` 68.16%. |
+| Performance: earlier transactions replayed once per frame | `25091d1`: replayed once per tree | ✅ **Fixed.** This replaces my local cache patch. Late-in-block transactions are still slow, because the replay still happens once per run. |
+| Doppler `create` (`0x30116425`) | `9117d9b`, `7b463b3`: zero `codeHash` treated as empty, estimator bytecode injected | ✅ **Fixed.** Every Doppler transaction that finished now runs and measures 0%. |
+| RPC 429 | relay side | ✅ No 429 failures in the re-run. |
+| Chainlink "not nested" message lumps four reasons together | `dda2031`: reasons split into `KeptAsCall` and `NotReached` | ⚠️ **Partly fixed.** `KeptAsCall` still covers "cheaper as a plain CALL", "reverted", "transient storage" and "selfdestruct". |
+| 4. Morpho flash-loan callback (`0x7e5f4b61`) | none | ❌ **Still fails**, with the same error. |
+| Morpho Bundler3 ("transfer amount exceeds allowance") | none | ❌ **Still fails**, at the same call. Execution order did not fix it. |
+
+**Accounting changes** make every nested result a little lower. Most transactions save 2,150
+gas less, Usual 16,729 less, and Railgun RelayAdapt `0x2d754e6f…` 48,861 less (54.64% →
+45.30%). The Railgun drop comes from an operation that runs after the nested call returns.
+The old version dropped it; the new version keeps it in RelayAdapt's own frame (test
+`5b02b4c`). The new numbers are the more accurate ones.
+
+Transactions without `--owned` (plain mode) are unchanged. I re-ran all 24 transactions
+cited in the Derive, Kelp, Polygon zkEVM, Railgun and Starknet reports, and every gas figure
+matched exactly.
+
+The rest of this document is the original report against `889de30`.
+
 ## What worked
 
 | tx | what | owned | before | nested (Schnorr) |

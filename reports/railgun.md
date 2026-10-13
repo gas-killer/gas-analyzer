@@ -1,6 +1,6 @@
 # Gas Killer × Railgun: Gas Savings Report
 
-Oct 8, 2026
+Oct 13, 2026
 
 ## Summary
 
@@ -18,7 +18,7 @@ You pay for the signature check and the storage writes, not the computation. If 
 
 ## What we measured
 
-All 15 direct calls we measured save between 61% and 79%. A sample is below, covering private transfers, shields and a RelayAdapt bundle.
+All 15 direct calls we measured save between 61% and 79%. A sample is below, covering private transfers and shields. The last three rows are RelayAdapt bundles, which save 45–68%.
 
 | Transaction | Function | Gas today | Gas saved | Saving |
 | --- | --- | --: | --: | --: |
@@ -28,7 +28,9 @@ All 15 direct calls we measured save between 61% and 79%. A sample is below, cov
 | [0x0376edd3…](https://etherscan.io/tx/0x0376edd36b0c9211b1a38f41e5f1c04233478ca4dcf7d4852ef313deb1c57ade) | `shield` | 724,515 | 505,863 | **69.8%** |
 | [0x6837bb8d…](https://etherscan.io/tx/0x6837bb8d629ee0dce5f045acfc6c1e296df4abe1907897820bf621462dc23425) | `shield` | 758,741 | 497,097 | **65.5%** |
 | [0x792a8e57…](https://etherscan.io/tx/0x792a8e5783cec82cc456d83f0f1703a2bf71eafa05984a17896809bd952567cc) | private transfer / unshield | 484,303 | 294,581 | **60.8%** |
-| [0x2d754e6f…](https://etherscan.io/tx/0x2d754e6f8a34058e5d07596e627cbc70e0c704279e9f745a4c0baef80389cca7) | RelayAdapt bundle | 523,496 | 286,015 | **54.6%** |
+| [0x6f534f5a…](https://etherscan.io/tx/0x6f534f5af7fa26b66e0c6a5f49505f7125665e88b0d1af23efca86da88109f27) | RelayAdapt bundle | 1,297,603 | 884,393 | **68.2%** |
+| [0x7c731150…](https://etherscan.io/tx/0x7c731150234add278ecae3ee9b6bcd35ee50435cc69bc47cce1a008e54c1f2ce) | RelayAdapt bundle | 1,120,780 | 749,350 | **66.9%** |
+| [0x2d754e6f…](https://etherscan.io/tx/0x2d754e6f8a34058e5d07596e627cbc70e0c704279e9f745a4c0baef80389cca7) | RelayAdapt bundle | 523,496 | 237,154 | **45.3%** |
 
 Savings assume Gas Killer's Schnorr signature scheme.
 
@@ -40,7 +42,7 @@ The saving comes from proof verification and Poseidon hashing inside the Railgun
 
 - **What gets cheaper:** the ZK verification and hashing run off-chain. On-chain, only the new commitments, nullifiers and transfers are applied.
 - **What stays the same:** privacy guarantees, commitments and nullifiers are exactly what the contract produces today.
-- **What integration involves:** the smart wallet would use the Gas Killer SDK. RelayAdapt bundles also save, at 55%, once RelayAdapt integrates alongside it.
+- **What integration involves:** the smart wallet would use the Gas Killer SDK. RelayAdapt bundles also save, at 45–68%, once RelayAdapt integrates alongside it.
 - **Who gains:** users pay less to shield, transfer and unshield, and relayers pay less to submit.
 
 ## How we measured
@@ -49,7 +51,7 @@ We replayed each transaction as Gas Killer would settle it and compared the gas 
 
 - **Real data:** real mainnet transactions, replayed at the block they ran in.
 - **Includes all costs:** the gas saved is net of the signature check and every storage write.
-- **An estimate:** Railgun has not integrated Gas Killer, so the numbers estimate a future integration. The RelayAdapt figure also includes an estimated fixed cost for the two-contract setup.
+- **An estimate:** Railgun has not integrated Gas Killer, so the numbers estimate a future integration. The RelayAdapt figures also include an estimated fixed cost for the two-contract setup.
 - **Volume:** in a 40,000-block sample, 53% of successful Railgun transactions went straight to the smart wallet and 39% went through RelayAdapt.
 
 ## Next steps
