@@ -82,6 +82,11 @@ jobs:
         if: steps.changes.outputs.run == 'true'
         run: make bench-save-baseline
 
+      # The report is judged by the PR's script, not the base branch's.
+      - name: Switch back to PR branch
+        if: steps.changes.outputs.run == 'true'
+        run: git checkout ${{ github.event.pull_request.head.sha }}
+
       - name: Check regressions and generate report
         id: regcheck
         if: steps.changes.outputs.run == 'true'
