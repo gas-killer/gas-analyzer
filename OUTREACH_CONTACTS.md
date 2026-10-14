@@ -177,8 +177,13 @@ people who would adopt it.
 - Weak pitch on gas alone: only the hook's fee collection saves.
 
 ### Derive
-- **Who:** Derive (formerly Lyra), an options and perps exchange. The team page lists
-  Nick Forster (co-founder & CEO) and Josh Kim (head of engineering) ✅.
+- **Who:** Derive (formerly Lyra), an options and perps exchange. The team page at
+  <https://www.derive.xyz/about> links each person's X account ✅:
+  - Josh Kim, head of engineering: [`@josh_pwrk`](https://x.com/josh_pwrk)
+  - Dominic Romanowski, co-founder (Foundation), engineer: [`@domrom__`](https://x.com/domrom__)
+  - Sean Dawson, head of research: [`@SeanNotShorn`](https://x.com/SeanNotShorn)
+  - Hitesh Donga, head of product: [`@HD_Derive`](https://x.com/HD_Derive)
+  - Nick Forster, co-founder & CEO: [`@nickforster`](https://x.com/nickforster)
 - **Discord** <https://discord.com/invite/Derive> ✅ (linked from the governance site).
 - **Governance forum** <https://forums.derive.xyz> ✅, governance site <https://gov.derive.xyz> ✅.
 - **X** [`@derivexyz`](https://x.com/derivexyz) ⚠️ (linked from Derive's own blog post, not seen on the site).
