@@ -117,7 +117,7 @@ Contact them only if there is a strategic reason (logo, case study, ecosystem in
 |---|---:|---:|---|---|
 | **Linea** | 54.54% | $21 ($1,348 @20) | `linea.build/contact/inquiries` — "Speak to an expert" | ✅ |
 | **Pyth** | 52.06% | $12 ($2,245 @20) | DAO forum <https://forum.pyth.network>; Douro Labs interest form `data.dourolabs.xyz/pyth-interest-form` | ✅ |
-| **Kelp** | 83.29% | $25 | Now under KernelDAO. X `@KelpDAO`, Discord `discord.gg/wfDdcmbMjN`; no email, form or forum found | ⚠️ search-derived |
+| **Kelp** | 83.29% | $25 | Now under KernelDAO. **Mihailo Maksa**, who leads Kelp's on-chain engineering per his GitHub: X [`@MihailoMaksa`](https://x.com/MihailoMaksa) ✅ (linked from his GitHub). Kelp's own site: X `@KelpDAO`, Discord `discord.gg/khSpqCFvGq`, Telegram `t.me/KelpDAOxyz` ✅. Context: rsETH lost ~$292M in an April 18, 2026 LayerZero bridge exploit; the deposit pool we measured was paused, then reopened (our deposits are from Aug 2026) | ✅ site and GitHub |
 | **Symbiotic** | 57.04% | $14 | X `@symbioticfi` (only real channel; no Discord, email or form); Telegram is announce-only; or intro via Mellow | ✅ docs.symbiotic.fi |
 | **Mellow** | 41.55% | $3 | Discord <https://discord.gg/mellow>; X `@Mellowprotocol`; no email or form | ✅ mellow.finance |
 | **Rocket Pool** | 15.66% | — | <https://dao.rocketpool.net> — **has a dedicated `Integration` category** | ✅ best-structured forum of any target |
