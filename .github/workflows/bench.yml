@@ -21,6 +21,10 @@ jobs:
   # end_to_end is excluded — it requires a live Sepolia node and is dominated
   # by network latency, making it unsuitable for threshold-based regression
   # detection.
+  #
+  # A PR that touches none of the benchmarked crates or the build setup skips
+  # the run: both sides would be the same build, so the comparison would only
+  # measure the shared runner's noise, which reaches the threshold on its own.
   # ────────────────────────────────────────────────────────────────────────
   bench:
     name: Benchmark regression check
@@ -34,31 +38,53 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
+      - name: Check whether the benchmarked code changed
+        id: changes
+        run: |
+          python3 .github/scripts/bench_inputs_changed.py \
+            --base ${{ github.event.pull_request.base.sha }} \
+            --package gas-analyzer-evmsketch >> "$GITHUB_OUTPUT"
+
+      - name: Report a skipped run
+        if: steps.changes.outputs.run != 'true'
+        run: |
+          printf '%s\n' '## Benchmark Results' '' \
+            '> Skipped: this PR changes none of the benchmarked crates or the build setup.' \
+            > regression-report.md
+
       - name: Pull bench fixtures from LFS
+        if: steps.changes.outputs.run == 'true'
         continue-on-error: true
         run: git lfs pull --include "crates/evmsketch/benches/fixtures/"
 
       - uses: Swatinem/rust-cache@v2
+        if: steps.changes.outputs.run == 'true'
 
       - name: Clear any stale Criterion data
+        if: steps.changes.outputs.run == 'true'
         run: rm -rf target/criterion/
 
       - name: Bench PR branch (candidate)
+        if: steps.changes.outputs.run == 'true'
         run: make bench-save-baseline BASELINE=candidate
 
       - name: Switch to base branch
+        if: steps.changes.outputs.run == 'true'
         run: git checkout ${{ github.event.pull_request.base.sha }}
 
       - name: Flush page cache and allocator
+        if: steps.changes.outputs.run == 'true'
         run: |
           sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
           python3 -c "import ctypes; ctypes.CDLL('libc.so.6').malloc_trim(0)"
 
       - name: Bench base branch (baseline)
+        if: steps.changes.outputs.run == 'true'
         run: make bench-save-baseline
 
       - name: Check regressions and generate report
         id: regcheck
+        if: steps.changes.outputs.run == 'true'
         continue-on-error: true
         run: |
           python3 .github/scripts/check_regressions.py \
