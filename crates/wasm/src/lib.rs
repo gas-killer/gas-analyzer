@@ -245,9 +245,12 @@ impl Replay {
     ) -> Result<Replay, String> {
         let state: BTreeMap<Address, AccountState> = serde_json::from_str(prestate_json)
             .map_err(|e| format!("Failed to parse prestate: {}", e))?;
-        let gas_price = parse_value(gas_price)?
-            .try_into()
-            .map_err(|_| "gas price is out of range".to_string())?;
+        let gas_price = parse_wei("gas price", gas_price)?.try_into().map_err(|_| {
+            format!(
+                "Invalid gas price {:?}: out of range",
+                gas_price.unwrap_or_default()
+            )
+        })?;
         Ok(Replay {
             seeds: Self::seeds(state)?,
             gas_price,
@@ -714,8 +717,13 @@ fn parse_caller(caller_address: &str) -> Result<Address, String> {
 
 /// A `msg.value` in wei, decimal or `0x` hex; zero when absent.
 fn parse_value(value: Option<&str>) -> Result<U256, String> {
-    value.map_or(Ok(U256::ZERO), |v| {
-        v.parse().map_err(|e| format!("Invalid value {v:?}: {e}"))
+    parse_wei("value", value)
+}
+
+/// An amount in wei, decimal or `0x` hex; zero when absent. `name` is the argument it came from.
+fn parse_wei(name: &str, wei: Option<&str>) -> Result<U256, String> {
+    wei.map_or(Ok(U256::ZERO), |v| {
+        v.parse().map_err(|e| format!("Invalid {name} {v:?}: {e}"))
     })
 }
 
@@ -2517,6 +2525,19 @@ mod tests {
         let writes = analyze_with(Some(&replay_with_code("0x600160005500", None)));
         assert!(idle.callees_executed && writes.callees_executed);
         assert_eq!(writes.gas_estimate - idle.gas_estimate, 22_100 + 2 * 3);
+    }
+
+    #[test]
+    fn test_a_malformed_gas_price_is_named_in_the_error() {
+        let err = Replay::parse("{}", Some("1.5 gwei"), None).err().unwrap();
+        assert!(err.starts_with("Invalid gas price \"1.5 gwei\""), "{err}");
+        let err = Replay::parse("{}", Some(&format!("0x1{}", "0".repeat(32))), None)
+            .err()
+            .unwrap();
+        assert!(
+            err.starts_with("Invalid gas price") && err.ends_with("out of range"),
+            "{err}"
+        );
     }
 
     #[test]
