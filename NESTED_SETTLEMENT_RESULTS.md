@@ -136,7 +136,13 @@ are repeated from `OUTREACH_CONTACTS.md`.
 - **Pitch:** every transfer spends about 1M gas on compliance checks. Nested settlement removes
   86–88% of it.
 
-### Usual: ~52% on USD0 minting
+### Usual: 54–60% on USD0 swaps and redemptions
+- **Re-measured 2026-10-14 on recent transactions** (`reports/usual.md`): `swap` saves 60.17%
+  (~306k gas) and `redeem` 53.9% (~289k), both 0% without nesting. About 25 a day. The saving
+  is the collateral-backing check inside `Usd0.mint`: seven oracle `getPrice` reads cost ~231k gas.
+- **Contacts:** X `@usualmoney`, Telegram `t.me/UsualCommunity`, Discord
+  `discord.com/invite/tempusual` ✅ (all from usual.money). Founders: Pierre Person, Adli Takkal
+  Bataille, Hugo Sallé de Chou (no X handles confirmed). The contracts code is not public.
 - **Who:** Usual Labs (France) ⚠️. Governance runs through the Usual DAO.
 - **Contact form** <https://usual.money/form/contact-us> ✅
 - **X** [`@usualmoney`](https://x.com/usualmoney) ✅, **LinkedIn**
