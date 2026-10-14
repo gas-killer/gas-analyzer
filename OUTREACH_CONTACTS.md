@@ -90,6 +90,22 @@ Six protocols. Everything else is rounding error at any gas price.
   relations). **Neither is right for this** — use the form.
 - Telegram `@PolygonHQ` (founders support). Support portal:
   `support.polygon.technology`.
+- `info@polygon.technology` ✅, listed on the Agglayer GitHub organization.
+- **People (2026-10-14):**
+  - Engineers on the rollup-manager contracts, from the `agglayer/agglayer-contracts` commits:
+    - Carlos Matallana (GitHub `krlosMata`) ✅. Public member of the Agglayer org and a 2026
+      committer. Devcon bios list him as protocol team lead for Polygon zkEVM. No X handle found.
+    - Krishang (GitHub `kamuikatsurgi`) ✅. Public org member, company @0xPolygon. X
+      [`@0xkrishang`](https://x.com/0xkrishang) and Telegram <https://t.me/kamuik16>, both
+      linked from his GitHub.
+    - GitHub `jesusholoo`, the top 2026 committer to `agglayer-contracts`. No name or socials
+      on the profile.
+  - Leadership: Sandeep Nailwal, CEO of the Polygon Foundation, which took over the Agglayer in
+    2025. X `@sandeepnailwal` ⚠️. Marc Boiron, CEO of Polygon Labs, X `@marcboiron` ⚠️.
+    Brendan Farmer, co-founder who led the Agglayer design, X `@_bfarmer` ⚠️. These handles
+    are from memory and still need checking.
+- **Context:** in 2026 Polygon Labs cut staff twice and repositioned as a payments company
+  (Coinme and Sequence acquisitions). Agglayer sits under the Foundation, so pitch it there.
 
 ---
 
