@@ -2,7 +2,8 @@
 """Report whether a PR changes anything the benchmarks measure.
 
 The benchmarked package's workspace dependencies come from `cargo metadata`, so the set follows
-Cargo.toml as crates are added. A PR touching none of them, nor the build or bench setup, would
+Cargo.toml as crates are added. Files those crates compile in from outside their own directories
+don't, and are listed in ALWAYS. A PR touching none of them, nor the build or bench setup, would
 compare a build against itself, which only measures the runner.
 """
 
@@ -22,6 +23,8 @@ ALWAYS = (
     ".cargo/",
     ".github/workflows/bench.yml",
     ".github/scripts/",
+    # The estimator embeds its bytecode, which the benches run, from here.
+    "abis/",
 )
 
 
