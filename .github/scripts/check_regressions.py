@@ -2,9 +2,12 @@
 """Detect Criterion benchmark regressions by comparing two named baselines.
 
 Walks target/criterion/ looking for <baseline>/estimates.json and
-<candidate>/estimates.json files, compares mean wall-time point estimates,
+<candidate>/estimates.json files, compares median wall-time point estimates,
 writes a Markdown report, and exits non-zero if any metric regresses beyond
 the given threshold.
+
+Medians rather than means: a shared runner stalls now and then, and a mean
+over one run per side absorbs those stalls into a figure the threshold flags.
 """
 
 import argparse
@@ -14,7 +17,7 @@ from pathlib import Path
 
 
 def load_estimates(criterion_dir: Path, baseline: str) -> dict[str, float]:
-    """Return bench_key → mean point estimate (nanoseconds) for a baseline."""
+    """Return bench_key → median point estimate (nanoseconds) for a baseline."""
     results: dict[str, float] = {}
     for path in sorted(criterion_dir.rglob(f"{baseline}/estimates.json")):
         rel = path.relative_to(criterion_dir)
@@ -23,7 +26,7 @@ def load_estimates(criterion_dir: Path, baseline: str) -> dict[str, float]:
         bench_key = "/".join(rel.parts[:-2])
         try:
             data = json.loads(path.read_text())
-            results[bench_key] = data["mean"]["point_estimate"]
+            results[bench_key] = data["median"]["point_estimate"]
         except (KeyError, json.JSONDecodeError, OSError):
             pass
     return results
@@ -73,7 +76,7 @@ def build_report(
 
     footer = (
         "<sub>Base and candidate benchmarks run back-to-back on the same CI runner. "
-        f"Only regressions >{threshold:.0f}% are flagged.</sub>"
+        f"Medians are compared, and only regressions >{threshold:.0f}% are flagged.</sub>"
     )
 
     if not baseline:
