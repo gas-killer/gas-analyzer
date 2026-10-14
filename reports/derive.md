@@ -30,8 +30,6 @@ All five proof submissions we measured save between 35% and 65%. The gas saved i
 
 Savings assume Gas Killer's Schnorr signature scheme.
 
-At ~0.25 gwei and the ETH price at our last measurement ($2,386), the saving is roughly $750 a month. At 20 gwei it would be roughly $60,000 a month. Both figures are approximate.
-
 ## Where the saving comes from
 
 The saving comes from the ZK proof check in every submission. The VerifiableApp contract calls a separate verifier, and that check costs about 291,000–298,000 gas no matter how big the batch is.

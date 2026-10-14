@@ -29,8 +29,6 @@ All four `updateStateKzgDA` calls we measured save over 54%. The on-chain part t
 
 Savings assume Gas Killer's Schnorr signature scheme.
 
-At the gas prices we saw when measuring (0.15–0.35 gwei), the saving is about $244 a month across roughly 41 updates a day. At 20 gwei it would be about $18,500 a month.
-
 ## Where the saving comes from
 
 The saving comes from processing each state update inside the Starknet Core contract. The function makes no external calls at all, so all of its computation can move off-chain.

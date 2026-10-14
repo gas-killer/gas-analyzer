@@ -34,7 +34,7 @@ All 15 direct calls we measured save between 61% and 79%. A sample is below, cov
 
 Savings assume Gas Killer's Schnorr signature scheme.
 
-At the gas prices we saw when measuring, the saving is about $876 a month across roughly 106 transactions a day. At 20 gwei it would be about $130,000 a month.
+Railgun processes roughly 106 of these transactions a day, so the saving recurs on each one.
 
 ## Where the saving comes from
 
