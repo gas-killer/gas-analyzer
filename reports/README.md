@@ -9,6 +9,7 @@ Schnorr signature scheme.
 | Securitize | BUIDL `transfer` (compliance service) | up to 88% | [securitize.md](securitize.md) |
 | Kelp | rsETH `depositETH` | 81–83% | [kelp.md](kelp.md) |
 | Railgun | private transfers, shields, RelayAdapt | 45–79% | [railgun.md](railgun.md) |
+| Scroll | bundle finalisation (proof check) | 65% | [scroll.md](scroll.md) |
 | Starknet | `updateStateKzgDA` | 54–75% | [starknet.md](starknet.md) |
 | Polygon Agglayer | proof verification for X Layer, Katana, Lumia, Silicon | 54–72% | [polygon-agglayer.md](polygon-agglayer.md) |
 | Derive | V3 proof submissions | 35–65% | [derive.md](derive.md) |

@@ -67,6 +67,10 @@ Six protocols. Everything else is rounding error at any gas price.
   Verified. This is the intended BD/technical entry point.
 - Discord <https://discord.gg/scroll>, GitHub <https://github.com/scroll-tech>.
 - **No published email.** The Tally form is the route.
+- **People (2026-10-14):** top committers to `scroll-tech/scroll-contracts` in 2025–26:
+  Péter Garamvölgyi (GitHub [`Thegaram`](https://github.com/Thegaram), 25 commits) ✅ and Xi Lin
+  (GitHub [`zimpha`](https://github.com/zimpha), 11) ✅. Neither GitHub links an X account.
+- **Report:** `reports/scroll.md`. 65.4% on bundle finalisation, re-measured October 2026; Scroll is still live.
 
 ### Chronicle
 - `hello@chroniclelabs.org` (general) and `gm@chroniclelabs.org` (partnerships) —
