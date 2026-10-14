@@ -51,6 +51,12 @@ Six protocols. Everything else is rounding error at any gas price.
   RAIL to post, which is a real barrier; budget for it or find a delegate.
 - Telegram `@railgunproject`, Discord via the governance portal. GitHub org:
   <https://github.com/Railgun-Community>.
+- **People (2026-10-14):**
+  - Alan Scott, co-founder, "handling adoption and partnerships". X
+    [`@tsu_kareta`](https://x.com/tsu_kareta) ⚠️, from IQ.wiki, a crowd-edited wiki.
+  - Kieran (GitHub [`mesquka`](https://github.com/mesquka)) ✅, the only committer to
+    `Railgun-Privacy/contract` in 2025–26. No socials on the profile.
+  - Official X [`@railgun_project`](https://x.com/railgun_project) ✅, from the Railgun-Community GitHub org.
 - **No published email found.** Railgun is the most decentralised target on this list and
   the hardest to reach through a conventional channel — but it has the single largest
   20-gwei value, so it is worth the effort of showing up in Telegram/Discord first.
