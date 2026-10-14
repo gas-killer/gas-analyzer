@@ -7,6 +7,8 @@ floor**, plus two projects measured outside the survey (Tacit and USD8). They ar
 dollar value* of the saving, routes each one to a contact channel, and flags what is
 verified versus what still needs a human to confirm.
 
+> **Correction (2026-10-14): "Polygon zkEVM" below is the Polygon Agglayer rollup manager.** The measured transactions go to `PolygonRollupManager` (`0x5132A183…`) but verify other Agglayer chains: X Layer (rollup 3), Lumia (7), Silicon (10) and Katana (20). None is Polygon zkEVM (rollup 1), which Polygon shut down on July 1, 2026. Selector `0x6c766877` is `verifyPessimisticTrustedAggregator`. The gas numbers are unchanged.
+
 ## Read this before sending anything
 
 The survey's own conclusion applies to the outreach: **at the gas prices prevailing when
@@ -32,7 +34,7 @@ Six protocols. Everything else is rounding error at any gas price.
 | **Scroll** | 65.44% | $703 | $6,818 | proof verification; they pay the highest gas price of anyone measured |
 | **Chronicle** | 32.64% | $304 | $6,041 | 189 qualifying txs/day; directly beats Chainlink, which scored 0.00% |
 | **Starknet** | 74.76% | $244 | $18,549 | `updateStateKzgDA` has **no calls in the program at all** — cleanest result in the survey |
-| **Polygon zkEVM** | 71.76% | $77 | $24,800 | two verify paths, both clear; 2nd-highest 20-gwei value |
+| **Polygon Agglayer** | 71.76% | $77 | $24,800 | two verify paths, both clear; 2nd-highest 20-gwei value |
 
 ### Aave
 - **Best channel: the governance forum.** <https://governance.aave.com> — verified live. No
@@ -81,7 +83,7 @@ Six protocols. Everything else is rounding error at any gas price.
 - Also consider the **Starknet Foundation** separately from StarkWare — the L1 state-update
   transactions are posted by the sequencer operator, so confirm who actually owns that cost.
 
-### Polygon zkEVM
+### Polygon Agglayer
 - **`/get-access` form on <https://polygon.technology/contact-us>** — labelled "Business
   Enquiries", the primary route. Verified.
 - Verified emails: `pr@polygon.technology` (press), `ir@polygon.technology` (investor
@@ -217,7 +219,7 @@ listed above would be cold.
    compete on gas, and they are small enough to answer a cold email.
 2. **Scroll second.** Purpose-built intake form, highest gas price paid of anyone measured,
    and the proof-verification result is the strongest technical finding in the survey.
-3. **Starknet and Polygon zkEVM** in parallel — both have working partner-inquiry forms.
+3. **Starknet and Polygon Agglayer** in parallel — both have working partner-inquiry forms.
 4. **Warm intros in parallel** with all of the above, aimed at Aave and Railgun
    specifically, since those two have the highest value and the hardest front doors.
 5. **Aave and Railgun last**, once there is a reference customer or an intro. Both are DAO

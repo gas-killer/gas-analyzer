@@ -30,6 +30,8 @@
 
 Every number in the transaction tables is the tool's own output. The dollar-value section is the one exception — it extrapolates measured gas prices and volumes to a month, and says so.
 
+> **Correction (2026-10-14): "Polygon zkEVM" below is the Polygon Agglayer rollup manager.** The measured transactions go to `PolygonRollupManager` (`0x5132A183…`) but verify other Agglayer chains: X Layer (rollup 3), Lumia (7), Silicon (10) and Katana (20). None is Polygon zkEVM (rollup 1), which Polygon shut down on July 1, 2026. Selector `0x6c766877` is `verifyPessimisticTrustedAggregator`. The gas numbers are unchanged.
+
 ## What the columns mean
 
 - **gas used** — what the transaction actually cost on chain.
@@ -148,7 +150,7 @@ Best and typical figures use only properly measured runs. They exclude the two O
 | **ERC-4337 EntryPoint** | 8 | 0 | **0.00%** | — | replay costs more (6); **the two 85.18% / 78.58% rows are now PROVEN artifacts** — `innerHandleOp` is not re-executed on replay (see below) |
 | **Starknet** | 4 | 4 | **74.76%** | 65.54% | — ; `updateStateKzgDA`, **no calls in the program**; base fixed at ~58,700 so the saving scales with gas |
 | **Scroll** | 4 | 3 | **65.44%** | 65.14% | under the floor (1, the non-proof batch commit); 3 wins within 108 gas of each other |
-| **Polygon zkEVM** | 5 | 5 | **71.76%** | 60.50% | — ; savings fall into two clusters, ~372,230 and ~404,048 |
+| **Polygon Agglayer** | 5 | 5 | **71.76%** | 60.50% | — ; savings fall into two clusters, ~372,230 and ~404,048 |
 | **Linea** | 3 | 2 | **54.54%** | 54.54% | replay costs more (1) — its other path delegates verification behind a `CALL` |
 | **Kelp** | 5 | 4 | **83.29%** | 81.72% | replay costs more (1) |
 | **Railgun** | 18 | 15 | **78.72%** | 72.02% | replay costs more (1) |
@@ -1333,18 +1335,18 @@ Update shorthand: `S` storage write, `C` call, `L0`–`L4` log with that many to
 | Starknet | [`0xdf208a1e…`](https://etherscan.io/tx/0xdf208a1efd933610f34fc9b758676d5d4de344c7dc86d24e4bca9f8d2f9f66a8) | `updateStateKzgDA` ✓ `0x507ee528` | 430,572 | 58,720 | +371,852 | **321,852** (74.75%) | — | 5 (3S/2L1) | **no calls in the program at all** — the surplus is pure inline proof verification |
 | Scroll | [`0x5dfe029f…`](https://etherscan.io/tx/0x5dfe029fdd4ef15b6d11614d77f813b759f8ef1ca0650e310ac19d838483facd) | *bundle finalisation* `0xc1aa4e19` | 449,337 | 105,300 | +344,037 | **294,037** (65.44%) | — | 5 (3S/1C/1L3) | recorded call replays successfully from the rollup contract |
 | Scroll | [`0xf715759f…`](https://etherscan.io/tx/0xf715759fa10020e47c7e43557d14155852eb6312a74c25f9b71cb107e8c945b5) | *bundle finalisation* `0xc1aa4e19` | 455,424 | 111,415 | +344,009 | **294,009** (64.56%) | — |  |  saving is within 28 gas of the row above |
-| Polygon zkEVM | [`0x23b8eef0…`](https://etherscan.io/tx/0x23b8eef0f5c1c42c6c5f84c94944afcbd1d9de147ba5b3a1353ec99a1842d8dd) | *batch verification* `0x6c766877` | 610,721 | 188,497 | +422,224 | **372,224** (60.95%) | — | 7 (3S/2C/2L3) | both recorded calls replay successfully |
-| Polygon zkEVM | [`0x287570a8…`](https://etherscan.io/tx/0x287570a8c25d027d8bc8caafc22146ca85c4170f4eb6de29f092917b24d606f4) | *batch verification* `0x6c766877` | 699,367 | 245,325 | +454,042 | **404,042** (57.77%) | — |  | **largest absolute saving in this file** |
+| Polygon Agglayer | [`0x23b8eef0…`](https://etherscan.io/tx/0x23b8eef0f5c1c42c6c5f84c94944afcbd1d9de147ba5b3a1353ec99a1842d8dd) | `verifyPessimisticTrustedAggregator` `0x6c766877` | 610,721 | 188,497 | +422,224 | **372,224** (60.95%) | — | 7 (3S/2C/2L3) | both recorded calls replay successfully |
+| Polygon Agglayer | [`0x287570a8…`](https://etherscan.io/tx/0x287570a8c25d027d8bc8caafc22146ca85c4170f4eb6de29f092917b24d606f4) | `verifyPessimisticTrustedAggregator` `0x6c766877` | 699,367 | 245,325 | +454,042 | **404,042** (57.77%) | — |  | **largest absolute saving in this file** |
 | Linea | [`0x8acb9674…`](https://etherscan.io/tx/0x8acb967410c2d19c339a78d605f952fb5408a568daa754953eccebe66d65a077) | *proof finalisation* `0x99467a35` | 231,160 | 55,108 | +176,052 | **126,052** (54.53%) | — |  |  |
-| Polygon zkEVM | [`0x6d0af448…`](https://etherscan.io/tx/0x6d0af448a99d15618509dd4802a00ac07be838bdbe12d5e5f08968315bb033c9) | `verifyBatchesTrustedAggregator` ✓ `0x1489ed10` | 409,069 | 136,260 | +272,809 | **222,809** (54.47%) | — |  | the confirmed-name proof path |
+| Polygon Agglayer | [`0x6d0af448…`](https://etherscan.io/tx/0x6d0af448a99d15618509dd4802a00ac07be838bdbe12d5e5f08968315bb033c9) | `verifyBatchesTrustedAggregator` ✓ `0x1489ed10` | 409,069 | 136,260 | +272,809 | **222,809** (54.47%) | — |  | the confirmed-name proof path |
 | Starknet | [`0x89d7d4a5…`](https://etherscan.io/tx/0x89d7d4a50e86de2334bbdafa0ada3abc673aa66d8ac69c02b83763d0a3ce6eb9) | `updateStateKzgDA` ✓ `0x507ee528` | 542,165 | 198,003 | +344,162 | **294,162** (54.26%) | — |  | bigger state diff (8 logs) so a lower %, same ~294,000 saving |
 | Linea | [`0x4546019a…`](https://etherscan.io/tx/0x4546019a7733a24736b222e6fc45bfceac2a2c1d8caae4ea99b696dd8d254858) | *finalisation* `0x755bc62f` | 427,765 | 426,122 | +1,643 | **0** (0.00%) | replay costs more | — | **control** — Linea's other path delegates verification to a separate contract, so it replays whole |
 | Scroll | [`0x6e321015…`](https://etherscan.io/tx/0x6e321015331f46cd0ba90af0262be38d49239d3e3e9f7d6a69068527f81aa1e4) | *batch commit* `0x9bbaa2ba` | 65,955 | 62,212 | +3,743 | **0** (0.00%) | under the floor | — | **control** — Scroll's non-proof call, no verification to remove |
-| Polygon zkEVM | [`0x5d45dec8…`](https://etherscan.io/tx/0x5d45dec824732cb577de414b76596943f90ac8171f2aa7560abf512deed70045) | *batch verification* `0x6c766877` | 518,713 | 96,477 | +422,236 | **372,236** (71.76%) | — | — | its **smallest** sampled transaction, and its best percentage |
+| Polygon Agglayer | [`0x5d45dec8…`](https://etherscan.io/tx/0x5d45dec824732cb577de414b76596943f90ac8171f2aa7560abf512deed70045) | `verifyPessimisticTrustedAggregator` `0x6c766877` | 518,713 | 96,477 | +422,236 | **372,236** (71.76%) | — | — | its **smallest** sampled transaction, and its best percentage |
 | Starknet | [`0xe04e714d…`](https://etherscan.io/tx/0xe04e714d933ecadcda0e76dd740aa2d0ad0c0a2e1fb867bd504e56f4424fcc15) | `updateStateKzgDA` ✓ `0x507ee528` | 430,536 | 58,672 | +371,864 | **321,864** (74.76%) | — | — |  |
 | Scroll | [`0x22912e89…`](https://etherscan.io/tx/0x22912e89717c67196197e392fed4903f6389fa36507bd9e7b4a71c3b273dedf6) | *bundle finalisation* `0xc1aa4e19` | 449,229 | 105,300 | +343,929 | **293,929** (65.43%) | — | — | same base as the other two rows to the gas |
 | Starknet | [`0xa9c4f70f…`](https://etherscan.io/tx/0xa9c4f70f98f57dbef8b36fce15f1b0d056ac46d8b2e0cb6fc898a11c20347c37) | `updateStateKzgDA` ✓ `0x507ee528` | 261,069 | 58,648 | +202,421 | **152,421** (58.38%) | — | — | the **smallest** Starknet call; base unchanged, so the saving scales with gas |
-| Polygon zkEVM | [`0x4796a155…`](https://etherscan.io/tx/0x4796a155edc6c34003daedfb132057155cc5f62fe1d4fd50258eb1c6cbf59fb7) | *batch verification* `0x6c766877` | 702,121 | 248,067 | +454,054 | **404,054** (57.55%) | — | — |  |
+| Polygon Agglayer | [`0x4796a155…`](https://etherscan.io/tx/0x4796a155edc6c34003daedfb132057155cc5f62fe1d4fd50258eb1c6cbf59fb7) | `verifyPessimisticTrustedAggregator` `0x6c766877` | 702,121 | 248,067 | +454,054 | **404,054** (57.55%) | — | — |  |
 | Linea | [`0xd07acdd6…`](https://etherscan.io/tx/0xd07acdd612e95f7d4aedfa893d92c06c0f9d6261632fc67490a93c4a2b1ce834) | *proof finalisation* `0x99467a35` | 231,112 | 55,072 | +176,040 | **126,040** (54.54%) | — | — | Linea's 50 calls span just 72 gas end to end |
 
 | Doppler | [`0x7b08cf0d…`](https://etherscan.io/tx/0x7b08cf0df79aaaf918bc03d62d402bceb70e3ac68e662a18464c3097d02071ff) | DopplerHookInitializer `collectFees` ✓ `0x817db73b` | 913,547 | 738,099 | +175,448 | **125,448** (13.73%) | — | — | the v4 `unlock` call re-executes at full price; the saving is the hook's own work around it |

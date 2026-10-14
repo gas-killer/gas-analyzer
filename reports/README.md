@@ -10,7 +10,7 @@ Schnorr signature scheme.
 | Kelp | rsETH `depositETH` | 81–83% | [kelp.md](kelp.md) |
 | Railgun | private transfers, shields, RelayAdapt | 45–79% | [railgun.md](railgun.md) |
 | Starknet | `updateStateKzgDA` | 54–75% | [starknet.md](starknet.md) |
-| Polygon zkEVM | batch verification | 54–72% | [polygon-zkevm.md](polygon-zkevm.md) |
+| Polygon Agglayer | proof verification for X Layer, Katana, Lumia, Silicon | 54–72% | [polygon-agglayer.md](polygon-agglayer.md) |
 | Derive | V3 proof submissions | 35–65% | [derive.md](derive.md) |
 
 The underlying measurements are in `../ALL_TRANSACTION_ANALYSES.md`, `../PROTOCOL_SURVEY.md` and

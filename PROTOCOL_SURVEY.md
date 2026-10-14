@@ -16,6 +16,8 @@ Every number in the results tables is analyzer output. Where a figure is my own 
 > moved, but treat any percentage in this file as provisional against
 > `ALL_TRANSACTION_ANALYSES.md`, which was regenerated wholesale.
 
+> **Correction (2026-10-14): "Polygon zkEVM" below is the Polygon Agglayer rollup manager.** The measured transactions go to `PolygonRollupManager` (`0x5132A183…`) but verify other Agglayer chains: X Layer (rollup 3), Lumia (7), Silicon (10) and Katana (20). None is Polygon zkEVM (rollup 1), which Polygon shut down on July 1, 2026. Selector `0x6c766877` is `verifyPessimisticTrustedAggregator`. The gas numbers are unchanged.
+
 ## Headline: Railgun
 
 **15 direct calls to the Railgun smart wallet, all trace-measured, all clearing the Schnorr floor.** Schnorr savings range **60.83%–78.72%** (median 72.02%).
@@ -2132,10 +2134,10 @@ zkEVM RollupManager `0x5132A183…` (2,112 B).
 | Starknet | `updateStateKzgDA` | 430,572 | 58,720 | **321,852 (74.75%)** |
 | Scroll | *bundle finalisation* `0xc1aa4e19` | 449,337 | 105,300 | **294,037 (65.44%)** |
 | Scroll | *bundle finalisation* `0xc1aa4e19` | 455,424 | 111,415 | **294,009 (64.56%)** |
-| Polygon zkEVM | *batch verification* `0x6c766877` | 610,721 | 188,497 | **372,224 (60.95%)** |
-| Polygon zkEVM | *batch verification* `0x6c766877` | 699,367 | 245,325 | **404,042 (57.77%)** |
+| Polygon Agglayer | `verifyPessimisticTrustedAggregator` `0x6c766877` | 610,721 | 188,497 | **372,224 (60.95%)** |
+| Polygon Agglayer | `verifyPessimisticTrustedAggregator` `0x6c766877` | 699,367 | 245,325 | **404,042 (57.77%)** |
 | Linea | *proof finalisation* `0x99467a35` | 231,160 | 55,108 | **126,052 (54.53%)** |
-| Polygon zkEVM | `verifyBatchesTrustedAggregator` | 409,069 | 136,260 | **222,809 (54.47%)** |
+| Polygon Agglayer | `verifyBatchesTrustedAggregator` | 409,069 | 136,260 | **222,809 (54.47%)** |
 | Starknet | `updateStateKzgDA` | 542,165 | 198,003 | **294,162 (54.26%)** |
 | Linea | *finalisation* `0x755bc62f` | 427,765 | 426,122 | 0 |
 | Scroll | *batch commit* `0x9bbaa2ba` | 65,955 | 62,212 | 0 |
@@ -2148,7 +2150,7 @@ rollups establish the structure:
 | Starknet | **fixed at ~58,700** over a 2.1x gas range (58,648 / 58,672 / 58,720) | saving scales with gas — 152,421 at its smallest call, 321,864 at its largest |
 | Scroll | fixed at 105,300 | saving pinned at ~294,000; three wins within 108 gas of each other |
 | Linea | fixed at ~55,090 | saving pinned at ~126,046; its 50 calls span just 72 gas end to end |
-| Polygon zkEVM | varies with log count (96,477 / 188,497 / ~247,000) | two clusters, ~372,230 and ~404,048 |
+| Polygon Agglayer | varies with log count (96,477 / 188,497 / ~247,000) | two clusters, ~372,230 and ~404,048 |
 
 An earlier version of this section said the saving was constant everywhere. That was wrong for
 Starknet: because its base is fixed, its saving tracks transaction size, and its smallest call
@@ -2191,8 +2193,8 @@ Exact per-selector counts over a 7-day window, not extrapolated from a sample:
 |---|---|---:|---:|---:|---:|---:|---:|---:|
 | Starknet | `updateStateKzgDA` | 283 | 40.8 | 415,242 | 306,542 | 374,766,528 | **$244** | $18,549 |
 | Scroll | `0xc1aa4e19` | 108 | 15.6 | 450,552 | 295,252 | 137,752,540 | **$703** | $6,818 |
-| Polygon zkEVM | `0x6c766877` | 203 | 29.2 | 635,422 | 409,026 | 358,699,108 | **$55** | $17,753 |
-| Polygon zkEVM | `verifyBatchesTrustedAggregator` | 135 | 19.4 | 430,384 | 244,124 | 142,373,277 | **$22** | $7,047 |
+| Polygon Agglayer | `0x6c766877` | 203 | 29.2 | 635,422 | 409,026 | 358,699,108 | **$55** | $17,753 |
+| Polygon Agglayer | `verifyBatchesTrustedAggregator` | 135 | 19.4 | 430,384 | 244,124 | 142,373,277 | **$22** | $7,047 |
 | Linea | `0x99467a35` | 50 | 7.2 | 231,156 | 126,066 | 27,230,291 | **$21** | $1,348 |
 | | **total** | **779** | | | | **1,040,821,744** | **$1,046** | **$51,514** |
 
@@ -2508,7 +2510,7 @@ ETH/USD $2,386, read from the Chainlink aggregator on-chain.
 | Railgun | 78.72% | 106 | 854,737 | **$876** | $130,162 |
 | **Scroll** | **65.44%** | **15.6** | **295,252** | **$703** | **$6,818** |
 | **Starknet** | **74.76%** | **40.8** | **306,542** | **$244** | **$18,549** |
-| **Polygon zkEVM** | **71.76%** | **48.6** | ~350,000 | **$77** | **$24,800** |
+| **Polygon Agglayer** | **71.76%** | **48.6** | ~350,000 | **$77** | **$24,800** |
 | **Linea** | **54.54%** | **7.2** | **126,066** | **$21** | **$1,348** |
 | Pyth | 28.01% | 29 | 54,614 | **$12** | $2,245 |
 | | | | | **~$3,650** | **~$291,000** |
