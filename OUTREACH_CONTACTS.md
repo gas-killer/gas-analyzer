@@ -45,6 +45,14 @@ Six protocols. Everything else is rounding error at any gas price.
 - **Practical note:** Aave Labs runs partnerships; the DAO runs the protocol. A gas-saving
   integration touching the pool contracts is a DAO conversation, so the forum is the real
   door. Expect to need a delegate to sponsor it — the Aave Chan Initiative is the usual route.
+- **People (2026-10-15):** BGD Labs, which maintained V3 for the DAO, left on April 1, 2026. Since
+  May, the `aave-dao/aave-v3-origin` commits come from Aave engineers:
+  - Dhairya Sethi (GitHub [`DhairyaSethi`](https://github.com/DhairyaSethi)), "smart contracts @aave,
+    prev @0xPolygon". X [`@imderl`](https://x.com/imderl) ✅, linked from his GitHub. Top 2026 committer.
+  - Alexandru-Vlad Niculae (GitHub [`avniculae`](https://github.com/avniculae)), "building smart
+    contracts @aave". X [`@_aniculae`](https://x.com/_aniculae) ✅, linked from his GitHub.
+- **Report:** `reports/aave.md`. V3 `borrow` saves 14–64% (~25% typical), re-measured October 2026,
+  about 1,090 borrows a day. Aave V4 went live on mainnet March 30, 2026 and has not been measured.
 
 ### Railgun
 - **Governance portal: <https://governance.railgun.org>** — DAO governance requires staked
