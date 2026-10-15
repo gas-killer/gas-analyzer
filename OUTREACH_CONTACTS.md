@@ -71,6 +71,15 @@ Six protocols. Everything else is rounding error at any gas price.
   Péter Garamvölgyi (GitHub [`Thegaram`](https://github.com/Thegaram), 25 commits) ✅ and Xi Lin
   (GitHub [`zimpha`](https://github.com/zimpha), 11) ✅. Neither GitHub links an X account.
 - **Report:** `reports/scroll.md`. 65.4% on bundle finalisation, re-measured October 2026; Scroll is still live.
+- **Co-founders on X** ⚠️ (from a Blockworks podcast page, consistent across sources, not checked
+  on X): Sandy Peng [`@SandyPeng1`](https://x.com/SandyPeng1), Ye Zhang
+  [`@yezhang1998`](https://x.com/yezhang1998), Haichen Shen [`@shenhaichen`](https://x.com/shenhaichen).
+  The project account has gone by both `@Scroll_ZKP` and `@buildwithscroll`.
+- **Context (Sept 8–9, 2026 forum update):** Scroll plans to move, over about nine months, from a
+  public general-purpose L2 to a private, application-specific network around its Compass AI
+  product. SCR moves to Ethereum mainnet. It is an update, not a DAO vote. Coverage does not say
+  whether ScrollChain keeps finalising proofs on Ethereum. Ask before pitching, because a
+  shrinking chain-ops team may not prioritise L1 gas.
 
 ### Chronicle
 - `hello@chroniclelabs.org` (general) and `gm@chroniclelabs.org` (partnerships) —
