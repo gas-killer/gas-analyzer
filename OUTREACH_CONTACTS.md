@@ -77,6 +77,15 @@ Six protocols. Everything else is rounding error at any gas price.
   **search-derived, NOT verified on-page**; chroniclelabs.org rate-limited every fetch
   attempt. Confirm before sending, or use Discord.
 - Discord <https://discord.com/invite/CjgvJ9EspJ>. GitHub <https://github.com/chronicleprotocol>.
+- **People (2026-10-15):**
+  - merkleplant (GitHub [`pmerkleplant`](https://github.com/pmerkleplant)) ✅. "Research engineer
+    building oracles" at Chronicle, and the main Scribe author (30 of the recent commits). X
+    [`@merkleplant_eth`](https://x.com/merkleplant_eth), linked from his GitHub. **Best first contact.**
+  - Jinsoo Heo (GitHub [`devkoriel`](https://github.com/devkoriel)) ✅, DevOps engineer. X
+    [`@devkoriel`](https://x.com/devkoriel); his GitHub README lists a Chronicle work email.
+  - The docs site links X [`@ChronicleLabs`](https://x.com/ChronicleLabs) and Discord
+    `discord.gg/H9rnwcU8p4` ✅.
+- **Report:** `reports/chronicle.md`. 29–32% per poke, re-measured October 2026 across five feeds.
 - **Strongest single story in the survey:** Chronicle measured 32.64% while Chainlink
   measured 0.00% on the same screening. That is a competitive-differentiation pitch, not
   just a cost pitch, and Chronicle already markets itself on gas efficiency.

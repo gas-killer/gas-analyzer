@@ -12,6 +12,7 @@ Schnorr signature scheme.
 | Scroll | bundle finalisation (proof check) | 65% | [scroll.md](scroll.md) |
 | Starknet | `updateStateKzgDA` | 54–75% | [starknet.md](starknet.md) |
 | Polygon Agglayer | proof verification for X Layer, Katana, Lumia, Silicon | 54–72% | [polygon-agglayer.md](polygon-agglayer.md) |
+| Chronicle | Scribe `poke` (price updates) | 29–32% | [chronicle.md](chronicle.md) |
 | Derive | V3 proof submissions | 35–65% | [derive.md](derive.md) |
 | Usual | USD0 `swap` and `redeem` (collateral check in Usd0) | 54–60% | [usual.md](usual.md) |
 
