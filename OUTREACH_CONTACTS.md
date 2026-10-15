@@ -75,6 +75,8 @@ Six protocols. Everything else is rounding error at any gas price.
   on X): Sandy Peng [`@SandyPeng1`](https://x.com/SandyPeng1), Ye Zhang
   [`@yezhang1998`](https://x.com/yezhang1998), Haichen Shen [`@shenhaichen`](https://x.com/shenhaichen).
   The project account has gone by both `@Scroll_ZKP` and `@buildwithscroll`.
+  **Josh reports (2026-10-15) that all three founders have left;** not confirmed publicly. Do not use
+  their handles. Use the Tally form, the engineers above, or the governance forum.
 - **Context (Sept 8–9, 2026 forum update):** Scroll plans to move, over about nine months, from a
   public general-purpose L2 to a private, application-specific network around its Compass AI
   product. SCR moves to Ethereum mainnet. It is an update, not a DAO vote. Coverage does not say
