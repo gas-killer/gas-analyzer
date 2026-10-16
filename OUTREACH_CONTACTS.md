@@ -211,9 +211,11 @@ heuristic fallback.
   check its `SECURITY.md` for a contact.
 - Do not confuse with "Tacit Protocol", an unrelated Chainlink hackathon project.
 
-### Morpho VaultV2 — pitch the curators
-The saving sits in the vault contract, and curators deploy and run the vaults. They are the
-people who would adopt it.
+### Morpho VaultV2 — pitch Morpho first, curators second
+The saving sits in the vault contract. **VaultV2 is not upgradeable** (checked on steakUSDC
+`0xbeef0880…`: a 21.8 KB `VaultV2`, with no proxy slots). Owners and curators only configure it.
+Adopting Gas Killer means Morpho ships a new VaultV2 version, curators deploy new vaults from it,
+and depositors move over. Pitch Morpho; curators are supporting voices.
 - **Morpho** (Association + Morpho Labs): forum <https://forum.morpho.org> (verified; has
   vault-provider categories), docs <https://docs.morpho.org>. No BD email found.
 - **Steakhouse Financial** (steakUSDC): "Get in touch" form

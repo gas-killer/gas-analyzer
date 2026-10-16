@@ -2842,3 +2842,67 @@ About 175k gas of these transactions runs in the diamond's own code. Every one m
 **Conclusion:** LI.FI is not a strong candidate overall. It is a router, and the gas belongs to the
 protocols it routes into. The Mayan path is a narrow, real saving of ~100k gas per transaction,
 worth raising only if LI.FI is already in conversation.
+
+## Axelar, Aztec and Alchemix (2026-10-16)
+
+Measured on `main` (`8aed5cf`).
+
+### Axelar Gateway: 22–37% with nesting, 0% without
+
+The Gateway (`0x4F449524…`) received 137 `execute` calls (`0x09c5eabe`) in the day to block
+26,205,436. Each one approves a batch of messages after checking validator signatures. The check
+runs in a separate auth contract (`0xe3b83f79…`), reached by a regular `CALL` of about 120k gas,
+nearly all of it `ecrecover`. Plain mode replays that call, so it scores 0%. With the auth contract
+passed as `--owned`:
+
+| tx | gas used | saved (nested, Schnorr) | % |
+|---|---:|---:|---:|
+| [`0x5c2f7ca3…`](https://etherscan.io/tx/0x5c2f7ca332352d4d7c14ca04f79bef27775c6fc760045809d1b3ff72f923a345) | 285,629 | 105,880 | **37.07%** |
+| [`0x44d96e5f…`](https://etherscan.io/tx/0x44d96e5f0b6a62c78c0ec4baeee8419e63ab45ee7cae2908bff0b4080ccf09a1) | 288,648 | 106,762 | **36.99%** |
+| [`0x1b32c4f8…`](https://etherscan.io/tx/0x1b32c4f88c6c6cd227dc3baa9ff0b969856b22168d5b307546a4440afc0df0a0) | 288,900 | 106,714 | **36.94%** |
+| [`0xd3240dc3…`](https://etherscan.io/tx/0xd3240dc31bbd2aa3441fe38db2b0f7096a522f0b47acf8f6e9ab245959ef4e58) | 350,580 | 98,372 | 28.06% |
+| [`0xf22581da…`](https://etherscan.io/tx/0xf22581da072028a061f0edac8ad66cb832e0b306bc7c8bf878a87977452ccbf4) | 417,149 | 92,445 | 22.16% |
+
+**Status:** Circle agreed in December 2025 to acquire Interop Labs, Axelar's original team, and
+its IP. The network, the Axelar Foundation and AXL stay independent. Common Prefix leads network
+development as of December 16, 2025, and its 2026 plans include "gas-free bridges". Pitch Common
+Prefix and the Foundation, not the original founders.
+
+### Aztec rollup: very high volume, not measurable with the current analyzer
+
+The canonical rollup (`0x91ff8bbd…`, read from the registry `0x35b22e09…`) received **258
+`submitEpochRootProof` calls in a day**, at a median of 1.75M gas and up to 2.27M. That is over
+450M gas a day, the most of any proof path in this survey. Each proof spends 722k gas in a
+`STATICCALL` to the Honk verifier (`0x098f47c0…`), plus a 50k point-evaluation precompile.
+
+**The analyzer runs out of memory on these.** The struct-log trace of the Honk verifier carries
+huge memory snapshots, and the CLI is killed at about 14 GB. Five proofs were tried, all killed.
+Fixing it needs the trace read in a streaming way or fetched without memory, which is a dev change.
+
+**Estimate from the call trace, not measured:** gas in read-only calls is 874k–898k per proof, so
+the saving is at least ~825k–850k gas (37–61%), before counting any of the rollup's own
+computation. Treat it as an estimate until the analyzer can replay one.
+
+**Status:** the token launched February 12, 2026, and the Alpha mainnet is live (v5.1.0). Aztec
+disclosed two vulnerabilities in March 2026. The separate, older Aztec Connect was exploited for
+$2.19M in June 2026; it is not this contract.
+
+### Alchemix V3: 71–85% on `mint`
+
+V3 replaced V2 in April–May 2026 (AIP-122, AIP-123). The AlchemistV3 contracts were found
+on-chain from alUSD and alETH mints: alETH `0xfa995b6a…`, alUSD `0xeb83112d…`; deposits go through
+the AlchemistRouter `0xdb852896…`. About 313 transactions in 21 days, roughly 15 a day; 104 are
+`mint`. A mint values the Mix-Yield Token across its 7 strategies with `STATICCALL`s, about 640k
+gas on alETH, and those calls are removable.
+
+| tx | Alchemist | function | gas used | saved (Schnorr) | % | measured |
+|---|---|---|---:|---:|---:|---|
+| [`0x3ec144c4…`](https://etherscan.io/tx/0x3ec144c4bffb5003e90c0a9574342cfc70024227fe20f87c286278c7fdc07fe5) | alETH | `mint` | 1,610,420 | 1,361,342 | **84.53%** | replay |
+| [`0x0f0f4034…`](https://etherscan.io/tx/0x0f0f403441c495f654d65ec69f615790594cf824f09bb31fe30d79f7159580b6) | alETH | `mint` | 1,600,587 | 1,351,497 | **84.44%** | replay |
+| [`0x216dc160…`](https://etherscan.io/tx/0x216dc160c441478483c6e83622d36c8265f842611954b22fecb31a5e80d17de3) | alUSD | `mint` | 881,980 | 627,945 | **71.20%** | replay |
+| [`0xe7413cef…`](https://etherscan.io/tx/0xe7413cef266c84253773a74b14b12b171a03d01c99be411f2f197c214f073dab) | alUSD | `mint` | 883,848 | 698,699 | 79.05% | `heur` |
+| [`0xc29618f3…`](https://etherscan.io/tx/0xc29618f3c3dcfbbfe0d6569574438f9dc2cefff38c11c858aab3069beda95c9d) | alETH | `burn` | 947,866 | 796,257 | 84.01% | `heur` |
+
+Only the three replayed rows should be quoted. The Alchemists are proxies (they `DELEGATECALL` an
+implementation), so an integration would be an upgrade; who controls the upgrade was not checked.
+Alchemix is small: Q2 2026 revenue was about $329k and mainnet stablecoin deposits about $7.4M.
