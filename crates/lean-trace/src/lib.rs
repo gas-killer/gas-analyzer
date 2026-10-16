@@ -4,8 +4,9 @@
 //! [`reads_memory`]). Parsing into [`LeanFrame`] skips the rest, along with `storage` and
 //! `returnData`, so a trace takes a fraction of its size once parsed.
 //!
-//! It lives here rather than in core because compiling it into core slows `compute_state_updates`
-//! by ~60% (`prestate_parsing/compute_state_updates_heavy`), from codegen alone.
+//! It lives in its own crate rather than in core because compiling it into core slows
+//! `compute_state_updates` by ~60% (`prestate_parsing/compute_state_updates_heavy`), from codegen
+//! alone.
 
 use std::fmt;
 
@@ -17,7 +18,7 @@ use serde::de::{self, IgnoredAny, MapAccess, Visitor};
 use gas_analyzer_core::trace::reads_memory;
 
 /// A [`DefaultFrame`] whose steps hold memory only where [`reads_memory`] says it's needed.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LeanFrame {
     failed: bool,
@@ -38,6 +39,21 @@ impl From<LeanFrame> for DefaultFrame {
     }
 }
 
+/// A `debug_traceTransaction` JSON-RPC response; `jsonrpc` and `id` are ignored.
+#[derive(Deserialize)]
+pub struct TraceResponse {
+    pub result: Option<LeanFrame>,
+    pub error: Option<RpcErrorBody>,
+}
+
+/// The `error` of a JSON-RPC response.
+#[derive(Deserialize)]
+pub struct RpcErrorBody {
+    #[serde(default)]
+    pub message: String,
+}
+
+#[derive(Debug)]
 #[repr(transparent)]
 struct LeanStructLog(StructLog);
 

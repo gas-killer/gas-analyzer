@@ -6,6 +6,7 @@ members = [
     "crates/core",
     "crates/evmsketch",
     "crates/gas-estimator",
+    "crates/lean-trace",
     "crates/rpc",
     "crates/wasm",
     "crates/indexer-api",
@@ -18,6 +19,7 @@ members = [
 default-members = [
     "crates/core",
     "crates/gas-estimator",
+    "crates/lean-trace",
     "crates/rpc",
     "crates/evmsketch",
     "crates/cli",

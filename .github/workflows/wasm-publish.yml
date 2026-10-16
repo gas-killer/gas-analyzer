@@ -9,6 +9,7 @@ on:
     paths:
       - 'crates/core/**'
       - 'crates/gas-estimator/**'
+      - 'crates/lean-trace/**'
       - 'crates/wasm/**'
       - 'abis/**'
       - 'Cargo.lock'

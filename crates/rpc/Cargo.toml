@@ -6,9 +6,17 @@ edition = "2024"
 [dependencies]
 gas-analyzer-core = { path = "../core" }
 gas-analyzer-estimator = { path = "../gas-estimator" }
+gas-analyzer-lean-trace = { path = "../lean-trace" }
 alloy = { version = "1.0.37", features = ["rpc", "rpc-types"] }
 alloy-eips = "1.0.37"
 alloy-provider = { version = "1.0.37", features = ["debug-api"] }
 alloy-rpc-types = "1.0.37"
 revm = { version = "31.0.1", default-features = false, features = ["std"] }
 anyhow = "1.0.98"
+bytes = "1"
+serde_json = "1.0"
+tokio = { version = "1.45.1", features = ["rt", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1.45.1", features = ["rt", "macros", "net", "io-util"] }
+url = "2.5.4"

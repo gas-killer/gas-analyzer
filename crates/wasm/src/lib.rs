@@ -20,11 +20,10 @@ use revm::database::{CacheDB, EmptyDB};
 use revm::primitives::KECCAK_EMPTY;
 use revm::primitives::hardfork::SpecId;
 use revm::state::{AccountInfo, Bytecode};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
-mod lean_trace;
-use lean_trace::LeanFrame;
+use gas_analyzer_lean_trace::{LeanFrame, TraceResponse};
 
 /// Initialize panic hook for better error messages in browser console.
 #[wasm_bindgen(start)]
@@ -181,19 +180,6 @@ fn callees_with_code(trace: &DefaultFrame) -> BTreeSet<Address> {
             Some(Address::from_word((*target).into()))
         })
         .collect()
-}
-
-/// A `debug_traceTransaction` JSON-RPC response; `jsonrpc` and `id` are ignored.
-#[derive(Deserialize)]
-struct TraceResponse {
-    result: Option<LeanFrame>,
-    error: Option<RpcErrorBody>,
-}
-
-#[derive(Deserialize)]
-struct RpcErrorBody {
-    #[serde(default)]
-    message: String,
 }
 
 /// Why [`analyze_trace_bytes_inner`] produced no result.
