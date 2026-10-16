@@ -46,6 +46,7 @@ We replayed each transaction as Gas Killer would settle it and compared the gas 
 - **Real data:** real mainnet transactions, replayed at the block they ran in.
 - **Includes all costs:** the gas saved is net of the signature check and every storage write.
 - **An estimate:** the rollup manager has not integrated Gas Killer, so the numbers estimate a future integration.
+- **Check it yourself:** you can run any of these transactions through the Gas Killer analyzer at [gaskiller.xyz/analyzer](https://gaskiller.xyz/analyzer).
 - **Volume:** the counts come from an exact 7-day window of verification calls, not a sample.
 - **Open question:** a change to the rollup manager goes through Polygon's upgrade process, which we have not assessed. Polygon zkEVM itself was shut down on July 1, 2026; none of these transactions are for it.
 

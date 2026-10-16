@@ -46,6 +46,7 @@ We replayed each transaction as Gas Killer would settle it and compared the gas 
 - **Real data:** real mainnet transactions, replayed at the block they ran in.
 - **Includes all costs:** the gas saved is net of the signature check and every storage write.
 - **An estimate:** Derive has not integrated Gas Killer, so the numbers estimate a future integration.
+- **Check it yourself:** you can run any of these transactions through the Gas Killer analyzer at [gaskiller.xyz/analyzer](https://gaskiller.xyz/analyzer).
 - **Volume:** 281 proof submissions in the first ~47 hours after launch (blocks 26,135,150–26,149,120), all successful. Early volume may not reflect steady state.
 - **Not measured:** deposits and withdrawals, which are mostly token transfers.
 

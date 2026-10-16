@@ -47,6 +47,7 @@ We replayed each transaction as Gas Killer would settle it and compared the gas 
 - **Real data:** real mainnet transactions, replayed at the block they ran in.
 - **Includes all costs:** the gas saved is net of the signature check and every storage write.
 - **An estimate:** these contracts have not integrated Gas Killer, so the numbers estimate a future integration. The fixed costs of a two-contract setup are included as a fixed estimate.
+- **Check it yourself:** you can run any of these transactions through the Gas Killer analyzer at [gaskiller.xyz/analyzer](https://gaskiller.xyz/analyzer).
 - **Volume:** BUIDL averaged about 1.8 transfers a day when we sampled it, so the total saving depends on transfer volume.
 
 ## Next steps

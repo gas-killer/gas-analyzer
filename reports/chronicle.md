@@ -46,6 +46,7 @@ We replayed each transaction as Gas Killer would settle it and compared the gas 
 - **Real data:** real mainnet pokes from October 2026, replayed at the block they ran in.
 - **Includes all costs:** the gas saved is net of Gas Killer's signature check and the storage write.
 - **An estimate:** Scribe has not integrated Gas Killer, so the numbers estimate a future integration.
+- **Check it yourself:** you can run any of these transactions through the Gas Killer analyzer at [gaskiller.xyz/analyzer](https://gaskiller.xyz/analyzer).
 - **Consistent over time:** 21 direct pokes we measured in September 2026 saved 28.6–32.6%, the same range as now.
 - **Batched pokes:** pokes sent together through Multicall3 do not save, because each inner poke is a separate call. The saving applies to direct pokes.
 - **Volume:** Scribe feeds received about 90 successful direct pokes across 21 feeds in the day to block 26,192,723.

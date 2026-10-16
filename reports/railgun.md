@@ -52,6 +52,7 @@ We replayed each transaction as Gas Killer would settle it and compared the gas 
 - **Real data:** real mainnet transactions, replayed at the block they ran in.
 - **Includes all costs:** the gas saved is net of the signature check and every storage write.
 - **An estimate:** Railgun has not integrated Gas Killer, so the numbers estimate a future integration. The RelayAdapt figures also include an estimated fixed cost for the two-contract setup.
+- **Check it yourself:** you can run any of these transactions through the Gas Killer analyzer at [gaskiller.xyz/analyzer](https://gaskiller.xyz/analyzer).
 - **Volume:** in a 40,000-block sample, 53% of successful Railgun transactions went straight to the smart wallet and 39% went through RelayAdapt.
 
 ## Next steps

@@ -46,6 +46,7 @@ We replayed each transaction as Gas Killer would settle it and compared the gas 
 - **Real data:** real mainnet transactions from October 2026, replayed at the block they ran in.
 - **Includes all costs:** the gas saved is net of the signature check and every storage write.
 - **An estimate:** ScrollChain has not integrated Gas Killer, so the numbers estimate a future integration.
+- **Check it yourself:** you can run any of these transactions through the Gas Killer analyzer at [gaskiller.xyz/analyzer](https://gaskiller.xyz/analyzer).
 - **Consistent over time:** finalisations we measured in September 2026 saved 64.6–65.4%, the same as now.
 - **Volume:** ScrollChain received 14 bundle finalisations and 14 batch commits in the day to block 26,191,901.
 

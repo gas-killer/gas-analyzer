@@ -61,6 +61,7 @@ We replayed each transaction as Gas Killer would settle it and compared the gas 
 - **Real data:** real mainnet borrows from October 2026, replayed at the block they ran in.
 - **Includes all costs:** the gas saved is net of the signature check and every storage write.
 - **An estimate:** the Pool has not integrated Gas Killer, so the numbers estimate a future integration.
+- **Check it yourself:** you can run any of these transactions through the Gas Killer analyzer at [gaskiller.xyz/analyzer](https://gaskiller.xyz/analyzer).
 - **Consistent over time:** 10 borrows we measured in September 2026 saved 15–60%, the same range as now.
 - **What saves nothing:** `supply`, `repay` and most `withdraw` calls do little work beyond their storage writes, so they save nothing.
 - **Volume:** the Aave V3 Pool received 362 successful borrows in the 8 hours to block 26,199,227, about 1,090 a day. Aave V4's spokes received about 175 direct borrows in the day to block 26,199,586, plus more inside `multicall`.
