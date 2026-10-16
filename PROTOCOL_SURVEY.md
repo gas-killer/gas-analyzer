@@ -2892,8 +2892,8 @@ $2.19M in June 2026; it is not this contract.
 V3 replaced V2 in April–May 2026 (AIP-122, AIP-123). The AlchemistV3 contracts were found
 on-chain from alUSD and alETH mints: alETH `0xfa995b6a…`, alUSD `0xeb83112d…`; deposits go through
 the AlchemistRouter `0xdb852896…`. About 313 transactions in 21 days, roughly 15 a day; 104 are
-`mint`. A mint values the Mix-Yield Token across its 7 strategies with `STATICCALL`s, about 640k
-gas on alETH, and those calls are removable.
+`mint`. A mint values the Mix-Yield Token across its strategies with `STATICCALL`s, about 740k
+gas on alETH (493k + 154k to the token, 94.5k price read), and those calls are removable.
 
 | tx | Alchemist | function | gas used | saved (Schnorr) | % | measured |
 |---|---|---|---:|---:|---:|---|
@@ -2903,6 +2903,7 @@ gas on alETH, and those calls are removable.
 | [`0xe7413cef…`](https://etherscan.io/tx/0xe7413cef266c84253773a74b14b12b171a03d01c99be411f2f197c214f073dab) | alUSD | `mint` | 883,848 | 698,699 | 79.05% | `heur` |
 | [`0xc29618f3…`](https://etherscan.io/tx/0xc29618f3c3dcfbbfe0d6569574438f9dc2cefff38c11c858aab3069beda95c9d) | alETH | `burn` | 947,866 | 796,257 | 84.01% | `heur` |
 
-Only the three replayed rows should be quoted. The Alchemists are proxies (they `DELEGATECALL` an
-implementation), so an integration would be an upgrade; who controls the upgrade was not checked.
+Only the three replayed rows should be quoted. Both Alchemists are EIP-1967 proxies sharing one implementation
+(`0xd5f26c90…`), so one upgrade covers both. Proxy admins: alETH `0x28f521e1…`, alUSD `0xdf0dd120…`.
+Report: `reports/alchemix.md`.
 Alchemix is small: Q2 2026 revenue was about $329k and mainnet stablecoin deposits about $7.4M.

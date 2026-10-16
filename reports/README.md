@@ -13,6 +13,7 @@ Schnorr signature scheme.
 | Starknet | `updateStateKzgDA` | 54–75% | [starknet.md](starknet.md) |
 | Polygon Agglayer | proof verification for X Layer, Katana, Lumia, Silicon | 54–72% | [polygon-agglayer.md](polygon-agglayer.md) |
 | Aave | V3 `borrow` (health-factor price reads) | 14–64% | [aave.md](aave.md) |
+| Alchemix | V3 `mint` (Mix-Yield Token valuation) | 71–85% | [alchemix.md](alchemix.md) |
 | Chronicle | Scribe `poke` (price updates) | 29–32% | [chronicle.md](chronicle.md) |
 | Derive | V3 proof submissions | 35–65% | [derive.md](derive.md) |
 | Usual | USD0 `swap` and `redeem` (collateral check in Usd0) | 54–60% | [usual.md](usual.md) |
