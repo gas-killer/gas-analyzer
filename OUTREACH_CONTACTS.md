@@ -250,6 +250,15 @@ and depositors move over. Pitch Morpho; curators are supporting voices.
 - Synthetix's May 2025 acquisition proposal (SIP-415) was withdrawn and is marked Rejected, so
   Derive is still independent.
 
+### Alchemix
+- **Report:** `reports/alchemix.md`. V3 `mint` saves 71–85% (630k–1.36M gas), measured October 2026.
+  Both Alchemists are upgradeable proxies sharing one implementation, so one upgrade covers both.
+- **Channels from alchemix.fi** ✅: X [`@alchemixfi`](https://x.com/alchemixfi), Discord
+  `discord.gg/alchemix`, forum <https://forum.alchemix.fi>.
+- **Engineers** (top `alchemix-finance/v3` committers, Aug–Oct 2026) ✅: GitHub `Silur` (site
+  silur.dev; Mastodon `@silur@infosec.exchange`; no X), `d0m0l33` and `Hesnicewithit` (no socials).
+- Co-founder "Scoopy Trooples", X `@scupytrooples` ⚠️ from memory, not checked.
+
 ### USD8
 - Already in contact with the founder. Gas is not their problem. They want off-chain compute
   over **historical** chain data, which they run in a TEE today.
