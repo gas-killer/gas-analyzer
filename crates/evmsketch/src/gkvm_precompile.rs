@@ -65,7 +65,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
 use alloy::primitives::{Address, B256, Bytes, keccak256};
 use gas_analyzer_core::gkvm::errors::SolError;
@@ -73,7 +73,10 @@ use gas_analyzer_core::gkvm::{
     GKVM_ADDRESS, GKVM_INPUT_BYTES_CAP, GKVM_OK_TAG, GKVM_RESULT_MEMO_ENTRIES, errors,
     gas_to_cycle_limit, gkvm_intrinsic_gas,
 };
-use gas_analyzer_gkvm::{GkVmError, GkVmJob, GkVmMountError, GkVmOutcome, GuestProgramSet};
+use gas_analyzer_gkvm::{
+    ArtifactMountV3, GkVmError, GkVmJob, GkVmMountError, GkVmOutcome, GuestProgramSet,
+    LoadedGuestProgram,
+};
 use lru::LruCache;
 use revm::context::{Cfg, ContextTr, LocalContextTr};
 use revm::handler::{EthPrecompiles, PrecompileProvider};
@@ -103,15 +106,26 @@ pub enum GkvmHostError {
 /// programs and artifacts, and each artifact's page-serving schedule.
 ///
 /// One instance lives on [`crate::LocalStateCache`] for the life of the
-/// process and is shared by every pass of every call.
+/// process and is shared by every pass of every call. The set it serves is
+/// not fixed at construction: [`GkvmHost::install_program`] and
+/// [`GkvmHost::install_artifact`] add verified programs and bundles to a
+/// running host — the hash-addressed distribution path, where the service
+/// fetches a consumer's program by its `programHash` the first time a task
+/// names it. Lookups take a read lock; installs take the write lock and are
+/// rare, so a guest run never waits on one for long and never holds one.
 pub struct GkvmHost {
-    programs: GuestProgramSet,
-    schedules: HashMap<B256, Vec<(u32, u64)>>,
+    programs: RwLock<GuestProgramSet>,
+    schedules: RwLock<HashMap<B256, ArtifactSchedule>>,
     /// Recent verdicts; see the module docs for when one answers a call.
     memo: Mutex<LruCache<MemoKey, MemoEntry>>,
     guest_runs: AtomicU64,
     memo_hits: AtomicU64,
 }
+
+/// An artifact's page-serving schedule — `(page, cycles)` pairs in serving
+/// order — shared between the host's table and the guest runs reading it,
+/// so a run never holds the table lock.
+type ArtifactSchedule = Arc<Vec<(u32, u64)>>;
 
 /// `(programHash, artifactRoot, keccak(payload))` — what `gkExec` is pure in,
 /// next to the cycle budget ([`MemoEntry::answers`]).
@@ -140,8 +154,8 @@ impl GkvmHost {
     /// A host serving `programs`.
     pub fn new(programs: GuestProgramSet) -> Self {
         Self {
-            programs,
-            schedules: HashMap::new(),
+            programs: RwLock::new(programs),
+            schedules: RwLock::new(HashMap::new()),
             memo: Mutex::new(LruCache::new(
                 NonZeroUsize::new(GKVM_RESULT_MEMO_ENTRIES).expect("non-zero"),
             )),
@@ -162,14 +176,21 @@ impl GkvmHost {
     /// the manifest, so a wrong schedule is a deterministic guest trap, never
     /// silent corruption. Without a declaration no pages are served — the
     /// same default as `gk-run` without `--schedule`.
-    pub fn with_artifact_schedule(mut self, root: B256, schedule: Vec<(u32, u64)>) -> Self {
-        self.schedules.insert(root, schedule);
-        // A verdict is only as good as the schedule it ran under.
-        self.memo
-            .get_mut()
-            .expect("gkvm memo mutex poisoned")
-            .clear();
+    pub fn with_artifact_schedule(self, root: B256, schedule: Vec<(u32, u64)>) -> Self {
+        self.set_artifact_schedule(root, schedule);
         self
+    }
+
+    /// [`GkvmHost::with_artifact_schedule`] for a host that is already shared:
+    /// declares (or replaces) the schedule of the artifact at `root` and drops
+    /// every memoized verdict — a verdict is only as good as the schedule it
+    /// ran under.
+    pub fn set_artifact_schedule(&self, root: B256, schedule: Vec<(u32, u64)>) {
+        self.schedules
+            .write()
+            .expect("gkvm schedules lock poisoned")
+            .insert(root, Arc::new(schedule));
+        self.memo.lock().expect("gkvm memo mutex poisoned").clear();
     }
 
     /// Declare [`ArtifactMountV3::sequential_schedule`] — the whole bundle,
@@ -179,23 +200,76 @@ impl GkvmHost {
     /// shipped so far loads its artifacts once, sequentially.
     ///
     /// [`ArtifactMountV3::sequential_schedule`]: gas_analyzer_gkvm::ArtifactMountV3::sequential_schedule
-    pub fn with_sequential_schedules(mut self) -> Self {
-        for root in self.programs.artifact_roots() {
-            if self.schedules.contains_key(&root) {
-                continue;
-            }
-            let artifact = self
-                .programs
-                .artifact(&root)
-                .expect("root listed by artifact_roots");
-            self = self.with_artifact_schedule(root, artifact.sequential_schedule());
+    pub fn with_sequential_schedules(self) -> Self {
+        let roots = self.programs().artifact_roots();
+        for root in roots {
+            self.schedule_sequentially_if_unset(root);
         }
         self
     }
 
-    /// The installed programs and mounted artifacts this host serves.
-    pub fn programs(&self) -> &GuestProgramSet {
-        &self.programs
+    /// Declares the sequential schedule for the mounted artifact at `root`
+    /// unless one is declared already. `true` when it was declared here.
+    fn schedule_sequentially_if_unset(&self, root: B256) -> bool {
+        if self
+            .schedules
+            .read()
+            .expect("gkvm schedules lock poisoned")
+            .contains_key(&root)
+        {
+            return false;
+        }
+        let schedule = self
+            .programs()
+            .artifact(&root)
+            .expect("root of a mounted artifact")
+            .sequential_schedule();
+        self.set_artifact_schedule(root, schedule);
+        true
+    }
+
+    /// The installed programs and mounted artifacts this host serves. A read
+    /// lock: drop the guard before anything slow.
+    pub fn programs(&self) -> RwLockReadGuard<'_, GuestProgramSet> {
+        self.programs.read().expect("gkvm programs lock poisoned")
+    }
+
+    /// Whether the program committed to by `hash` is installed.
+    pub fn has_program(&self, hash: &B256) -> bool {
+        self.programs().program(hash).is_some()
+    }
+
+    /// Installs a verified program on a running host: the hash-addressed
+    /// distribution path, where the service fetched the ELF named by a task's
+    /// `programHash`, verified it ([`LoadedGuestProgram::from_bytes`]) and
+    /// now serves it like a boot-time slot. `false` when the program was
+    /// installed already. The memo needs no care: a missing program is an
+    /// environment failure, which the memo never holds.
+    pub fn install_program(&self, program: LoadedGuestProgram) -> bool {
+        let mut programs = self.programs.write().expect("gkvm programs lock poisoned");
+        if programs.program(&program.hash).is_some() {
+            return false;
+        }
+        programs.insert_program(program);
+        true
+    }
+
+    /// Mounts a verified artifact bundle on a running host, served front to
+    /// back ([`ArtifactMountV3::sequential_schedule`]) unless a schedule was
+    /// declared for its root. `false` when the root was mounted already.
+    ///
+    /// [`ArtifactMountV3::sequential_schedule`]: gas_analyzer_gkvm::ArtifactMountV3::sequential_schedule
+    pub fn install_artifact(&self, artifact: ArtifactMountV3) -> bool {
+        let root = artifact.root;
+        {
+            let mut programs = self.programs.write().expect("gkvm programs lock poisoned");
+            if programs.artifact(&root).is_some() {
+                return false;
+            }
+            programs.insert_artifact(artifact);
+        }
+        self.schedule_sequentially_if_unset(root);
+        true
     }
 
     /// Guest executions actually performed (not calls answered).
@@ -255,23 +329,29 @@ impl GkvmHost {
         payload: &[u8],
         cycle_limit: u64,
     ) -> Result<(GkVmOutcome, u64), GkvmHostError> {
-        let program = self
-            .programs
-            .program(&program_hash)
-            .ok_or(GkvmHostError::ProgramNotInstalled(program_hash))?;
-        let artifact = if artifact_root.is_zero() {
-            None
-        } else {
-            Some(
-                self.programs
-                    .artifact(&artifact_root)
-                    .ok_or(GkvmHostError::ArtifactNotMounted(artifact_root))?,
-            )
+        let (program, artifact) = {
+            let programs = self.programs();
+            let program = programs
+                .program(&program_hash)
+                .ok_or(GkvmHostError::ProgramNotInstalled(program_hash))?;
+            let artifact = if artifact_root.is_zero() {
+                None
+            } else {
+                Some(
+                    programs
+                        .artifact(&artifact_root)
+                        .ok_or(GkvmHostError::ArtifactNotMounted(artifact_root))?,
+                )
+            };
+            (program, artifact)
         };
         let schedule = self
             .schedules
+            .read()
+            .expect("gkvm schedules lock poisoned")
             .get(&artifact_root)
-            .map_or(&[][..], Vec::as_slice);
+            .cloned();
+        let schedule: &[(u32, u64)] = schedule.as_deref().map_or(&[], Vec::as_slice);
 
         self.guest_runs.fetch_add(1, Ordering::Relaxed);
         let report = gas_analyzer_gkvm::run(&GkVmJob {
@@ -450,7 +530,6 @@ mod tests {
     };
     use alloy::primitives::{U256, address, keccak256};
     use gas_analyzer_core::{SimProfile, StateUpdate};
-    use gas_analyzer_gkvm::{ArtifactMountV3, LoadedGuestProgram};
     use revm::database::{CacheDB, EmptyDB};
     use revm::state::{AccountInfo, Bytecode};
 
@@ -999,5 +1078,52 @@ mod tests {
         let (small, large) = (spent(1_000), spent(2_000));
         assert_eq!(large - small, U256::from(2_000u64));
         assert!(small > U256::from(gkvm_intrinsic_gas(8) + 2_040));
+    }
+
+    #[test]
+    fn a_program_installed_at_runtime_is_served_by_a_shared_host() {
+        // A host with hello only, shared the way LocalStateCache holds it for
+        // the life of the process.
+        let mut programs = GuestProgramSet::default();
+        programs.insert_program(
+            LoadedGuestProgram::from_bytes(HELLO_C.to_vec(), keccak256(HELLO_C), "<fixture>")
+                .expect("fixture loads"),
+        );
+        let host = Arc::new(GkvmHost::new(programs));
+        let bench = keccak256(BENCH_C);
+        assert!(!host.has_program(&bench));
+
+        // Before the install: an environment failure, never a signable verdict.
+        let err = host
+            .exec(bench, B256::ZERO, &1_000u64.to_be_bytes(), 1_000_000)
+            .expect_err("not installed");
+        assert!(matches!(err, GkvmHostError::ProgramNotInstalled(_)));
+
+        // The distribution path: bytes fetched by hash, verified, installed on
+        // the live host — then served through the real extraction exactly
+        // like a boot-time slot.
+        let fetched = LoadedGuestProgram::from_bytes(BENCH_C.to_vec(), bench, "<mirror>")
+            .expect("fixture loads");
+        assert!(host.install_program(fetched));
+        assert!(host.has_program(&bench));
+        let mut expected = vec![keccak256(HELLO_C), bench];
+        expected.sort_unstable();
+        assert_eq!(host.programs().program_hashes(), expected);
+
+        let slots = record(
+            mounts(&host),
+            STATIC_CONSUMER,
+            wire(BENCH_C, &1_000u64.to_be_bytes()),
+            3_000_000,
+        )
+        .expect("extraction");
+        assert_eq!(slots[0], word(2), "STATICCALL succeeded");
+        assert_eq!(host.guest_runs(), 1);
+
+        // Installing the same program again is a no-op.
+        let again = LoadedGuestProgram::from_bytes(BENCH_C.to_vec(), bench, "<mirror>")
+            .expect("fixture loads");
+        assert!(!host.install_program(again));
+        assert_eq!(host.programs().program_count(), 2);
     }
 }
