@@ -259,6 +259,17 @@ and depositors move over. Pitch Morpho; curators are supporting voices.
   silur.dev; Mastodon `@silur@infosec.exchange`; no X), `d0m0l33` and `Hesnicewithit` (no socials).
 - Co-founder "Scoopy Trooples", X `@scupytrooples` ⚠️ from memory, not checked.
 
+### YieldNest
+- **Report:** `reports/yieldnest.md`. ynETH MAX `processAccounting` saves 76–79% (about 565k gas a
+  call), measured October 2026. One keeper sends every call, about 1.8 a day. The ynRWAx
+  `requestWithdrawal` path saves only ~7%.
+- **Channels from yieldnest.finance** ✅: X [`@YieldNestFi`](https://x.com/YieldNestFi), Discord
+  `discord.com/invite/ayAZuQgFaE`, Telegram `t.me/YieldNest`, GitHub `github.com/yieldnest`.
+  No email or form.
+- **People:** Amadeo Brands, co-founder and CEO (named on yieldnest.finance via press; no X handle
+  verified). Shawn Fladager and Dan Octavian are listed as co-founders on Dealroom ⚠️ (AI-generated
+  profile). No engineering lead is public; engineering hires go through the deCircle recruiter.
+
 ### USD8
 - Already in contact with the founder. Gas is not their problem. They want off-chain compute
   over **historical** chain data, which they run in a TEE today.
