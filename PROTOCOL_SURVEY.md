@@ -2912,3 +2912,25 @@ rows: direct Alchemist `mint`/`burn` save 64–86%. Both Alchemists are EIP-1967
 (`0xd5f26c90…`), so one upgrade covers both. Proxy admins: alETH `0x28f521e1…`, alUSD `0xdf0dd120…`.
 Report: `reports/alchemix.md`.
 Alchemix is small: Q2 2026 revenue was about $329k and mainnet stablecoin deposits about $7.4M.
+
+## The Interfold (formerly Enclave, Gnosis Guild) — 2026-10-19
+
+Contracts, read on-chain from the registries: main `Interfold` `0x28cf63b4…c715`,
+`CiphernodeRegistry` `0xc927a5b2…f2d7`, `BondingRegistry` `0x0ec90465…915F`, `SlashingManager`
+`0x753109ee…`, ticket token `0xC0B5b49a…`, FOLD `0xE172e9B6…`. Network Alpha went live on mainnet
+in mid-2026. DefiLlama TVL is about $326k. Volume is low: the main contract has 27 transactions
+since August 2026, and the registry has 189.
+
+Measured on `main` (`c1d45ee`), plain mode, Schnorr:
+
+| tx | function | gas used | result |
+|---|---|---:|---|
+| [`0xb0224ee5…`](https://etherscan.io/tx/0xb0224ee50bbe1b80ec0779f60abf2fb8f1ec50c4e78a71fac9507ab7eaa61f0e) | `publishCiphertextOutput` | 1,156,765 | **360,911 saved (31.20%)**, replay |
+| [`0x59797920…`](https://etherscan.io/tx/0x597979204381c2da7b85979e8a690b87db12679513e9ebbcd835c775893c373a) | `publishCommittee` (typical, 3.70M) | 3,699,690 | **0%**: replay costs 3,724,650. Mostly a 92 KB calldata public key and its storage, no verification |
+| [`0x538734bb…`](https://etherscan.io/tx/0x538734bb537b0007a9282075b5ca7947656caf8fc66b5be548b349d06158914f) | `publishCommittee` (with proof, 6.38M) | 6,383,200 | **OOM** at ~14 GB (issue #230). Call-trace estimate ≥ ~4.66M saved (73%) |
+| [`0x71b8f012…`](https://etherscan.io/tx/0x71b8f01267c7edaf4015a58407eef393418e3eb56feb66950bed04c4a96c0660) | `publishPlaintextOutput` | 6,919,424 | **OOM** at ~14 GB (issue #230). Call-trace estimate ≥ ~5.36M saved (77%) |
+
+The two OOM transactions spend 4.7M–5.4M gas in read-only proof verification (about 2.08M in the
+`modexp` precompile, plus 1.7M–1.8M in verifier contracts). All of it is called directly from the
+target contract, not under a regular `CALL`, so plain mode should remove it once the analyzer can
+replay them. Most `publishCommittee` calls are the 3.70M kind that saves nothing.
