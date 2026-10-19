@@ -2934,3 +2934,67 @@ The two OOM transactions spend 4.7M–5.4M gas in read-only proof verification (
 `modexp` precompile, plus 1.7M–1.8M in verifier contracts). All of it is called directly from the
 target contract, not under a regular `CALL`, so plain mode should remove it once the analyzer can
 replay them. Most `publishCommittee` calls are the 3.70M kind that saves nothing.
+
+## YieldNest — 2026-10-19
+
+Measured on `main` (`c1d45ee`), plain mode, over the 30 days (216,000 blocks) to block 26,227,180.
+All contracts were checked on-chain: ynETH `0x09db87A5…` (160.7 ETH supply), ynLSDe `0x35Ec69A7…`,
+ynETH MAX (ynETHx) `0x657d9ABA…` (a YieldNest `Vault`, 3,821 supply), RWA MAX (ynRWAx)
+`0x01Ba6972…` (a YieldNest `Vault`), and the ynRWAx `WithdrawalRequest` contract `0x6f4f5D74…`.
+
+**What reaches YieldNest directly.** 1,112 transactions touched the four tokens. Apart from
+approvals and transfers, only three YieldNest functions were called directly:
+
+| contract | function | txs in 30 days | median gas |
+|---|---|---:|---:|
+| ynETH MAX | `processAccounting()` `0xe6ef2a27` | 53 | 744,448 |
+| ynRWAx WithdrawalRequest | `requestWithdrawal(uint256,address)` `0x21739779` | 97 | 620,940 |
+| ynETH MAX | `0x465d8576` (unidentified) | 1 | 113,872 |
+
+Everything else was swaps through aggregators and Curve pools (KyberSwap, 1inch, OKX, Enso,
+Pendle, CoW, and a diamond router routing through the ynRWAx/USDC Curve pool). ynETH and ynLSDe
+had no direct deposits or withdrawals in the window.
+
+### `processAccounting`: 76–79%, every one
+
+| tx | gas used | base | saved (Schnorr) | % |
+|---|---:|---:|---:|---:|
+| [`0xcaf7bb74…`](https://etherscan.io/tx/0xcaf7bb74b11de8ad34c96b73f2dd88ac6e2408cc5deb2b11f4dcba16145c6710) | 714,878 | 98,329 | 566,549 | **79.25%** |
+| [`0x3015ff44…`](https://etherscan.io/tx/0x3015ff44b641b43591ec9fdf53807edf6fa30a66adadace8a94ee91d3cac6f7a) | 744,977 | 129,342 | 565,635 | **75.93%** |
+| [`0x1c576c22…`](https://etherscan.io/tx/0x1c576c2297e3e44c5ce45da54e05e6dc152ba6a436bd6dc71a4bb3b4fac5391d) | 744,675 | 129,342 | 565,333 | **75.92%** |
+| [`0xe29d8160…`](https://etherscan.io/tx/0xe29d81603083f244d9b0f12dd4c494993ee85472f8a5481b5affbd2b013408ac) | 744,448 | 129,342 | 565,106 | **75.91%** |
+| [`0xc6995839…`](https://etherscan.io/tx/0xc69958393747a9481d4bde0087b6c48646c376644f99bf336bd25714464500e5) | 744,047 | 129,342 | 564,705 | **75.90%** |
+
+All five were measured by replay. The base is fixed at 129,342 (98,329 on the smaller one), so
+the saving is a near-constant ~565,000 gas. In the call trace, 531,524 of 744,448 gas is
+`STATICCALL`: the vault pricing its positions across its strategies (Morpho, Lido and others)
+before it writes the new total. That read-only work is what Gas Killer removes. The base (129,342)
+is larger than the regular `CALL`s the vault must replay (55,791), so it passes the artifact test.
+The analyzer printed its re-entrancy note, which is harmless here.
+
+All ten senders sampled were one keeper, `0xf71e7175…`. That makes integration a single change
+on YieldNest's side. Volume is about 1.8 a day.
+
+### `requestWithdrawal`: about 7%, and nesting does not help
+
+| tx | gas used | saved (Schnorr) | % |
+|---|---:|---:|---:|
+| [`0xb2663828…`](https://etherscan.io/tx/0xb26638284f637468a857cfedf875f27ef750fb3fc79f45820da2ac1ffac8777f) | 597,392 | 43,073 | 7.21% |
+| [`0x2c2a126e…`](https://etherscan.io/tx/0x2c2a126e74a6c3598064f846425bb4722a76f5ca7992f5d6a112de3ddf2a94a1) | 620,940 | 42,881 | 6.91% |
+| [`0x3544914d…`](https://etherscan.io/tx/0x3544914d5b957ee0e879c9d936c5dcde386b6cdabeaebd63a8560b47c061fb69) | 620,952 | 42,845 | 6.90% |
+| [`0x55016716…`](https://etherscan.io/tx/0x5501671666cb727824c0b3c7eace1335c46216bb6a26844b36f97ba1a59da915) | 628,504 | 42,953 | 6.83% |
+
+A fifth (`0xb7bd3a53…`) fell back to the heuristic because the node rate-limited the replay and
+is excluded. Each request deploys a new contract through a `BeaconProxyFactory` (`0x974937bf…`,
+about 227,000 gas). A deployment is a state change and has to be replayed. The vault's
+share-pricing read (about 122,000 gas) sits inside the vault's own `transferFrom` call. With
+`--owned` set to the vault, the analyzer declined to nest it ("cheaper as a plain CALL"), so the
+result stays 7.21%. Adding the factory as owned makes it worse (0%), since its frame is the
+deployment itself.
+
+The one `0x465d8576` call measured 0%.
+
+**Verdict.** `processAccounting` is one of the cleanest results in the survey: 76–79% on every
+call, a fixed saving of about 565,000 gas, read-only pricing work in the contract that is called
+directly, and a single keeper sending it. Its limit is volume (1.8 a day). The user-facing
+withdrawal path saves about 7%.
