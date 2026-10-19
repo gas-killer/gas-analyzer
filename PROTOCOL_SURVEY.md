@@ -2903,7 +2903,12 @@ gas on alETH (493k + 154k to the token, 94.5k price read), and those calls are r
 | [`0xe7413cef…`](https://etherscan.io/tx/0xe7413cef266c84253773a74b14b12b171a03d01c99be411f2f197c214f073dab) | alUSD | `mint` | 883,848 | 698,699 | 79.05% | `heur` |
 | [`0xc29618f3…`](https://etherscan.io/tx/0xc29618f3c3dcfbbfe0d6569574438f9dc2cefff38c11c858aab3069beda95c9d) | alETH | `burn` | 947,866 | 796,257 | 84.01% | `heur` |
 
-Only the three replayed rows should be quoted. Both Alchemists are EIP-1967 proxies sharing one implementation
+Second round (2026-10-19): another alETH `mint` 86.17% (1,344,556 of 1,560,331), an alUSD `mint`
+64.19% (619,792 of 965,512), and an alETH `burn` 77.02% (740,199 of 961,054), all replayed. The
+earlier `burn` fallback was specific to that transaction. AlchemistRouter flows save little:
+`depositETH` 0%, `depositUnderlying` 0% plain and 3.85% nested, `withdrawETH` 0% plain and 9.57%
+nested, `claimRedemption` 0% both ways (owned: both Alchemists and the MYT). Quote only the replayed
+rows: direct Alchemist `mint`/`burn` save 64–86%. Both Alchemists are EIP-1967 proxies sharing one implementation
 (`0xd5f26c90…`), so one upgrade covers both. Proxy admins: alETH `0x28f521e1…`, alUSD `0xdf0dd120…`.
 Report: `reports/alchemix.md`.
 Alchemix is small: Q2 2026 revenue was about $329k and mainnet stablecoin deposits about $7.4M.

@@ -1,10 +1,10 @@
 # Gas Killer × Alchemix: Gas Savings Report
 
-Oct 16, 2026
+Oct 19, 2026
 
 ## Summary
 
-Gas Killer could cut the gas cost of an Alchemix V3 `mint` by **71–85%**, about 630,000–1,360,000 gas on each one. We measured this on real Ethereum mainnet mints on both Alchemists, alETH and alUSD, in October 2026. Almost all of the saving is the work of valuing the Mix-Yield Token across its strategies, which Gas Killer moves off-chain.
+Gas Killer could cut the gas cost of an Alchemix V3 `mint` or `burn` by **64–86%**, about 620,000–1,360,000 gas on each one. We measured this on real Ethereum mainnet transactions on both Alchemists, alETH and alUSD, in October 2026. Almost all of the saving is the work of valuing the Mix-Yield Token across its strategies, which Gas Killer moves off-chain.
 
 ## What is Gas Killer
 
@@ -18,13 +18,16 @@ You pay for the signature check and the storage writes, not the computation. If 
 
 ## What we measured
 
-All three mints we replayed save over 70%. Mints on the alETH Alchemist cost more today, and save more.
+All six mints and burns we replayed save over 60%. Transactions on the alETH Alchemist cost more today, and save more.
 
 | Transaction | Alchemist | Function | Gas today | Gas saved | Saving |
 | --- | --- | --- | --: | --: | --: |
+| [0x7168b87c…](https://etherscan.io/tx/0x7168b87c279403cbb40599b9003a8d740db2c4b3c94cc573e2a0a1e536fd368e) | alETH | `mint` | 1,560,331 | 1,344,556 | **86.2%** |
 | [0x3ec144c4…](https://etherscan.io/tx/0x3ec144c4bffb5003e90c0a9574342cfc70024227fe20f87c286278c7fdc07fe5) | alETH | `mint` | 1,610,420 | 1,361,342 | **84.5%** |
 | [0x0f0f4034…](https://etherscan.io/tx/0x0f0f403441c495f654d65ec69f615790594cf824f09bb31fe30d79f7159580b6) | alETH | `mint` | 1,600,587 | 1,351,497 | **84.4%** |
+| [0x4aa443c7…](https://etherscan.io/tx/0x4aa443c7b2ce0bc9328279d0675a59f86f0865613fd4e9d887b78542d63e7c81) | alETH | `burn` | 961,054 | 740,199 | **77.0%** |
 | [0x216dc160…](https://etherscan.io/tx/0x216dc160c441478483c6e83622d36c8265f842611954b22fecb31a5e80d17de3) | alUSD | `mint` | 881,980 | 627,945 | **71.2%** |
+| [0x27763a14…](https://etherscan.io/tx/0x27763a14d1c0d8b537497e4d7489c5c18c433cb65d7cc3ecd474983f2d3e17cf) | alUSD | `mint` | 965,512 | 619,792 | **64.2%** |
 
 Savings assume Gas Killer's Schnorr signature scheme.
 
@@ -41,18 +44,18 @@ The saving comes from valuing the Mix-Yield Token before each mint. The Alchemis
 
 We replayed each transaction as Gas Killer would settle it and compared the gas against what it actually cost.
 
-- **Real data:** real mainnet mints from October 2026, replayed at the block they ran in.
+- **Real data:** real mainnet transactions from October 2026, replayed at the block they ran in.
 - **Includes all costs:** the gas saved is net of the signature check and every storage write.
 - **An estimate:** the Alchemists have not integrated Gas Killer, so the numbers estimate a future integration.
 - **Check it yourself:** you can run any of these transactions through the Gas Killer analyzer at [gaskiller.xyz/analyzer](https://gaskiller.xyz/analyzer).
-- **Not yet measured:** `burn`, deposits through the AlchemistRouter, withdrawals and redemptions. Our replay could not complete a `burn` yet, so we have left it out.
+- **Router flows save little:** deposits, withdrawals and redemptions through the AlchemistRouter saved 0–10% in the four we measured, because most of their gas is token moves and strategy deposits that have to be applied anyway. The saving is in calls made directly to the Alchemists.
 - **Volume:** the two Alchemists had 104 mints, and about 313 transactions in all, in the 21 days to mid-October 2026.
 
 ## Next steps
 
 We would like a 30-minute call to walk through these numbers with your engineering team.
 
-1. We run the same analysis on burns, deposits, withdrawals and redemptions, or any other Alchemix transactions you choose.
+1. We run the same analysis on any other Alchemix transactions or contracts you choose.
 2. Together we pick one contract path for a testnet pilot.
 3. You see the gas difference on your own transactions before committing to anything.
 
