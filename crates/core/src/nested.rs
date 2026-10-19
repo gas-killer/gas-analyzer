@@ -65,14 +65,19 @@ fn sha256(data: &[u8]) -> B256 {
     B256::from_slice(&Sha256::digest(data))
 }
 
-/// The root frame's leaf: exactly today's single-transition digest.
+/// The root frame's leaf: the single-transition digest for the `msg.value` the tree settles
+/// with. A zero value keeps the four-field encoding, so it hashes exactly as before.
 pub fn root_leaf(
     transition_index: U256,
     target: Address,
     selector: FixedBytes<4>,
     program: &Bytes,
+    value: U256,
 ) -> B256 {
-    sha256(&(transition_index, target, selector, program.clone()).abi_encode_params())
+    if value.is_zero() {
+        return sha256(&(transition_index, target, selector, program.clone()).abi_encode_params());
+    }
+    sha256(&(transition_index, target, selector, program.clone(), value).abi_encode_params())
 }
 
 /// A callee frame's leaf.
@@ -1225,9 +1230,13 @@ pub struct EncodedTree {
 
 /// Hash every frame bottom-up (a `NESTED` op names its child's leaf, and a leaf hashes its
 /// program), build the tree, then build witnesses bottom-up (a witness carries its children's).
+///
+/// `root_value` is the `msg.value` the tree settles with. The trace can't supply it, which is why
+/// the root frame's own `value` is always zero.
 pub fn encode_frame_tree(
     frames: &[FrameProgram],
     root_selector: FixedBytes<4>,
+    root_value: U256,
     chain_id: u64,
     expiry_block: u64,
 ) -> Result<EncodedTree> {
@@ -1261,7 +1270,7 @@ pub fn encode_frame_tree(
             .transition_index
             .ok_or_else(|| anyhow::anyhow!("frame {i} has no transition index"))?;
         frame_leaves[i] = if i == 0 {
-            root_leaf(index, frame.target, root_selector, &programs[0])
+            root_leaf(index, frame.target, root_selector, &programs[0], root_value)
         } else {
             nested_leaf(
                 chain_id,
@@ -1334,9 +1343,24 @@ mod tests {
                 U256::from(7),
                 A11CE,
                 FixedBytes::from([0x12, 0x34, 0x56, 0x78]),
-                &bytes!("c0ffee")
+                &bytes!("c0ffee"),
+                U256::ZERO
             ),
             b256!("0x18fece75dabcbe169342c5e311d4af162b89a28a80cb659d125f7fe70e191b2b")
+        );
+    }
+
+    #[test]
+    fn valued_root_leaf_matches_solidity() {
+        assert_eq!(
+            root_leaf(
+                U256::from(7),
+                A11CE,
+                FixedBytes::from([0x12, 0x34, 0x56, 0x78]),
+                &bytes!("c0ffee"),
+                U256::from(5)
+            ),
+            b256!("0x9e2758ecd6d0b8e5563e02127be8e49b5cb8bcbe907e0d44d24968d955d0d6eb")
         );
     }
 
@@ -2103,7 +2127,7 @@ mod tests {
             &[B, C],
         );
         let selector = FixedBytes::from([0xde, 0xad, 0xbe, 0xef]);
-        let encoded = encode_frame_tree(&tree.frames, selector, 1, 1060).unwrap();
+        let encoded = encode_frame_tree(&tree.frames, selector, U256::ZERO, 1, 1060).unwrap();
 
         assert_eq!(encoded.leaves.len(), 4);
         assert_eq!(encoded.leaves[0], expiry_leaf(1, ROOT, 1060));
@@ -2119,7 +2143,7 @@ mod tests {
         ));
         assert_eq!(
             encoded.frame_leaves[0],
-            root_leaf(U256::ZERO, ROOT, selector, &encoded.programs[0])
+            root_leaf(U256::ZERO, ROOT, selector, &encoded.programs[0], U256::ZERO)
         );
 
         // The root's NESTED op names B's leaf; B's witness carries C's.
@@ -2154,9 +2178,27 @@ mod tests {
     }
 
     #[test]
+    fn a_valued_tree_binds_its_value_in_the_root_leaf_only() {
+        let tree = split(root_calls(B, 0, 1_000_000, 100_000), &[B]);
+        let selector = FixedBytes::from([0xde, 0xad, 0xbe, 0xef]);
+        let value = U256::from(10).pow(U256::from(18));
+        let unvalued = encode_frame_tree(&tree.frames, selector, U256::ZERO, 1, 1060).unwrap();
+        let valued = encode_frame_tree(&tree.frames, selector, value, 1, 1060).unwrap();
+
+        assert_eq!(
+            valued.frame_leaves[0],
+            root_leaf(U256::ZERO, ROOT, selector, &valued.programs[0], value)
+        );
+        assert_ne!(valued.frame_leaves[0], unvalued.frame_leaves[0]);
+        assert_ne!(valued.root, unvalued.root);
+        assert_eq!(valued.frame_leaves[1..], unvalued.frame_leaves[1..]);
+        assert_eq!(valued.programs, unvalued.programs);
+    }
+
+    #[test]
     fn encoding_rejects_a_frame_without_an_index() {
         let mut tree = split(root_calls(B, 0, 1_000_000, 100_000), &[B]);
         tree.frames[1].transition_index = None;
-        assert!(encode_frame_tree(&tree.frames, FixedBytes::ZERO, 1, 1060).is_err());
+        assert!(encode_frame_tree(&tree.frames, FixedBytes::ZERO, U256::ZERO, 1, 1060).is_err());
     }
 }

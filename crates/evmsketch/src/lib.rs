@@ -2565,6 +2565,7 @@ mod tests {
             let encoded = gas_analyzer_core::nested::encode_frame_tree(
                 &tree.frames,
                 [0x9c, 0x6e, 0xfc, 0x5a].into(),
+                U256::ZERO,
                 SEPOLIA_CHAIN_ID,
                 1_000,
             )
