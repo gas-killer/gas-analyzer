@@ -243,6 +243,9 @@ pub struct UnboundedCost {
     pub calls: usize,
     /// Number of `Log0`–`Log4` ops.
     pub logs: usize,
+    /// Number of `Create`/`Create2` ops, only ever nonzero for a nested frame tree. Like `Call`s
+    /// they re-execute on-chain, initcode included, and are charged at their measured gas.
+    pub creates: usize,
     /// Upper bound on the gas needed to apply this payload on-chain: the transaction's intrinsic
     /// cost, the signature-verification floor, each op's execution cost, the intrinsic gas for the
     /// encoded payload's own bytes, and `verifyAndUpdate`'s decode/dispatch overhead. See
@@ -268,9 +271,11 @@ pub enum UnboundedCostViolation {
         /// Non-tracker `Store` ops, the usual driver when this trips.
         stores: usize,
     },
-    /// `CREATE`/`CREATE2` found. Not a cost question: the struct-log path extracts a
-    /// `Create`/`Create2` op carrying initcode to re-execute on replay, and a net diff cannot
-    /// reconstruct that, so contract creation is unrepresentable here regardless of price.
+    /// `CREATE`/`CREATE2` found in a flat payload. Not a cost question: the struct-log path
+    /// extracts a `Create`/`Create2` op carrying initcode to re-execute on replay, and a net diff
+    /// cannot reconstruct that, so contract creation is unrepresentable here regardless of price.
+    /// A nested frame tree is always split from struct logs, so it carries the initcode and
+    /// [`validate_unbounded_tree_cost`] admits its creates.
     CreateNotAllowed {
         /// Index of the offending op in the update list.
         index: usize,
@@ -303,9 +308,9 @@ impl std::error::Error for UnboundedCostViolation {}
 
 /// Upper bound on the gas required to apply `updates` on-chain via `verifyAndUpdate`.
 ///
-/// `external_call_gas` is the measured cost of the payload's `Call` ops, taken from the trace — they
-/// re-execute on-chain at real prices, so they are charged at what they actually cost rather than
-/// estimated. `signature_floor` is the scheme's verification cost
+/// `external_call_gas` is the measured cost of the payload's `Call` (and any `Create`/`Create2`)
+/// ops, taken from the trace — they re-execute on-chain at real prices, so they are charged at what
+/// they actually cost rather than estimated. `signature_floor` is the scheme's verification cost
 /// (`SignatureType::turetzky_upper_gas_limit`); pass the larger scheme's when the scheme is not yet
 /// known, since the payload is signed independently of it.
 ///
@@ -347,7 +352,8 @@ pub fn estimate_applied_payload_gas(
             StateUpdate::Log2(l) => LOG_BASE + LOG_TOPIC * 2 + l.data.len() as u64 * LOG_BYTE,
             StateUpdate::Log3(l) => LOG_BASE + LOG_TOPIC * 3 + l.data.len() as u64 * LOG_BYTE,
             StateUpdate::Log4(l) => LOG_BASE + LOG_TOPIC * 4 + l.data.len() as u64 * LOG_BYTE,
-            // Rejected by the caller; priced at zero so the bound stays defined either way.
+            // Charged through `external_call_gas`, which a create's analytic cost would
+            // understate: it leaves out the initcode's execution and the code deposit.
             StateUpdate::Create(_) | StateUpdate::Create2(_) => 0,
         });
     }
@@ -389,11 +395,41 @@ pub fn validate_unbounded_cost(
     signature_floor: u64,
     budget: u64,
 ) -> Result<UnboundedCost, UnboundedCostViolation> {
+    validate(updates, external_call_gas, false, signature_floor, budget)
+}
+
+/// [`validate_unbounded_cost`] for every frame of a nested tree together, which lands in one
+/// transaction. The tree is split from struct logs, so its `Create`/`Create2` ops carry the initcode
+/// replay needs and are admitted, charged at `create_gas`, their measured cost from the trace.
+pub fn validate_unbounded_tree_cost(
+    updates: &[StateUpdate],
+    external_call_gas: u64,
+    create_gas: u64,
+    signature_floor: u64,
+    budget: u64,
+) -> Result<UnboundedCost, UnboundedCostViolation> {
+    validate(
+        updates,
+        external_call_gas.saturating_add(create_gas),
+        true,
+        signature_floor,
+        budget,
+    )
+}
+
+fn validate(
+    updates: &[StateUpdate],
+    replayed_gas: u64,
+    creates_replayable: bool,
+    signature_floor: u64,
+    budget: u64,
+) -> Result<UnboundedCost, UnboundedCostViolation> {
     let mut cost = UnboundedCost {
         stores: 0,
         tracker_stores: 0,
         calls: 0,
         logs: 0,
+        creates: 0,
         applied_gas_upper_bound: 0,
     };
     for (index, update) in updates.iter().enumerate() {
@@ -408,13 +444,16 @@ pub fn validate_unbounded_cost(
             | StateUpdate::Log2(_)
             | StateUpdate::Log3(_)
             | StateUpdate::Log4(_) => cost.logs += 1,
+            StateUpdate::Create(_) | StateUpdate::Create2(_) if creates_replayable => {
+                cost.creates += 1
+            }
             StateUpdate::Create(_) | StateUpdate::Create2(_) => {
                 return Err(UnboundedCostViolation::CreateNotAllowed { index });
             }
         }
     }
     cost.applied_gas_upper_bound =
-        estimate_applied_payload_gas(updates, external_call_gas, signature_floor);
+        estimate_applied_payload_gas(updates, replayed_gas, signature_floor);
     if cost.applied_gas_upper_bound > budget {
         return Err(UnboundedCostViolation::PayloadTooExpensive {
             estimated: cost.applied_gas_upper_bound,
@@ -681,6 +720,37 @@ mod tests {
         assert!(matches!(
             err,
             UnboundedCostViolation::CreateNotAllowed { index: 0 }
+        ));
+    }
+
+    #[test]
+    fn tree_admits_creates_at_their_measured_gas() {
+        let updates = [store(), create()];
+        let free =
+            validate_unbounded_tree_cost(&updates, 0, 0, 0, UNBOUNDED_PAYLOAD_GAS_BUDGET).unwrap();
+        let cost =
+            validate_unbounded_tree_cost(&updates, 0, 50_000, 0, UNBOUNDED_PAYLOAD_GAS_BUDGET)
+                .unwrap();
+        assert_eq!(cost.creates, 1);
+        assert_eq!(
+            cost.applied_gas_upper_bound,
+            free.applied_gas_upper_bound + 50_000
+        );
+    }
+
+    #[test]
+    fn tree_create_gas_counts_against_the_budget() {
+        let err = validate_unbounded_tree_cost(
+            &[create()],
+            0,
+            UNBOUNDED_PAYLOAD_GAS_BUDGET,
+            0,
+            UNBOUNDED_PAYLOAD_GAS_BUDGET,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            UnboundedCostViolation::PayloadTooExpensive { .. }
         ));
     }
 }

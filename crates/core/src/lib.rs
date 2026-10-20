@@ -30,7 +30,7 @@ pub use prestate::{
 pub use sim_profile::{
     SimProfile, UNBOUNDED_BLOCK_GAS_LIMIT, UNBOUNDED_COLD_SSTORE_COST,
     UNBOUNDED_PAYLOAD_GAS_BUDGET, UNBOUNDED_TX_GAS_LIMIT, UnboundedCost, UnboundedCostViolation,
-    estimate_applied_payload_gas, validate_unbounded_cost,
+    estimate_applied_payload_gas, validate_unbounded_cost, validate_unbounded_tree_cost,
 };
 pub use trace::{
     TraceExtract, compute_state_updates, compute_state_updates_canonical, copy_memory,
