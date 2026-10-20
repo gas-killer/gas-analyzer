@@ -18,6 +18,7 @@ Schnorr signature scheme.
 | Derive | V3 proof submissions | 35–65% | [derive.md](derive.md) |
 | Usual | USD0 `swap` and `redeem` (collateral check in Usd0) | 54–60% | [usual.md](usual.md) |
 | YieldNest | ynETH MAX `processAccounting` (strategy position reads) | 76–79% | [yieldnest.md](yieldnest.md) |
+| Tacit | TacitEvmPool `transact` (Groth16 proof check) | 47–55% | [tacit.md](tacit.md) |
 
 The underlying measurements are in `../ALL_TRANSACTION_ANALYSES.md`, `../PROTOCOL_SURVEY.md` and
 `../NESTED_SETTLEMENT_RESULTS.md`. The Securitize, Usual and Railgun RelayAdapt figures use nested settlement (`--owned`), re-measured

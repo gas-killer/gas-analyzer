@@ -9,6 +9,21 @@ verified versus what still needs a human to confirm.
 
 > **Correction (2026-10-14): "Polygon zkEVM" below is the Polygon Agglayer rollup manager.** The measured transactions go to `PolygonRollupManager` (`0x5132A183…`) but verify other Agglayer chains: X Layer (rollup 3), Lumia (7), Silicon (10) and Katana (20). None is Polygon zkEVM (rollup 1), which Polygon shut down on July 1, 2026. Selector `0x6c766877` is `verifyPessimisticTrustedAggregator`. The gas numbers are unchanged.
 
+## Outreach status (2026-10-20)
+
+| protocol | status |
+|---|---|
+| Alchemix | contacted, waiting for a reply |
+| Kelp | not interested, because of their dependencies |
+| The Interfold | similar answer to Kelp (dependencies) |
+| Privacy Pools | interested; busy with V2 and will come back to us. MOU drafted |
+| Tacit | contacted; report sent on request (`reports/tacit.md`) |
+| Chronicle | replied, skeptical (FROST, quorum size, cheap gas, post-quantum) |
+| Polygon Agglayer | contacted; asked them to point us to the right person |
+| YieldNest | Josh knows the founder; report to be sent |
+| Railgun | Josh knows the founder; it is a DAO, so adoption needs governance |
+| LI.FI | founder advises Josh's accelerator; skeptical |
+
 ## Read this before sending anything
 
 The survey's own conclusion applies to the outreach: **at the gas prices prevailing when
@@ -185,7 +200,7 @@ heuristic fallback.
 | project | best % (Schnorr) | best tx | what saves |
 |---|---:|---|---|
 | **Privacy Pools** | 59.59% | [`0x8cc80eae…`](https://etherscan.io/tx/0x8cc80eae520f1c61fe39f18ab0ea82e4afbbb6ed4c0ddca71d26b5627628f92a) | PoolVault `ragequit`; the proof check lives in the pool. The PPRouter wrapper saves nothing |
-| **Tacit** | 54.50% | [`0xe98ed820…`](https://etherscan.io/tx/0xe98ed82065ba594d6b51dd7833c3b7d0a91026c6be4a30b6901c762490698a53) | `TacitEvmPool` ZK proof check (254k gas `STATICCALL` to `TransactVerifier`); no regular calls. Only one tx measured |
+| **Tacit** | 54.50% | [`0xd5df306f…`](https://etherscan.io/tx/0xd5df306f7533e8416a7cb202adf7a3a168742b95bb379579ad7c9fd9437fc90a) | `TacitEvmPool.transact` ZK proof check (254,510 gas `STATICCALL` to the verifier); no regular calls. 4 of 4 measured save 47–55%; 241 direct calls in 60 days. Report: `reports/tacit.md` |
 | **Morpho VaultV2** | 40.43% | [`0x2e91acd5…`](https://etherscan.io/tx/0x2e91acd5286eeda304294f8f2c9803b7d140dd0cf7426e16ee285e9f6b1f0fca) | `redeem`/`deposit` on VaultV2; 15 wins across 3 vaults and 3 curators |
 | **Doppler** | 13.73% | [`0x7b08cf0d…`](https://etherscan.io/tx/0x7b08cf0df79aaaf918bc03d62d402bceb70e3ac68e662a18464c3097d02071ff) | only the v4 hook's `collectFees`; `Airlock.create` saves nothing |
 | **USD8** | ~17.5% | Sepolia only | Treasury `0xd2840edb`; approximate (replayed against current state). **Not a gas pitch** — see below |
