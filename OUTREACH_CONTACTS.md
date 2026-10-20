@@ -17,10 +17,10 @@ verified versus what still needs a human to confirm.
 | Kelp | not interested, because of their dependencies |
 | The Interfold | similar answer to Kelp (dependencies) |
 | Privacy Pools | interested; busy with V2 and will come back to us. MOU drafted |
-| Tacit | contacted; report sent on request (`reports/tacit.md`) |
+| Tacit | contacted; report requested and ready to send (`reports/tacit.md`) |
 | Chronicle | replied, skeptical (FROST, quorum size, cheap gas, post-quantum) |
 | Polygon Agglayer | contacted; asked them to point us to the right person |
-| YieldNest | Josh knows the founder; report to be sent |
+| YieldNest | Josh knows the founder; report ready to send |
 | Railgun | Josh knows the founder; it is a DAO, so adoption needs governance |
 | LI.FI | founder advises Josh's accelerator; skeptical |
 
