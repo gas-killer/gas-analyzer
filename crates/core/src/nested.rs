@@ -756,6 +756,12 @@ fn split_frame_tree(
                 }
                 // No frame was entered (EOA / precompile / failed call): the call completed
                 // inline. Account its gas now if it was emitted.
+                if p.emitted_create {
+                    let deployed = struct_log.stack.as_ref().and_then(|s| s.last());
+                    if deployed.is_none_or(|address| address.is_zero()) {
+                        bail!(failed_create(p.parent_depth));
+                    }
+                }
                 if let Some(gas_after_opcode) = p.emitted_call_gas {
                     let gas = gas_after_opcode.saturating_sub(struct_log.gas);
                     let caller = frames.last_mut().expect("root frame must remain");
@@ -794,6 +800,9 @@ fn split_frame_tree(
                 flush_slice(&mut frames, &programs);
             }
             let frame = frames.pop().expect("frame stack underflow");
+            if frame.emitted_create && !success {
+                bail!(failed_create(depth));
+            }
             let parent_program = frames.last().and_then(|f| f.program);
             if !success {
                 for program in &mut programs[frame.first_program..] {
@@ -1201,6 +1210,15 @@ fn prune_unprofitable(programs: &mut [ProgramState], cost: &NestingCostModel) {
             }
         }
     }
+}
+
+/// A replayed `Create`/`Create2` that fails reverts the whole settlement, and dropping the op
+/// instead would skip the nonce bump the failed attempt made, moving every later `CREATE`.
+fn failed_create(depth: u64) -> String {
+    format!(
+        "an emitted CREATE/CREATE2 at depth {depth} failed in the trace; its replay would revert \
+         the settlement"
+    )
 }
 
 /// Native gas of every `CALL` the kept programs replay: their own `CALL` ops, plus each pruned
@@ -1772,6 +1790,45 @@ mod tests {
         )
     }
 
+    fn split_err(logs: Vec<StructLog>) -> String {
+        compute_frame_tree_canonical(trace(logs), ROOT, &|_| false, &NESTING_COST_MODEL_V1)
+            .expect_err("a failed emitted create cannot settle")
+            .to_string()
+    }
+
+    #[test]
+    fn create_whose_initcode_reverted_is_rejected() {
+        let logs = vec![
+            bump(1, 1),
+            create2(1, 1_000_000),
+            stop(2, 950_000),
+            resume(1, 940_000, false),
+        ];
+        assert!(split_err(logs).contains("CREATE/CREATE2 at depth 1 failed"));
+    }
+
+    /// A collision or an unaffordable endowment fails before any initcode runs.
+    #[test]
+    fn create_that_failed_without_a_frame_is_rejected() {
+        let logs = vec![bump(1, 1), create2(1, 1_000_000), resume(1, 968_000, false)];
+        assert!(split_err(logs).contains("CREATE/CREATE2 at depth 1 failed"));
+    }
+
+    #[test]
+    fn failed_create_inside_a_native_call_replays_with_the_call() {
+        let logs = vec![
+            bump(1, 1),
+            call(1, 1_000_000, C),
+            create2(2, 990_000),
+            stop(3, 980_000),
+            resume(2, 970_000, false),
+            resume(1, 960_000, true),
+        ];
+        let tree = split(logs, &[]);
+        assert_eq!(kinds(&tree.frames[0].updates), ["STORE", "CALL"]);
+        assert_eq!(tree.create_gas_total, 0);
+    }
+
     #[test]
     fn create_in_the_root_program_counts_its_gas_apart_from_calls() {
         let logs = vec![
@@ -1788,7 +1845,7 @@ mod tests {
 
     #[test]
     fn create_that_enters_no_frame_is_counted_inline() {
-        let logs = vec![bump(1, 1), create2(1, 1_000_000), stop(1, 968_000)];
+        let logs = vec![bump(1, 1), create2(1, 1_000_000), resume(1, 968_000, true)];
         let tree = split(logs, &[]);
         assert_eq!(tree.create_gas_total, 32_000);
     }
