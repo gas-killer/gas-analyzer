@@ -409,6 +409,11 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
         }
     }
 
+    // A trace that ends on the create aborted at the opcode itself (out of gas, static context).
+    if let Some((depth, _)) = pending_create {
+        bail!(crate::nested::failed_create(depth));
+    }
+
     // Panic if there are any remaining CALLs that didn't exit (shouldn't happen)
     if !call_gas_tracking.is_empty() {
         let call_indices: Vec<_> = call_gas_tracking.keys().copied().collect();
@@ -1170,7 +1175,8 @@ mod tests {
             create_resume(1, 980_000, None),
         ]);
         let without_frame = legacy(vec![create2(1, 1_000_000), create_resume(1, 968_000, None)]);
-        for result in [with_frame, without_frame] {
+        let trace_ends_on_create = legacy(vec![create2(1, 1_000_000)]);
+        for result in [with_frame, without_frame, trace_ends_on_create] {
             let err = result.expect_err("a failed create must not be emitted");
             assert!(err.to_string().contains("CREATE/CREATE2 at depth 1 failed"));
         }
