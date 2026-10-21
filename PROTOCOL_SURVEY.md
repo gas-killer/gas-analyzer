@@ -2998,3 +2998,40 @@ The one `0x465d8576` call measured 0%.
 call, a fixed saving of about 565,000 gas, read-only pricing work in the contract that is called
 directly, and a single keeper sending it. Its limit is volume (1.8 a day). The user-facing
 withdrawal path saves about 7%.
+
+## L2 proof verification, revisited — the saving is the proof (2026-10-21)
+
+A review of the Starknet report on the Starknet forum pointed out that `updateStateKzgDA` makes
+external calls, that the fact-registry check is what makes Starknet a validity rollup, and that
+`blobhash` can only be read inside the blob transaction. All three are correct. The call traces show
+the same pattern on every L2 in this survey: **the removable gas is the proof check itself.** The
+analyzer counts `STATICCALL`s as removable, and every verifier is reached by `STATICCALL`.
+
+Moving a rollup's proof check off-chain replaces the validity proof with operator stake. None of these
+contracts has a withdrawal delay long enough for a fraud proof, so the stake would have to cover
+everything withdrawable. That is not an integration a rollup will accept. The "safe" column below
+keeps the proof (and, where present, the blob checks) on-chain: reported saving minus the gas of the
+checks, from each transaction's call trace. It is my arithmetic, not an analyzer run.
+
+| L2 | tx | gas used | reported saving | proof and DA checks kept | safe saving |
+|---|---|---:|---:|---|---:|
+| Starknet | [`0xe04e714d…`](https://etherscan.io/tx/0xe04e714d933ecadcda0e76dd740aa2d0ad0c0a2e1fb867bd504e56f4424fcc15) | 430,536 | 321,864 | 6 × KZG point evaluation (300,000) + `isValid` (13,071) | 8,793 (2.0%) |
+| Starknet | [`0x89d7d4a5…`](https://etherscan.io/tx/0x89d7d4a50e86de2334bbdafa0ada3abc673aa66d8ac69c02b83763d0a3ce6eb9) | 542,165 | 294,162 | same, 313,071 | 0 |
+| Scroll | [`0x375ae6ca…`](https://etherscan.io/tx/0x375ae6cafaadb8456f89068f728f0c72993b935092d052d68a3edda055f6ab10) | 448,139 | 292,851 | `MultipleVersionRollupVerifier` (300,852) | 0 |
+| Agglayer (X Layer) | [`0x23b8eef0…`](https://etherscan.io/tx/0x23b8eef0f5c1c42c6c5f84c94944afcbd1d9de147ba5b3a1353ec99a1842d8dd) | 610,721 | 372,224 | AgglayerGateway → `SP1Verifier` (309,721) + `AggchainECDSAMultisig` (10,439) | ~52,000 (≤8.5%) |
+| Agglayer (Katana) | [`0x287570a8…`](https://etherscan.io/tx/0x287570a8c25d027d8bc8caafc22146ca85c4170f4eb6de29f092917b24d606f4) | 699,367 | 404,042 | `SP1Verifier` (303,221) + `AggchainFEP` (53,219) | ~47,600 (≤6.8%) |
+| Agglayer (Silicon) | [`0x6d0af448…`](https://etherscan.io/tx/0x6d0af448a99d15618509dd4802a00ac07be838bdbe12d5e5f08968315bb033c9) | 409,069 | 222,809 | `FflonkVerifier_12` (166,899) | ~55,900 (≤13.7%) |
+| Linea | [`0x8acb9674…`](https://etherscan.io/tx/0x8acb967410c2d19c339a78d605f952fb5408a568daa754953eccebe66d65a077) | 231,160 | 126,052 | 3 × KZG point evaluation (150,000) | 0 |
+| Linea (nested) | [`0x4546019a…`](https://etherscan.io/tx/0x4546019a7733a24736b222e6fc45bfceac2a2c1d8caae4ea99b696dd8d254858) | 427,765 | 232,706 | `PlonkVerifierFull` (281,335) | 0 |
+| Derive | [`0xf83f7406…`](https://etherscan.io/tx/0xf83f74064b25f3a5b0533d1f1e02a891eca4c91b5d4363b5e4dffed26eb22ebb) | 442,743 | 288,710 | `SP1VerifierGateway` (298,160) | 0 |
+
+The Agglayer remainder is an upper bound. A proof check kept on-chain has to be bound to what the
+contract writes, so the hashing that builds the proof's public inputs would also have to stay, and
+that is most of what is left.
+
+**What it means.** The L2 block was the survey's best structural result, and it does not survive this
+objection. Proof verification is removable gas only in the narrow sense the analyzer measures; for a
+rollup it is the security guarantee. Privacy protocols (Railgun, Tacit, Privacy Pools, World ID) have
+a milder version of the same question: an attested user proof that is false could drain the pool, so
+slashable stake would have to cover pool value. That is worth answering before those pitches go
+further. Corrected: `reports/starknet.md`. Still showing original figures: Scroll, Agglayer, Derive.
