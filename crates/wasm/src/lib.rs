@@ -583,6 +583,7 @@ pub fn analyze_prestate_inner(
         // Eligibility rules out regular CALLs at target depth, and with them re-entry.
         call_gas_total: 0,
         callee_gas_total: 0,
+        create_gas_total: 0,
         sstore_gas_total,
         refund_counter,
         reentered: false,

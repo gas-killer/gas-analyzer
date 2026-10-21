@@ -1214,7 +1214,7 @@ fn prune_unprofitable(programs: &mut [ProgramState], cost: &NestingCostModel) {
 
 /// A replayed `Create`/`Create2` that fails reverts the whole settlement, and dropping the op
 /// instead would skip the nonce bump the failed attempt made, moving every later `CREATE`.
-fn failed_create(depth: u64) -> String {
+pub(crate) fn failed_create(depth: u64) -> String {
     format!(
         "an emitted CREATE/CREATE2 at depth {depth} failed in the trace; its replay would revert \
          the settlement"
