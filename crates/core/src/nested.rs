@@ -201,6 +201,10 @@ pub struct FrameTreeExtract {
     /// The part of `call_gas_total` spent inside the callees, without the `CALL` opcodes' own
     /// cost: what a simulation that runs those `CALL`s into code-less accounts misses.
     pub callee_gas_total: u64,
+    /// Gas of every `CREATE`/`CREATE2` op the kept programs replay, initcode execution and code
+    /// deposit included. Kept apart from `call_gas_total`, whose consumers price creates
+    /// analytically.
+    pub create_gas_total: u64,
     /// Every contract whose transition counter the trace moves: the contracts a settlement
     /// pins, whether they are nested frames or run natively inside a `CALL`.
     pub counter_moves: BTreeSet<Address>,
@@ -425,13 +429,15 @@ struct ProgramState {
     native_gas: u64,
     /// Gas of the storage writes and logs the program reproduces.
     effect_gas: u64,
-    /// Native gas of calls made from this frame, nested or not.
+    /// Native gas of calls and creates made from this frame, nested or not.
     child_call_gas: u64,
     /// Native gas of the `CALL` ops in this frame's own program.
     direct_call_gas: u64,
     /// What `native_gas` and `direct_call_gas` spent inside the callees.
     native_callee_gas: u64,
     direct_callee_gas: u64,
+    /// Native gas of the `CREATE`/`CREATE2` ops in this frame's own program.
+    direct_create_gas: u64,
     /// Turned back into a `CALL` for not paying its nesting overhead.
     pruned: bool,
 }
@@ -449,11 +455,15 @@ struct WalkFrame {
     call_gas: u64,
     /// What `call_gas` spent inside the callees.
     callee_gas: u64,
+    /// Native gas of the `CREATE`/`CREATE2` ops in `out`, travelling with it like `call_gas`.
+    create_gas: u64,
     /// The gas at this frame's first step, and the `gasCost` of the `CALL` that opened it.
     entry_gas: u64,
     call_gas_cost: u64,
     emitted_view: BTreeMap<B256, B256>,
     emitted_call_gas: Option<u64>,
+    /// `emitted_call_gas` measures a `CREATE`/`CREATE2` rather than a `CALL`.
+    emitted_create: bool,
     /// Set on the first frame of a nested program: gas at the `CALL` that opened it.
     nested_start_gas: Option<u64>,
     /// Programs with this id or above were opened inside this frame, and are dropped with
@@ -467,6 +477,7 @@ struct PendingFrame {
     program: Option<usize>,
     emitted_view: BTreeMap<B256, B256>,
     emitted_call_gas: Option<u64>,
+    emitted_create: bool,
     nested_start_gas: Option<u64>,
     call_gas_cost: u64,
 }
@@ -687,6 +698,7 @@ fn split_frame_tree(
         direct_call_gas: 0,
         native_callee_gas: 0,
         direct_callee_gas: 0,
+        direct_create_gas: 0,
         pruned: false,
     }];
     let mut frames = vec![WalkFrame {
@@ -697,10 +709,12 @@ fn split_frame_tree(
         out: Vec::new(),
         call_gas: 0,
         callee_gas: 0,
+        create_gas: 0,
         entry_gas: 0,
         call_gas_cost: 0,
         emitted_view: BTreeMap::new(),
         emitted_call_gas: None,
+        emitted_create: false,
         nested_start_gas: None,
         first_program: 0,
     }];
@@ -724,10 +738,12 @@ fn split_frame_tree(
                     out: Vec::new(),
                     call_gas: 0,
                     callee_gas: 0,
+                    create_gas: 0,
                     entry_gas: struct_log.gas,
                     call_gas_cost: p.call_gas_cost,
                     emitted_view: p.emitted_view,
                     emitted_call_gas: p.emitted_call_gas,
+                    emitted_create: p.emitted_create,
                     nested_start_gas: p.nested_start_gas,
                     first_program,
                 });
@@ -740,10 +756,20 @@ fn split_frame_tree(
                 }
                 // No frame was entered (EOA / precompile / failed call): the call completed
                 // inline. Account its gas now if it was emitted.
+                if p.emitted_create {
+                    let deployed = struct_log.stack.as_ref().and_then(|s| s.last());
+                    if deployed.is_none_or(|address| address.is_zero()) {
+                        bail!(failed_create(p.parent_depth));
+                    }
+                }
                 if let Some(gas_after_opcode) = p.emitted_call_gas {
                     let gas = gas_after_opcode.saturating_sub(struct_log.gas);
                     let caller = frames.last_mut().expect("root frame must remain");
-                    caller.call_gas += gas;
+                    if p.emitted_create {
+                        caller.create_gas += gas;
+                    } else {
+                        caller.call_gas += gas;
+                    }
                     if let Some(parent) = caller.program {
                         programs[parent].child_call_gas += gas;
                     }
@@ -774,6 +800,9 @@ fn split_frame_tree(
                 flush_slice(&mut frames, &programs);
             }
             let frame = frames.pop().expect("frame stack underflow");
+            if frame.emitted_create && !success {
+                bail!(failed_create(depth));
+            }
             let parent_program = frames.last().and_then(|f| f.program);
             if !success {
                 for program in &mut programs[frame.first_program..] {
@@ -784,8 +813,13 @@ fn split_frame_tree(
             if let Some(gas_after_opcode) = frame.emitted_call_gas {
                 let gas = gas_after_opcode.saturating_sub(struct_log.gas);
                 let caller = frames.last_mut().expect("root frame must remain");
-                caller.call_gas += gas;
-                caller.callee_gas += callee_gas(gas, frame.call_gas_cost, Some(frame.entry_gas));
+                if frame.emitted_create {
+                    caller.create_gas += gas;
+                } else {
+                    caller.call_gas += gas;
+                    caller.callee_gas +=
+                        callee_gas(gas, frame.call_gas_cost, Some(frame.entry_gas));
+                }
                 if let Some(parent) = parent_program {
                     programs[parent].child_call_gas += gas;
                 }
@@ -801,6 +835,7 @@ fn split_frame_tree(
                     programs[id].updates = Some(frame.out);
                     programs[id].direct_call_gas = frame.call_gas;
                     programs[id].direct_callee_gas = frame.callee_gas;
+                    programs[id].direct_create_gas = frame.create_gas;
                     if let Some(parent) = parent_program {
                         programs[parent].child_call_gas += native;
                     }
@@ -837,6 +872,7 @@ fn split_frame_tree(
                 parent.out.extend(frame.out);
                 parent.call_gas += frame.call_gas;
                 parent.callee_gas += frame.callee_gas;
+                parent.create_gas += frame.create_gas;
                 // An emitting child ran while the parent was suspended, so its emitted view
                 // is a superset of the parent's — adopt it.
                 if child_emitting {
@@ -895,6 +931,7 @@ fn split_frame_tree(
                         program: cur_program,
                         emitted_view,
                         emitted_call_gas: None,
+                        emitted_create: false,
                         nested_start_gas: None,
                         call_gas_cost: 0,
                     });
@@ -915,6 +952,7 @@ fn split_frame_tree(
                         program: None,
                         emitted_view: BTreeMap::new(),
                         emitted_call_gas: None,
+                        emitted_create: false,
                         nested_start_gas: None,
                         call_gas_cost: 0,
                     });
@@ -935,6 +973,7 @@ fn split_frame_tree(
                     program: None,
                     emitted_view: BTreeMap::new(),
                     emitted_call_gas: None,
+                    emitted_create: false,
                     nested_start_gas: None,
                     call_gas_cost: struct_log.gas_cost,
                 };
@@ -968,6 +1007,7 @@ fn split_frame_tree(
                                 direct_call_gas: 0,
                                 native_callee_gas: 0,
                                 direct_callee_gas: 0,
+                                direct_create_gas: 0,
                                 pruned: false,
                             });
                             programs[parent].children.push(id);
@@ -993,7 +1033,9 @@ fn split_frame_tree(
                 }
             }
             "CREATE" | "CREATE2" => {
-                if cur_emitting && !op_errored {
+                let emitted = cur_emitting && !op_errored;
+                let gas_at_opcode = struct_log.gas;
+                if emitted {
                     // Initcode can call back into the target: boundary here too.
                     flush_slice(&mut frames, &programs);
                     if append_state_update_from_struct_log(&mut frames[idx].out, struct_log)?
@@ -1010,7 +1052,10 @@ fn split_frame_tree(
                         storage_ctx: None,
                         program: None,
                         emitted_view: BTreeMap::new(),
-                        emitted_call_gas: None,
+                        // The op re-runs its initcode on replay, so its native gas is paid
+                        // on-chain just like an emitted `CALL`'s.
+                        emitted_call_gas: emitted.then_some(gas_at_opcode),
+                        emitted_create: emitted,
                         nested_start_gas: None,
                         call_gas_cost: 0,
                     });
@@ -1041,6 +1086,7 @@ fn split_frame_tree(
     programs[0].updates = Some(root_frame.out);
     programs[0].direct_call_gas = root_frame.call_gas;
     programs[0].direct_callee_gas = root_frame.callee_gas;
+    programs[0].direct_create_gas = root_frame.create_gas;
 
     let counter_moves = root_frame
         .journal
@@ -1058,6 +1104,8 @@ fn split_frame_tree(
     let call_gas_total = native_call_gas(&programs, |p| (p.direct_call_gas, p.native_gas));
     let callee_gas_total =
         native_call_gas(&programs, |p| (p.direct_callee_gas, p.native_callee_gas));
+    // A pruned frame's creates are already inside its native gas in `call_gas_total`.
+    let create_gas_total = native_call_gas(&programs, |p| (p.direct_create_gas, 0));
     let frames = compact(programs)?;
     tracing::Span::current().record("frame_count", frames.len());
 
@@ -1066,6 +1114,7 @@ fn split_frame_tree(
         skipped_opcodes,
         call_gas_total,
         callee_gas_total,
+        create_gas_total,
         counter_moves,
     })
 }
@@ -1161,6 +1210,15 @@ fn prune_unprofitable(programs: &mut [ProgramState], cost: &NestingCostModel) {
             }
         }
     }
+}
+
+/// A replayed `Create`/`Create2` that fails reverts the whole settlement, and dropping the op
+/// instead would skip the nonce bump the failed attempt made, moving every later `CREATE`.
+fn failed_create(depth: u64) -> String {
+    format!(
+        "an emitted CREATE/CREATE2 at depth {depth} failed in the trace; its replay would revert \
+         the settlement"
+    )
 }
 
 /// Native gas of every `CALL` the kept programs replay: their own `CALL` ops, plus each pruned
@@ -1720,6 +1778,127 @@ mod tests {
         let tree = split(logs, &[B]);
         assert_eq!(kinds(&tree.frames[0].updates), ["STORE"]);
         assert_eq!(tree.call_gas_total, 0);
+    }
+
+    fn create2(depth: u64, gas: u64) -> StructLog {
+        log(
+            "CREATE2",
+            depth,
+            gas,
+            &[U256::ZERO, U256::ZERO, U256::ZERO, U256::from(7)],
+            0,
+        )
+    }
+
+    fn split_err(logs: Vec<StructLog>) -> String {
+        compute_frame_tree_canonical(trace(logs), ROOT, &|_| false, &NESTING_COST_MODEL_V1)
+            .expect_err("a failed emitted create cannot settle")
+            .to_string()
+    }
+
+    #[test]
+    fn create_whose_initcode_reverted_is_rejected() {
+        let logs = vec![
+            bump(1, 1),
+            create2(1, 1_000_000),
+            stop(2, 950_000),
+            resume(1, 940_000, false),
+        ];
+        assert!(split_err(logs).contains("CREATE/CREATE2 at depth 1 failed"));
+    }
+
+    /// A collision or an unaffordable endowment fails before any initcode runs.
+    #[test]
+    fn create_that_failed_without_a_frame_is_rejected() {
+        let logs = vec![bump(1, 1), create2(1, 1_000_000), resume(1, 968_000, false)];
+        assert!(split_err(logs).contains("CREATE/CREATE2 at depth 1 failed"));
+    }
+
+    #[test]
+    fn failed_create_inside_a_native_call_replays_with_the_call() {
+        let logs = vec![
+            bump(1, 1),
+            call(1, 1_000_000, C),
+            create2(2, 990_000),
+            stop(3, 980_000),
+            resume(2, 970_000, false),
+            resume(1, 960_000, true),
+        ];
+        let tree = split(logs, &[]);
+        assert_eq!(kinds(&tree.frames[0].updates), ["STORE", "CALL"]);
+        assert_eq!(tree.create_gas_total, 0);
+    }
+
+    #[test]
+    fn create_in_the_root_program_counts_its_gas_apart_from_calls() {
+        let logs = vec![
+            bump(1, 1),
+            create2(1, 1_000_000),
+            stop(2, 950_000),
+            resume(1, 940_000, true),
+        ];
+        let tree = split(logs, &[]);
+        assert_eq!(kinds(&tree.frames[0].updates), ["STORE", "CREATE"]);
+        assert_eq!(tree.create_gas_total, 60_000);
+        assert_eq!(tree.call_gas_total, 0);
+    }
+
+    #[test]
+    fn create_that_enters_no_frame_is_counted_inline() {
+        let logs = vec![bump(1, 1), create2(1, 1_000_000), resume(1, 968_000, true)];
+        let tree = split(logs, &[]);
+        assert_eq!(tree.create_gas_total, 32_000);
+    }
+
+    #[test]
+    fn create_in_a_kept_nested_frame_is_counted_and_not_a_saving() {
+        let logs = vec![
+            bump(1, 1),
+            call(1, 3_000_000, B),
+            bump(2, 1),
+            create2(2, 2_990_000),
+            stop(3, 2_980_000),
+            resume(2, 2_970_000, true),
+            resume(1, 100_000, true),
+        ];
+        let tree = split(logs, &[B]);
+        assert_eq!(tree.frames.len(), 2);
+        assert_eq!(kinds(&tree.frames[1].updates), ["STORE", "CREATE"]);
+        assert_eq!(tree.create_gas_total, 20_000);
+        assert_eq!(tree.call_gas_total, 0);
+    }
+
+    /// A pruned frame replays as one native call, so its create is inside that call's gas.
+    #[test]
+    fn create_in_a_pruned_frame_is_counted_once_as_its_call() {
+        let logs = vec![
+            bump(1, 1),
+            call(1, 1_000_000, B),
+            bump(2, 1),
+            create2(2, 990_000),
+            stop(3, 980_000),
+            resume(2, 970_000, true),
+            resume(1, 960_000, true),
+        ];
+        let tree = split(logs, &[B]);
+        assert_eq!(tree.frames.len(), 1, "B is too cheap to nest");
+        assert_eq!(tree.create_gas_total, 0);
+        assert_eq!(tree.call_gas_total, 40_000);
+    }
+
+    #[test]
+    fn create_inside_a_reverted_delegatecall_is_not_counted() {
+        let logs = vec![
+            bump(1, 1),
+            delegatecall(1, 1_000_000, LIB),
+            create2(2, 990_000),
+            stop(3, 980_000),
+            resume(2, 970_000, true),
+            resume(1, 960_000, false),
+        ];
+        let tree = split(logs, &[]);
+        assert_eq!(kinds(&tree.frames[0].updates), ["STORE"]);
+        assert_eq!(tree.create_gas_total, 0);
     }
 
     #[test]

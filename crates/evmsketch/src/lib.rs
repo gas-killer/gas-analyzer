@@ -148,7 +148,7 @@ use gas_analyzer_core::{
     Opcode, PrestateEligibility, SignatureType, StateUpdate, build_state_updates_from_prestate,
     classify_prestate_eligibility, compute_state_updates, compute_state_updates_canonical,
     encode_state_updates_to_abi, estimate_gas_from_operations, extract_operation_counts_from_trace,
-    validate_unbounded_cost,
+    validate_unbounded_cost, validate_unbounded_tree_cost,
 };
 use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
 use gas_analyzer_rpc::{
@@ -1597,11 +1597,16 @@ pub async fn call_to_frame_tree_with_evmsketch(
             .flat_map(|f| without_nested_ops(&f.updates))
             .collect();
         let signature_floor = SignatureType::Bls.turetzky_upper_gas_limit();
-        validate_unbounded_cost(&all, tree.call_gas_total, signature_floor, budget).map_err(
-            |violation| {
-                anyhow!("unbounded-profile payload rejected for consumer {root}: {violation}")
-            },
-        )?;
+        validate_unbounded_tree_cost(
+            &all,
+            tree.call_gas_total,
+            tree.create_gas_total,
+            signature_floor,
+            budget,
+        )
+        .map_err(|violation| {
+            anyhow!("unbounded-profile payload rejected for consumer {root}: {violation}")
+        })?;
     }
 
     let mut hints: HashMap<Address, Vec<B256>> = HashMap::new();
