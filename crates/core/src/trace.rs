@@ -212,6 +212,9 @@ pub struct TraceExtract {
     /// The part of `call_gas_total` spent inside the callees, without the `CALL` opcodes' own
     /// cost: what a simulation that runs those `CALL`s into code-less accounts misses.
     pub callee_gas_total: u64,
+    /// Total gas consumed by the extracted CREATE/CREATE2s (gross, pre-refund): the opcode, its
+    /// initcode's execution and the code deposit.
+    pub create_gas_total: u64,
     /// Total gas actually charged for the extracted SSTOREs (from struct-log
     /// `gasCost`), reflecting cold/warm/dirty pricing per write.
     pub sstore_gas_total: u64,
@@ -273,8 +276,11 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
     let mut call_gas_tracking: HashMap<usize, CallGas> = HashMap::new();
     // An extracted CALL whose callee's first step, if it has one, is the next log.
     let mut awaiting_entry: Option<(u64, usize)> = None;
+    // An extracted CREATE/CREATE2's (depth, gas at the opcode), until execution resumes at its depth.
+    let mut pending_create: Option<(u64, u64)> = None;
     let mut total_call_gas = 0u64;
     let mut callee_gas_total = 0u64;
+    let mut create_gas_total = 0u64;
     let mut sstore_gas_total = 0u64;
     let mut reentered = false;
 
@@ -287,6 +293,20 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
             && let Some(call) = call_gas_tracking.get_mut(&idx)
         {
             call.entry_gas = Some(struct_log.gas);
+        }
+
+        // The resume log carries the deployed address (zero on failure) on top of the stack.
+        if let Some((create_depth, gas_at_opcode)) = pending_create
+            && depth <= create_depth
+        {
+            pending_create = None;
+            let deployed = (depth == create_depth)
+                .then(|| struct_log.stack.as_ref().and_then(|s| s.last()))
+                .flatten();
+            if deployed.is_none_or(|address| address.is_zero()) {
+                bail!(crate::nested::failed_create(create_depth));
+            }
+            create_gas_total += gas_at_opcode.saturating_sub(struct_log.gas);
         }
 
         // Re-entry detection: any CALL-family opcode below depth 1 whose
@@ -365,6 +385,9 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
                         // write (cold/warm/dirty per EIP-2929/2200).
                         sstore_gas_total += gas_cost;
                     }
+                    if op == "CREATE" || op == "CREATE2" {
+                        pending_create = Some((depth, gas_after_opcode));
+                    }
                     if op == "CALL" {
                         let call_index_1based = state_updates.len();
                         call_stack.push((depth, call_index_1based));
@@ -386,6 +409,11 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
         }
     }
 
+    // A trace that ends on the create aborted at the opcode itself (out of gas, static context).
+    if let Some((depth, _)) = pending_create {
+        bail!(crate::nested::failed_create(depth));
+    }
+
     // Panic if there are any remaining CALLs that didn't exit (shouldn't happen)
     if !call_gas_tracking.is_empty() {
         let call_indices: Vec<_> = call_gas_tracking.keys().copied().collect();
@@ -402,6 +430,7 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
         skipped_opcodes,
         call_gas_total: total_call_gas,
         callee_gas_total,
+        create_gas_total,
         sstore_gas_total,
         refund_counter,
         reentered,
@@ -1088,5 +1117,81 @@ mod tests {
         ]);
         // Only TARGET's own A=1 is canonical; x's write is x's business.
         assert_eq!(stores(&updates), vec![(slot(0xAA), val(1))]);
+    }
+
+    /// A CREATE2 of empty initcode (offset=size=salt=value=0).
+    fn create2(depth: u64, gas: u64) -> StructLog {
+        log("CREATE2", depth, gas, &[U256::ZERO; 4], &[], None)
+    }
+
+    /// A resume log after a create, carrying the deployed address (zero on failure).
+    fn create_resume(depth: u64, gas: u64, deployed: Option<Address>) -> StructLog {
+        let top = deployed.map_or(U256::ZERO, addr_word);
+        log("JUMPDEST", depth, gas, &[top], &[], None)
+    }
+
+    fn legacy(logs: Vec<StructLog>) -> Result<TraceExtract> {
+        compute_state_updates(
+            DefaultFrame {
+                failed: false,
+                gas: 0,
+                return_value: Default::default(),
+                struct_logs: logs,
+            },
+            None,
+        )
+    }
+
+    const DEPLOYED: Address = Address::new([0x33; 20]);
+
+    #[test]
+    fn legacy_create_gas_covers_initcode_execution() {
+        let extract = legacy(vec![
+            create2(1, 1_000_000),
+            sstore(2, slot(1), val(1)),
+            create_resume(1, 940_000, Some(DEPLOYED)),
+        ])
+        .unwrap();
+        assert_eq!(extract.state_updates.len(), 1);
+        assert_eq!(extract.create_gas_total, 60_000);
+        assert_eq!(extract.call_gas_total, 0);
+    }
+
+    #[test]
+    fn legacy_create_without_a_frame_is_counted() {
+        let extract = legacy(vec![
+            create2(1, 1_000_000),
+            create_resume(1, 968_000, Some(DEPLOYED)),
+        ])
+        .unwrap();
+        assert_eq!(extract.create_gas_total, 32_000);
+    }
+
+    #[test]
+    fn legacy_failed_create_is_rejected() {
+        let with_frame = legacy(vec![
+            create2(1, 1_000_000),
+            log("REVERT", 2, 990_000, &[U256::ZERO; 2], &[], None),
+            create_resume(1, 980_000, None),
+        ]);
+        let without_frame = legacy(vec![create2(1, 1_000_000), create_resume(1, 968_000, None)]);
+        let trace_ends_on_create = legacy(vec![create2(1, 1_000_000)]);
+        for result in [with_frame, without_frame, trace_ends_on_create] {
+            let err = result.expect_err("a failed create must not be emitted");
+            assert!(err.to_string().contains("CREATE/CREATE2 at depth 1 failed"));
+        }
+    }
+
+    #[test]
+    fn legacy_failed_create_inside_a_call_is_not_emitted() {
+        let extract = legacy(vec![
+            call(1, 1_000_000, Address::new([0x11; 20])),
+            create2(2, 990_000),
+            create_resume(2, 980_000, None),
+            resume(1, 970_000, true),
+        ])
+        .unwrap();
+        assert_eq!(extract.state_updates.len(), 1);
+        assert_eq!(extract.create_gas_total, 0);
     }
 }

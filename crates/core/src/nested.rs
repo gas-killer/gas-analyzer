@@ -202,8 +202,10 @@ pub struct FrameTreeExtract {
     /// cost: what a simulation that runs those `CALL`s into code-less accounts misses.
     pub callee_gas_total: u64,
     /// Gas of every `CREATE`/`CREATE2` op the kept programs replay, initcode execution and code
-    /// deposit included. Kept apart from `call_gas_total`, whose consumers price creates
-    /// analytically.
+    /// deposit included. Kept apart from `call_gas_total`, as in [`TraceExtract`], so creates are
+    /// budgeted on their own.
+    ///
+    /// [`TraceExtract`]: crate::trace::TraceExtract
     pub create_gas_total: u64,
     /// Every contract whose transition counter the trace moves: the contracts a settlement
     /// pins, whether they are nested frames or run natively inside a `CALL`.
@@ -1214,7 +1216,7 @@ fn prune_unprofitable(programs: &mut [ProgramState], cost: &NestingCostModel) {
 
 /// A replayed `Create`/`Create2` that fails reverts the whole settlement, and dropping the op
 /// instead would skip the nonce bump the failed attempt made, moving every later `CREATE`.
-fn failed_create(depth: u64) -> String {
+pub(crate) fn failed_create(depth: u64) -> String {
     format!(
         "an emitted CREATE/CREATE2 at depth {depth} failed in the trace; its replay would revert \
          the settlement"

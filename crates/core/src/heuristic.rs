@@ -50,11 +50,6 @@ pub const CALLDATA_NONZERO_BYTE_COST: u64 = 16;
 pub const LOG_BASE_COST: u64 = 375;
 pub const LOG_TOPIC_COST: u64 = 375;
 pub const LOG_DATA_COST_PER_BYTE: u64 = 8;
-/// EIP-3860: 2 gas per 32-byte word of initcode
-pub const CREATE_BASE_COST: u64 = 32_000;
-pub const INITCODE_WORD_COST: u64 = 2;
-/// keccak256 word cost used by CREATE2 to hash initcode
-pub const KECCAK_WORD_COST: u64 = 6;
 
 /// Operations and gas data extracted from a trace
 #[derive(Debug, Default)]
@@ -111,6 +106,10 @@ pub fn estimate_gas_from_state_updates(extract: &TraceExtract) -> u64 {
     // Add actual gas used by external calls (cannot be optimized)
     gas += extract.call_gas_total;
 
+    // Measured rather than priced: a create's cost is dominated by its initcode's execution and
+    // the code deposit, neither of which the op carries.
+    gas += extract.create_gas_total;
+
     // Actual per-write SSTORE charges (cold/warm/dirty) from the trace.
     gas += extract.sstore_gas_total;
 
@@ -137,14 +136,8 @@ pub fn estimate_gas_from_state_updates(extract: &TraceExtract) -> u64 {
             StateUpdate::Log4(log) => {
                 LOG_BASE_COST + LOG_TOPIC_COST * 4 + log.data.len() as u64 * LOG_DATA_COST_PER_BYTE
             }
-            StateUpdate::Create(c) => {
-                let words = (c.initcode.len() as u64).div_ceil(32);
-                CREATE_BASE_COST + words * INITCODE_WORD_COST
-            }
-            StateUpdate::Create2(c) => {
-                let words = (c.initcode.len() as u64).div_ceil(32);
-                CREATE_BASE_COST + words * INITCODE_WORD_COST + words * KECCAK_WORD_COST
-            }
+            // Covered by create_gas_total above.
+            StateUpdate::Create(_) | StateUpdate::Create2(_) => 0,
         };
     }
 
@@ -391,6 +384,28 @@ mod refund_tests {
         assert_eq!(
             estimate_gas_from_state_updates(&e),
             BASE_TX_COST + 22_100 + empty_calldata()
+        );
+    }
+
+    #[test]
+    fn create_charged_its_measured_gas() {
+        let e = TraceExtract {
+            state_updates: vec![StateUpdate::Create2(
+                crate::types::IStateUpdateTypes::Create2 {
+                    salt: Default::default(),
+                    value: Default::default(),
+                    initcode: vec![0u8; 64].into(),
+                },
+            )],
+            create_gas_total: 194_170,
+            ..Default::default()
+        };
+        let calldata = calldata_gas(&crate::encoding::encode_state_updates_to_abi(
+            &e.state_updates,
+        ));
+        assert_eq!(
+            estimate_gas_from_state_updates(&e),
+            BASE_TX_COST + calldata + 194_170
         );
     }
 
