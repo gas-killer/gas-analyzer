@@ -3053,6 +3053,16 @@ and 42 transactions on mainnet in about 18 months**, no NAV updates among them. 
 | `0x41eacff5…` | `0xed8ceb08` | 1 | 1 | 346,356 | 0% (heuristic only) |
 
 Fund creation is contract deployment and setup, and deposits are storage writes and token transfers,
-so there is nothing to remove. The 279,645-gas deposit `0x61168a44…` never completed a measured replay
+so there is nothing to remove.
+
+**The event-based census missed the factories' event-less calls.** A `trace_filter` over both
+factories found 90 direct transactions, including **10 `storeNAV(address,bytes)`** (`0xa106a394`,
+149,139–5,370,326 gas) and **58 `submitPermissions(bytes[])`** (`0xf6f5cd60`, 55,062–3,767,867 gas).
+Both are fund-setup steps, alongside `initCreateFund` and `finalizeCreateFund`. `storeNAV` saves the
+fund's NAV *method*: in `0x66874089…`, 577,580 of 746,082 gas is a CREATE2 deploying a data contract
+that holds it. It is not a NAV calculation. Measured: `storeNAV` `0x66874089…` (746,082) and
+`0x97fea11c…` (5,370,326), and `submitPermissions` `0xd31c9380…` (200,353), all 0% by replay;
+`submitPermissions` `0x1402ae9c…` (3,767,867) 0% on the heuristic. No NAV *execution* was found on
+mainnet. The 279,645-gas deposit `0x61168a44…` never completed a measured replay
 (rate limits); its call trace shows only ~12,000 gas of read-only work. **Verdict: no candidate on
 mainnet.** Rethink's other chains (HyperEVM, Base, Arbitrum, Polygon) were not checked.
