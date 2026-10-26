@@ -3035,3 +3035,24 @@ rollup it is the security guarantee. Privacy protocols (Railgun, Tacit, Privacy 
 a milder version of the same question: an attested user proof that is false could drain the pool, so
 slashable stake would have to cover pool value. That is worth answering before those pitches go
 further. Corrected: `reports/starknet.md`. Still showing original figures: Scroll, Agglayer, Derive.
+
+## Rethink Finance — every mainnet transaction type measures 0% (2026-10-26)
+
+Found from the fund `0x27414080…` back to its factories (`0x0f46b4a1…`, `0x9825a09f…`) and beacon
+(`0x296203d9…`). Every proxy on that beacon was listed through its `BeaconUpgraded` event: **11 funds
+and 42 transactions on mainnet in about 18 months**, no NAV updates among them. Measured on `main`
+(`c1d45ee`), plain mode:
+
+| type | selector | txs | measured | gas used | result |
+|---|---|---:|---:|---:|---|
+| fund creation | `0x5a12e39a` | 11 | 2 | 4,497,147 / 5,024,559 | 0% (replay costs more: 4,614,330 / 5,191,446) |
+| factory follow-up | `0x5d0e942c` | 7 | 2 | 1,083,246 / 789,924 | 0% (replay 1,204,218 / 854,259) |
+| fund deposit | `0xec68ac8d` | 12 | 3 | 291,307 / 179,808 / 142,086 | 0% (largest removable surplus 19,728) |
+| small fund call | `0x5c19a95c` | 11 | — | 48,314 | below the 50,000 floor |
+| Safe `execTransaction` | `0x6a761202` | 1 | 1 | 912,596 | 0% (replay 903,372) |
+| `0x41eacff5…` | `0xed8ceb08` | 1 | 1 | 346,356 | 0% (heuristic only) |
+
+Fund creation is contract deployment and setup, and deposits are storage writes and token transfers,
+so there is nothing to remove. The 279,645-gas deposit `0x61168a44…` never completed a measured replay
+(rate limits); its call trace shows only ~12,000 gas of read-only work. **Verdict: no candidate on
+mainnet.** Rethink's other chains (HyperEVM, Base, Arbitrum, Polygon) were not checked.
