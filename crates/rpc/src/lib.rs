@@ -284,15 +284,20 @@ where
 /// How a failed `muxTracer` request was answered, if it was.
 ///
 /// An endpoint can refuse a tracer in the JSON-RPC body or, at a gateway, with a 4xx status before
-/// any JSON-RPC is parsed; both are answers. A connection failure, a timeout or a 5xx is not, and
-/// stays an error.
+/// any JSON-RPC is parsed; both are answers. A connection failure, a 5xx, or a rate limit or
+/// request timeout (HTTP 429 or 408, or their JSON-RPC equivalents) is not: it says the endpoint is
+/// busy, not what it supports, and requesting the separate tracers at once would only add load.
+/// Those stay errors, for the caller to retry with backoff as it would without `muxTracer`.
 fn classify_mux_error(error: &TransportError) -> Result<MuxedTraces> {
-    let (reason, payload) = if let Some(resp) = error.as_error_resp() {
+    let (reason, payload) = if let Some(resp) = error
+        .as_error_resp()
+        .filter(|resp| !is_rate_limited(resp.code, &resp.message))
+    {
         (resp.to_string(), Some(resp.clone()))
     } else if let Some(http) = error
         .as_transport_err()
         .and_then(|kind| kind.as_http_error())
-        .filter(|http| (400..500).contains(&http.status))
+        .filter(|http| (400..500).contains(&http.status) && ![408, 429].contains(&http.status))
     {
         (format!("HTTP {}: {}", http.status, http.body), None)
     } else {
@@ -303,6 +308,16 @@ fn classify_mux_error(error: &TransportError) -> Result<MuxedTraces> {
     } else {
         MuxedTraces::Rejected { reason, payload }
     })
+}
+
+/// Whether a JSON-RPC error says the endpoint is throttling requests: code 429, or -32005 as geth,
+/// Infura and Alchemy use it, or the wording of either.
+fn is_rate_limited(code: i64, message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    code == 429
+        || code == -32005
+        || message.contains("rate limit")
+        || message.contains("too many requests")
 }
 
 /// What a `muxTracer` request for the prestate diff and call frame produced.
@@ -637,6 +652,44 @@ mod tests {
 
         let dropped = TransportErrorKind::custom_str("connection refused");
         assert!(classify_mux_error(&dropped).is_err());
+
+        for status in [408, 429] {
+            let busy = TransportErrorKind::http_error(status, "Too Many Requests".into());
+            assert!(
+                classify_mux_error(&busy).is_err(),
+                "HTTP {status} is not an answer"
+            );
+        }
+    }
+
+    /// A rate limit in the JSON-RPC body says the endpoint is busy, not what it supports, so it
+    /// neither falls back nor counts toward pausing `muxTracer`.
+    #[test]
+    fn a_json_rpc_rate_limit_is_an_error_not_a_rejection() {
+        for (code, message) in [
+            (429, "Too Many Requests"),
+            (-32005, "limit exceeded"),
+            (
+                -32000,
+                "Your app has exceeded its compute units per second capacity, rate limit",
+            ),
+        ] {
+            let error = alloy::transports::RpcError::ErrorResp(ErrorPayload {
+                code,
+                message: message.to_string().into(),
+                data: None,
+            });
+            assert!(classify_mux_error(&error).is_err(), "{code} {message}");
+        }
+        let reverted = alloy::transports::RpcError::ErrorResp(ErrorPayload {
+            code: 3,
+            message: "execution reverted".into(),
+            data: None,
+        });
+        assert!(matches!(
+            classify_mux_error(&reverted),
+            Ok(MuxedTraces::Rejected { .. })
+        ));
     }
 
     #[test]
