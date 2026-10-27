@@ -9,6 +9,7 @@
 
 use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
 use alloy::rpc::types::eth::TransactionRequest;
+use alloy::rpc::types::trace::geth::{CallFrame, DiffMode};
 use alloy_eips::BlockId;
 use alloy_eips::BlockNumberOrTag;
 use alloy_genesis::ChainConfig;
@@ -27,6 +28,7 @@ use sp1_cc_client_executor::{ContractCalldata, ContractInput};
 use sp1_cc_host_executor::{EvmSketch, Genesis};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use url::Url;
@@ -152,7 +154,8 @@ use gas_analyzer_core::{
 };
 use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
 use gas_analyzer_rpc::{
-    get_call_frame_from_call_with_profile, get_prestate_diff_from_call_with_profile,
+    MuxedTraces, get_call_frame_from_call_with_profile,
+    get_prestate_diff_and_call_frame_with_profile, get_prestate_diff_from_call_with_profile,
     get_trace_from_call_with_profile,
 };
 
@@ -196,6 +199,8 @@ pub struct EvmSketchExecutorCache {
     /// `RootProvider` is `Clone` (Arc-backed), so callers share one HTTP
     /// connection pool rather than creating a new one per invocation.
     trace_providers: Mutex<HashMap<String, RootProvider<Ethereum>>>,
+    /// What each trace endpoint has shown about `muxTracer`, by RPC URL.
+    mux_support: Mutex<HashMap<String, Arc<MuxSupport>>>,
 }
 
 impl EvmSketchExecutorCache {
@@ -210,6 +215,7 @@ impl EvmSketchExecutorCache {
             )),
             chain_ids: Mutex::new(HashMap::new()),
             trace_providers: Mutex::new(HashMap::new()),
+            mux_support: Mutex::new(HashMap::new()),
         }
     }
 
@@ -244,6 +250,12 @@ impl EvmSketchExecutorCache {
                 .or_insert_with(|| provider.clone());
         }
         Ok(provider)
+    }
+
+    /// What `rpc_url` has shown about `muxTracer`, shared by every request to it.
+    fn mux_support(&self, rpc_url: &str) -> Arc<MuxSupport> {
+        let mut support = self.mux_support.lock().expect("mux_support mutex poisoned");
+        Arc::clone(support.entry(rpc_url.to_string()).or_default())
     }
 
     #[cfg(test)]
@@ -1251,9 +1263,11 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
     // Extract the state updates (hybrid prestate/struct-log path) and build the executor
     // concurrently — they are independent, so on a cache miss this hides the executor build behind
     // the trace fetch.
+    let mux = cache.mux_support(rpc_url);
     let (extracted, (executor, executor_lookup)) = tokio::try_join!(
         extract_state_updates_hybrid(
             &provider,
+            &mux,
             tx_request,
             block_id,
             contract_address,
@@ -1355,6 +1369,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
 /// calls that could observe it, so it cannot change the extracted diff.
 async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
     provider: &P,
+    mux: &MuxSupport,
     tx_request: TransactionRequest,
     block: BlockId,
     consumer: Address,
@@ -1368,7 +1383,7 @@ async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
     if encoding.signs_prestate_net() {
         attempted_prestate = true;
         let started = Instant::now();
-        let net = try_prestate_net(provider, &tx_request, block, consumer, profile).await?;
+        let net = try_prestate_net(provider, mux, &tx_request, block, consumer, profile).await?;
         trace_fetch += started.elapsed();
         if let Some(updates) = net {
             tracing::Span::current().record("extraction", Extraction::PrestateNet.as_str());
@@ -1434,18 +1449,14 @@ struct Extracted {
 /// the tracers are unavailable or fail. Never returns an unsound diff.
 async fn try_prestate_net<P: Provider + DebugApi>(
     provider: &P,
+    mux: &MuxSupport,
     tx_request: &TransactionRequest,
     block: BlockId,
     consumer: Address,
     profile: SimProfile,
 ) -> Result<Option<Vec<StateUpdate>>> {
-    // Each tracer re-simulates the call, and for the heavy-compute calls this encoding exists to
-    // serve that simulation dominates the request — so issue both concurrently rather than paying
-    // for two sequential executions.
-    let (diff, frame) = tokio::try_join!(
-        get_prestate_diff_from_call_with_profile(provider, tx_request.clone(), block, profile),
-        get_call_frame_from_call_with_profile(provider, tx_request.clone(), block, profile),
-    )?;
+    let (diff, frame) =
+        prestate_diff_and_call_frame(provider, mux, tx_request, block, profile).await?;
     match classify_prestate_eligibility(&frame, &diff, consumer) {
         PrestateEligibility::Eligible => Ok(Some(build_state_updates_from_prestate(
             consumer, &diff, &frame,
@@ -1455,6 +1466,142 @@ async fn try_prestate_net<P: Provider + DebugApi>(
             Ok(None)
         }
     }
+}
+
+/// How long an endpoint that will not serve `muxTracer` goes without being asked. Long enough that
+/// the wasted request is negligible, short enough that a plan change, an upgrade or a backend swap
+/// behind the URL is picked up without a restart.
+const MUX_PAUSE: Duration = Duration::from_secs(60 * 60);
+
+/// Rejections in a row, with no answer in between, after which `muxTracer` is paused. A few, so a
+/// burst of call-specific failures such as tracer timeouts on heavy calls does not pause it.
+const MUX_REJECTIONS_BEFORE_PAUSE: u32 = 3;
+
+/// What a trace endpoint has shown about `muxTracer`, shared by every request to it.
+///
+/// An endpoint that says it lacks `muxTracer`, answers it in an unusable shape, or keeps rejecting
+/// it is paused: requests go straight to the separate tracers until the pause ends. Pausing only
+/// ever costs speed, never correctness, since both paths return the same frames.
+#[derive(Debug)]
+pub(crate) struct MuxSupport {
+    pause: Duration,
+    epoch: Instant,
+    /// Milliseconds after `epoch` until which `muxTracer` is not requested.
+    paused_until_ms: AtomicU64,
+    rejections: AtomicU32,
+}
+
+impl Default for MuxSupport {
+    fn default() -> Self {
+        Self::with_pause(MUX_PAUSE)
+    }
+}
+
+impl MuxSupport {
+    fn with_pause(pause: Duration) -> Self {
+        Self {
+            pause,
+            epoch: Instant::now(),
+            paused_until_ms: AtomicU64::new(0),
+            rejections: AtomicU32::new(0),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn is_paused(&self) -> bool {
+        self.now_ms() < self.paused_until_ms.load(Ordering::Relaxed)
+    }
+
+    fn pause(&self) {
+        let until = self
+            .now_ms()
+            .saturating_add(u64::try_from(self.pause.as_millis()).unwrap_or(u64::MAX));
+        self.paused_until_ms.store(until, Ordering::Relaxed);
+        self.rejections.store(0, Ordering::Relaxed);
+    }
+
+    /// The endpoint served the request, whatever became of the call.
+    fn answered(&self) {
+        self.rejections.store(0, Ordering::Relaxed);
+    }
+
+    /// Records a rejection, pausing `muxTracer` when it is one too many. Returns whether it did.
+    fn rejected(&self) -> bool {
+        let pause =
+            self.rejections.fetch_add(1, Ordering::Relaxed) + 1 >= MUX_REJECTIONS_BEFORE_PAUSE;
+        if pause {
+            self.pause();
+        }
+        pause
+    }
+}
+
+/// The prestate diff and `callTracer` frame the net form is built from.
+///
+/// Each tracer request re-simulates the call, and for the heavy-compute calls this encoding exists
+/// to serve that simulation dominates the request, so one `muxTracer` request runs it once for
+/// both. Otherwise the two tracers go concurrently, which costs a second execution but no extra
+/// latency, and returns the same frames.
+///
+/// Only an error the EVM raised is returned without trying the separate tracers: it would recur
+/// on both, so retrying would only execute the failing call twice more. Anything else may be
+/// about the mux rather than the call (a tracer timeout the mux's extra hooks tipped over, a
+/// load-balanced backend that refuses it), so it falls back, at the cost of the separate requests
+/// on a call that may fail again.
+async fn prestate_diff_and_call_frame<P: Provider + DebugApi>(
+    provider: &P,
+    mux: &MuxSupport,
+    tx_request: &TransactionRequest,
+    block: BlockId,
+    profile: SimProfile,
+) -> Result<(DiffMode, CallFrame)> {
+    if !mux.is_paused() {
+        match get_prestate_diff_and_call_frame_with_profile(
+            provider,
+            tx_request.clone(),
+            block,
+            profile,
+        )
+        .await?
+        {
+            MuxedTraces::Frames(frames) => {
+                mux.answered();
+                return Ok(*frames);
+            }
+            MuxedTraces::Rejected {
+                reason,
+                payload: Some(payload),
+            } if is_evm_failure(&payload) => {
+                mux.answered();
+                bail!("muxTracer debug_trace_call failed: {reason}");
+            }
+            MuxedTraces::Rejected { reason, .. } => {
+                if mux.rejected() {
+                    tracing::warn!(%reason, pause_secs = mux.pause.as_secs(), "muxTracer rejected repeatedly; pausing it for this endpoint");
+                } else {
+                    tracing::warn!(%reason, "muxTracer request rejected; requesting the tracers separately");
+                }
+            }
+            MuxedTraces::Unsupported => {
+                mux.pause();
+                tracing::info!(
+                    pause_secs = mux.pause.as_secs(),
+                    "endpoint lacks muxTracer; pausing it for this endpoint"
+                );
+            }
+            MuxedTraces::Malformed(reason) => {
+                mux.pause();
+                tracing::warn!(%reason, pause_secs = mux.pause.as_secs(), "muxTracer answered in an unusable shape; pausing it for this endpoint");
+            }
+        }
+    }
+    tokio::try_join!(
+        get_prestate_diff_from_call_with_profile(provider, tx_request.clone(), block, profile),
+        get_call_frame_from_call_with_profile(provider, tx_request.clone(), block, profile),
+    )
 }
 
 // ============================================================================
@@ -1529,7 +1676,8 @@ pub async fn call_to_frame_tree_with_evmsketch(
     let mut extraction = Extraction::StructLog;
     if encoding.signs_prestate_net() {
         let started = Instant::now();
-        let net = try_prestate_net(&provider, &tx_request, block, root, profile).await?;
+        let mux = cache.mux_support(rpc_url);
+        let net = try_prestate_net(&provider, &mux, &tx_request, block, root, profile).await?;
         trace_fetch += started.elapsed();
         extraction = Extraction::PrestateFallback;
         if let Some(updates) = net {
@@ -2355,6 +2503,216 @@ mod tests {
 
         assert_eq!(hints.get(&contract), Some(&vec![]));
         assert_eq!(hints.len(), 1);
+    }
+
+    fn mux_fixture_diff() -> serde_json::Value {
+        serde_json::json!({
+            "pre": {"0x0000000000000000000000000000000000001001": {"storage": {
+                "0x0000000000000000000000000000000000000000000000000000000000000001":
+                    "0x0000000000000000000000000000000000000000000000000000000000000000"}}},
+            "post": {"0x0000000000000000000000000000000000001001": {"storage": {
+                "0x0000000000000000000000000000000000000000000000000000000000000001":
+                    "0x0000000000000000000000000000000000000000000000000000000000000042"}}}
+        })
+    }
+
+    fn mux_fixture_frame() -> serde_json::Value {
+        serde_json::json!({
+            "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            "to": "0x0000000000000000000000000000000000001001",
+            "gas": "0x2dc6c0",
+            "gasUsed": "0x5208",
+            "input": "0x",
+            "value": "0x0",
+            "type": "CALL"
+        })
+    }
+
+    /// A provider answering each request with the next queued response, and the queue.
+    fn mux_mock() -> (RootProvider<Ethereum>, alloy_transport::mock::Asserter) {
+        let asserter = alloy_transport::mock::Asserter::new();
+        let provider = alloy_provider::ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_mocked_client(asserter.clone());
+        (provider, asserter)
+    }
+
+    /// Queues the two separate tracer answers.
+    fn push_separate(asserter: &alloy_transport::mock::Asserter) {
+        asserter.push_success(&mux_fixture_diff());
+        asserter.push_success(&mux_fixture_frame());
+    }
+
+    async fn mux_traces(
+        provider: &RootProvider<Ethereum>,
+        mux: &MuxSupport,
+    ) -> Result<(DiffMode, CallFrame)> {
+        prestate_diff_and_call_frame(
+            provider,
+            mux,
+            &TransactionRequest::default(),
+            BlockId::latest(),
+            SimProfile::Chain,
+        )
+        .await
+    }
+
+    /// A provider that rejects `muxTracer` in wording no heuristic knows still yields both frames,
+    /// from the two tracers requested separately, and the rejection does not give up on
+    /// `muxTracer`: it may have been about the call.
+    #[tokio::test]
+    async fn test_a_mux_rejection_in_any_wording_falls_back_to_separate_tracers() {
+        let (provider, asserter) = mux_mock();
+        let mux = MuxSupport::default();
+        asserter.push_failure_msg("method not allowed on this plan");
+        push_separate(&asserter);
+
+        let (got_diff, got_frame) = mux_traces(&provider, &mux)
+            .await
+            .expect("the separate tracers answer");
+
+        assert_eq!(
+            got_diff,
+            serde_json::from_value::<DiffMode>(mux_fixture_diff()).unwrap()
+        );
+        assert_eq!(
+            got_frame,
+            serde_json::from_value::<CallFrame>(mux_fixture_frame()).unwrap()
+        );
+        assert!(!mux.is_paused());
+    }
+
+    /// An error the EVM raised would recur on both separate tracers, so it is returned without
+    /// executing the failing call twice more.
+    #[tokio::test]
+    async fn test_an_evm_failure_is_returned_without_falling_back() {
+        let (provider, asserter) = mux_mock();
+        asserter.push_failure(alloy_json_rpc::ErrorPayload {
+            code: 3,
+            message: "execution reverted".into(),
+            data: None,
+        });
+
+        let error = mux_traces(&provider, &MuxSupport::default())
+            .await
+            .expect_err("the call reverted");
+
+        assert!(
+            error
+                .to_string()
+                .contains("muxTracer debug_trace_call failed"),
+            "the mux error itself, not a fallback's: {error}"
+        );
+        assert!(asserter.pop_response().is_none(), "no request was retried");
+    }
+
+    /// Any other error may be about the mux, not the call: a tracer timeout its extra hooks tipped
+    /// over, or a load-balanced backend that refuses it. So it falls back even on an endpoint that
+    /// has already answered a mux.
+    #[tokio::test]
+    async fn test_a_timeout_falls_back_even_after_mux_succeeded() {
+        let (provider, asserter) = mux_mock();
+        let mux = MuxSupport::default();
+        asserter.push_success(&serde_json::json!({
+            "prestateTracer": mux_fixture_diff(),
+            "callTracer": mux_fixture_frame(),
+        }));
+        asserter.push_failure_msg("execution timeout");
+        push_separate(&asserter);
+
+        mux_traces(&provider, &mux).await.expect("the mux answers");
+        mux_traces(&provider, &mux)
+            .await
+            .expect("the separate tracers answer after the mux timed out");
+        assert!(asserter.pop_response().is_none());
+        assert!(!mux.is_paused());
+    }
+
+    /// An endpoint that lacks `muxTracer`, or answers it in an unusable shape, is asked for the
+    /// separate tracers directly while the pause lasts.
+    #[tokio::test]
+    async fn test_an_endpoint_that_cannot_mux_is_not_asked_again() {
+        for (lacks_mux, answer) in [
+            (true, None),
+            (
+                false,
+                Some(serde_json::json!({"prestateTracer": {}, "callTracer": mux_fixture_frame()})),
+            ),
+        ] {
+            let (provider, asserter) = mux_mock();
+            let mux = MuxSupport::default();
+            match answer {
+                Some(malformed) => asserter.push_success(&malformed),
+                None => asserter.push_failure_msg("unsupported tracer type"),
+            }
+            push_separate(&asserter);
+            push_separate(&asserter);
+
+            mux_traces(&provider, &mux)
+                .await
+                .expect("the fallback answers");
+            assert!(mux.is_paused(), "lacks_mux={lacks_mux}");
+            mux_traces(&provider, &mux)
+                .await
+                .expect("the separate tracers answer without a mux attempt");
+            assert!(asserter.pop_response().is_none());
+        }
+    }
+
+    /// Rejections in unrecognised wording pause `muxTracer` once they repeat, and an answer in
+    /// between starts the count over, so occasional call-specific failures never pause it.
+    #[tokio::test]
+    async fn test_repeated_rejections_pause_mux_and_an_answer_resets_the_count() {
+        let (provider, asserter) = mux_mock();
+        let mux = MuxSupport::default();
+        for _ in 1..MUX_REJECTIONS_BEFORE_PAUSE {
+            asserter.push_failure_msg("Forbidden");
+            push_separate(&asserter);
+        }
+        asserter.push_success(&serde_json::json!({
+            "prestateTracer": mux_fixture_diff(),
+            "callTracer": mux_fixture_frame(),
+        }));
+        for _ in 0..MUX_REJECTIONS_BEFORE_PAUSE {
+            asserter.push_failure_msg("Forbidden");
+            push_separate(&asserter);
+        }
+        push_separate(&asserter);
+
+        for _ in 1..MUX_REJECTIONS_BEFORE_PAUSE {
+            mux_traces(&provider, &mux).await.unwrap();
+        }
+        mux_traces(&provider, &mux).await.expect("the mux answers");
+        assert!(!mux.is_paused(), "an answer starts the count over");
+        for _ in 0..MUX_REJECTIONS_BEFORE_PAUSE {
+            mux_traces(&provider, &mux).await.unwrap();
+        }
+        assert!(mux.is_paused());
+        mux_traces(&provider, &mux)
+            .await
+            .expect("the separate tracers answer without a mux attempt");
+        assert!(asserter.pop_response().is_none());
+    }
+
+    /// A pause ends, so an endpoint that gains `muxTracer` is used again without a restart.
+    #[tokio::test]
+    async fn test_a_paused_endpoint_is_asked_again_once_the_pause_ends() {
+        let (provider, asserter) = mux_mock();
+        let mux = MuxSupport::with_pause(Duration::ZERO);
+        asserter.push_failure_msg("unsupported tracer type");
+        push_separate(&asserter);
+        asserter.push_success(&serde_json::json!({
+            "prestateTracer": mux_fixture_diff(),
+            "callTracer": mux_fixture_frame(),
+        }));
+
+        mux_traces(&provider, &mux)
+            .await
+            .expect("the fallback answers");
+        mux_traces(&provider, &mux)
+            .await
+            .expect("the mux is asked again and answers");
+        assert!(asserter.pop_response().is_none());
     }
 
     /// End-to-end coverage of the extraction dispatcher and the `rpc` tracer helpers against a
@@ -3255,6 +3613,7 @@ mod tests {
         ) -> (Vec<StateUpdate>, HashSet<Opcode>) {
             let extracted = extract_state_updates_hybrid(
                 provider,
+                &MuxSupport::default(),
                 call_request(to),
                 BlockId::latest(),
                 to,
@@ -3274,6 +3633,7 @@ mod tests {
         ) -> (Vec<StateUpdate>, HashSet<Opcode>) {
             let extracted = extract_state_updates_hybrid(
                 provider,
+                &MuxSupport::default(),
                 call_request(to),
                 BlockId::latest(),
                 to,
@@ -3304,6 +3664,52 @@ mod tests {
             let (canonical, _, _) =
                 compute_state_updates_canonical(trace, to).expect("canonical extraction failed");
             (net, legacy, canonical)
+        }
+
+        /// anvil has no `muxTracer`, so the one-call request reports it unsupported rather than
+        /// failing, and the net form is built from the two tracers requested separately.
+        #[tokio::test]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
+        async fn test_endpoint_without_mux_tracer_falls_back_to_separate_tracers() {
+            let anvil = LocalAnvil::spawn().await;
+            let provider = anvil.provider();
+            let consumer = address!("0x0000000000000000000000000000000000001001");
+            set_code(&provider, consumer, eligible_code()).await;
+
+            let muxed = get_prestate_diff_and_call_frame_with_profile(
+                &provider,
+                call_request(consumer),
+                BlockId::latest(),
+                SimProfile::Chain,
+            )
+            .await
+            .expect("an unsupported tracer is not an error");
+            assert!(
+                matches!(muxed, MuxedTraces::Unsupported),
+                "anvil reports muxTracer unsupported: {muxed:?}"
+            );
+
+            let (diff, frame) = prestate_diff_and_call_frame(
+                &provider,
+                &MuxSupport::default(),
+                &call_request(consumer),
+                BlockId::latest(),
+                SimProfile::Chain,
+            )
+            .await
+            .expect("separate tracers succeed");
+            assert_eq!(
+                (diff, frame),
+                tokio::try_join!(
+                    get_prestate_diff_from_call(
+                        &provider,
+                        call_request(consumer),
+                        BlockId::latest()
+                    ),
+                    get_call_frame_from_call(&provider, call_request(consumer), BlockId::latest()),
+                )
+                .unwrap()
+            );
         }
 
         /// Eligible call, against a real tracer: the net form reaches the same end state and event
@@ -3713,6 +4119,7 @@ mod tests {
             // replaces the request's 3M and the burner completes.
             let extracted = extract_state_updates_hybrid(
                 &provider,
+                &MuxSupport::default(),
                 call_request(consumer),
                 BlockId::latest(),
                 consumer,
@@ -3750,6 +4157,7 @@ mod tests {
 
             let updates = extract_state_updates_hybrid(
                 &provider,
+                &MuxSupport::default(),
                 call_request(consumer),
                 BlockId::latest(),
                 consumer,
@@ -3788,6 +4196,7 @@ mod tests {
 
             let updates = extract_state_updates_hybrid(
                 &provider,
+                &MuxSupport::default(),
                 call_request(consumer),
                 BlockId::latest(),
                 consumer,

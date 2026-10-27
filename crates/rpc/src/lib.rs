@@ -6,11 +6,15 @@
 
 use alloy::primitives::{Address, FixedBytes};
 use alloy::rpc::types::BlockOverrides;
+use alloy::rpc::types::trace::geth::mux::{MuxConfig, MuxFrame};
 use alloy::rpc::types::trace::geth::{
-    CallConfig, CallFrame, DefaultFrame, DiffMode, GethDebugTracingCallOptions,
-    GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace, PreStateConfig, PreStateFrame,
+    CallConfig, CallFrame, DefaultFrame, DiffMode, GethDebugBuiltInTracerType,
+    GethDebugTracingCallOptions, GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace,
+    PreStateConfig, PreStateFrame,
 };
+use alloy::transports::TransportError;
 use alloy_eips::BlockId;
+use alloy_json_rpc::ErrorPayload;
 use alloy_provider::Provider;
 use alloy_provider::ext::DebugApi;
 use alloy_rpc_types::TransactionTrait;
@@ -169,11 +173,7 @@ where
 {
     let mut tx_request = tx_request.into();
     let mut options = GethDebugTracingCallOptions {
-        tracing_options: GethDebugTracingOptions::prestate_tracer(PreStateConfig {
-            diff_mode: Some(true),
-            disable_code: Some(true),
-            ..Default::default()
-        }),
+        tracing_options: GethDebugTracingOptions::prestate_tracer(prestate_diff_config()),
         ..Default::default()
     };
     apply_sim_profile(&mut tx_request, &mut options, profile);
@@ -218,10 +218,7 @@ where
 {
     let mut tx_request = tx_request.into();
     let mut options = GethDebugTracingCallOptions {
-        tracing_options: GethDebugTracingOptions::call_tracer(CallConfig {
-            with_log: Some(true),
-            ..Default::default()
-        }),
+        tracing_options: GethDebugTracingOptions::call_tracer(call_with_log_config()),
         ..Default::default()
     };
     apply_sim_profile(&mut tx_request, &mut options, profile);
@@ -233,6 +230,177 @@ where
         GethTrace::CallTracer(frame) => Ok(frame),
         other => Err(anyhow!("expected call frame, got {other:?}")),
     }
+}
+
+/// Simulate a call once and return both the prestate diff of
+/// [`get_prestate_diff_from_call`] and the `callTracer` frame of
+/// [`get_call_frame_from_call`], configured identically, from one `muxTracer` request.
+///
+/// Each tracer request re-executes the call, so asking for both separately runs it twice; for the
+/// heavy-compute calls the prestate net form exists to serve, execution is nearly all of the cost.
+///
+/// Any answer other than the two frames is reported rather than returned as an error, so the
+/// caller can request the tracers separately: endpoints that lack or allow-list `muxTracer` word
+/// the rejection differently, and an error that came from executing the call will recur on the
+/// separate requests anyway. Only a transport failure, where nothing was answered, is an error.
+pub async fn get_prestate_diff_and_call_frame_with_profile<P, Req>(
+    provider: &P,
+    tx_request: Req,
+    block: BlockId,
+    profile: SimProfile,
+) -> Result<MuxedTraces>
+where
+    P: Provider + DebugApi,
+    Req: Into<alloy::rpc::types::eth::TransactionRequest>,
+{
+    let mut tx_request = tx_request.into();
+    let mut options = GethDebugTracingCallOptions {
+        tracing_options: GethDebugTracingOptions::mux_tracer(MuxConfig(
+            [
+                (
+                    GethDebugBuiltInTracerType::PreStateTracer,
+                    Some(prestate_diff_config().into()),
+                ),
+                (
+                    GethDebugBuiltInTracerType::CallTracer,
+                    Some(call_with_log_config().into()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )),
+        ..Default::default()
+    };
+    apply_sim_profile(&mut tx_request, &mut options, profile);
+    match provider.debug_trace_call(tx_request, block, options).await {
+        Ok(trace) => Ok(match split_prestate_and_call(trace) {
+            Ok(frames) => MuxedTraces::Frames(Box::new(frames)),
+            Err(e) => MuxedTraces::Malformed(e.to_string()),
+        }),
+        Err(e) => classify_mux_error(&e),
+    }
+}
+
+/// How a failed `muxTracer` request was answered, if it was.
+///
+/// An endpoint can refuse a tracer in the JSON-RPC body or, at a gateway, with a 4xx status before
+/// any JSON-RPC is parsed; both are answers. A connection failure, a 5xx, or a rate limit or
+/// request timeout (HTTP 429 or 408, or their JSON-RPC equivalents) is not: it says the endpoint is
+/// busy, not what it supports, and requesting the separate tracers at once would only add load.
+/// Those stay errors, for the caller to retry with backoff as it would without `muxTracer`.
+fn classify_mux_error(error: &TransportError) -> Result<MuxedTraces> {
+    let (reason, payload) = if let Some(resp) = error.as_error_resp() {
+        (resp.to_string(), Some(resp.clone()))
+    } else if let Some(http) = error
+        .as_transport_err()
+        .and_then(|kind| kind.as_http_error())
+        .filter(|http| (400..500).contains(&http.status) && ![408, 429].contains(&http.status))
+    {
+        // Gateways put the same JSON-RPC error in a 4xx body that a node would send with a 200.
+        (
+            format!("HTTP {}: {}", http.status, http.body),
+            json_rpc_error_in(&http.body),
+        )
+    } else {
+        bail!("muxTracer debug_trace_call failed: {error}");
+    };
+    if payload
+        .as_ref()
+        .is_some_and(|payload| is_rate_limited(payload.code, &payload.message))
+    {
+        bail!("muxTracer debug_trace_call failed: {reason}");
+    }
+    Ok(if is_unsupported_tracer(&reason) {
+        MuxedTraces::Unsupported
+    } else {
+        MuxedTraces::Rejected { reason, payload }
+    })
+}
+
+/// The JSON-RPC error object in a response body, if the body is one.
+fn json_rpc_error_in(body: &str) -> Option<ErrorPayload> {
+    let response: serde_json::Value = serde_json::from_str(body).ok()?;
+    serde_json::from_value(response.get("error")?.clone()).ok()
+}
+
+/// Whether a JSON-RPC error says the endpoint is throttling requests: code 429, or -32005 as geth,
+/// Infura and Alchemy use it, or the wording of either.
+fn is_rate_limited(code: i64, message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    code == 429
+        || code == -32005
+        || message.contains("rate limit")
+        || message.contains("too many requests")
+}
+
+/// What a `muxTracer` request for the prestate diff and call frame produced.
+#[derive(Debug)]
+pub enum MuxedTraces {
+    /// Both frames, from one execution of the call.
+    Frames(Box<(DiffMode, CallFrame)>),
+    /// The endpoint said it has no `muxTracer`.
+    Unsupported,
+    /// The endpoint answered with an error, which may be about the call or about `muxTracer`.
+    /// `payload` is the JSON-RPC error when there was one, rather than a bare HTTP status.
+    Rejected {
+        reason: String,
+        payload: Option<ErrorPayload>,
+    },
+    /// The endpoint ran the request but answered in a shape other than the two frames.
+    Malformed(String),
+}
+
+/// The prestate diff and call frame out of a `muxTracer` response.
+fn split_prestate_and_call(trace: GethTrace) -> Result<(DiffMode, CallFrame)> {
+    let GethTrace::MuxTracer(MuxFrame(mut frames)) = trace else {
+        bail!("expected mux frame, got {trace:?}");
+    };
+    let diff = match frames.remove(&GethDebugBuiltInTracerType::PreStateTracer) {
+        Some(GethTrace::PreStateTracer(PreStateFrame::Diff(diff))) => diff,
+        other => bail!("expected prestate diff frame in mux response, got {other:?}"),
+    };
+    let frame = match frames.remove(&GethDebugBuiltInTracerType::CallTracer) {
+        Some(GethTrace::CallTracer(frame)) => frame,
+        other => bail!("expected call frame in mux response, got {other:?}"),
+    };
+    Ok((diff, frame))
+}
+
+/// The `prestateTracer` config the prestate net form reads: the net diff, without contract code.
+fn prestate_diff_config() -> PreStateConfig {
+    PreStateConfig {
+        diff_mode: Some(true),
+        disable_code: Some(true),
+        ..Default::default()
+    }
+}
+
+/// The `callTracer` config the prestate net form reads: the call tree with its logs.
+fn call_with_log_config() -> CallConfig {
+    CallConfig {
+        with_log: Some(true),
+        ..Default::default()
+    }
+}
+
+/// Whether an RPC error message says the endpoint does not offer the requested tracer, as opposed
+/// to the call itself failing. Matched on the message because codes differ: anvil answers `-32602
+/// "unsupported tracer type"`, geth reports the tracer as not found, and hosted providers that
+/// allow-list tracers call it not available or not allowed.
+fn is_unsupported_tracer(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("tracer")
+        && [
+            "unsupported",
+            "unknown",
+            "not supported",
+            "not found",
+            "not available",
+            "not allowed",
+            "disabled",
+        ]
+        .iter()
+        .any(|reason| message.contains(reason))
 }
 
 /// Compute state updates from an existing transaction using its actual trace.
@@ -332,4 +500,243 @@ pub async fn get_preceding_transactions<P: Provider>(
         .collect();
 
     Ok(preceding)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CALL_FRAME: &str = r#"{
+        "from": "0x004260f8179001930baf7d65a96ae9647ea1dc1d",
+        "gas": "0x1c9c380",
+        "gasUsed": "0x177a6",
+        "to": "0x974554de55ac3e837c3502a11c27eab2993c761f",
+        "input": "0x8344f7710000000000000000000000000000000000000000000000000000000000000001",
+        "logs": [{
+            "address": "0x974554de55ac3e837c3502a11c27eab2993c761f",
+            "topics": ["0x5c1b3e2a1f8d7e0c4b9a6f3d2e1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c"],
+            "data": "0x0000000000000000000000000000000000000000000000000000000000000002",
+            "position": "0x0"
+        }],
+        "value": "0x0",
+        "type": "CALL"
+    }"#;
+
+    const PRESTATE_DIFF: &str = r#"{
+        "pre": {
+            "0x974554de55ac3e837c3502a11c27eab2993c761f": {
+                "balance": "0x0",
+                "nonce": 1,
+                "storage": {
+                    "0x0000000000000000000000000000000000000000000000000000000000000003": "0x0000000000000000000000000000000000000000000000000000000000000001"
+                }
+            }
+        },
+        "post": {
+            "0x974554de55ac3e837c3502a11c27eab2993c761f": {
+                "storage": {
+                    "0x0000000000000000000000000000000000000000000000000000000000000003": "0x0000000000000000000000000000000000000000000000000000000000000002"
+                }
+            }
+        }
+    }"#;
+
+    #[test]
+    fn a_mux_response_splits_into_the_frames_the_separate_tracers_return() {
+        let response =
+            format!(r#"{{"callTracer": {CALL_FRAME}, "prestateTracer": {PRESTATE_DIFF}}}"#);
+        let trace: GethTrace = serde_json::from_str(&response).unwrap();
+
+        let (diff, frame) = split_prestate_and_call(trace).unwrap();
+
+        assert_eq!(
+            diff,
+            serde_json::from_str::<DiffMode>(PRESTATE_DIFF).unwrap()
+        );
+        assert_eq!(
+            frame,
+            serde_json::from_str::<CallFrame>(CALL_FRAME).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_mux_response_missing_a_tracer_is_an_error() {
+        let response = format!(r#"{{"callTracer": {CALL_FRAME}}}"#);
+        let trace: GethTrace = serde_json::from_str(&response).unwrap();
+
+        assert!(split_prestate_and_call(trace).is_err());
+    }
+
+    /// A provider that answers each request with the next queued response.
+    fn mocked() -> (impl Provider + DebugApi, alloy_transport::mock::Asserter) {
+        let asserter = alloy_transport::mock::Asserter::new();
+        let provider =
+            alloy_provider::ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        (provider, asserter)
+    }
+
+    async fn muxed(provider: &(impl Provider + DebugApi)) -> MuxedTraces {
+        get_prestate_diff_and_call_frame_with_profile(
+            provider,
+            alloy::rpc::types::eth::TransactionRequest::default(),
+            BlockId::latest(),
+            SimProfile::Chain,
+        )
+        .await
+        .expect("an answered request is never an error")
+    }
+
+    #[tokio::test]
+    async fn both_frames_come_back_from_one_request() {
+        let (provider, asserter) = mocked();
+        let response: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"callTracer": {CALL_FRAME}, "prestateTracer": {PRESTATE_DIFF}}}"#
+        ))
+        .unwrap();
+        asserter.push_success(&response);
+
+        assert!(matches!(muxed(&provider).await, MuxedTraces::Frames(..)));
+    }
+
+    #[tokio::test]
+    async fn a_rejection_in_any_wording_is_reported_rather_than_raised() {
+        let (provider, asserter) = mocked();
+        asserter.push_failure_msg("method not allowed on this plan");
+
+        let MuxedTraces::Rejected { reason, .. } = muxed(&provider).await else {
+            panic!("an unrecognised rejection must still be reported as one");
+        };
+        assert!(reason.contains("method not allowed"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_known_missing_tracer_is_reported_as_unsupported() {
+        let (provider, asserter) = mocked();
+        asserter.push_failure_msg("unsupported tracer type");
+
+        assert!(matches!(muxed(&provider).await, MuxedTraces::Unsupported));
+    }
+
+    /// An endpoint that runs the mux but ignores `diffMode` answers with the full prestate.
+    #[tokio::test]
+    async fn an_answer_in_the_wrong_shape_is_reported_as_malformed() {
+        let (provider, asserter) = mocked();
+        let response: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"callTracer": {CALL_FRAME}, "prestateTracer": {{"0x974554de55ac3e837c3502a11c27eab2993c761f": {{"balance": "0x0"}}}}}}"#
+        ))
+        .unwrap();
+        asserter.push_success(&response);
+
+        assert!(matches!(muxed(&provider).await, MuxedTraces::Malformed(_)));
+    }
+
+    /// A gateway can refuse a tracer with a 4xx before any JSON-RPC is parsed; that is still an
+    /// answer. A server error or a dropped connection is not.
+    #[test]
+    fn a_4xx_status_is_an_answer_and_a_server_or_connection_failure_is_not() {
+        use alloy::transports::TransportErrorKind;
+
+        let plan = TransportErrorKind::http_error(
+            403,
+            "tracer muxTracer is not available on this plan".into(),
+        );
+        assert!(matches!(
+            classify_mux_error(&plan),
+            Ok(MuxedTraces::Unsupported)
+        ));
+
+        let forbidden = TransportErrorKind::http_error(403, "Forbidden".into());
+        let Ok(MuxedTraces::Rejected { reason, .. }) = classify_mux_error(&forbidden) else {
+            panic!("a 4xx in any wording is an answer");
+        };
+        assert!(reason.contains("HTTP 403"), "{reason}");
+
+        let refused = TransportErrorKind::http_error(
+            400,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"unsupported tracer type"}}"#.into(),
+        );
+        assert!(matches!(
+            classify_mux_error(&refused),
+            Ok(MuxedTraces::Unsupported)
+        ));
+
+        let bad_gateway = TransportErrorKind::http_error(502, "bad gateway".into());
+        assert!(classify_mux_error(&bad_gateway).is_err());
+
+        let dropped = TransportErrorKind::custom_str("connection refused");
+        assert!(classify_mux_error(&dropped).is_err());
+
+        let reverted = TransportErrorKind::http_error(
+            400,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"execution reverted"}}"#.into(),
+        );
+        let Ok(MuxedTraces::Rejected {
+            payload: Some(payload),
+            ..
+        }) = classify_mux_error(&reverted)
+        else {
+            panic!("a JSON-RPC error in a 4xx body keeps its payload");
+        };
+        assert_eq!(
+            (payload.code, payload.message.as_ref()),
+            (3, "execution reverted")
+        );
+
+        let throttled = TransportErrorKind::http_error(
+            400,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"limit exceeded"}}"#.into(),
+        );
+        assert!(classify_mux_error(&throttled).is_err());
+
+        for status in [408, 429] {
+            let busy = TransportErrorKind::http_error(status, "Too Many Requests".into());
+            assert!(
+                classify_mux_error(&busy).is_err(),
+                "HTTP {status} is not an answer"
+            );
+        }
+    }
+
+    /// A rate limit in the JSON-RPC body says the endpoint is busy, not what it supports, so it
+    /// neither falls back nor counts toward pausing `muxTracer`.
+    #[test]
+    fn a_json_rpc_rate_limit_is_an_error_not_a_rejection() {
+        for (code, message) in [
+            (429, "Too Many Requests"),
+            (-32005, "limit exceeded"),
+            (
+                -32000,
+                "Your app has exceeded its compute units per second capacity, rate limit",
+            ),
+        ] {
+            let error = alloy::transports::RpcError::ErrorResp(ErrorPayload {
+                code,
+                message: message.to_string().into(),
+                data: None,
+            });
+            assert!(classify_mux_error(&error).is_err(), "{code} {message}");
+        }
+        let reverted = alloy::transports::RpcError::ErrorResp(ErrorPayload {
+            code: 3,
+            message: "execution reverted".into(),
+            data: None,
+        });
+        assert!(matches!(
+            classify_mux_error(&reverted),
+            Ok(MuxedTraces::Rejected { .. })
+        ));
+    }
+
+    #[test]
+    fn only_a_missing_tracer_counts_as_unsupported() {
+        assert!(is_unsupported_tracer("unsupported tracer type"));
+        assert!(is_unsupported_tracer("tracer not found"));
+        assert!(is_unsupported_tracer("Unknown tracer: muxTracer"));
+        assert!(is_unsupported_tracer(
+            "tracer muxTracer is not available on this plan"
+        ));
+        assert!(!is_unsupported_tracer("execution reverted"));
+        assert!(!is_unsupported_tracer("out of gas"));
+        assert!(!is_unsupported_tracer("request timed out"));
+    }
 }
