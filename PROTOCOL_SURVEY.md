@@ -2883,6 +2883,27 @@ Fixing it needs the trace read in a streaming way or fetched without memory, whi
 the saving is at least ~825k–850k gas (37–61%), before counting any of the rollup's own
 computation. Treat it as an estimate until the analyzer can replay one.
 
+**Measured, 2026-10-27: 83%.** Built from `claude/determined-edison-cfike5` (`059480d`, which
+streams the trace so it fits in memory: peak ~200 MB instead of 14 GB), three `submitEpochRootProof`
+calls (`0x069d1525`) replayed in full:
+
+| tx | gas used | base | saved (Schnorr) | % |
+|---|---:|---:|---:|---:|
+| [`0x99b5d08e…`](https://etherscan.io/tx/0x99b5d08e92288d59672f29366b5bdb500d47e8c96d18bdfd6b8eed2dbcf1f131) | 1,752,317 | 246,975 | 1,455,342 | **83.05%** |
+| [`0x1c36fa10…`](https://etherscan.io/tx/0x1c36fa106f4197cdde4a8b3772fd7b16c568e0555a0bec39eaf04a27da26fd10) | 1,733,099 | 244,072 | 1,439,027 | **83.03%** |
+| [`0xc08b4b96…`](https://etherscan.io/tx/0xc08b4b963d320a39bcfb2b75c2c41e84f7da759f311e7cbb07815df7c312497f) | 1,674,882 | 235,207 | 1,389,675 | **82.97%** |
+
+A fourth (`0x1f050b7b…`) failed because the node's `debug_traceTransaction` timed out, not the analyzer.
+Artifact test on `0x99b5d08e…`: base 246,975 vs 37,974 of regular calls, passes. The re-entrancy note
+is printed and harmless here.
+
+Where the saving sits (call trace of `0x99b5d08e…`): 721,697 gas is the Honk verifier `STATICCALL`,
+152,456 is precompiles (including the point evaluation), 12,761 another read. **Unlike every other L2
+in this survey, the rollup's own code also does a lot:** keeping the verifier and precompiles on-chain
+still leaves about **581,000 gas (~33%)**, my arithmetic, not an analyzer run. Part of that is likely the
+hashing that binds the proof to the state written, which would also have to stay, so treat 33% as an
+upper bound for the proof-kept-on-chain version.
+
 **Status:** the token launched February 12, 2026, and the Alpha mainnet is live (v5.1.0). Aztec
 disclosed two vulnerabilities in March 2026. The separate, older Aztec Connect was exploited for
 $2.19M in June 2026; it is not this contract.
