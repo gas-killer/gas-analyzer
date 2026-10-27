@@ -289,25 +289,38 @@ where
 /// busy, not what it supports, and requesting the separate tracers at once would only add load.
 /// Those stay errors, for the caller to retry with backoff as it would without `muxTracer`.
 fn classify_mux_error(error: &TransportError) -> Result<MuxedTraces> {
-    let (reason, payload) = if let Some(resp) = error
-        .as_error_resp()
-        .filter(|resp| !is_rate_limited(resp.code, &resp.message))
-    {
+    let (reason, payload) = if let Some(resp) = error.as_error_resp() {
         (resp.to_string(), Some(resp.clone()))
     } else if let Some(http) = error
         .as_transport_err()
         .and_then(|kind| kind.as_http_error())
         .filter(|http| (400..500).contains(&http.status) && ![408, 429].contains(&http.status))
     {
-        (format!("HTTP {}: {}", http.status, http.body), None)
+        // Gateways put the same JSON-RPC error in a 4xx body that a node would send with a 200.
+        (
+            format!("HTTP {}: {}", http.status, http.body),
+            json_rpc_error_in(&http.body),
+        )
     } else {
         bail!("muxTracer debug_trace_call failed: {error}");
     };
+    if payload
+        .as_ref()
+        .is_some_and(|payload| is_rate_limited(payload.code, &payload.message))
+    {
+        bail!("muxTracer debug_trace_call failed: {reason}");
+    }
     Ok(if is_unsupported_tracer(&reason) {
         MuxedTraces::Unsupported
     } else {
         MuxedTraces::Rejected { reason, payload }
     })
+}
+
+/// The JSON-RPC error object in a response body, if the body is one.
+fn json_rpc_error_in(body: &str) -> Option<ErrorPayload> {
+    let response: serde_json::Value = serde_json::from_str(body).ok()?;
+    serde_json::from_value(response.get("error")?.clone()).ok()
 }
 
 /// Whether a JSON-RPC error says the endpoint is throttling requests: code 429, or -32005 as geth,
@@ -652,6 +665,28 @@ mod tests {
 
         let dropped = TransportErrorKind::custom_str("connection refused");
         assert!(classify_mux_error(&dropped).is_err());
+
+        let reverted = TransportErrorKind::http_error(
+            400,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"execution reverted"}}"#.into(),
+        );
+        let Ok(MuxedTraces::Rejected {
+            payload: Some(payload),
+            ..
+        }) = classify_mux_error(&reverted)
+        else {
+            panic!("a JSON-RPC error in a 4xx body keeps its payload");
+        };
+        assert_eq!(
+            (payload.code, payload.message.as_ref()),
+            (3, "execution reverted")
+        );
+
+        let throttled = TransportErrorKind::http_error(
+            400,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"limit exceeded"}}"#.into(),
+        );
+        assert!(classify_mux_error(&throttled).is_err());
 
         for status in [408, 429] {
             let busy = TransportErrorKind::http_error(status, "Too Many Requests".into());
