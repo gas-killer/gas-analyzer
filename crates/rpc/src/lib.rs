@@ -282,7 +282,7 @@ where
     };
     Ok(match split_prestate_and_call(trace) {
         Ok(frames) => MuxedTraces::Frames(Box::new(frames)),
-        Err(e) => MuxedTraces::Rejected(e.to_string()),
+        Err(e) => MuxedTraces::Malformed(e.to_string()),
     })
 }
 
@@ -293,8 +293,10 @@ pub enum MuxedTraces {
     Frames(Box<(DiffMode, CallFrame)>),
     /// The endpoint said it has no `muxTracer`.
     Unsupported,
-    /// The endpoint answered with an error or a shape other than the two frames.
+    /// The endpoint answered with an error, which may be about the call or about `muxTracer`.
     Rejected(String),
+    /// The endpoint ran the request but answered in a shape other than the two frames.
+    Malformed(String),
 }
 
 /// The prestate diff and call frame out of a `muxTracer` response.
@@ -557,7 +559,7 @@ mod tests {
 
     /// An endpoint that runs the mux but ignores `diffMode` answers with the full prestate.
     #[tokio::test]
-    async fn an_answer_in_the_wrong_shape_is_reported_as_rejected() {
+    async fn an_answer_in_the_wrong_shape_is_reported_as_malformed() {
         let (provider, asserter) = mocked();
         let response: serde_json::Value = serde_json::from_str(&format!(
             r#"{{"callTracer": {CALL_FRAME}, "prestateTracer": {{"0x974554de55ac3e837c3502a11c27eab2993c761f": {{"balance": "0x0"}}}}}}"#
@@ -565,7 +567,7 @@ mod tests {
         .unwrap();
         asserter.push_success(&response);
 
-        assert!(matches!(muxed(&provider).await, MuxedTraces::Rejected(_)));
+        assert!(matches!(muxed(&provider).await, MuxedTraces::Malformed(_)));
     }
 
     #[test]
