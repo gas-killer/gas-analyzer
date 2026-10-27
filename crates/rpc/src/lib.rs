@@ -12,6 +12,7 @@ use alloy::rpc::types::trace::geth::{
     GethDebugTracingCallOptions, GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace,
     PreStateConfig, PreStateFrame,
 };
+use alloy::transports::TransportError;
 use alloy_eips::BlockId;
 use alloy_provider::Provider;
 use alloy_provider::ext::DebugApi;
@@ -270,19 +271,36 @@ where
         ..Default::default()
     };
     apply_sim_profile(&mut tx_request, &mut options, profile);
-    let trace = match provider.debug_trace_call(tx_request, block, options).await {
-        Ok(trace) => trace,
-        Err(e) => match e.as_error_resp() {
-            Some(resp) if is_unsupported_tracer(&resp.message) => {
-                return Ok(MuxedTraces::Unsupported);
-            }
-            Some(resp) => return Ok(MuxedTraces::Rejected(resp.to_string())),
-            None => bail!("muxTracer debug_trace_call failed: {e}"),
-        },
+    match provider.debug_trace_call(tx_request, block, options).await {
+        Ok(trace) => Ok(match split_prestate_and_call(trace) {
+            Ok(frames) => MuxedTraces::Frames(Box::new(frames)),
+            Err(e) => MuxedTraces::Malformed(e.to_string()),
+        }),
+        Err(e) => classify_mux_error(&e),
+    }
+}
+
+/// How a failed `muxTracer` request was answered, if it was.
+///
+/// An endpoint can refuse a tracer in the JSON-RPC body or, at a gateway, with a 4xx status before
+/// any JSON-RPC is parsed; both are answers. A connection failure, a timeout or a 5xx is not, and
+/// stays an error.
+fn classify_mux_error(error: &TransportError) -> Result<MuxedTraces> {
+    let message = if let Some(resp) = error.as_error_resp() {
+        resp.to_string()
+    } else if let Some(http) = error
+        .as_transport_err()
+        .and_then(|kind| kind.as_http_error())
+        .filter(|http| (400..500).contains(&http.status))
+    {
+        format!("HTTP {}: {}", http.status, http.body)
+    } else {
+        bail!("muxTracer debug_trace_call failed: {error}");
     };
-    Ok(match split_prestate_and_call(trace) {
-        Ok(frames) => MuxedTraces::Frames(Box::new(frames)),
-        Err(e) => MuxedTraces::Malformed(e.to_string()),
+    Ok(if is_unsupported_tracer(&message) {
+        MuxedTraces::Unsupported
+    } else {
+        MuxedTraces::Rejected(message)
     })
 }
 
@@ -334,13 +352,22 @@ fn call_with_log_config() -> CallConfig {
 
 /// Whether an RPC error message says the endpoint does not offer the requested tracer, as opposed
 /// to the call itself failing. Matched on the message because codes differ: anvil answers `-32602
-/// "unsupported tracer type"`, geth reports the tracer as not found.
+/// "unsupported tracer type"`, geth reports the tracer as not found, and hosted providers that
+/// allow-list tracers call it not available or not allowed.
 fn is_unsupported_tracer(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("tracer")
-        && ["unsupported", "unknown", "not supported", "not found"]
-            .iter()
-            .any(|reason| message.contains(reason))
+        && [
+            "unsupported",
+            "unknown",
+            "not supported",
+            "not found",
+            "not available",
+            "not allowed",
+            "disabled",
+        ]
+        .iter()
+        .any(|reason| message.contains(reason))
 }
 
 /// Compute state updates from an existing transaction using its actual trace.
@@ -570,11 +597,51 @@ mod tests {
         assert!(matches!(muxed(&provider).await, MuxedTraces::Malformed(_)));
     }
 
+    /// A gateway can refuse a tracer with a 4xx before any JSON-RPC is parsed; that is still an
+    /// answer. A server error or a dropped connection is not.
+    #[test]
+    fn a_4xx_status_is_an_answer_and_a_server_or_connection_failure_is_not() {
+        use alloy::transports::TransportErrorKind;
+
+        let plan = TransportErrorKind::http_error(
+            403,
+            "tracer muxTracer is not available on this plan".into(),
+        );
+        assert!(matches!(
+            classify_mux_error(&plan),
+            Ok(MuxedTraces::Unsupported)
+        ));
+
+        let forbidden = TransportErrorKind::http_error(403, "Forbidden".into());
+        let Ok(MuxedTraces::Rejected(reason)) = classify_mux_error(&forbidden) else {
+            panic!("a 4xx in any wording is an answer");
+        };
+        assert!(reason.contains("HTTP 403"), "{reason}");
+
+        let refused = TransportErrorKind::http_error(
+            400,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"unsupported tracer type"}}"#.into(),
+        );
+        assert!(matches!(
+            classify_mux_error(&refused),
+            Ok(MuxedTraces::Unsupported)
+        ));
+
+        let bad_gateway = TransportErrorKind::http_error(502, "bad gateway".into());
+        assert!(classify_mux_error(&bad_gateway).is_err());
+
+        let dropped = TransportErrorKind::custom_str("connection refused");
+        assert!(classify_mux_error(&dropped).is_err());
+    }
+
     #[test]
     fn only_a_missing_tracer_counts_as_unsupported() {
         assert!(is_unsupported_tracer("unsupported tracer type"));
         assert!(is_unsupported_tracer("tracer not found"));
         assert!(is_unsupported_tracer("Unknown tracer: muxTracer"));
+        assert!(is_unsupported_tracer(
+            "tracer muxTracer is not available on this plan"
+        ));
         assert!(!is_unsupported_tracer("execution reverted"));
         assert!(!is_unsupported_tracer("out of gas"));
         assert!(!is_unsupported_tracer("request timed out"));

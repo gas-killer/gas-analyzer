@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 gas-analyzer-core = { path = "../core" }
 gas-analyzer-estimator = { path = "../gas-estimator" }
-alloy = { version = "1.0.37", features = ["rpc", "rpc-types"] }
+alloy = { version = "1.0.37", features = ["rpc", "rpc-types", "transports"] }
 alloy-eips = "1.0.37"
 alloy-provider = { version = "1.0.37", features = ["debug-api"] }
 alloy-rpc-types = "1.0.37"
