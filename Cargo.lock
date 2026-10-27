@@ -3885,6 +3885,7 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "alloy-eips",
+ "alloy-json-rpc",
  "alloy-provider",
  "alloy-rpc-types",
  "alloy-transport",

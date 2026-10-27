@@ -28,7 +28,7 @@ use sp1_cc_client_executor::{ContractCalldata, ContractInput};
 use sp1_cc_host_executor::{EvmSketch, Genesis};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use url::Url;
@@ -1467,30 +1467,20 @@ async fn try_prestate_net<P: Provider + DebugApi>(
     }
 }
 
-/// What a trace endpoint has shown about `muxTracer`, remembered for the life of the process so
-/// that what one request learned shapes the next.
-#[derive(Debug)]
-pub(crate) struct MuxSupport(AtomicU8);
-
-impl Default for MuxSupport {
-    fn default() -> Self {
-        Self(AtomicU8::new(Self::UNKNOWN))
-    }
+/// Whether a trace endpoint has shown it cannot serve `muxTracer`, remembered for the life of the
+/// process so that later requests go straight to the separate tracers.
+#[derive(Debug, Default)]
+pub(crate) struct MuxSupport {
+    unavailable: AtomicBool,
 }
 
 impl MuxSupport {
-    const UNKNOWN: u8 = 0;
-    /// It has answered a `muxTracer` request with both frames.
-    const CONFIRMED: u8 = 1;
-    /// It said it has no `muxTracer`, or answered in a shape the net form cannot use.
-    const UNAVAILABLE: u8 = 2;
-
-    fn get(&self) -> u8 {
-        self.0.load(Ordering::Relaxed)
+    fn is_unavailable(&self) -> bool {
+        self.unavailable.load(Ordering::Relaxed)
     }
 
-    fn set(&self, state: u8) {
-        self.0.store(state, Ordering::Relaxed);
+    fn mark_unavailable(&self) {
+        self.unavailable.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1501,10 +1491,11 @@ impl MuxSupport {
 /// both. Otherwise the two tracers go concurrently, which costs a second execution but no extra
 /// latency, and returns the same frames.
 ///
-/// `mux` keeps a failing call from being executed three times. Once the endpoint has answered a
-/// `muxTracer` request, an error from it is about the call and is returned as is; requested again
-/// separately, it would only fail again after two more executions. Before that, an error falls back
-/// without marking the endpoint, since one timed-out call must not disable `muxTracer` for good.
+/// Only an error the EVM raised is returned without trying the separate tracers: it would recur
+/// on both, so retrying would only execute the failing call twice more. Anything else may be
+/// about the mux rather than the call (a tracer timeout the mux's extra hooks tipped over, a
+/// load-balanced backend that refuses it), so it falls back, at the cost of the separate requests
+/// on a call that may fail again.
 async fn prestate_diff_and_call_frame<P: Provider + DebugApi>(
     provider: &P,
     mux: &MuxSupport,
@@ -1512,7 +1503,7 @@ async fn prestate_diff_and_call_frame<P: Provider + DebugApi>(
     block: BlockId,
     profile: SimProfile,
 ) -> Result<(DiffMode, CallFrame)> {
-    if mux.get() != MuxSupport::UNAVAILABLE {
+    if !mux.is_unavailable() {
         match get_prestate_diff_and_call_frame_with_profile(
             provider,
             tx_request.clone(),
@@ -1521,24 +1512,24 @@ async fn prestate_diff_and_call_frame<P: Provider + DebugApi>(
         )
         .await?
         {
-            MuxedTraces::Frames(frames) => {
-                mux.set(MuxSupport::CONFIRMED);
-                return Ok(*frames);
-            }
-            MuxedTraces::Rejected(reason) if mux.get() == MuxSupport::CONFIRMED => {
+            MuxedTraces::Frames(frames) => return Ok(*frames),
+            MuxedTraces::Rejected {
+                reason,
+                payload: Some(payload),
+            } if is_evm_failure(&payload) => {
                 bail!("muxTracer debug_trace_call failed: {reason}");
             }
-            MuxedTraces::Rejected(reason) => {
+            MuxedTraces::Rejected { reason, .. } => {
                 tracing::warn!(%reason, "muxTracer request rejected; requesting the tracers separately");
             }
             MuxedTraces::Unsupported => {
-                mux.set(MuxSupport::UNAVAILABLE);
+                mux.mark_unavailable();
                 tracing::info!(
                     "endpoint lacks muxTracer; requesting the tracers separately from now on"
                 );
             }
             MuxedTraces::Malformed(reason) => {
-                mux.set(MuxSupport::UNAVAILABLE);
+                mux.mark_unavailable();
                 tracing::warn!(%reason, "muxTracer answered in an unusable shape; requesting the tracers separately from now on");
             }
         }
@@ -2503,8 +2494,8 @@ mod tests {
     }
 
     /// A provider that rejects `muxTracer` in wording no heuristic knows still yields both frames,
-    /// from the two tracers requested separately, and a rejection before any success does not
-    /// give up on `muxTracer`: it may have been about the call.
+    /// from the two tracers requested separately, and the rejection does not give up on
+    /// `muxTracer`: it may have been about the call.
     #[tokio::test]
     async fn test_a_mux_rejection_in_any_wording_falls_back_to_separate_tracers() {
         let (provider, asserter) = mux_mock();
@@ -2524,26 +2515,23 @@ mod tests {
             got_frame,
             serde_json::from_value::<CallFrame>(mux_fixture_frame()).unwrap()
         );
-        assert_eq!(mux.get(), MuxSupport::UNKNOWN);
+        assert!(!mux.is_unavailable());
     }
 
-    /// Once the endpoint has answered a `muxTracer` request, an error is about the call: returning
-    /// it saves two more executions that would only fail the same way.
+    /// An error the EVM raised would recur on both separate tracers, so it is returned without
+    /// executing the failing call twice more.
     #[tokio::test]
-    async fn test_an_error_after_mux_succeeded_is_returned_without_falling_back() {
+    async fn test_an_evm_failure_is_returned_without_falling_back() {
         let (provider, asserter) = mux_mock();
-        let mux = MuxSupport::default();
-        asserter.push_success(&serde_json::json!({
-            "prestateTracer": mux_fixture_diff(),
-            "callTracer": mux_fixture_frame(),
-        }));
-        asserter.push_failure_msg("execution timeout");
+        asserter.push_failure(alloy_json_rpc::ErrorPayload {
+            code: 3,
+            message: "execution reverted".into(),
+            data: None,
+        });
 
-        mux_traces(&provider, &mux).await.expect("the mux answers");
-        assert_eq!(mux.get(), MuxSupport::CONFIRMED);
-        let error = mux_traces(&provider, &mux)
+        let error = mux_traces(&provider, &MuxSupport::default())
             .await
-            .expect_err("the call failed");
+            .expect_err("the call reverted");
 
         assert!(
             error
@@ -2552,6 +2540,28 @@ mod tests {
             "the mux error itself, not a fallback's: {error}"
         );
         assert!(asserter.pop_response().is_none(), "no request was retried");
+    }
+
+    /// Any other error may be about the mux, not the call: a tracer timeout its extra hooks tipped
+    /// over, or a load-balanced backend that refuses it. So it falls back even on an endpoint that
+    /// has already answered a mux.
+    #[tokio::test]
+    async fn test_a_timeout_falls_back_even_after_mux_succeeded() {
+        let (provider, asserter) = mux_mock();
+        let mux = MuxSupport::default();
+        asserter.push_success(&serde_json::json!({
+            "prestateTracer": mux_fixture_diff(),
+            "callTracer": mux_fixture_frame(),
+        }));
+        asserter.push_failure_msg("execution timeout");
+        push_separate(&asserter);
+
+        mux_traces(&provider, &mux).await.expect("the mux answers");
+        mux_traces(&provider, &mux)
+            .await
+            .expect("the separate tracers answer after the mux timed out");
+        assert!(asserter.pop_response().is_none());
+        assert!(!mux.is_unavailable());
     }
 
     /// An endpoint that lacks `muxTracer`, or answers it in an unusable shape, is asked for the
@@ -2577,7 +2587,7 @@ mod tests {
             mux_traces(&provider, &mux)
                 .await
                 .expect("the fallback answers");
-            assert_eq!(mux.get(), MuxSupport::UNAVAILABLE, "lacks_mux={lacks_mux}");
+            assert!(mux.is_unavailable(), "lacks_mux={lacks_mux}");
             mux_traces(&provider, &mux)
                 .await
                 .expect("the separate tracers answer without a mux attempt");

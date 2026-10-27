@@ -14,6 +14,7 @@ use alloy::rpc::types::trace::geth::{
 };
 use alloy::transports::TransportError;
 use alloy_eips::BlockId;
+use alloy_json_rpc::ErrorPayload;
 use alloy_provider::Provider;
 use alloy_provider::ext::DebugApi;
 use alloy_rpc_types::TransactionTrait;
@@ -286,21 +287,21 @@ where
 /// any JSON-RPC is parsed; both are answers. A connection failure, a timeout or a 5xx is not, and
 /// stays an error.
 fn classify_mux_error(error: &TransportError) -> Result<MuxedTraces> {
-    let message = if let Some(resp) = error.as_error_resp() {
-        resp.to_string()
+    let (reason, payload) = if let Some(resp) = error.as_error_resp() {
+        (resp.to_string(), Some(resp.clone()))
     } else if let Some(http) = error
         .as_transport_err()
         .and_then(|kind| kind.as_http_error())
         .filter(|http| (400..500).contains(&http.status))
     {
-        format!("HTTP {}: {}", http.status, http.body)
+        (format!("HTTP {}: {}", http.status, http.body), None)
     } else {
         bail!("muxTracer debug_trace_call failed: {error}");
     };
-    Ok(if is_unsupported_tracer(&message) {
+    Ok(if is_unsupported_tracer(&reason) {
         MuxedTraces::Unsupported
     } else {
-        MuxedTraces::Rejected(message)
+        MuxedTraces::Rejected { reason, payload }
     })
 }
 
@@ -312,7 +313,11 @@ pub enum MuxedTraces {
     /// The endpoint said it has no `muxTracer`.
     Unsupported,
     /// The endpoint answered with an error, which may be about the call or about `muxTracer`.
-    Rejected(String),
+    /// `payload` is the JSON-RPC error when there was one, rather than a bare HTTP status.
+    Rejected {
+        reason: String,
+        payload: Option<ErrorPayload>,
+    },
     /// The endpoint ran the request but answered in a shape other than the two frames.
     Malformed(String),
 }
@@ -570,7 +575,7 @@ mod tests {
         let (provider, asserter) = mocked();
         asserter.push_failure_msg("method not allowed on this plan");
 
-        let MuxedTraces::Rejected(reason) = muxed(&provider).await else {
+        let MuxedTraces::Rejected { reason, .. } = muxed(&provider).await else {
             panic!("an unrecognised rejection must still be reported as one");
         };
         assert!(reason.contains("method not allowed"), "{reason}");
@@ -613,7 +618,7 @@ mod tests {
         ));
 
         let forbidden = TransportErrorKind::http_error(403, "Forbidden".into());
-        let Ok(MuxedTraces::Rejected(reason)) = classify_mux_error(&forbidden) else {
+        let Ok(MuxedTraces::Rejected { reason, .. }) = classify_mux_error(&forbidden) else {
             panic!("a 4xx in any wording is an answer");
         };
         assert!(reason.contains("HTTP 403"), "{reason}");
