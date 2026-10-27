@@ -28,7 +28,7 @@ use sp1_cc_client_executor::{ContractCalldata, ContractInput};
 use sp1_cc_host_executor::{EvmSketch, Genesis};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use url::Url;
@@ -226,11 +226,6 @@ impl EvmSketchExecutorCache {
     /// `Provider + DebugApi` bounds required by `get_trace_from_call`.
     /// Subsequent calls for the same URL return a clone of the same underlying
     /// provider — cheap Arc bump, shared connection pool.
-    fn mux_support(&self, rpc_url: &str) -> Arc<MuxSupport> {
-        let mut support = self.mux_support.lock().expect("mux_support mutex poisoned");
-        Arc::clone(support.entry(rpc_url.to_string()).or_default())
-    }
-
     fn get_or_create_trace_provider(&self, rpc_url: &str) -> Result<RootProvider<Ethereum>> {
         {
             let providers = self
@@ -255,6 +250,12 @@ impl EvmSketchExecutorCache {
                 .or_insert_with(|| provider.clone());
         }
         Ok(provider)
+    }
+
+    /// What `rpc_url` has shown about `muxTracer`, shared by every request to it.
+    fn mux_support(&self, rpc_url: &str) -> Arc<MuxSupport> {
+        let mut support = self.mux_support.lock().expect("mux_support mutex poisoned");
+        Arc::clone(support.entry(rpc_url.to_string()).or_default())
     }
 
     #[cfg(test)]
@@ -1467,20 +1468,74 @@ async fn try_prestate_net<P: Provider + DebugApi>(
     }
 }
 
-/// Whether a trace endpoint has shown it cannot serve `muxTracer`, remembered for the life of the
-/// process so that later requests go straight to the separate tracers.
-#[derive(Debug, Default)]
+/// How long an endpoint that will not serve `muxTracer` goes without being asked. Long enough that
+/// the wasted request is negligible, short enough that a plan change, an upgrade or a backend swap
+/// behind the URL is picked up without a restart.
+const MUX_PAUSE: Duration = Duration::from_secs(60 * 60);
+
+/// Rejections in a row, with no answer in between, after which `muxTracer` is paused. A few, so a
+/// burst of call-specific failures such as tracer timeouts on heavy calls does not pause it.
+const MUX_REJECTIONS_BEFORE_PAUSE: u32 = 3;
+
+/// What a trace endpoint has shown about `muxTracer`, shared by every request to it.
+///
+/// An endpoint that says it lacks `muxTracer`, answers it in an unusable shape, or keeps rejecting
+/// it is paused: requests go straight to the separate tracers until the pause ends. Pausing only
+/// ever costs speed, never correctness, since both paths return the same frames.
+#[derive(Debug)]
 pub(crate) struct MuxSupport {
-    unavailable: AtomicBool,
+    pause: Duration,
+    epoch: Instant,
+    /// Milliseconds after `epoch` until which `muxTracer` is not requested.
+    paused_until_ms: AtomicU64,
+    rejections: AtomicU32,
+}
+
+impl Default for MuxSupport {
+    fn default() -> Self {
+        Self::with_pause(MUX_PAUSE)
+    }
 }
 
 impl MuxSupport {
-    fn is_unavailable(&self) -> bool {
-        self.unavailable.load(Ordering::Relaxed)
+    fn with_pause(pause: Duration) -> Self {
+        Self {
+            pause,
+            epoch: Instant::now(),
+            paused_until_ms: AtomicU64::new(0),
+            rejections: AtomicU32::new(0),
+        }
     }
 
-    fn mark_unavailable(&self) {
-        self.unavailable.store(true, Ordering::Relaxed);
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn is_paused(&self) -> bool {
+        self.now_ms() < self.paused_until_ms.load(Ordering::Relaxed)
+    }
+
+    fn pause(&self) {
+        let until = self
+            .now_ms()
+            .saturating_add(u64::try_from(self.pause.as_millis()).unwrap_or(u64::MAX));
+        self.paused_until_ms.store(until, Ordering::Relaxed);
+        self.rejections.store(0, Ordering::Relaxed);
+    }
+
+    /// The endpoint served the request, whatever became of the call.
+    fn answered(&self) {
+        self.rejections.store(0, Ordering::Relaxed);
+    }
+
+    /// Records a rejection, pausing `muxTracer` when it is one too many. Returns whether it did.
+    fn rejected(&self) -> bool {
+        let pause =
+            self.rejections.fetch_add(1, Ordering::Relaxed) + 1 >= MUX_REJECTIONS_BEFORE_PAUSE;
+        if pause {
+            self.pause();
+        }
+        pause
     }
 }
 
@@ -1503,7 +1558,7 @@ async fn prestate_diff_and_call_frame<P: Provider + DebugApi>(
     block: BlockId,
     profile: SimProfile,
 ) -> Result<(DiffMode, CallFrame)> {
-    if !mux.is_unavailable() {
+    if !mux.is_paused() {
         match get_prestate_diff_and_call_frame_with_profile(
             provider,
             tx_request.clone(),
@@ -1512,25 +1567,34 @@ async fn prestate_diff_and_call_frame<P: Provider + DebugApi>(
         )
         .await?
         {
-            MuxedTraces::Frames(frames) => return Ok(*frames),
+            MuxedTraces::Frames(frames) => {
+                mux.answered();
+                return Ok(*frames);
+            }
             MuxedTraces::Rejected {
                 reason,
                 payload: Some(payload),
             } if is_evm_failure(&payload) => {
+                mux.answered();
                 bail!("muxTracer debug_trace_call failed: {reason}");
             }
             MuxedTraces::Rejected { reason, .. } => {
-                tracing::warn!(%reason, "muxTracer request rejected; requesting the tracers separately");
+                if mux.rejected() {
+                    tracing::warn!(%reason, pause_secs = mux.pause.as_secs(), "muxTracer rejected repeatedly; pausing it for this endpoint");
+                } else {
+                    tracing::warn!(%reason, "muxTracer request rejected; requesting the tracers separately");
+                }
             }
             MuxedTraces::Unsupported => {
-                mux.mark_unavailable();
+                mux.pause();
                 tracing::info!(
-                    "endpoint lacks muxTracer; requesting the tracers separately from now on"
+                    pause_secs = mux.pause.as_secs(),
+                    "endpoint lacks muxTracer; pausing it for this endpoint"
                 );
             }
             MuxedTraces::Malformed(reason) => {
-                mux.mark_unavailable();
-                tracing::warn!(%reason, "muxTracer answered in an unusable shape; requesting the tracers separately from now on");
+                mux.pause();
+                tracing::warn!(%reason, pause_secs = mux.pause.as_secs(), "muxTracer answered in an unusable shape; pausing it for this endpoint");
             }
         }
     }
@@ -2515,7 +2579,7 @@ mod tests {
             got_frame,
             serde_json::from_value::<CallFrame>(mux_fixture_frame()).unwrap()
         );
-        assert!(!mux.is_unavailable());
+        assert!(!mux.is_paused());
     }
 
     /// An error the EVM raised would recur on both separate tracers, so it is returned without
@@ -2561,11 +2625,11 @@ mod tests {
             .await
             .expect("the separate tracers answer after the mux timed out");
         assert!(asserter.pop_response().is_none());
-        assert!(!mux.is_unavailable());
+        assert!(!mux.is_paused());
     }
 
     /// An endpoint that lacks `muxTracer`, or answers it in an unusable shape, is asked for the
-    /// separate tracers directly from then on.
+    /// separate tracers directly while the pause lasts.
     #[tokio::test]
     async fn test_an_endpoint_that_cannot_mux_is_not_asked_again() {
         for (lacks_mux, answer) in [
@@ -2587,12 +2651,68 @@ mod tests {
             mux_traces(&provider, &mux)
                 .await
                 .expect("the fallback answers");
-            assert!(mux.is_unavailable(), "lacks_mux={lacks_mux}");
+            assert!(mux.is_paused(), "lacks_mux={lacks_mux}");
             mux_traces(&provider, &mux)
                 .await
                 .expect("the separate tracers answer without a mux attempt");
             assert!(asserter.pop_response().is_none());
         }
+    }
+
+    /// Rejections in unrecognised wording pause `muxTracer` once they repeat, and an answer in
+    /// between starts the count over, so occasional call-specific failures never pause it.
+    #[tokio::test]
+    async fn test_repeated_rejections_pause_mux_and_an_answer_resets_the_count() {
+        let (provider, asserter) = mux_mock();
+        let mux = MuxSupport::default();
+        for _ in 1..MUX_REJECTIONS_BEFORE_PAUSE {
+            asserter.push_failure_msg("Forbidden");
+            push_separate(&asserter);
+        }
+        asserter.push_success(&serde_json::json!({
+            "prestateTracer": mux_fixture_diff(),
+            "callTracer": mux_fixture_frame(),
+        }));
+        for _ in 0..MUX_REJECTIONS_BEFORE_PAUSE {
+            asserter.push_failure_msg("Forbidden");
+            push_separate(&asserter);
+        }
+        push_separate(&asserter);
+
+        for _ in 1..MUX_REJECTIONS_BEFORE_PAUSE {
+            mux_traces(&provider, &mux).await.unwrap();
+        }
+        mux_traces(&provider, &mux).await.expect("the mux answers");
+        assert!(!mux.is_paused(), "an answer starts the count over");
+        for _ in 0..MUX_REJECTIONS_BEFORE_PAUSE {
+            mux_traces(&provider, &mux).await.unwrap();
+        }
+        assert!(mux.is_paused());
+        mux_traces(&provider, &mux)
+            .await
+            .expect("the separate tracers answer without a mux attempt");
+        assert!(asserter.pop_response().is_none());
+    }
+
+    /// A pause ends, so an endpoint that gains `muxTracer` is used again without a restart.
+    #[tokio::test]
+    async fn test_a_paused_endpoint_is_asked_again_once_the_pause_ends() {
+        let (provider, asserter) = mux_mock();
+        let mux = MuxSupport::with_pause(Duration::ZERO);
+        asserter.push_failure_msg("unsupported tracer type");
+        push_separate(&asserter);
+        asserter.push_success(&serde_json::json!({
+            "prestateTracer": mux_fixture_diff(),
+            "callTracer": mux_fixture_frame(),
+        }));
+
+        mux_traces(&provider, &mux)
+            .await
+            .expect("the fallback answers");
+        mux_traces(&provider, &mux)
+            .await
+            .expect("the mux is asked again and answers");
+        assert!(asserter.pop_response().is_none());
     }
 
     /// End-to-end coverage of the extraction dispatcher and the `rpc` tracer helpers against a
