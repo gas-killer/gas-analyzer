@@ -236,15 +236,17 @@ where
 ///
 /// Each tracer request re-executes the call, so asking for both separately runs it twice; for the
 /// heavy-compute calls the prestate net form exists to serve, execution is nearly all of the cost.
-/// Returns `Ok(None)` when the endpoint rejects `muxTracer` (anvil does, and so may hosted RPCs):
-/// the rejection comes before execution, so the caller loses nothing by then requesting the two
-/// tracers separately, which yields the same frames.
+///
+/// Any answer other than the two frames is reported rather than returned as an error, so the
+/// caller can request the tracers separately: endpoints that lack or allow-list `muxTracer` word
+/// the rejection differently, and an error that came from executing the call will recur on the
+/// separate requests anyway. Only a transport failure, where nothing was answered, is an error.
 pub async fn get_prestate_diff_and_call_frame_with_profile<P, Req>(
     provider: &P,
     tx_request: Req,
     block: BlockId,
     profile: SimProfile,
-) -> Result<Option<(DiffMode, CallFrame)>>
+) -> Result<MuxedTraces>
 where
     P: Provider + DebugApi,
     Req: Into<alloy::rpc::types::eth::TransactionRequest>,
@@ -270,15 +272,29 @@ where
     apply_sim_profile(&mut tx_request, &mut options, profile);
     let trace = match provider.debug_trace_call(tx_request, block, options).await {
         Ok(trace) => trace,
-        Err(e)
-            if e.as_error_resp()
-                .is_some_and(|resp| is_unsupported_tracer(&resp.message)) =>
-        {
-            return Ok(None);
-        }
-        Err(e) => bail!("muxTracer debug_trace_call failed: {e}"),
+        Err(e) => match e.as_error_resp() {
+            Some(resp) if is_unsupported_tracer(&resp.message) => {
+                return Ok(MuxedTraces::Unsupported);
+            }
+            Some(resp) => return Ok(MuxedTraces::Rejected(resp.to_string())),
+            None => bail!("muxTracer debug_trace_call failed: {e}"),
+        },
     };
-    split_prestate_and_call(trace).map(Some)
+    Ok(match split_prestate_and_call(trace) {
+        Ok(frames) => MuxedTraces::Frames(Box::new(frames)),
+        Err(e) => MuxedTraces::Rejected(e.to_string()),
+    })
+}
+
+/// What a `muxTracer` request for the prestate diff and call frame produced.
+#[derive(Debug)]
+pub enum MuxedTraces {
+    /// Both frames, from one execution of the call.
+    Frames(Box<(DiffMode, CallFrame)>),
+    /// The endpoint said it has no `muxTracer`.
+    Unsupported,
+    /// The endpoint answered with an error or a shape other than the two frames.
+    Rejected(String),
 }
 
 /// The prestate diff and call frame out of a `muxTracer` response.
@@ -487,6 +503,69 @@ mod tests {
         let trace: GethTrace = serde_json::from_str(&response).unwrap();
 
         assert!(split_prestate_and_call(trace).is_err());
+    }
+
+    /// A provider that answers each request with the next queued response.
+    fn mocked() -> (impl Provider + DebugApi, alloy_transport::mock::Asserter) {
+        let asserter = alloy_transport::mock::Asserter::new();
+        let provider =
+            alloy_provider::ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        (provider, asserter)
+    }
+
+    async fn muxed(provider: &(impl Provider + DebugApi)) -> MuxedTraces {
+        get_prestate_diff_and_call_frame_with_profile(
+            provider,
+            alloy::rpc::types::eth::TransactionRequest::default(),
+            BlockId::latest(),
+            SimProfile::Chain,
+        )
+        .await
+        .expect("an answered request is never an error")
+    }
+
+    #[tokio::test]
+    async fn both_frames_come_back_from_one_request() {
+        let (provider, asserter) = mocked();
+        let response: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"callTracer": {CALL_FRAME}, "prestateTracer": {PRESTATE_DIFF}}}"#
+        ))
+        .unwrap();
+        asserter.push_success(&response);
+
+        assert!(matches!(muxed(&provider).await, MuxedTraces::Frames(..)));
+    }
+
+    #[tokio::test]
+    async fn a_rejection_in_any_wording_is_reported_rather_than_raised() {
+        let (provider, asserter) = mocked();
+        asserter.push_failure_msg("method not allowed on this plan");
+
+        let MuxedTraces::Rejected(reason) = muxed(&provider).await else {
+            panic!("an unrecognised rejection must still be reported as one");
+        };
+        assert!(reason.contains("method not allowed"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_known_missing_tracer_is_reported_as_unsupported() {
+        let (provider, asserter) = mocked();
+        asserter.push_failure_msg("unsupported tracer type");
+
+        assert!(matches!(muxed(&provider).await, MuxedTraces::Unsupported));
+    }
+
+    /// An endpoint that runs the mux but ignores `diffMode` answers with the full prestate.
+    #[tokio::test]
+    async fn an_answer_in_the_wrong_shape_is_reported_as_rejected() {
+        let (provider, asserter) = mocked();
+        let response: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"callTracer": {CALL_FRAME}, "prestateTracer": {{"0x974554de55ac3e837c3502a11c27eab2993c761f": {{"balance": "0x0"}}}}}}"#
+        ))
+        .unwrap();
+        asserter.push_success(&response);
+
+        assert!(matches!(muxed(&provider).await, MuxedTraces::Rejected(_)));
     }
 
     #[test]

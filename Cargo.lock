@@ -3887,11 +3887,13 @@ dependencies = [
  "alloy-eips",
  "alloy-provider",
  "alloy-rpc-types",
+ "alloy-transport",
  "anyhow",
  "gas-analyzer-core",
  "gas-analyzer-estimator",
  "revm 31.0.2",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

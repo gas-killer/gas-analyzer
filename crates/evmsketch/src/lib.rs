@@ -153,8 +153,9 @@ use gas_analyzer_core::{
 };
 use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
 use gas_analyzer_rpc::{
-    get_call_frame_from_call_with_profile, get_prestate_diff_and_call_frame_with_profile,
-    get_prestate_diff_from_call_with_profile, get_trace_from_call_with_profile,
+    MuxedTraces, get_call_frame_from_call_with_profile,
+    get_prestate_diff_and_call_frame_with_profile, get_prestate_diff_from_call_with_profile,
+    get_trace_from_call_with_profile,
 };
 
 // ============================================================================
@@ -1456,23 +1457,30 @@ async fn try_prestate_net<P: Provider + DebugApi>(
 ///
 /// Each tracer request re-simulates the call, and for the heavy-compute calls this encoding exists
 /// to serve that simulation dominates the request, so one `muxTracer` request runs it once for
-/// both. An endpoint without `muxTracer` gets the two tracers concurrently instead, which costs a
-/// second execution but no extra latency, and returns the same frames.
+/// both. Any other answer gets the two tracers concurrently instead, which costs a second execution
+/// but no extra latency, and returns the same frames or the call's own error.
 async fn prestate_diff_and_call_frame<P: Provider + DebugApi>(
     provider: &P,
     tx_request: &TransactionRequest,
     block: BlockId,
     profile: SimProfile,
 ) -> Result<(DiffMode, CallFrame)> {
-    if let Some(frames) =
-        get_prestate_diff_and_call_frame_with_profile(provider, tx_request.clone(), block, profile)
-            .await?
+    match get_prestate_diff_and_call_frame_with_profile(
+        provider,
+        tx_request.clone(),
+        block,
+        profile,
+    )
+    .await?
     {
-        return Ok(frames);
+        MuxedTraces::Frames(frames) => return Ok(*frames),
+        MuxedTraces::Unsupported => {
+            tracing::debug!("endpoint lacks muxTracer; requesting the tracers separately");
+        }
+        MuxedTraces::Rejected(reason) => {
+            tracing::warn!(%reason, "muxTracer request rejected; requesting the tracers separately");
+        }
     }
-    tracing::debug!(
-        "endpoint lacks muxTracer; requesting the prestate and call tracers separately"
-    );
     tokio::try_join!(
         get_prestate_diff_from_call_with_profile(provider, tx_request.clone(), block, profile),
         get_call_frame_from_call_with_profile(provider, tx_request.clone(), block, profile),
@@ -2377,6 +2385,49 @@ mod tests {
 
         assert_eq!(hints.get(&contract), Some(&vec![]));
         assert_eq!(hints.len(), 1);
+    }
+
+    /// A provider that rejects `muxTracer` in wording no heuristic knows still yields both frames,
+    /// from the two tracers requested separately.
+    #[tokio::test]
+    async fn test_a_mux_rejection_in_any_wording_falls_back_to_separate_tracers() {
+        let diff: serde_json::Value = serde_json::json!({
+            "pre": {"0x0000000000000000000000000000000000001001": {"storage": {
+                "0x0000000000000000000000000000000000000000000000000000000000000001":
+                    "0x0000000000000000000000000000000000000000000000000000000000000000"}}},
+            "post": {"0x0000000000000000000000000000000000001001": {"storage": {
+                "0x0000000000000000000000000000000000000000000000000000000000000001":
+                    "0x0000000000000000000000000000000000000000000000000000000000000042"}}}
+        });
+        let frame: serde_json::Value = serde_json::json!({
+            "from": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+            "to": "0x0000000000000000000000000000000000001001",
+            "gas": "0x2dc6c0",
+            "gasUsed": "0x5208",
+            "input": "0x",
+            "value": "0x0",
+            "type": "CALL"
+        });
+        let asserter = alloy_transport::mock::Asserter::new();
+        asserter.push_failure_msg("method not allowed on this plan");
+        asserter.push_success(&diff);
+        asserter.push_success(&frame);
+        let provider = alloy_provider::ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let (got_diff, got_frame) = prestate_diff_and_call_frame(
+            &provider,
+            &TransactionRequest::default(),
+            BlockId::latest(),
+            SimProfile::Chain,
+        )
+        .await
+        .expect("the separate tracers answer");
+
+        assert_eq!(got_diff, serde_json::from_value::<DiffMode>(diff).unwrap());
+        assert_eq!(
+            got_frame,
+            serde_json::from_value::<CallFrame>(frame).unwrap()
+        );
     }
 
     /// End-to-end coverage of the extraction dispatcher and the `rpc` tracer helpers against a
@@ -3346,7 +3397,10 @@ mod tests {
             )
             .await
             .expect("an unsupported tracer is not an error");
-            assert!(muxed.is_none(), "anvil rejects muxTracer");
+            assert!(
+                matches!(muxed, MuxedTraces::Unsupported),
+                "anvil reports muxTracer unsupported: {muxed:?}"
+            );
 
             let (diff, frame) = prestate_diff_and_call_frame(
                 &provider,
