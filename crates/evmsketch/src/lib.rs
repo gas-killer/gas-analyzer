@@ -9,6 +9,7 @@
 
 use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
 use alloy::rpc::types::eth::TransactionRequest;
+use alloy::rpc::types::trace::geth::{CallFrame, DiffMode};
 use alloy_eips::BlockId;
 use alloy_eips::BlockNumberOrTag;
 use alloy_genesis::ChainConfig;
@@ -152,8 +153,8 @@ use gas_analyzer_core::{
 };
 use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
 use gas_analyzer_rpc::{
-    get_call_frame_from_call_with_profile, get_prestate_diff_from_call_with_profile,
-    get_trace_from_call_with_profile,
+    get_call_frame_from_call_with_profile, get_prestate_diff_and_call_frame_with_profile,
+    get_prestate_diff_from_call_with_profile, get_trace_from_call_with_profile,
 };
 
 // ============================================================================
@@ -1439,13 +1440,7 @@ async fn try_prestate_net<P: Provider + DebugApi>(
     consumer: Address,
     profile: SimProfile,
 ) -> Result<Option<Vec<StateUpdate>>> {
-    // Each tracer re-simulates the call, and for the heavy-compute calls this encoding exists to
-    // serve that simulation dominates the request — so issue both concurrently rather than paying
-    // for two sequential executions.
-    let (diff, frame) = tokio::try_join!(
-        get_prestate_diff_from_call_with_profile(provider, tx_request.clone(), block, profile),
-        get_call_frame_from_call_with_profile(provider, tx_request.clone(), block, profile),
-    )?;
+    let (diff, frame) = prestate_diff_and_call_frame(provider, tx_request, block, profile).await?;
     match classify_prestate_eligibility(&frame, &diff, consumer) {
         PrestateEligibility::Eligible => Ok(Some(build_state_updates_from_prestate(
             consumer, &diff, &frame,
@@ -1455,6 +1450,33 @@ async fn try_prestate_net<P: Provider + DebugApi>(
             Ok(None)
         }
     }
+}
+
+/// The prestate diff and `callTracer` frame the net form is built from.
+///
+/// Each tracer request re-simulates the call, and for the heavy-compute calls this encoding exists
+/// to serve that simulation dominates the request, so one `muxTracer` request runs it once for
+/// both. An endpoint without `muxTracer` gets the two tracers concurrently instead, which costs a
+/// second execution but no extra latency, and returns the same frames.
+async fn prestate_diff_and_call_frame<P: Provider + DebugApi>(
+    provider: &P,
+    tx_request: &TransactionRequest,
+    block: BlockId,
+    profile: SimProfile,
+) -> Result<(DiffMode, CallFrame)> {
+    if let Some(frames) =
+        get_prestate_diff_and_call_frame_with_profile(provider, tx_request.clone(), block, profile)
+            .await?
+    {
+        return Ok(frames);
+    }
+    tracing::debug!(
+        "endpoint lacks muxTracer; requesting the prestate and call tracers separately"
+    );
+    tokio::try_join!(
+        get_prestate_diff_from_call_with_profile(provider, tx_request.clone(), block, profile),
+        get_call_frame_from_call_with_profile(provider, tx_request.clone(), block, profile),
+    )
 }
 
 // ============================================================================
@@ -3304,6 +3326,48 @@ mod tests {
             let (canonical, _, _) =
                 compute_state_updates_canonical(trace, to).expect("canonical extraction failed");
             (net, legacy, canonical)
+        }
+
+        /// anvil has no `muxTracer`, so the one-call request reports it unsupported rather than
+        /// failing, and the net form is built from the two tracers requested separately.
+        #[tokio::test]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
+        async fn test_endpoint_without_mux_tracer_falls_back_to_separate_tracers() {
+            let anvil = LocalAnvil::spawn().await;
+            let provider = anvil.provider();
+            let consumer = address!("0x0000000000000000000000000000000000001001");
+            set_code(&provider, consumer, eligible_code()).await;
+
+            let muxed = get_prestate_diff_and_call_frame_with_profile(
+                &provider,
+                call_request(consumer),
+                BlockId::latest(),
+                SimProfile::Chain,
+            )
+            .await
+            .expect("an unsupported tracer is not an error");
+            assert!(muxed.is_none(), "anvil rejects muxTracer");
+
+            let (diff, frame) = prestate_diff_and_call_frame(
+                &provider,
+                &call_request(consumer),
+                BlockId::latest(),
+                SimProfile::Chain,
+            )
+            .await
+            .expect("separate tracers succeed");
+            assert_eq!(
+                (diff, frame),
+                tokio::try_join!(
+                    get_prestate_diff_from_call(
+                        &provider,
+                        call_request(consumer),
+                        BlockId::latest()
+                    ),
+                    get_call_frame_from_call(&provider, call_request(consumer), BlockId::latest()),
+                )
+                .unwrap()
+            );
         }
 
         /// Eligible call, against a real tracer: the net form reaches the same end state and event

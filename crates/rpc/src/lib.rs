@@ -6,9 +6,11 @@
 
 use alloy::primitives::{Address, FixedBytes};
 use alloy::rpc::types::BlockOverrides;
+use alloy::rpc::types::trace::geth::mux::{MuxConfig, MuxFrame};
 use alloy::rpc::types::trace::geth::{
-    CallConfig, CallFrame, DefaultFrame, DiffMode, GethDebugTracingCallOptions,
-    GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace, PreStateConfig, PreStateFrame,
+    CallConfig, CallFrame, DefaultFrame, DiffMode, GethDebugBuiltInTracerType,
+    GethDebugTracingCallOptions, GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace,
+    PreStateConfig, PreStateFrame,
 };
 use alloy_eips::BlockId;
 use alloy_provider::Provider;
@@ -169,11 +171,7 @@ where
 {
     let mut tx_request = tx_request.into();
     let mut options = GethDebugTracingCallOptions {
-        tracing_options: GethDebugTracingOptions::prestate_tracer(PreStateConfig {
-            diff_mode: Some(true),
-            disable_code: Some(true),
-            ..Default::default()
-        }),
+        tracing_options: GethDebugTracingOptions::prestate_tracer(prestate_diff_config()),
         ..Default::default()
     };
     apply_sim_profile(&mut tx_request, &mut options, profile);
@@ -218,10 +216,7 @@ where
 {
     let mut tx_request = tx_request.into();
     let mut options = GethDebugTracingCallOptions {
-        tracing_options: GethDebugTracingOptions::call_tracer(CallConfig {
-            with_log: Some(true),
-            ..Default::default()
-        }),
+        tracing_options: GethDebugTracingOptions::call_tracer(call_with_log_config()),
         ..Default::default()
     };
     apply_sim_profile(&mut tx_request, &mut options, profile);
@@ -233,6 +228,101 @@ where
         GethTrace::CallTracer(frame) => Ok(frame),
         other => Err(anyhow!("expected call frame, got {other:?}")),
     }
+}
+
+/// Simulate a call once and return both the prestate diff of
+/// [`get_prestate_diff_from_call`] and the `callTracer` frame of
+/// [`get_call_frame_from_call`], configured identically, from one `muxTracer` request.
+///
+/// Each tracer request re-executes the call, so asking for both separately runs it twice; for the
+/// heavy-compute calls the prestate net form exists to serve, execution is nearly all of the cost.
+/// Returns `Ok(None)` when the endpoint rejects `muxTracer` (anvil does, and so may hosted RPCs):
+/// the rejection comes before execution, so the caller loses nothing by then requesting the two
+/// tracers separately, which yields the same frames.
+pub async fn get_prestate_diff_and_call_frame_with_profile<P, Req>(
+    provider: &P,
+    tx_request: Req,
+    block: BlockId,
+    profile: SimProfile,
+) -> Result<Option<(DiffMode, CallFrame)>>
+where
+    P: Provider + DebugApi,
+    Req: Into<alloy::rpc::types::eth::TransactionRequest>,
+{
+    let mut tx_request = tx_request.into();
+    let mut options = GethDebugTracingCallOptions {
+        tracing_options: GethDebugTracingOptions::mux_tracer(MuxConfig(
+            [
+                (
+                    GethDebugBuiltInTracerType::PreStateTracer,
+                    Some(prestate_diff_config().into()),
+                ),
+                (
+                    GethDebugBuiltInTracerType::CallTracer,
+                    Some(call_with_log_config().into()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )),
+        ..Default::default()
+    };
+    apply_sim_profile(&mut tx_request, &mut options, profile);
+    let trace = match provider.debug_trace_call(tx_request, block, options).await {
+        Ok(trace) => trace,
+        Err(e)
+            if e.as_error_resp()
+                .is_some_and(|resp| is_unsupported_tracer(&resp.message)) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => bail!("muxTracer debug_trace_call failed: {e}"),
+    };
+    split_prestate_and_call(trace).map(Some)
+}
+
+/// The prestate diff and call frame out of a `muxTracer` response.
+fn split_prestate_and_call(trace: GethTrace) -> Result<(DiffMode, CallFrame)> {
+    let GethTrace::MuxTracer(MuxFrame(mut frames)) = trace else {
+        bail!("expected mux frame, got {trace:?}");
+    };
+    let diff = match frames.remove(&GethDebugBuiltInTracerType::PreStateTracer) {
+        Some(GethTrace::PreStateTracer(PreStateFrame::Diff(diff))) => diff,
+        other => bail!("expected prestate diff frame in mux response, got {other:?}"),
+    };
+    let frame = match frames.remove(&GethDebugBuiltInTracerType::CallTracer) {
+        Some(GethTrace::CallTracer(frame)) => frame,
+        other => bail!("expected call frame in mux response, got {other:?}"),
+    };
+    Ok((diff, frame))
+}
+
+/// The `prestateTracer` config the prestate net form reads: the net diff, without contract code.
+fn prestate_diff_config() -> PreStateConfig {
+    PreStateConfig {
+        diff_mode: Some(true),
+        disable_code: Some(true),
+        ..Default::default()
+    }
+}
+
+/// The `callTracer` config the prestate net form reads: the call tree with its logs.
+fn call_with_log_config() -> CallConfig {
+    CallConfig {
+        with_log: Some(true),
+        ..Default::default()
+    }
+}
+
+/// Whether an RPC error message says the endpoint does not offer the requested tracer, as opposed
+/// to the call itself failing. Matched on the message because codes differ: anvil answers `-32602
+/// "unsupported tracer type"`, geth reports the tracer as not found.
+fn is_unsupported_tracer(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("tracer")
+        && ["unsupported", "unknown", "not supported", "not found"]
+            .iter()
+            .any(|reason| message.contains(reason))
 }
 
 /// Compute state updates from an existing transaction using its actual trace.
@@ -332,4 +422,80 @@ pub async fn get_preceding_transactions<P: Provider>(
         .collect();
 
     Ok(preceding)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CALL_FRAME: &str = r#"{
+        "from": "0x004260f8179001930baf7d65a96ae9647ea1dc1d",
+        "gas": "0x1c9c380",
+        "gasUsed": "0x177a6",
+        "to": "0x974554de55ac3e837c3502a11c27eab2993c761f",
+        "input": "0x8344f7710000000000000000000000000000000000000000000000000000000000000001",
+        "logs": [{
+            "address": "0x974554de55ac3e837c3502a11c27eab2993c761f",
+            "topics": ["0x5c1b3e2a1f8d7e0c4b9a6f3d2e1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c"],
+            "data": "0x0000000000000000000000000000000000000000000000000000000000000002",
+            "position": "0x0"
+        }],
+        "value": "0x0",
+        "type": "CALL"
+    }"#;
+
+    const PRESTATE_DIFF: &str = r#"{
+        "pre": {
+            "0x974554de55ac3e837c3502a11c27eab2993c761f": {
+                "balance": "0x0",
+                "nonce": 1,
+                "storage": {
+                    "0x0000000000000000000000000000000000000000000000000000000000000003": "0x0000000000000000000000000000000000000000000000000000000000000001"
+                }
+            }
+        },
+        "post": {
+            "0x974554de55ac3e837c3502a11c27eab2993c761f": {
+                "storage": {
+                    "0x0000000000000000000000000000000000000000000000000000000000000003": "0x0000000000000000000000000000000000000000000000000000000000000002"
+                }
+            }
+        }
+    }"#;
+
+    #[test]
+    fn a_mux_response_splits_into_the_frames_the_separate_tracers_return() {
+        let response =
+            format!(r#"{{"callTracer": {CALL_FRAME}, "prestateTracer": {PRESTATE_DIFF}}}"#);
+        let trace: GethTrace = serde_json::from_str(&response).unwrap();
+
+        let (diff, frame) = split_prestate_and_call(trace).unwrap();
+
+        assert_eq!(
+            diff,
+            serde_json::from_str::<DiffMode>(PRESTATE_DIFF).unwrap()
+        );
+        assert_eq!(
+            frame,
+            serde_json::from_str::<CallFrame>(CALL_FRAME).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_mux_response_missing_a_tracer_is_an_error() {
+        let response = format!(r#"{{"callTracer": {CALL_FRAME}}}"#);
+        let trace: GethTrace = serde_json::from_str(&response).unwrap();
+
+        assert!(split_prestate_and_call(trace).is_err());
+    }
+
+    #[test]
+    fn only_a_missing_tracer_counts_as_unsupported() {
+        assert!(is_unsupported_tracer("unsupported tracer type"));
+        assert!(is_unsupported_tracer("tracer not found"));
+        assert!(is_unsupported_tracer("Unknown tracer: muxTracer"));
+        assert!(!is_unsupported_tracer("execution reverted"));
+        assert!(!is_unsupported_tracer("out of gas"));
+        assert!(!is_unsupported_tracer("request timed out"));
+    }
 }
