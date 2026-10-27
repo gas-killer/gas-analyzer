@@ -3087,3 +3087,24 @@ that holds it. It is not a NAV calculation. Measured: `storeNAV` `0x66874089…`
 mainnet. The 279,645-gas deposit `0x61168a44…` never completed a measured replay
 (rate limits); its call trace shows only ~12,000 gas of read-only work. **Verdict: no candidate on
 mainnet.** Rethink's other chains (HyperEVM, Base, Arbitrum, Polygon) were not checked.
+
+## Fhenix CoFHE — live on mainnet since October 21, and 0% (2026-10-27)
+
+CoFHE, Fhenix's FHE coprocessor, went live on Ethereum on 2026-10-21. The TaskManager was resolved
+on-chain from the CoFHEAddressBook (`0xC0F4e00E…`, `getTm(1)`): `0x52e7a0ca…`, with an ACL-like
+contract `0xa2f76994…` beside it. **476 transactions in 60,000 blocks (~8 days)** emitted ~3,500 task
+events, about 7 encrypted operations per transaction. Most callers are confidential-token wrappers
+(`FHERC20NativeWrapperUUPS` `0x1cc41c77…`, `FHERC20ERC20WrapperUUPS` `0xaaf2bf3b…` and several more),
+at 450k–634k gas each.
+
+| tx | caller | gas used | replay cost | plain | nested (TaskManager, ACL, address book owned) |
+|---|---|---:|---:|---:|---:|
+| [`0x19b4576c…`](https://etherscan.io/tx/0x19b4576cbd1c7b8c5456920342f44b48369c1f45a03b6a8d795489d6fe4cc232) | native wrapper | 456,569 | 510,325 | 0% | 0% |
+| [`0x64917b29…`](https://etherscan.io/tx/0x64917b2921c6d0a17e1f3faaab4bd727335c48dc6017b593a6a028d8db8f6c90) | native wrapper | 634,333 | 707,466 | 0% | 0% |
+| [`0x859ca8d2…`](https://etherscan.io/tx/0x859ca8d25c2e6adf9a35e94695bb454d8d4ef5ceee526d6f603c200964960caa) | ERC20 wrapper | 539,685 | 587,684 | 0% | 0% |
+
+In nested mode the analyzer declined to nest the TaskManager ("cheaper as a plain CALL"), so the ACL
+never became a nested frame either. **Why there is nothing to remove:** the FHE computation already
+happens off-chain, in Fhenix's own workers. On-chain, each operation only records a task, its ACL
+permissions and the handles, which are storage writes. Read-only work is only ~40,000 gas per
+transaction. CoFHE is itself an off-chain coprocessor, so what is left on-chain is bookkeeping.
