@@ -75,12 +75,26 @@ jobs:
         with:
           version: v1.8.5
 
+      # The tracer-equivalence suite needs a client that serves muxTracer, which anvil does not.
+      # Pinned to the reth the gas-killer testnet simulates against (service's helm/sim-node), so a
+      # reth bump there is checked here first.
+      - name: Install reth
+        env:
+          RETH_VERSION: v2.7.0
+        run: |
+          mkdir -p "$RUNNER_TEMP/reth"
+          curl -fsSL "https://github.com/paradigmxyz/reth/releases/download/${RETH_VERSION}/reth-${RETH_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/reth"
+          "$RUNNER_TEMP/reth/reth" --version
+          echo "$RUNNER_TEMP/reth" >> "$GITHUB_PATH"
+
       - name: cargo test (evmsketch - default)
         run: cargo test
 
       - name: cargo test --ignored (evmsketch RPC)
         if: env.RPC_URL != ''
-        run: cargo test -- --ignored
+        # tracer_equivalence has its own step below.
+        run: cargo test -- --ignored --skip tracer_equivalence
 
       # `gas-analyzer-core`'s `sp1-cc` feature is off by default, so the plain
       # `cargo test` above never builds the SimProfile -> EnvOverrides
@@ -96,6 +110,9 @@ jobs:
       # tests (which need RPC_URL) are not pulled in.
       - name: cargo test (evmsketch anvil integration)
         run: cargo test -p gas-analyzer-evmsketch anvil_integration -- --ignored
+
+      - name: cargo test (evmsketch tracer equivalence, reth)
+        run: cargo test -p gas-analyzer-evmsketch tracer_equivalence -- --ignored
 
   test-wasm:
     runs-on: ubuntu-latest

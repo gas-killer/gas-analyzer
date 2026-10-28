@@ -2750,11 +2750,11 @@ mod tests {
         const DEV: Address = address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
         const AVS: Address = address!("0x0000000000000000000000000000000000000a75");
 
-        fn word_u(v: u64) -> [u8; 32] {
+        pub(super) fn word_u(v: u64) -> [u8; 32] {
             U256::from(v).to_be_bytes()
         }
 
-        fn word_a(a: Address) -> [u8; 32] {
+        pub(super) fn word_a(a: Address) -> [u8; 32] {
             let mut w = [0u8; 32];
             w[12..].copy_from_slice(a.as_slice());
             w
@@ -2851,7 +2851,7 @@ mod tests {
         }
 
         /// `NestedRouter.process(user, weights)`.
-        fn process_request(router: Address, weights: u64) -> TransactionRequest {
+        pub(super) fn process_request(router: Address, weights: u64) -> TransactionRequest {
             let mut data = vec![0x9c, 0x6e, 0xfc, 0x5a];
             data.extend_from_slice(&word_a(address!(
                 "0x000000000000000000000000000000000000beef"
@@ -3263,21 +3263,21 @@ mod tests {
         }
 
         /// 32-byte topic with the given last byte, as hex for a PUSH32 immediate.
-        fn topic_hex(last: u8) -> String {
+        pub(super) fn topic_hex(last: u8) -> String {
             format!("{}{last:02x}", "00".repeat(31))
         }
 
-        fn hex_code(spaced_hex: &str) -> Bytes {
+        pub(super) fn hex_code(spaced_hex: &str) -> Bytes {
             Bytes::from(alloy::hex::decode(spaced_hex.replace(' ', "")).expect("valid hex"))
         }
 
-        fn addr_hex(a: Address) -> String {
+        pub(super) fn addr_hex(a: Address) -> String {
             alloy::hex::encode(a.as_slice())
         }
 
         /// SSTORE(1,0x42); MSTORE(0,0xab); LOG1(mem[0..32], topic 0xaa);
         /// SSTORE(2,5); SSTORE(2,0) — net zero; SSTORE(5,0) — zeroes a pre-seeded slot; STOP.
-        fn eligible_code() -> Bytes {
+        pub(super) fn eligible_code() -> Bytes {
             hex_code(&format!(
                 "6042600155 60ab600052 7f{}60206000a1 6005600255 6000600255 6000600555 00",
                 topic_hex(0xaa),
@@ -3287,7 +3287,7 @@ mod tests {
         /// LOG1(topic 0xaa); DELEGATECALL(lib); POP; LOG1(topic 0xbb); STOP.
         /// True emission order with the lib's log is aa, cc, bb — a naive DFS
         /// over the call tree would give aa, bb, cc.
-        fn delegate_root_code(lib: Address) -> Bytes {
+        pub(super) fn delegate_root_code(lib: Address) -> Bytes {
             hex_code(&format!(
                 "7f{}60006000a1 6000600060006000 73{} 5af450 7f{}60006000a1 00",
                 topic_hex(0xaa),
@@ -3297,12 +3297,12 @@ mod tests {
         }
 
         /// LOG1(topic 0xcc); SSTORE(3,7); STOP — runs in the root's storage context.
-        fn delegate_lib_code() -> Bytes {
+        pub(super) fn delegate_lib_code() -> Bytes {
             hex_code(&format!("7f{}60006000a1 6007600355 00", topic_hex(0xcc)))
         }
 
         /// CALL(callee, no args, no value); POP; SSTORE(4,1); STOP.
-        fn caller_code(callee: Address) -> Bytes {
+        pub(super) fn caller_code(callee: Address) -> Bytes {
             hex_code(&format!(
                 "60006000600060006000 73{} 5af150 6001600455 00",
                 addr_hex(callee),
@@ -3310,12 +3310,12 @@ mod tests {
         }
 
         /// SSTORE(1,9); STOP — the callee's own storage, reproduced only by CALL replay.
-        fn callee_code() -> Bytes {
+        pub(super) fn callee_code() -> Bytes {
             hex_code("6009600155 00")
         }
 
         /// SSTORE(1,0x42); LOG1(topic 0xdd, no data); REVERT(0,0).
-        fn reverter_code() -> Bytes {
+        pub(super) fn reverter_code() -> Bytes {
             hex_code(&format!(
                 "6042600155 7f{}60006000a1 60006000fd",
                 topic_hex(0xdd)
@@ -3323,7 +3323,7 @@ mod tests {
         }
 
         /// DELEGATECALL(reverter); POP — swallow the failure; SSTORE(2,0x22); STOP.
-        fn catcher_code(lib: Address) -> Bytes {
+        pub(super) fn catcher_code(lib: Address) -> Bytes {
             hex_code(&format!(
                 "6000600060006000 73{} 5af450 6022600255 00",
                 addr_hex(lib),
@@ -3406,7 +3406,7 @@ mod tests {
         /// `SELFBALANCE >= SLOAD(0)`. The diff is `[Store(0, value), Call(self, 0, 0x01)]`, and the
         /// call re-runs the balance check when the payload is applied, so it only lands when the
         /// settlement carries the ETH.
-        fn backed_deposit_code() -> Bytes {
+        pub(super) fn backed_deposit_code() -> Bytes {
             hex_code(
                 "36 601f 57 34 6000 55 6001 6000 53 6000 6000 6001 6000 6000 30 5a f1 15 6029 57 00 \
                  5b 6000 54 47 10 6029 57 00 5b 6000 6000 fd",
@@ -4227,6 +4227,530 @@ mod tests {
             assert!(
                 estimated > budget,
                 "{estimated} must exceed the {budget} budget"
+            );
+        }
+    }
+
+    mod tracer_equivalence {
+        use super::anvil_integration::{
+            addr_hex, backed_deposit_code, callee_code, caller_code, catcher_code,
+            delegate_lib_code, delegate_root_code, eligible_code, hex_code, process_request,
+            reverter_code, topic_hex, word_a, word_u,
+        };
+        use super::*;
+
+        // ========================================================================
+        // Tracer-path equivalence (gas-killer/service#521)
+        //
+        // An operator gets the net form's frames from one `muxTracer` request or, where its
+        // endpoint refuses that, from `prestateTracer` and `callTracer` separately. Both feed the
+        // task digest, so for every call shape they must encode to the same bytes. These run
+        // each shape through both paths of `try_prestate_net` against a real client and compare
+        // the encoded updates, not the frames: fields the encoder never reads, such as the
+        // top-level `gas`, may differ.
+        //
+        // Anvil has no `muxTracer`, so these spawn a dev node of the client under test:
+        // `GK_TRACE_CLIENT=reth` (default) or `geth`, from `$RETH_BIN` / `$GETH_BIN` or PATH.
+        // Run them on every bump of the reth the fleet simulates against.
+        // ========================================================================
+
+        enum Client {
+            Reth,
+            Geth,
+        }
+
+        impl Client {
+            fn from_env() -> Self {
+                match std::env::var("GK_TRACE_CLIENT").as_deref() {
+                    Ok("geth") => Client::Geth,
+                    Ok("reth") | Err(_) => Client::Reth,
+                    Ok(other) => panic!("GK_TRACE_CLIENT must be 'reth' or 'geth', got '{other}'"),
+                }
+            }
+        }
+
+        /// A dev-mode node that mines each transaction as it arrives, killed on drop.
+        struct LocalTraceNode {
+            child: std::process::Child,
+            url: String,
+            /// A funded account, which deploys the shapes.
+            dev: Address,
+            /// Signs deployments locally where the node will not: reth's `eth_sendTransaction`
+            /// rejects a contract creation as an invalid request. `None` sends them unsigned.
+            signer: Option<alloy_signer_local::PrivateKeySigner>,
+            datadir: std::path::PathBuf,
+        }
+
+        /// Distinct free ports: each listener is held until all are bound, so the OS cannot hand
+        /// the same port out twice.
+        fn free_ports<const N: usize>() -> [u16; N] {
+            let listeners: [std::net::TcpListener; N] = std::array::from_fn(|_| {
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind to pick a free port")
+            });
+            listeners.map(|listener| listener.local_addr().expect("local_addr").port())
+        }
+
+        impl LocalTraceNode {
+            async fn spawn() -> LocalTraceNode {
+                let [http, p2p, auth] = free_ports();
+                let datadir = std::env::temp_dir().join(format!("gk-trace-node-{http}"));
+                let dir = datadir.to_string_lossy().to_string();
+                let client = Client::from_env();
+                let (bin, args): (String, Vec<String>) = match client {
+                    Client::Reth => (
+                        std::env::var("RETH_BIN").unwrap_or_else(|_| "reth".into()),
+                        [
+                            "node",
+                            "--dev",
+                            "--datadir",
+                            &dir,
+                            "--http",
+                            "--http.port",
+                            &http.to_string(),
+                            "--http.api",
+                            "eth,debug,net,web3",
+                            "--port",
+                            &p2p.to_string(),
+                            "--authrpc.port",
+                            &auth.to_string(),
+                            "--disable-discovery",
+                            "--ipcdisable",
+                        ]
+                        .map(String::from)
+                        .to_vec(),
+                    ),
+                    Client::Geth => (
+                        std::env::var("GETH_BIN").unwrap_or_else(|_| "geth".into()),
+                        // No --datadir: geth's dev mode then keeps the chain in memory.
+                        [
+                            "--dev",
+                            "--http",
+                            "--http.port",
+                            &http.to_string(),
+                            "--http.api",
+                            "eth,debug,net,web3",
+                            "--port",
+                            &p2p.to_string(),
+                            "--authrpc.port",
+                            &auth.to_string(),
+                            "--nodiscover",
+                            "--ipcdisable",
+                        ]
+                        .map(String::from)
+                        .to_vec(),
+                    ),
+                };
+                let log_path = datadir.with_extension("log");
+                let log = std::fs::File::create(&log_path).expect("create the node log");
+                let child = std::process::Command::new(&bin)
+                    .args(&args)
+                    .stdout(log.try_clone().expect("clone the node log"))
+                    .stderr(log)
+                    .spawn()
+                    .unwrap_or_else(|e| {
+                        let _ = std::fs::remove_file(&log_path);
+                        panic!("failed to spawn `{bin}`: {e}")
+                    });
+                // Owned from here, so a node that never becomes ready is still killed and its
+                // datadir and log removed when the panic below unwinds.
+                let mut node = LocalTraceNode {
+                    child,
+                    url: format!("http://127.0.0.1:{http}"),
+                    dev: Address::ZERO,
+                    signer: None,
+                    datadir,
+                };
+                let provider = node.provider();
+                let mut last_err = None;
+                for _ in 0..300 {
+                    let ready = match client {
+                        // reth's dev chain prefunds the standard test mnemonic's accounts.
+                        Client::Reth => provider.get_chain_id().await.map(|_| {
+                            let signer: alloy_signer_local::PrivateKeySigner =
+                                "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+                                    .parse()
+                                    .expect("the first test-mnemonic key");
+                            (signer.address(), Some(signer))
+                        }),
+                        // geth's dev account is created per run and unlocked.
+                        Client::Geth => provider
+                            .raw_request::<_, Vec<Address>>("eth_accounts".into(), ())
+                            .await
+                            .map(|accounts| (accounts.first().copied().unwrap_or_default(), None)),
+                    };
+                    match ready {
+                        Ok((dev, signer)) if dev != Address::ZERO => {
+                            node.dev = dev;
+                            node.signer = signer;
+                            return node;
+                        }
+                        Ok(_) => last_err = Some("no dev account yet".to_string()),
+                        Err(e) => last_err = Some(e.to_string()),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+                let tail: Vec<&str> = log.lines().rev().take(20).collect();
+                panic!(
+                    "`{bin}` did not become ready within 30s; last error: {last_err:?}\n{}",
+                    tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+                );
+            }
+
+            fn provider(&self) -> RootProvider<Ethereum> {
+                RootProvider::<Ethereum>::new_http(Url::parse(&self.url).expect("valid url"))
+            }
+
+            /// Deploys creation code from the dev account and returns the new address.
+            async fn deploy(&self, creation: Vec<u8>) -> Address {
+                let provider = self.provider();
+                let hash: B256 = match &self.signer {
+                    Some(signer) => {
+                        use alloy::eips::eip2718::Encodable2718;
+                        use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
+                        use alloy_signer::SignerSync;
+
+                        let input = Bytes::from(creation);
+                        let gas_limit = provider
+                            .estimate_gas(TransactionRequest {
+                                to: Some(TxKind::Create),
+                                ..TransactionRequest::default()
+                                    .from(self.dev)
+                                    .input(input.clone().into())
+                            })
+                            .await
+                            .expect("eth_estimateGas");
+                        let tx = TxLegacy {
+                            chain_id: Some(provider.get_chain_id().await.expect("eth_chainId")),
+                            nonce: provider
+                                .get_transaction_count(self.dev)
+                                .pending()
+                                .await
+                                .expect("eth_getTransactionCount"),
+                            gas_price: provider.get_gas_price().await.expect("eth_gasPrice") * 2,
+                            gas_limit: gas_limit * 2,
+                            to: TxKind::Create,
+                            value: U256::ZERO,
+                            input,
+                        };
+                        let signature = signer
+                            .sign_hash_sync(&tx.signature_hash())
+                            .expect("sign the deployment");
+                        let raw = TxEnvelope::Legacy(tx.into_signed(signature)).encoded_2718();
+                        provider
+                            .raw_request("eth_sendRawTransaction".into(), (Bytes::from(raw),))
+                            .await
+                            .expect("eth_sendRawTransaction")
+                    }
+                    None => provider
+                        .raw_request(
+                            "eth_sendTransaction".into(),
+                            (serde_json::json!({
+                                "from": self.dev,
+                                "data": format!("0x{}", alloy::hex::encode(creation)),
+                            }),),
+                        )
+                        .await
+                        .expect("eth_sendTransaction"),
+                };
+                let mut receipt = serde_json::Value::Null;
+                let mut last_err = None;
+                for _ in 0..300 {
+                    // geth answers "transaction indexing is in progress" for a while after start.
+                    match provider
+                        .raw_request::<_, serde_json::Value>(
+                            "eth_getTransactionReceipt".into(),
+                            (hash,),
+                        )
+                        .await
+                    {
+                        Ok(found) => receipt = found,
+                        Err(e) => last_err = Some(e.to_string()),
+                    }
+                    if !receipt.is_null() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                assert!(
+                    !receipt.is_null(),
+                    "no receipt for {hash} within 15s; last error: {last_err:?}"
+                );
+                assert_eq!(receipt["status"], "0x1", "deployment reverted: {receipt}");
+                receipt["contractAddress"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("no contract address in {receipt}"))
+                    .parse()
+                    .expect("an address")
+            }
+
+            /// Deploys `runtime` as is, through a constructor that only returns it.
+            async fn deploy_runtime(&self, runtime: Bytes) -> Address {
+                self.deploy_runtime_seeded(runtime, &[]).await
+            }
+
+            /// Deploys `runtime` with `(slot, value)` stored by the constructor, so a traced call
+            /// can find a slot already set, as the anvil suite does with `anvil_setStorageAt`.
+            async fn deploy_runtime_seeded(&self, runtime: Bytes, seeds: &[(u8, u8)]) -> Address {
+                let len = u16::try_from(runtime.len()).expect("runtime under 64 KiB");
+                // PUSH1 value; PUSH1 slot; SSTORE per seed, 5 bytes each.
+                let mut creation: Vec<u8> = seeds
+                    .iter()
+                    .flat_map(|&(slot, value)| [0x60, value, 0x60, slot, 0x55])
+                    .collect();
+                let offset = u8::try_from(creation.len() + 12).expect("a short constructor");
+                // PUSH2 len; DUP1; PUSH1 offset; PUSH1 0; CODECOPY; PUSH1 0; RETURN — 12 bytes.
+                creation.push(0x61);
+                creation.extend_from_slice(&len.to_be_bytes());
+                creation
+                    .extend_from_slice(&[0x80, 0x60, offset, 0x60, 0x00, 0x39, 0x60, 0x00, 0xf3]);
+                creation.extend_from_slice(&runtime);
+                let address = self.deploy(creation).await;
+                for &(slot, value) in seeds {
+                    let stored = self
+                        .provider()
+                        .get_storage_at(address, U256::from(slot))
+                        .await
+                        .expect("eth_getStorageAt");
+                    assert_eq!(
+                        stored,
+                        U256::from(value),
+                        "seed of slot {slot} did not land"
+                    );
+                }
+                address
+            }
+
+            async fn deploy_fixture(&self, creation_hex: &str, args: &[[u8; 32]]) -> Address {
+                let mut creation =
+                    alloy::hex::decode(creation_hex.trim()).expect("valid creation hex");
+                for word in args {
+                    creation.extend_from_slice(word);
+                }
+                self.deploy(creation).await
+            }
+        }
+
+        impl Drop for LocalTraceNode {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                let _ = std::fs::remove_dir_all(&self.datadir);
+                let _ = std::fs::remove_file(self.datadir.with_extension("log"));
+            }
+        }
+
+        /// SSTORE(1,1); CALL(self, data 0x01); SSTORE(3,3); STOP. On the reentrant call:
+        /// SSTORE(2,2); LOG1(topic 0xee); STOP.
+        fn reentrant_code() -> Bytes {
+            hex_code(&format!(
+                "36 6022 57 6001600155 6001600053 60006000600160006000 30 5a f1 50 6003600355 00 \
+                 5b 6002600255 7f{}60006000a1 00",
+                topic_hex(0xee),
+            ))
+        }
+
+        /// CALL(callee) twice, logging between, so logs and writes interleave across frames.
+        fn twice_caller_code(callee: Address) -> Bytes {
+            hex_code(&format!(
+                "60006000600060006000 73{a} 5af150 7f{t}60006000a1 60006000600060006000 73{a} 5af150 \
+                 6001600455 00",
+                a = addr_hex(callee),
+                t = topic_hex(0xab),
+            ))
+        }
+
+        /// Sums 100..1 in a loop, then SSTORE(0, sum); STOP: compute with one write, the
+        /// array-summation example's shape.
+        fn summing_loop_code() -> Bytes {
+            hex_code("6000 6064 5b 80 91 01 90 6001 90 03 80 6004 57 50 6000 55 00")
+        }
+
+        struct Shape {
+            name: &'static str,
+            request: TransactionRequest,
+            consumer: Address,
+            /// Pinned so the suite cannot silently stop comparing bytes: a shape that falls back
+            /// to struct logs compares only whether both paths agreed to fall back.
+            net_form: bool,
+        }
+
+        fn request_to(node: &LocalTraceNode, to: Address) -> TransactionRequest {
+            TransactionRequest::default()
+                .from(node.dev)
+                .to(to)
+                .gas_limit(3_000_000)
+        }
+
+        async fn shapes(node: &LocalTraceNode) -> Vec<Shape> {
+            let mut shapes = Vec::new();
+            let mut add = |name, request: TransactionRequest, consumer, net_form| {
+                shapes.push(Shape {
+                    name,
+                    request,
+                    consumer,
+                    net_form,
+                })
+            };
+
+            // Slot 5 is seeded so the call's SSTORE(5,0) deletes it: diff mode shows a deletion by
+            // leaving the slot out of `post`, the case the two paths are likeliest to differ on.
+            let eligible = node.deploy_runtime_seeded(eligible_code(), &[(5, 1)]).await;
+            add(
+                "writes, a net-zero write, a deletion and a log",
+                request_to(node, eligible),
+                eligible,
+                true,
+            );
+
+            let summing = node.deploy_runtime(summing_loop_code()).await;
+            add(
+                "compute loop, then one write",
+                request_to(node, summing),
+                summing,
+                true,
+            );
+
+            let lib = node.deploy_runtime(delegate_lib_code()).await;
+            let root = node.deploy_runtime(delegate_root_code(lib)).await;
+            add(
+                "delegatecall with logs either side",
+                request_to(node, root),
+                root,
+                true,
+            );
+
+            let callee = node.deploy_runtime(callee_code()).await;
+            let caller = node.deploy_runtime(caller_code(callee)).await;
+            add(
+                "call into another contract",
+                request_to(node, caller),
+                caller,
+                false,
+            );
+
+            let twice = node.deploy_runtime(twice_caller_code(callee)).await;
+            add(
+                "logs between two subcalls",
+                request_to(node, twice),
+                twice,
+                false,
+            );
+
+            let reverter = node.deploy_runtime(reverter_code()).await;
+            let catcher = node.deploy_runtime(catcher_code(reverter)).await;
+            add(
+                "caught reverted delegatecall",
+                request_to(node, catcher),
+                catcher,
+                true,
+            );
+
+            let reentrant = node.deploy_runtime(reentrant_code()).await;
+            add(
+                "reentrant self-call",
+                request_to(node, reentrant),
+                reentrant,
+                false,
+            );
+
+            let deposit = node.deploy_runtime(backed_deposit_code()).await;
+            add(
+                "self-call carrying value",
+                request_to(node, deposit).value(U256::from(1_000u64)),
+                deposit,
+                false,
+            );
+
+            let registry = node
+                .deploy_fixture(
+                    include_str!("../tests/fixtures/nested/SchnorrStakeRegistry.hex"),
+                    &[word_u(2), word_u(3), word_a(node.dev), word_u(0)],
+                )
+                .await;
+            let avs = address!("0x0000000000000000000000000000000000000a75");
+            let ledger = node
+                .deploy_fixture(
+                    include_str!("../tests/fixtures/nested/NestedLedger.hex"),
+                    &[word_a(avs), word_a(registry), word_u(3)],
+                )
+                .await;
+            let vault = node
+                .deploy_fixture(
+                    include_str!("../tests/fixtures/nested/NestedVault.hex"),
+                    &[word_a(avs), word_a(registry), word_a(ledger)],
+                )
+                .await;
+            let router = node
+                .deploy_fixture(
+                    include_str!("../tests/fixtures/nested/NestedRouter.hex"),
+                    &[word_a(avs), word_a(registry), word_a(vault)],
+                )
+                .await;
+            add(
+                "nested chain: router, vault, ledger",
+                process_request(router, 4).from(node.dev),
+                router,
+                false,
+            );
+
+            shapes
+        }
+
+        /// The encoded updates one path produces, or `None` where the net form falls back.
+        async fn encode_via(
+            provider: &RootProvider<Ethereum>,
+            mux: &MuxSupport,
+            shape: &Shape,
+        ) -> Option<Bytes> {
+            try_prestate_net(
+                provider,
+                mux,
+                &shape.request,
+                BlockId::latest(),
+                shape.consumer,
+                SimProfile::Chain,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e:#}", shape.name))
+            .map(|updates| encode_state_updates_to_abi(&updates))
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a reth or geth dev node; run with --ignored"]
+        async fn test_mux_and_separate_tracers_encode_the_same_updates() {
+            let node = LocalTraceNode::spawn().await;
+            let provider = node.provider();
+            let mut differences = Vec::new();
+            for shape in shapes(&node).await {
+                let mux = MuxSupport::default();
+                let muxed = encode_via(&provider, &mux, &shape).await;
+                assert!(
+                    !mux.is_paused() && mux.rejections.load(Ordering::Relaxed) == 0,
+                    "{}: the node did not serve muxTracer, so nothing was compared",
+                    shape.name
+                );
+                let separate_only = MuxSupport::default();
+                separate_only.pause();
+                let separate = encode_via(&provider, &separate_only, &shape).await;
+                assert_eq!(
+                    muxed.is_some(),
+                    shape.net_form,
+                    "{}: expected net form {}",
+                    shape.name,
+                    shape.net_form
+                );
+                if muxed != separate {
+                    differences.push(format!(
+                        "{}:\n  muxTracer: {muxed:?}\n  separate:  {separate:?}",
+                        shape.name
+                    ));
+                }
+            }
+            assert!(
+                differences.is_empty(),
+                "tracer paths encode differently:\n{}",
+                differences.join("\n")
             );
         }
     }

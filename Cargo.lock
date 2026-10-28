@@ -3855,6 +3855,8 @@ dependencies = [
  "alloy-provider",
  "alloy-rpc-client",
  "alloy-rpc-types",
+ "alloy-signer",
+ "alloy-signer-local",
  "alloy-transport",
  "anyhow",
  "criterion",
