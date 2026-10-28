@@ -4381,9 +4381,36 @@ mod tests {
             /// Deploys creation code from the dev account and returns the new address.
             async fn deploy(&self, creation: Vec<u8>) -> Address {
                 let provider = self.provider();
+                let data = format!("0x{}", alloy::hex::encode(creation));
+                // reth's dev signer fills nothing in, so a request missing any field a legacy
+                // transaction needs is "invalid transaction request".
+                let gas: U256 = provider
+                    .raw_request(
+                        "eth_estimateGas".into(),
+                        (serde_json::json!({ "from": self.dev, "data": data }),),
+                    )
+                    .await
+                    .expect("eth_estimateGas");
+                let nonce: U256 = provider
+                    .raw_request("eth_getTransactionCount".into(), (self.dev, "pending"))
+                    .await
+                    .expect("eth_getTransactionCount");
+                let gas_price: U256 = provider
+                    .raw_request("eth_gasPrice".into(), ())
+                    .await
+                    .expect("eth_gasPrice");
+                let chain_id: U256 = provider
+                    .raw_request("eth_chainId".into(), ())
+                    .await
+                    .expect("eth_chainId");
                 let tx = serde_json::json!({
                     "from": self.dev,
-                    "data": format!("0x{}", alloy::hex::encode(creation)),
+                    "data": data,
+                    "type": "0x0",
+                    "gas": gas * U256::from(2u64),
+                    "gasPrice": gas_price * U256::from(2u64),
+                    "nonce": nonce,
+                    "chainId": chain_id,
                 });
                 let hash: B256 = provider
                     .raw_request("eth_sendTransaction".into(), (tx,))
