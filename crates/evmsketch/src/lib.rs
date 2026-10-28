@@ -4471,13 +4471,39 @@ mod tests {
 
             /// Deploys `runtime` as is, through a constructor that only returns it.
             async fn deploy_runtime(&self, runtime: Bytes) -> Address {
+                self.deploy_runtime_seeded(runtime, &[]).await
+            }
+
+            /// Deploys `runtime` with `(slot, value)` stored by the constructor, so a traced call
+            /// can find a slot already set, as the anvil suite does with `anvil_setStorageAt`.
+            async fn deploy_runtime_seeded(&self, runtime: Bytes, seeds: &[(u8, u8)]) -> Address {
                 let len = u16::try_from(runtime.len()).expect("runtime under 64 KiB");
-                // PUSH2 len; DUP1; PUSH1 12; PUSH1 0; CODECOPY; PUSH1 0; RETURN — 12 bytes.
-                let mut creation = vec![0x61];
+                // PUSH1 value; PUSH1 slot; SSTORE per seed, 5 bytes each.
+                let mut creation: Vec<u8> = seeds
+                    .iter()
+                    .flat_map(|&(slot, value)| [0x60, value, 0x60, slot, 0x55])
+                    .collect();
+                let offset = u8::try_from(creation.len() + 12).expect("a short constructor");
+                // PUSH2 len; DUP1; PUSH1 offset; PUSH1 0; CODECOPY; PUSH1 0; RETURN — 12 bytes.
+                creation.push(0x61);
                 creation.extend_from_slice(&len.to_be_bytes());
-                creation.extend_from_slice(&[0x80, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x00, 0xf3]);
+                creation
+                    .extend_from_slice(&[0x80, 0x60, offset, 0x60, 0x00, 0x39, 0x60, 0x00, 0xf3]);
                 creation.extend_from_slice(&runtime);
-                self.deploy(creation).await
+                let address = self.deploy(creation).await;
+                for &(slot, value) in seeds {
+                    let stored = self
+                        .provider()
+                        .get_storage_at(address, U256::from(slot))
+                        .await
+                        .expect("eth_getStorageAt");
+                    assert_eq!(
+                        stored,
+                        U256::from(value),
+                        "seed of slot {slot} did not land"
+                    );
+                }
+                address
             }
 
             async fn deploy_fixture(&self, creation_hex: &str, args: &[[u8; 32]]) -> Address {
@@ -4552,9 +4578,11 @@ mod tests {
                 })
             };
 
-            let eligible = node.deploy_runtime(eligible_code()).await;
+            // Slot 5 is seeded so the call's SSTORE(5,0) deletes it: diff mode shows a deletion by
+            // leaving the slot out of `post`, the case the two paths are likeliest to differ on.
+            let eligible = node.deploy_runtime_seeded(eligible_code(), &[(5, 1)]).await;
             add(
-                "writes, a net-zero write and a log",
+                "writes, a net-zero write, a deletion and a log",
                 request_to(node, eligible),
                 eligible,
                 true,
