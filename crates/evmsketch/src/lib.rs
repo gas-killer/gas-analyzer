@@ -4348,9 +4348,16 @@ mod tests {
                     .stderr(log)
                     .spawn()
                     .unwrap_or_else(|e| panic!("failed to spawn `{bin}`: {e}"));
-                let url = format!("http://127.0.0.1:{http}");
-                let provider =
-                    RootProvider::<Ethereum>::new_http(Url::parse(&url).expect("valid url"));
+                // Owned from here, so a node that never becomes ready is still killed and its
+                // datadir and log removed when the panic below unwinds.
+                let mut node = LocalTraceNode {
+                    child,
+                    url: format!("http://127.0.0.1:{http}"),
+                    dev: Address::ZERO,
+                    signer: None,
+                    datadir,
+                };
+                let provider = node.provider();
                 let mut last_err = None;
                 for _ in 0..300 {
                     let ready = match client {
@@ -4370,13 +4377,9 @@ mod tests {
                     };
                     match ready {
                         Ok((dev, signer)) if dev != Address::ZERO => {
-                            return LocalTraceNode {
-                                child,
-                                url,
-                                dev,
-                                signer,
-                                datadir,
-                            };
+                            node.dev = dev;
+                            node.signer = signer;
+                            return node;
                         }
                         Ok(_) => last_err = Some("no dev account yet".to_string()),
                         Err(e) => last_err = Some(e.to_string()),
