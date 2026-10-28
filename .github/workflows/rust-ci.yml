@@ -93,7 +93,8 @@ jobs:
 
       - name: cargo test --ignored (evmsketch RPC)
         if: env.RPC_URL != ''
-        run: cargo test -- --ignored
+        # tracer_equivalence has its own step below.
+        run: cargo test -- --ignored --skip tracer_equivalence
 
       # `gas-analyzer-core`'s `sp1-cc` feature is off by default, so the plain
       # `cargo test` above never builds the SimProfile -> EnvOverrides

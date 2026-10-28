@@ -4347,7 +4347,10 @@ mod tests {
                     .stdout(log.try_clone().expect("clone the node log"))
                     .stderr(log)
                     .spawn()
-                    .unwrap_or_else(|e| panic!("failed to spawn `{bin}`: {e}"));
+                    .unwrap_or_else(|e| {
+                        let _ = std::fs::remove_file(&log_path);
+                        panic!("failed to spawn `{bin}`: {e}")
+                    });
                 // Owned from here, so a node that never becomes ready is still killed and its
                 // datadir and log removed when the panic below unwinds.
                 let mut node = LocalTraceNode {
@@ -4451,19 +4454,28 @@ mod tests {
                         .expect("eth_sendTransaction"),
                 };
                 let mut receipt = serde_json::Value::Null;
+                let mut last_err = None;
                 for _ in 0..300 {
                     // geth answers "transaction indexing is in progress" for a while after start.
-                    if let Ok(found) = provider
-                        .raw_request("eth_getTransactionReceipt".into(), (hash,))
+                    match provider
+                        .raw_request::<_, serde_json::Value>(
+                            "eth_getTransactionReceipt".into(),
+                            (hash,),
+                        )
                         .await
                     {
-                        receipt = found;
+                        Ok(found) => receipt = found,
+                        Err(e) => last_err = Some(e.to_string()),
                     }
                     if !receipt.is_null() {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
+                assert!(
+                    !receipt.is_null(),
+                    "no receipt for {hash} within 15s; last error: {last_err:?}"
+                );
                 assert_eq!(receipt["status"], "0x1", "deployment reverted: {receipt}");
                 receipt["contractAddress"]
                     .as_str()
