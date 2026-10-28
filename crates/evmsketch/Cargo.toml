@@ -33,6 +33,8 @@ alloy-consensus = "1"
 alloy-hardforks = "0.4"
 alloy-rpc-client = "1"
 alloy-rpc-types = "1.0.37"
+alloy-signer = "1"
+alloy-signer-local = "1"
 alloy-transport = "1"
 criterion   = { version = "0.5", features = ["html_reports", "async_tokio"] }
 dhat        = "0.3"

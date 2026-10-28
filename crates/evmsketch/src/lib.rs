@@ -4273,8 +4273,11 @@ mod tests {
         struct LocalTraceNode {
             child: std::process::Child,
             url: String,
-            /// The dev account the node signs for; funded, so it deploys the shapes.
+            /// A funded account, which deploys the shapes.
             dev: Address,
+            /// Signs deployments locally where the node will not: reth's `eth_sendTransaction`
+            /// rejects a contract creation as an invalid request. `None` sends them unsigned.
+            signer: Option<alloy_signer_local::PrivateKeySigner>,
             datadir: std::path::PathBuf,
         }
 
@@ -4292,7 +4295,8 @@ mod tests {
                 let [http, p2p, auth] = free_ports();
                 let datadir = std::env::temp_dir().join(format!("gk-trace-node-{http}"));
                 let dir = datadir.to_string_lossy().to_string();
-                let (bin, args): (String, Vec<String>) = match Client::from_env() {
+                let client = Client::from_env();
+                let (bin, args): (String, Vec<String>) = match client {
                     Client::Reth => (
                         std::env::var("RETH_BIN").unwrap_or_else(|_| "reth".into()),
                         [
@@ -4349,19 +4353,32 @@ mod tests {
                     RootProvider::<Ethereum>::new_http(Url::parse(&url).expect("valid url"));
                 let mut last_err = None;
                 for _ in 0..300 {
-                    match provider
-                        .raw_request::<_, Vec<Address>>("eth_accounts".into(), ())
-                        .await
-                    {
-                        Ok(accounts) if !accounts.is_empty() => {
+                    let ready = match client {
+                        // reth's dev chain prefunds the standard test mnemonic's accounts.
+                        Client::Reth => provider.get_chain_id().await.map(|_| {
+                            let signer: alloy_signer_local::PrivateKeySigner =
+                                "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+                                    .parse()
+                                    .expect("the first test-mnemonic key");
+                            (signer.address(), Some(signer))
+                        }),
+                        // geth's dev account is created per run and unlocked.
+                        Client::Geth => provider
+                            .raw_request::<_, Vec<Address>>("eth_accounts".into(), ())
+                            .await
+                            .map(|accounts| (accounts.first().copied().unwrap_or_default(), None)),
+                    };
+                    match ready {
+                        Ok((dev, signer)) if dev != Address::ZERO => {
                             return LocalTraceNode {
                                 child,
                                 url,
-                                dev: accounts[0],
+                                dev,
+                                signer,
                                 datadir,
                             };
                         }
-                        Ok(_) => last_err = Some("eth_accounts is empty".to_string()),
+                        Ok(_) => last_err = Some("no dev account yet".to_string()),
                         Err(e) => last_err = Some(e.to_string()),
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -4381,41 +4398,55 @@ mod tests {
             /// Deploys creation code from the dev account and returns the new address.
             async fn deploy(&self, creation: Vec<u8>) -> Address {
                 let provider = self.provider();
-                let data = format!("0x{}", alloy::hex::encode(creation));
-                // reth's dev signer fills nothing in, so a request missing any field a legacy
-                // transaction needs is "invalid transaction request".
-                let gas: U256 = provider
-                    .raw_request(
-                        "eth_estimateGas".into(),
-                        (serde_json::json!({ "from": self.dev, "data": data }),),
-                    )
-                    .await
-                    .expect("eth_estimateGas");
-                let nonce: U256 = provider
-                    .raw_request("eth_getTransactionCount".into(), (self.dev, "pending"))
-                    .await
-                    .expect("eth_getTransactionCount");
-                let gas_price: U256 = provider
-                    .raw_request("eth_gasPrice".into(), ())
-                    .await
-                    .expect("eth_gasPrice");
-                let chain_id: U256 = provider
-                    .raw_request("eth_chainId".into(), ())
-                    .await
-                    .expect("eth_chainId");
-                let tx = serde_json::json!({
-                    "from": self.dev,
-                    "data": data,
-                    "type": "0x0",
-                    "gas": gas * U256::from(2u64),
-                    "gasPrice": gas_price * U256::from(2u64),
-                    "nonce": nonce,
-                    "chainId": chain_id,
-                });
-                let hash: B256 = provider
-                    .raw_request("eth_sendTransaction".into(), (tx,))
-                    .await
-                    .expect("eth_sendTransaction");
+                let hash: B256 = match &self.signer {
+                    Some(signer) => {
+                        use alloy::eips::eip2718::Encodable2718;
+                        use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
+                        use alloy_signer::SignerSync;
+
+                        let input = Bytes::from(creation);
+                        let gas_limit = provider
+                            .estimate_gas(TransactionRequest {
+                                to: Some(TxKind::Create),
+                                ..TransactionRequest::default()
+                                    .from(self.dev)
+                                    .input(input.clone().into())
+                            })
+                            .await
+                            .expect("eth_estimateGas");
+                        let tx = TxLegacy {
+                            chain_id: Some(provider.get_chain_id().await.expect("eth_chainId")),
+                            nonce: provider
+                                .get_transaction_count(self.dev)
+                                .pending()
+                                .await
+                                .expect("eth_getTransactionCount"),
+                            gas_price: provider.get_gas_price().await.expect("eth_gasPrice") * 2,
+                            gas_limit: gas_limit * 2,
+                            to: TxKind::Create,
+                            value: U256::ZERO,
+                            input,
+                        };
+                        let signature = signer
+                            .sign_hash_sync(&tx.signature_hash())
+                            .expect("sign the deployment");
+                        let raw = TxEnvelope::Legacy(tx.into_signed(signature)).encoded_2718();
+                        provider
+                            .raw_request("eth_sendRawTransaction".into(), (Bytes::from(raw),))
+                            .await
+                            .expect("eth_sendRawTransaction")
+                    }
+                    None => provider
+                        .raw_request(
+                            "eth_sendTransaction".into(),
+                            (serde_json::json!({
+                                "from": self.dev,
+                                "data": format!("0x{}", alloy::hex::encode(creation)),
+                            }),),
+                        )
+                        .await
+                        .expect("eth_sendTransaction"),
+                };
                 let mut receipt = serde_json::Value::Null;
                 for _ in 0..300 {
                     // geth answers "transaction indexing is in progress" for a while after start.
