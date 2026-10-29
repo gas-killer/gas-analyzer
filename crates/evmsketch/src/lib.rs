@@ -4403,6 +4403,21 @@ mod tests {
 
             /// Deploys creation code from the dev account and returns the new address.
             async fn deploy(&self, creation: Vec<u8>) -> Address {
+                let receipt = self.transact(TxKind::Create, creation).await;
+                receipt["contractAddress"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("no contract address in {receipt}"))
+                    .parse()
+                    .expect("an address")
+            }
+
+            /// Sends `input` to `to` from the dev account, for a shape's setup calls.
+            async fn send(&self, to: Address, input: Vec<u8>) {
+                self.transact(TxKind::Call(to), input).await;
+            }
+
+            /// Mines a transaction from the dev account and returns its successful receipt.
+            async fn transact(&self, kind: TxKind, input: Vec<u8>) -> serde_json::Value {
                 let provider = self.provider();
                 let hash: B256 = match &self.signer {
                     Some(signer) => {
@@ -4410,10 +4425,10 @@ mod tests {
                         use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
                         use alloy_signer::SignerSync;
 
-                        let input = Bytes::from(creation);
+                        let input = Bytes::from(input);
                         let gas_limit = provider
                             .estimate_gas(TransactionRequest {
-                                to: Some(TxKind::Create),
+                                to: Some(kind),
                                 ..TransactionRequest::default()
                                     .from(self.dev)
                                     .input(input.clone().into())
@@ -4429,29 +4444,32 @@ mod tests {
                                 .expect("eth_getTransactionCount"),
                             gas_price: provider.get_gas_price().await.expect("eth_gasPrice") * 2,
                             gas_limit: gas_limit * 2,
-                            to: TxKind::Create,
+                            to: kind,
                             value: U256::ZERO,
                             input,
                         };
                         let signature = signer
                             .sign_hash_sync(&tx.signature_hash())
-                            .expect("sign the deployment");
+                            .expect("sign the transaction");
                         let raw = TxEnvelope::Legacy(tx.into_signed(signature)).encoded_2718();
                         provider
                             .raw_request("eth_sendRawTransaction".into(), (Bytes::from(raw),))
                             .await
                             .expect("eth_sendRawTransaction")
                     }
-                    None => provider
-                        .raw_request(
-                            "eth_sendTransaction".into(),
-                            (serde_json::json!({
-                                "from": self.dev,
-                                "data": format!("0x{}", alloy::hex::encode(creation)),
-                            }),),
-                        )
-                        .await
-                        .expect("eth_sendTransaction"),
+                    None => {
+                        let mut tx = serde_json::json!({
+                            "from": self.dev,
+                            "data": format!("0x{}", alloy::hex::encode(input)),
+                        });
+                        if let TxKind::Call(to) = kind {
+                            tx["to"] = serde_json::json!(to);
+                        }
+                        provider
+                            .raw_request("eth_sendTransaction".into(), (tx,))
+                            .await
+                            .expect("eth_sendTransaction")
+                    }
                 };
                 let mut receipt = serde_json::Value::Null;
                 let mut last_err = None;
@@ -4476,12 +4494,8 @@ mod tests {
                     !receipt.is_null(),
                     "no receipt for {hash} within 15s; last error: {last_err:?}"
                 );
-                assert_eq!(receipt["status"], "0x1", "deployment reverted: {receipt}");
-                receipt["contractAddress"]
-                    .as_str()
-                    .unwrap_or_else(|| panic!("no contract address in {receipt}"))
-                    .parse()
-                    .expect("an address")
+                assert_eq!(receipt["status"], "0x1", "transaction reverted: {receipt}");
+                receipt
             }
 
             /// Deploys `runtime` as is, through a constructor that only returns it.
@@ -4564,6 +4578,15 @@ mod tests {
         /// array-summation example's shape.
         fn summing_loop_code() -> Bytes {
             hex_code("6000 6064 5b 80 91 01 90 6001 90 03 80 6004 57 50 6000 55 00")
+        }
+
+        /// `sig`'s selector followed by `words`, already ABI-encoded.
+        fn calldata(sig: &str, words: &[[u8; 32]]) -> Vec<u8> {
+            let mut data = alloy::primitives::keccak256(sig.as_bytes())[..4].to_vec();
+            for word in words {
+                data.extend_from_slice(word);
+            }
+            data
         }
 
         struct Shape {
@@ -4662,6 +4685,9 @@ mod tests {
                 false,
             );
 
+            // The service e2e's example contracts, compiled at the refs its e2e workflow pins
+            // (`forge inspect <C> bytecode`): OnchainLife from gas-killer/example-contracts, the
+            // rest from gas-killer/solidity-sdk. Each is called the way that workflow calls it.
             let registry = node
                 .deploy_fixture(
                     include_str!("../tests/fixtures/nested/SchnorrStakeRegistry.hex"),
@@ -4669,6 +4695,108 @@ mod tests {
                 )
                 .await;
             let avs = address!("0x0000000000000000000000000000000000000a75");
+
+            // A glider in board word 0, as the e2e seeds it. One generation is ~16.5M gas.
+            let glider: U256 = "2381976568446569244317409228317215686658"
+                .parse()
+                .expect("a decimal word");
+            let mut life_args = vec![word_a(avs), word_a(registry), glider.to_be_bytes()];
+            life_args.extend([[0u8; 32]; 15]);
+            let life = node
+                .deploy_fixture(
+                    include_str!("../tests/fixtures/examples/OnchainLife.hex"),
+                    &life_args,
+                )
+                .await;
+            add(
+                "OnchainLife: one generation",
+                request_to(node, life)
+                    .gas_limit(25_000_000)
+                    .input(Bytes::from(calldata("step(uint32)", &[word_u(1)])).into()),
+                life,
+                true,
+            );
+
+            let summation = node
+                .deploy_fixture(
+                    include_str!("../tests/fixtures/examples/ArraySummation.hex"),
+                    &[
+                        word_a(avs),
+                        word_a(registry),
+                        word_u(100),
+                        word_u(1000),
+                        word_u(42),
+                    ],
+                )
+                .await;
+            add(
+                "ArraySummation: sum([0, 1, 2])",
+                request_to(node, summation).input(
+                    Bytes::from(calldata(
+                        "sum(uint256[])",
+                        &[word_u(0x20), word_u(3), word_u(0), word_u(1), word_u(2)],
+                    ))
+                    .into(),
+                ),
+                summation,
+                true,
+            );
+
+            let observer = node
+                .deploy_fixture(
+                    include_str!("../tests/fixtures/examples/ReentrantObserver.hex"),
+                    &[],
+                )
+                .await;
+            let checkpoint = node
+                .deploy_fixture(
+                    include_str!("../tests/fixtures/examples/ReentrantCheckpoint.hex"),
+                    &[word_a(avs), word_a(registry), word_a(observer)],
+                )
+                .await;
+            add(
+                "ReentrantCheckpoint: advance, re-entered by its observer",
+                request_to(node, checkpoint).input(Bytes::from(calldata("advance()", &[])).into()),
+                checkpoint,
+                false,
+            );
+
+            let relay = node
+                .deploy_fixture(
+                    include_str!("../tests/fixtures/nested/CycleRelay.hex"),
+                    &[word_a(avs), word_a(registry)],
+                )
+                .await;
+            let cycle_root = node
+                .deploy_fixture(
+                    include_str!("../tests/fixtures/nested/CycleRoot.hex"),
+                    &[word_a(avs), word_a(registry), word_a(relay), word_u(1000)],
+                )
+                .await;
+            node.send(relay, calldata("setRoot(address)", &[word_a(cycle_root)]))
+                .await;
+            add(
+                "nested cycle: root, relay, back into root",
+                request_to(node, cycle_root).input(Bytes::from(calldata("start()", &[])).into()),
+                cycle_root,
+                false,
+            );
+
+            let gateway = node
+                .deploy_fixture(
+                    include_str!("../tests/fixtures/nested/DepositGateway.hex"),
+                    &[word_a(avs), word_a(registry), word_u(1000)],
+                )
+                .await;
+            add(
+                "nested deposit: gateway forwarding ETH to its vault",
+                request_to(node, gateway)
+                    .value(U256::from(10_000_000_000_000_000u64))
+                    .input(Bytes::from(calldata("deposit(address)", &[word_a(node.dev)])).into()),
+                gateway,
+                false,
+            );
+
             let ledger = node
                 .deploy_fixture(
                     include_str!("../tests/fixtures/nested/NestedLedger.hex"),
@@ -4723,6 +4851,12 @@ mod tests {
             let provider = node.provider();
             let mut differences = Vec::new();
             for shape in shapes(&node).await {
+                // A reverting call falls back on both paths too, so a broken fixture would pass
+                // as an agreement unless the call itself is held to succeed.
+                provider
+                    .call(shape.request.clone())
+                    .await
+                    .unwrap_or_else(|e| panic!("{}: the call reverts: {e}", shape.name));
                 let mux = MuxSupport::default();
                 let muxed = encode_via(&provider, &mux, &shape).await;
                 assert!(
