@@ -21,7 +21,7 @@ use alloy_rpc_types::TransactionTrait;
 use anyhow::{Result, anyhow, bail};
 
 use gas_analyzer_core::SimProfile;
-use gas_analyzer_core::trace::{TraceExtract, compute_state_updates};
+use gas_analyzer_core::trace::{TraceExtract, compute_state_updates, ensure_call_succeeded};
 use gas_analyzer_estimator::PrecedingTx;
 
 /// Apply a [`SimProfile`]'s environment overrides to a `debug_traceCall`
@@ -91,6 +91,9 @@ pub async fn get_tx_trace<P: Provider + DebugApi>(
 ///
 /// This simulates the call at the given block and returns the default-format trace.
 /// Requires an RPC that supports debug_traceCall (e.g. Geth, Erigon).
+///
+/// A call the EVM failed at the top level is an [`EvmFailure`](gas_analyzer_core::trace::EvmFailure) error rather than a trace: its
+/// struct log still shows the writes the EVM rolled back.
 pub async fn get_trace_from_call<P, Req>(
     provider: &P,
     tx_request: Req,
@@ -137,6 +140,7 @@ where
     else {
         return Err(anyhow!("Expected default trace from debug_trace_call"));
     };
+    ensure_call_succeeded(&trace)?;
 
     Ok(trace)
 }
@@ -573,6 +577,37 @@ mod tests {
         let provider =
             alloy_provider::ProviderBuilder::new().connect_mocked_client(asserter.clone());
         (provider, asserter)
+    }
+
+    /// The struct log of a reverted call still shows its writes, so the trace is never returned.
+    #[tokio::test]
+    async fn a_reverted_call_trace_is_an_evm_failure() {
+        let (provider, asserter) = mocked();
+        let trace = |failed: bool| {
+            serde_json::json!({
+                "failed": failed,
+                "gas": 30000,
+                "returnValue": "0x",
+                "structLogs": [{"pc": 0, "op": "SSTORE", "gas": 50000, "gasCost": 20000, "depth": 1, "stack": ["0x1", "0x0"]}],
+            })
+        };
+        asserter.push_success(&trace(true));
+        asserter.push_success(&trace(false));
+        let request = || alloy::rpc::types::eth::TransactionRequest::default();
+
+        let error = get_trace_from_call(&provider, request(), BlockId::latest())
+            .await
+            .expect_err("the call reverted");
+        assert!(
+            error
+                .downcast_ref::<gas_analyzer_core::trace::EvmFailure>()
+                .is_some(),
+            "{error:#}"
+        );
+        let trace = get_trace_from_call(&provider, request(), BlockId::latest())
+            .await
+            .expect("a successful call's trace");
+        assert_eq!(trace.struct_logs.len(), 1);
     }
 
     async fn muxed(provider: &(impl Provider + DebugApi)) -> MuxedTraces {

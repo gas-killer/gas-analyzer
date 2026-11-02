@@ -490,6 +490,52 @@ pub fn compute_state_updates_canonical(
     Ok((root.updates, tree.skipped_opcodes, tree.call_gas_total))
 }
 
+// ============================================================================
+// Call Outcome
+// ============================================================================
+
+/// A simulated call the EVM failed at the top level, by a revert or an exceptional halt. On chain
+/// such a call changes nothing, so it has no program to sign, and simulating it again at the same
+/// block fails the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvmFailure {
+    reason: String,
+}
+
+impl EvmFailure {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for EvmFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the call failed in the EVM: {}", self.reason)
+    }
+}
+
+impl std::error::Error for EvmFailure {}
+
+/// Rejects a struct-log trace whose top-level call failed.
+///
+/// The struct log records every write as it executes, whether or not the call later reverts, and
+/// the extractors read writes straight off it; only `failed` says the EVM rolled them all back.
+pub fn ensure_call_succeeded(trace: &DefaultFrame) -> std::result::Result<(), EvmFailure> {
+    if trace.failed {
+        return Err(EvmFailure::new(format!(
+            "reverted or halted, returning {}",
+            trace.return_value
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{B256, U256};
@@ -944,6 +990,19 @@ mod tests {
             "A=5 is asserted before CALL(x) so its re-entrant read is canonical"
         );
         assert_eq!(stores(&updates), vec![(slot(0xAA), val(5))]);
+    }
+
+    #[test]
+    fn a_failed_top_level_call_is_rejected() {
+        let trace = |failed| DefaultFrame {
+            failed,
+            gas: 0,
+            return_value: alloy_primitives::Bytes::from_static(&[0xab]),
+            struct_logs: vec![sstore(1, slot(0xAA), val(1))],
+        };
+        let error = ensure_call_succeeded(&trace(true)).expect_err("the call reverted");
+        assert!(error.to_string().contains("0xab"), "{error}");
+        assert_eq!(ensure_call_succeeded(&trace(false)), Ok(()));
     }
 
     #[test]

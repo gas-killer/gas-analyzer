@@ -26,6 +26,7 @@ pub use heuristic::{
 };
 pub use prestate::{
     PrestateEligibility, build_state_updates_from_prestate, classify_prestate_eligibility,
+    frame_failure,
 };
 pub use sim_profile::{
     SimProfile, UNBOUNDED_BLOCK_GAS_LIMIT, UNBOUNDED_COLD_SSTORE_COST,
@@ -33,8 +34,8 @@ pub use sim_profile::{
     estimate_applied_payload_gas, validate_unbounded_cost, validate_unbounded_tree_cost,
 };
 pub use trace::{
-    TraceExtract, compute_state_updates, compute_state_updates_canonical, copy_memory,
-    parse_trace_memory,
+    EvmFailure, TraceExtract, compute_state_updates, compute_state_updates_canonical, copy_memory,
+    ensure_call_succeeded, parse_trace_memory,
 };
 pub use types::{
     DummyExternal, IStateUpdateTypes, Opcode, RevertingContext, SimpleStorage, StateUpdate,

@@ -137,9 +137,10 @@ pub mod simple_rpc_db;
 use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 
 // Re-exported so downstream consumers (e.g. the Gas Killer service) can name
-// the profile without a direct gas-analyzer-core dependency.
+// the profile and recognise an EVM failure without a direct gas-analyzer-core dependency.
 pub use gas_analyzer_core::SimProfile;
 pub use gas_analyzer_core::nested;
+pub use gas_analyzer_core::trace::EvmFailure;
 
 pub use gas_analyzer_core::nested::frame_tree_total;
 use gas_analyzer_core::nested::{
@@ -150,7 +151,7 @@ use gas_analyzer_core::{
     Opcode, PrestateEligibility, SignatureType, StateUpdate, build_state_updates_from_prestate,
     classify_prestate_eligibility, compute_state_updates, compute_state_updates_canonical,
     encode_state_updates_to_abi, estimate_gas_from_operations, extract_operation_counts_from_trace,
-    validate_unbounded_cost, validate_unbounded_tree_cost,
+    frame_failure, validate_unbounded_cost, validate_unbounded_tree_cost,
 };
 use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
 use gas_analyzer_rpc::{
@@ -1446,7 +1447,8 @@ struct Extracted {
 
 /// Build the prestate net form: `Ok(Some(updates))` when the call admits it, `Ok(None)` when the net
 /// form cannot represent the call and the struct-log extractor must produce the program, `Err` when
-/// the tracers are unavailable or fail. Never returns an unsound diff.
+/// the tracers are unavailable or fail, or an [`EvmFailure`] when the call itself failed. Never
+/// returns an unsound diff.
 async fn try_prestate_net<P: Provider + DebugApi>(
     provider: &P,
     mux: &MuxSupport,
@@ -1457,6 +1459,12 @@ async fn try_prestate_net<P: Provider + DebugApi>(
 ) -> Result<Option<Vec<StateUpdate>>> {
     let (diff, frame) =
         prestate_diff_and_call_frame(provider, mux, tx_request, block, profile).await?;
+    // The root frame already proves the call failed. The struct-log trace the fallback would fetch
+    // is the heaviest response of the three, so it would only rerun the call to say the same, and a
+    // timeout there would surface as an untyped, retryable error.
+    if let Some(reason) = frame_failure(&frame) {
+        return Err(anyhow::Error::new(EvmFailure::new(reason)));
+    }
     match classify_prestate_eligibility(&frame, &diff, consumer) {
         PrestateEligibility::Eligible => Ok(Some(build_state_updates_from_prestate(
             consumer, &diff, &frame,
@@ -1576,7 +1584,9 @@ async fn prestate_diff_and_call_frame<P: Provider + DebugApi>(
                 payload: Some(payload),
             } if is_evm_failure(&payload) => {
                 mux.answered();
-                bail!("muxTracer debug_trace_call failed: {reason}");
+                return Err(anyhow::Error::new(EvmFailure::new(format!(
+                    "muxTracer debug_trace_call failed: {reason}"
+                ))));
             }
             MuxedTraces::Rejected { reason, .. } => {
                 if mux.rejected() {
@@ -2543,6 +2553,38 @@ mod tests {
         asserter.push_success(&mux_fixture_frame());
     }
 
+    /// A call the separate tracers show failed is an EVM failure without a struct-log trace.
+    #[tokio::test]
+    async fn test_a_failed_root_frame_is_an_evm_failure_without_a_struct_log_trace() {
+        let (provider, asserter) = mux_mock();
+        let mut frame = mux_fixture_frame();
+        frame["error"] = "execution reverted".into();
+        asserter.push_success(&serde_json::json!({
+            "prestateTracer": mux_fixture_diff(),
+            "callTracer": frame,
+        }));
+
+        let error = try_prestate_net(
+            &provider,
+            &MuxSupport::default(),
+            &TransactionRequest::default(),
+            BlockId::latest(),
+            address!("0x0000000000000000000000000000000000001001"),
+            SimProfile::Chain,
+        )
+        .await
+        .expect_err("the call reverted");
+
+        assert!(
+            error.downcast_ref::<EvmFailure>().is_some(),
+            "typed as an EVM failure: {error:#}"
+        );
+        assert!(
+            asserter.pop_response().is_none(),
+            "no other trace requested"
+        );
+    }
+
     async fn mux_traces(
         provider: &RootProvider<Ethereum>,
         mux: &MuxSupport,
@@ -2602,6 +2644,14 @@ mod tests {
                 .to_string()
                 .contains("muxTracer debug_trace_call failed"),
             "the mux error itself, not a fallback's: {error}"
+        );
+        assert!(
+            error.to_string().contains("execution reverted"),
+            "the reason survives plain formatting: {error}"
+        );
+        assert!(
+            error.downcast_ref::<EvmFailure>().is_some(),
+            "typed as an EVM failure: {error:#}"
         );
         assert!(asserter.pop_response().is_none(), "no request was retried");
     }
@@ -3475,9 +3525,9 @@ mod tests {
             let anvil = spawn_as_sepolia().await;
             let provider = anvil.provider();
             let consumer = address!("0x0000000000000000000000000000000000001001");
-            // A thousand-slot writer, so the parse cost is decisively non-zero rather than
-            // riding on clock granularity.
-            set_code(&provider, consumer, thousand_slot_writer_code()).await;
+            // A hundred-slot writer, so the parse cost is decisively non-zero rather than
+            // riding on clock granularity, while the call still fits the request's gas.
+            set_code(&provider, consumer, hundred_slot_writer_code()).await;
             let block = provider.get_block_number().await.expect("block number");
             let cache = EvmSketchExecutorCache::new(4);
 
@@ -3604,6 +3654,59 @@ mod tests {
             );
         }
 
+        /// `SSTORE(0, 1)`, then `REVERT`: a write the EVM rolls back, which the struct log still
+        /// records.
+        fn write_then_revert_code() -> Bytes {
+            hex_code("6001600055 60006000fd")
+        }
+
+        /// A call that reverts after writing has no program under any encoding or entry point.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
+        async fn test_a_reverted_call_is_an_evm_failure() {
+            let anvil = spawn_as_sepolia().await;
+            let provider = anvil.provider();
+            let consumer = address!("0x0000000000000000000000000000000000001001");
+            set_code(&provider, consumer, write_then_revert_code()).await;
+            let block = provider.get_block_number().await.expect("block number");
+            let cache = EvmSketchExecutorCache::new(4);
+            let is_evm_failure =
+                |error: &anyhow::Error| error.downcast_ref::<EvmFailure>().is_some();
+
+            for encoding in [
+                StateEncoding::Legacy,
+                StateEncoding::Canonical,
+                StateEncoding::PrestateNet,
+            ] {
+                let error = call_to_encoded_state_updates_with_evmsketch_profiled(
+                    &cache,
+                    &anvil.url,
+                    call_request(consumer),
+                    block,
+                    encoding,
+                    SimProfile::Chain,
+                )
+                .await
+                .expect_err("a reverted call has no program");
+                assert!(is_evm_failure(&error), "{encoding:?}: {error:#}");
+            }
+
+            for encoding in [StateEncoding::Canonical, StateEncoding::PrestateNet] {
+                let error = call_to_frame_tree_with_evmsketch(
+                    &cache,
+                    &anvil.url,
+                    call_request(consumer),
+                    block,
+                    encoding,
+                    SimProfile::Chain,
+                    &gas_analyzer_core::nested::NESTING_COST_MODEL_V1,
+                )
+                .await
+                .expect_err("a reverted call has no frame tree");
+                assert!(is_evm_failure(&error), "{encoding:?}: {error:#}");
+            }
+        }
+
         /// Extract the same call under an encoding, through the real dispatcher, on the real chain
         /// environment.
         async fn extract_under(
@@ -3643,6 +3746,28 @@ mod tests {
             .await
             .expect("extraction failed");
             (extracted.state_updates, extracted.skipped_opcodes)
+        }
+
+        /// The error a `PrestateNet` extraction under `profile` fails with.
+        async fn extract_error_under_profile(
+            provider: &RootProvider<Ethereum>,
+            to: Address,
+            profile: SimProfile,
+        ) -> anyhow::Error {
+            match extract_state_updates_hybrid(
+                provider,
+                &MuxSupport::default(),
+                call_request(to),
+                BlockId::latest(),
+                to,
+                StateEncoding::PrestateNet,
+                profile,
+            )
+            .await
+            {
+                Ok(extracted) => panic!("extracted {:?}", extracted.state_updates),
+                Err(error) => error,
+            }
         }
 
         /// Run the `PrestateNet` dispatcher and, for comparison, each struct-log encoder directly.
@@ -3859,14 +3984,13 @@ mod tests {
             );
         }
 
-        /// A reverted call must fall back. Without the classifier's failure check the net form would
-        /// classify this Eligible and emit the LOG the tracer still reports for the reverted root frame —
-        /// anvil does not prune it, though geth does — on top of an empty storage diff, i.e. an event
-        /// that never happened. This is the test that makes that guard load-bearing rather than
-        /// defensive, and it fails if the guard is removed.
+        /// A reverted call is never eligible, and `PrestateNet` rejects it. Without the classifier's
+        /// failure check the net form would classify this Eligible and emit the LOG the tracer still
+        /// reports for the reverted root frame — anvil does not prune it, though geth does — on top of
+        /// an empty storage diff, i.e. an event that never happened.
         #[tokio::test]
         #[ignore = "spawns a local anvil; requires foundry on PATH"]
-        async fn test_hybrid_falls_back_on_reverted_call() {
+        async fn test_prestate_net_rejects_reverted_call() {
             let anvil = LocalAnvil::spawn().await;
             let provider = anvil.provider();
             let reverter = address!("0x0000000000000000000000000000000000001006");
@@ -3880,11 +4004,10 @@ mod tests {
                 "reverted call must force the struct-log fallback"
             );
 
-            let (net, _, canonical) = extract_all(&provider, reverter).await;
-            assert_updates_eq(
-                &net,
-                &canonical,
-                "on fallback, PrestateNet must equal its paired canonical encoder",
+            let error = extract_error_under_profile(&provider, reverter, SimProfile::Chain).await;
+            assert!(
+                error.downcast_ref::<EvmFailure>().is_some(),
+                "a reverted call is an EVM failure, not a program: {error:#}"
             );
         }
 
@@ -4029,6 +4152,11 @@ mod tests {
             hex_code("6103e8 5b 80 15 6015 57 80 6001 90 55 6001 90 03 6003 56 5b 00")
         }
 
+        /// The same loop over slots 100 down to 1, about 2.2M gas.
+        fn hundred_slot_writer_code() -> Bytes {
+            hex_code("6064 5b 80 15 6014 57 80 6001 90 55 6001 90 03 6002 56 5b 00")
+        }
+
         /// Same busy loop, but writing TWO slots — a consumer that is not
         /// single-slot-commitment-shaped, which the payload budget now permits.
         fn gigagas_two_slot_code() -> Bytes {
@@ -4038,48 +4166,36 @@ mod tests {
         /// The consequence of running `Unbounded` against a node whose execution cap was never
         /// lifted, pinned so it cannot drift.
         ///
-        /// The consumer writes one slot and then runs out of gas. Extraction does not fail — it
-        /// succeeds with the writes that happened *before* the gas ran out, because the struct-log
-        /// encoders journal the root frame and never discard it, and a prestate diff of a partly
-        /// executed call reports the same. So the payload is neither correct nor empty: it commits an
-        /// intermediate state the real execution never ended at.
-        ///
-        /// Nothing downstream catches this. A one-store payload is comfortably inside the on-chain
-        /// budget, and it is a plain `Ok`, so no caller can distinguish it from a genuine result. It is caught only by every operator running a cap-lifted node: a
-        /// minority of clamped nodes are outvoted, but a majority would reach quorum on the partial
-        /// write. That is why node provisioning is a consensus requirement here, not a performance
-        /// tuning knob.
+        /// The consumer writes one slot and then runs out of gas. The struct log still records the
+        /// write, so without the failure check a clamped node would sign an intermediate state the
+        /// real execution never ended at. It fails instead, and the clamped operator declines
+        /// rather than voting for a partial write.
         #[tokio::test(flavor = "multi_thread")]
         #[ignore = "spawns a local anvil; requires foundry on PATH"]
-        async fn chain_profile_oog_after_a_write_yields_a_partial_payload() {
+        async fn chain_profile_oog_after_a_write_is_an_evm_failure() {
             let anvil = LocalAnvil::spawn_with(&["--disable-block-gas-limit"]).await;
             let provider = anvil.provider();
             let consumer = address!("0x0000000000000000000000000000000000002003");
             set_code(&provider, consumer, write_then_gigagas_code()).await;
 
-            let (clamped, _) = extract_under_profile(&provider, consumer, SimProfile::Chain).await;
-            assert_updates_eq(
-                &clamped,
-                &[store_up(1, 0x42)],
-                "a clamped node signs the pre-OOG write, not an error and not an empty payload",
+            let error = extract_error_under_profile(&provider, consumer, SimProfile::Chain).await;
+            assert!(
+                error.downcast_ref::<EvmFailure>().is_some(),
+                "a clamped node fails the call rather than signing the pre-OOG write: {error:#}"
             );
 
-            // The same call on a correctly-provisioned node completes the loop and reaches the same
-            // single store — here the payloads agree, but only because this fixture's write happens
-            // to be its final state. The hazard is that the clamped result is indistinguishable from
-            // a real one regardless.
             let (lifted, _) =
                 extract_under_profile(&provider, consumer, SimProfile::Unbounded).await;
             assert_updates_eq(
                 &lifted,
                 &[store_up(1, 0x42)],
-                "the cap-lifted run completes the loop and commits the same slot",
+                "the cap-lifted run completes the loop and commits the slot",
             );
         }
 
         /// Under `Chain` the burner OOGs (tx gas 3M < 40M needed): the #165 revert
-        /// classification forces fallback. Under `Unbounded` the same call — same
-        /// request, gas lifted to the pinned 2^40 override — extracts exactly
+        /// classification forces fallback, which rejects the halted call. Under `Unbounded` the
+        /// same call — same request, gas lifted to the pinned 2^40 override — extracts exactly
         /// [Store(1,0x42), Log1(0xee)] via the prestate fast path.
         #[tokio::test(flavor = "multi_thread")]
         #[ignore = "spawns a local anvil; requires foundry on PATH"]
@@ -4101,18 +4217,13 @@ mod tests {
                  got {chain_classification:?}"
             );
 
-            // Pin what the fallback actually *returns*, not just how it classifies. A node whose
-            // execution cap has not been lifted behaves exactly like this: the call OOGs and
-            // extraction succeeds with an empty payload rather than failing. That is not unsound —
-            // an empty diff writes nothing — but it is also not an error the caller can detect, so
-            // a mis-provisioned operator silently signs a payload that disagrees with every
-            // correctly-provisioned one. See `chain_profile_oog_after_a_write_yields_a_partial_payload`
-            // for the sharper case.
-            let (chain_updates, _) =
-                extract_under_profile(&provider, consumer, SimProfile::Chain).await;
+            // A node whose execution cap has not been lifted behaves exactly like this: the call
+            // OOGs, so the operator declines instead of signing a payload that disagrees with every
+            // correctly-provisioned one.
+            let error = extract_error_under_profile(&provider, consumer, SimProfile::Chain).await;
             assert!(
-                chain_updates.is_empty(),
-                "a clamped node yields an empty payload, not an error: {chain_updates:?}"
+                error.downcast_ref::<EvmFailure>().is_some(),
+                "a clamped node fails the call rather than signing for it: {error:#}"
             );
 
             // Unbounded: identical request; the profile's pinned tx-gas override
