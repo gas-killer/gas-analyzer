@@ -151,7 +151,7 @@ use gas_analyzer_core::{
     Opcode, PrestateEligibility, SignatureType, StateUpdate, build_state_updates_from_prestate,
     classify_prestate_eligibility, compute_state_updates, compute_state_updates_canonical,
     encode_state_updates_to_abi, estimate_gas_from_operations, extract_operation_counts_from_trace,
-    validate_unbounded_cost, validate_unbounded_tree_cost,
+    frame_failure, validate_unbounded_cost, validate_unbounded_tree_cost,
 };
 use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
 use gas_analyzer_rpc::{
@@ -1447,7 +1447,8 @@ struct Extracted {
 
 /// Build the prestate net form: `Ok(Some(updates))` when the call admits it, `Ok(None)` when the net
 /// form cannot represent the call and the struct-log extractor must produce the program, `Err` when
-/// the tracers are unavailable or fail. Never returns an unsound diff.
+/// the tracers are unavailable or fail, or an [`EvmFailure`] when the call itself failed. Never
+/// returns an unsound diff.
 async fn try_prestate_net<P: Provider + DebugApi>(
     provider: &P,
     mux: &MuxSupport,
@@ -1458,6 +1459,12 @@ async fn try_prestate_net<P: Provider + DebugApi>(
 ) -> Result<Option<Vec<StateUpdate>>> {
     let (diff, frame) =
         prestate_diff_and_call_frame(provider, mux, tx_request, block, profile).await?;
+    // The root frame already proves the call failed. The struct-log trace the fallback would fetch
+    // is the heaviest response of the three, so it would only rerun the call to say the same, and a
+    // timeout there would surface as an untyped, retryable error.
+    if let Some(reason) = frame_failure(&frame) {
+        return Err(anyhow::Error::new(EvmFailure::new(reason)));
+    }
     match classify_prestate_eligibility(&frame, &diff, consumer) {
         PrestateEligibility::Eligible => Ok(Some(build_state_updates_from_prestate(
             consumer, &diff, &frame,
@@ -2543,6 +2550,38 @@ mod tests {
     fn push_separate(asserter: &alloy_transport::mock::Asserter) {
         asserter.push_success(&mux_fixture_diff());
         asserter.push_success(&mux_fixture_frame());
+    }
+
+    /// A call the separate tracers show failed is an EVM failure without a struct-log trace.
+    #[tokio::test]
+    async fn test_a_failed_root_frame_is_an_evm_failure_without_a_struct_log_trace() {
+        let (provider, asserter) = mux_mock();
+        let mut frame = mux_fixture_frame();
+        frame["error"] = "execution reverted".into();
+        asserter.push_success(&serde_json::json!({
+            "prestateTracer": mux_fixture_diff(),
+            "callTracer": frame,
+        }));
+
+        let error = try_prestate_net(
+            &provider,
+            &MuxSupport::default(),
+            &TransactionRequest::default(),
+            BlockId::latest(),
+            address!("0x0000000000000000000000000000000000001001"),
+            SimProfile::Chain,
+        )
+        .await
+        .expect_err("the call reverted");
+
+        assert!(
+            error.downcast_ref::<EvmFailure>().is_some(),
+            "typed as an EVM failure: {error:#}"
+        );
+        assert!(
+            asserter.pop_response().is_none(),
+            "no other trace requested"
+        );
     }
 
     async fn mux_traces(
@@ -3940,15 +3979,13 @@ mod tests {
             );
         }
 
-        /// A reverted call must fall back, and the fallback must reject it. Without the classifier's
+        /// A reverted call is never eligible, and `PrestateNet` rejects it. Without the classifier's
         /// failure check the net form would classify this Eligible and emit the LOG the tracer still
         /// reports for the reverted root frame — anvil does not prune it, though geth does — on top of
-        /// an empty storage diff, i.e. an event that never happened. The struct-log trace it falls
-        /// back to records the rolled-back store and log too, so only its failure flag stands between
-        /// the call and a program.
+        /// an empty storage diff, i.e. an event that never happened.
         #[tokio::test]
         #[ignore = "spawns a local anvil; requires foundry on PATH"]
-        async fn test_hybrid_rejects_reverted_call() {
+        async fn test_prestate_net_rejects_reverted_call() {
             let anvil = LocalAnvil::spawn().await;
             let provider = anvil.provider();
             let reverter = address!("0x0000000000000000000000000000000000001006");

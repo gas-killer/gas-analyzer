@@ -26,6 +26,7 @@ pub use heuristic::{
 };
 pub use prestate::{
     PrestateEligibility, build_state_updates_from_prestate, classify_prestate_eligibility,
+    frame_failure,
 };
 pub use sim_profile::{
     SimProfile, UNBOUNDED_BLOCK_GAS_LIMIT, UNBOUNDED_COLD_SSTORE_COST,

@@ -127,7 +127,7 @@ fn scan_target_depth(frame: &CallFrame) -> Option<String> {
 /// Clients disagree on which field they populate — geth-family tracers set `error` and add
 /// `revertReason` when the reason decodes, while others report only the latter — so a frame is
 /// treated as failed if either is present.
-fn frame_failure(frame: &CallFrame) -> Option<&str> {
+pub fn frame_failure(frame: &CallFrame) -> Option<&str> {
     frame.error.as_deref().or(frame.revert_reason.as_deref())
 }
 
