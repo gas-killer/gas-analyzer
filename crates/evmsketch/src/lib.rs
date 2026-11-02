@@ -1584,8 +1584,9 @@ async fn prestate_diff_and_call_frame<P: Provider + DebugApi>(
                 payload: Some(payload),
             } if is_evm_failure(&payload) => {
                 mux.answered();
-                return Err(anyhow::Error::new(EvmFailure::new(reason))
-                    .context("muxTracer debug_trace_call failed"));
+                return Err(anyhow::Error::new(EvmFailure::new(format!(
+                    "muxTracer debug_trace_call failed: {reason}"
+                ))));
             }
             MuxedTraces::Rejected { reason, .. } => {
                 if mux.rejected() {
@@ -2643,6 +2644,10 @@ mod tests {
                 .to_string()
                 .contains("muxTracer debug_trace_call failed"),
             "the mux error itself, not a fallback's: {error}"
+        );
+        assert!(
+            error.to_string().contains("execution reverted"),
+            "the reason survives plain formatting: {error}"
         );
         assert!(
             error.downcast_ref::<EvmFailure>().is_some(),
