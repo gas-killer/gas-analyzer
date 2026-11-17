@@ -2778,7 +2778,8 @@ mod tests {
         use super::*;
         use gas_analyzer_core::UNBOUNDED_PAYLOAD_GAS_BUDGET;
         use gas_analyzer_rpc::{
-            get_call_frame_from_call, get_prestate_diff_from_call, get_trace_from_call,
+            get_call_frame_from_call, get_preceding_transactions, get_prestate_diff_from_call,
+            get_trace_from_call,
         };
 
         // ========================================================================
@@ -3142,6 +3143,149 @@ mod tests {
 
             assert!(replay_at(0).is_err(), "the gate rejects a zero gas price");
             replay_at(1_000_000_000).expect("the gate admits the original gas price");
+        }
+
+        /// `GAS` (`gasleft()`) in a replayed preceding tx reads what it read on chain (#50).
+        ///
+        /// A contract that branches on `gasleft()`, or forwards it to a sub-call, only replays
+        /// faithfully if every opcode before the `GAS` costs what it cost on chain. The costs
+        /// that depend on state are storage writes, priced by the slot's current value, so the
+        /// replay must start from the real pre-block state rather than an empty one.
+        ///
+        /// The probe writes a slot seeded non-zero, then records `gasleft()`. On chain that
+        /// write modifies an existing value; from empty state it would create one and cost
+        /// 17,100 gas more, shifting the recorded `gasleft()`.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; run with --ignored"]
+        async fn test_preceding_replay_reproduces_gasleft() {
+            use revm::database::EmptyDB;
+            use revm::database_interface::DatabaseRef;
+            use revm::state::{AccountInfo, Bytecode};
+
+            // The estimator prices Sepolia under Osaka (see `runs_unsupported_hardfork`); pin
+            // anvil to it so chain and replay charge the same fork whatever anvil's default.
+            let anvil = LocalAnvil::spawn_with(&[
+                "--chain-id",
+                &SEPOLIA_CHAIN_ID.to_string(),
+                "--hardfork",
+                "osaka",
+            ])
+            .await;
+            let provider = anvil.provider();
+            let probe = Address::repeat_byte(0x5a);
+            // SSTORE(0, 1); SSTORE(1, GAS); STOP
+            let probe_code = hex_code("6001600055 5a600155 00");
+            set_code(&provider, probe, probe_code.clone()).await;
+            set_storage(&provider, probe, B256::ZERO, B256::with_last_byte(5)).await;
+            // The estimator reads state at the block before its anchor.
+            for _ in 0..2 {
+                let _: serde_json::Value = provider
+                    .raw_request("evm_mine".into(), ())
+                    .await
+                    .expect("evm_mine");
+            }
+
+            // Mine the probe call and a filler transfer in one block, so the probe call is a
+            // preceding tx of the filler.
+            let _: serde_json::Value = provider
+                .raw_request("evm_setAutomine".into(), (false,))
+                .await
+                .expect("evm_setAutomine");
+            let send = |to: Address, gas: u64| {
+                let provider = provider.clone();
+                async move {
+                    let tx = serde_json::json!({
+                        "from": DEV,
+                        "to": to,
+                        "gas": format!("0x{gas:x}"),
+                    });
+                    let hash: B256 = provider
+                        .raw_request("eth_sendTransaction".into(), (tx,))
+                        .await
+                        .expect("eth_sendTransaction");
+                    hash
+                }
+            };
+            let probe_hash = send(probe, 100_000).await;
+            let filler_hash = send(Address::repeat_byte(0xf1), 21_000).await;
+            let _: serde_json::Value = provider
+                .raw_request("evm_mine".into(), ())
+                .await
+                .expect("evm_mine");
+
+            let receipt = |hash: B256| {
+                let provider = provider.clone();
+                async move {
+                    provider
+                        .get_transaction_receipt(hash)
+                        .await
+                        .expect("eth_getTransactionReceipt")
+                        .unwrap_or_else(|| panic!("{hash} was not mined"))
+                }
+            };
+            let probe_receipt = receipt(probe_hash).await;
+            let filler_receipt = receipt(filler_hash).await;
+            assert!(probe_receipt.status(), "the probe call reverted");
+            let block = probe_receipt.block_number.expect("a block number");
+            assert_eq!(filler_receipt.block_number, Some(block));
+            assert_eq!(probe_receipt.transaction_index, Some(0));
+            assert_eq!(filler_receipt.transaction_index, Some(1));
+
+            let on_chain = provider
+                .get_storage_at(probe, U256::from(1))
+                .block_id(BlockId::number(block))
+                .await
+                .expect("eth_getStorageAt");
+            assert!(!on_chain.is_zero(), "the probe recorded gasleft()");
+
+            let preceding = get_preceding_transactions(&provider, block, 1)
+                .await
+                .expect("preceding transactions");
+            assert_eq!(preceding.len(), 1);
+
+            let gk = GasKillerEvmSketchDefault::builder(anvil.url.parse().expect("url"))
+                .at_block(BlockNumberOrTag::Number(block))
+                .build()
+                .await
+                .expect("estimator");
+            let (replayed_db, sim_env) = gk
+                .state_after_preceding(
+                    &preceding,
+                    OriginalTx {
+                        value: U256::ZERO,
+                        gas_price: 0,
+                    },
+                )
+                .expect("replay");
+            let replayed = replayed_db
+                .storage_ref(probe, U256::from(1))
+                .expect("storage read");
+            assert_eq!(
+                replayed, on_chain,
+                "gasleft() in the replayed probe call differs from chain"
+            );
+
+            // Control: the same replay from empty state misprices the first write, so the test
+            // fails if the replay ever stops reading the real pre-block state.
+            let mut empty_db = CacheDB::new(EmptyDB::default());
+            empty_db.insert_account_info(
+                probe,
+                AccountInfo::from_bytecode(Bytecode::new_raw(probe_code)),
+            );
+            gas_analyzer_estimator::replay_preceding_transactions(
+                &mut empty_db,
+                &preceding,
+                &sim_env,
+            )
+            .expect("replay from empty state");
+            let from_empty = empty_db
+                .storage_ref(probe, U256::from(1))
+                .expect("storage read");
+            assert_eq!(
+                on_chain - from_empty,
+                U256::from(17_100),
+                "from empty state the 5 -> 1 write is priced as 0 -> 1 (22,100 vs 5,000 gas)"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread")]
