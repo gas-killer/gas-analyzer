@@ -2351,8 +2351,11 @@ mod tests {
         make_trace(vec![call, resume])
     }
 
+    /// The estimator is funded for the ETH its calls send (#127), so a forwarded value is measured
+    /// whether or not the transaction's `value` is passed, and costs the same either way: a CALL's
+    /// gas doesn't depend on the sender's balance.
     #[test]
-    fn test_forwarded_value_is_measured_only_when_the_transaction_brings_it() {
+    fn test_forwarded_value_is_measured_with_or_without_the_transactions_value() {
         let trace = value_call_trace("de0b6b3a7640000"); // 1 ETH
         let analyze = |value| {
             analyze_trace_inner(
@@ -2367,12 +2370,16 @@ mod tests {
             )
             .unwrap()
         };
+        let without_value = analyze(None);
         assert!(
-            analyze(None).is_heuristic,
-            "the estimator has no ETH to forward"
+            !without_value.is_heuristic,
+            "the estimator is funded for the call's ETH"
         );
-        assert!(!analyze(Some("1000000000000000000")).is_heuristic);
-        assert!(!analyze(Some("0xde0b6b3a7640000")).is_heuristic);
+        for value in ["1000000000000000000", "0xde0b6b3a7640000"] {
+            let with_value = analyze(Some(value));
+            assert!(!with_value.is_heuristic);
+            assert_eq!(with_value.gas_estimate, without_value.gas_estimate);
+        }
     }
 
     /// The 25,000-gas charge for a `CALL` that sends ETH to an account that doesn't exist (EIP-161).

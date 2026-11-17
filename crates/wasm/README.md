@@ -24,7 +24,7 @@ Analyzes the `result` of `debug_traceTransaction` with the default struct-log tr
 - `caller`: the transaction's sender.
 - `block`: block number, as a `bigint`.
 - `origin`: the transaction's target contract, for detecting re-entrant callbacks.
-- `value`: the transaction's `msg.value` in wei, as a decimal or `0x` hex string. Pass it for transactions that send ETH: without it, a payload that forwards that ETH in a `CALL` can't be simulated and falls back to the heuristic.
+- `value`: the transaction's `msg.value` in wei, as a decimal or `0x` hex string. Pass it for transactions that send ETH, so the payload runs with the ETH the transaction brought in. A payload that forwards ETH in a `CALL` is priced either way: the estimator is funded for the ETH its calls send, and a `CALL` costs the same gas whatever the sender's balance.
 - `prestateDiff`: the transaction's `prestateTracer` diff, as a JSON string (see `analyze_prestate`). It needs `origin`. Without it the simulation starts from an empty state, so:
   - every write is priced as a fresh 22,100-gas one, where changing a set slot costs 5,000 and rewriting its value 2,200;
   - every `CALL` that sends ETH pays the 25,000-gas charge for creating its recipient, which on chain only a new account pays.

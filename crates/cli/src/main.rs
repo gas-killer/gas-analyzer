@@ -168,6 +168,17 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 .get_transaction_receipt(bytes.into())
                 .await?
                 .expect("couldn't fetch tx receipt for tx");
+            // A contract creation has no existing contract to settle against (#32), as the
+            // indexer's `SkipReason::ContractCreation` treats it.
+            if receipt.to.is_none() {
+                println!(
+                    "{} 0x{} is a contract-creation transaction; Gas Killer settles calls to \
+                     existing contracts, so there is nothing to analyze.",
+                    "Skipped:".yellow(),
+                    hex::encode(bytes)
+                );
+                return Ok(());
+            }
             let block_number = receipt
                 .block_number
                 .expect("couldn't retrieve block number");

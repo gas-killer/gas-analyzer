@@ -8,7 +8,7 @@
 //!
 //! No reth-evm, no sp1-contract-call, no async, no I/O.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, OnceLock};
 
 use alloy_dyn_abi::DynSolValue;
@@ -177,6 +177,62 @@ where
         sim_env,
         false,
     )
+}
+
+/// Total ETH the `Call` updates send out of the contract applying them.
+fn call_value_total(state_updates: &[StateUpdate]) -> U256 {
+    state_updates
+        .iter()
+        .filter_map(|update| match update {
+            StateUpdate::Call(call) => Some(call.value),
+            _ => None,
+        })
+        .fold(U256::ZERO, U256::saturating_add)
+}
+
+/// Give `contract_address` at least `required` wei before the estimator replaces its code (#127).
+///
+/// A `Call` update sends its `value` from the contract's own balance. On chain that ETH may have
+/// arrived mid-transaction in a way the program doesn't replay, so a contract that held less at
+/// the forked block would halt the estimate with `OutOfFunds`, though a CALL costs the same gas
+/// whatever the sender's balance. Only pricing is affected: a contract already holding enough is
+/// left untouched, so balance checks against it read what they read on chain. Runs before
+/// injection, which carries the balance over.
+///
+/// If the account can't be read, nothing is funded: writing over an account that was never read
+/// could lower its real balance and zero its nonce, and would hide the backend failure behind a
+/// clean-looking estimate. The estimate then fails as it would without funding.
+fn fund_value_calls<DB>(cache_db: &mut CacheDB<DB>, contract_address: Address, required: U256)
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+{
+    use revm::database_interface::DatabaseRef;
+
+    if required.is_zero() {
+        return;
+    }
+    let account = match cache_db.basic_ref(contract_address) {
+        Ok(account) => account.unwrap_or_default(),
+        Err(e) => {
+            tracing::debug!(
+                %contract_address,
+                error = ?e,
+                "not funding value calls: account read failed"
+            );
+            return;
+        }
+    };
+    if account.balance >= required {
+        return;
+    }
+    cache_db.insert_account_info(
+        contract_address,
+        AccountInfo {
+            balance: required,
+            ..account
+        },
+    );
 }
 
 /// Where `contract_address`'s original code is kept once the estimator replaces it. Distinct per
@@ -361,7 +417,9 @@ where
 /// * `cache_db` - A CacheDB wrapping any database backend
 /// * `contract_address` - The address to inject the estimator contract at
 /// * `caller_address` - The address to use as the caller (also used as tx.origin)
-/// * `state_updates` - The state updates to estimate gas for
+/// * `state_updates` - The state updates to estimate gas for. A flat program: no `Nested` ops,
+///   since only `contract_address` is funded for its value calls. Nested trees go through
+///   [`estimate_frame_tree_gas`]; strip ops with `gas_analyzer_core::nested::without_nested_ops`.
 /// * `sim_env` - Simulation environment fields (block and tx context)
 #[tracing::instrument(name = "gas.evm_execute", skip_all, fields(block_number = sim_env.number, state_update_count = state_updates.len()))]
 pub fn estimate_state_changes_gas<DB>(
@@ -375,7 +433,15 @@ where
     DB: revm::database_interface::DatabaseRef,
     <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
 {
+    debug_assert!(
+        !state_updates
+            .iter()
+            .any(|update| matches!(update, StateUpdate::Nested(_))),
+        "estimate_state_changes_gas takes a flat program; price nested trees with \
+         estimate_frame_tree_gas"
+    );
     let calldata = build_gas_estimation_calldata(state_updates)?;
+    fund_value_calls(cache_db, contract_address, call_value_total(state_updates));
 
     estimate_gas_raw(
         cache_db,
@@ -416,6 +482,16 @@ where
     if frames.is_empty() {
         return Err(anyhow!("a frame tree needs a root frame"));
     }
+    // A contract can appear in several frames; fund it for every call it sends across them.
+    let mut call_values: HashMap<Address, U256> = HashMap::new();
+    for frame in frames {
+        let total = call_values.entry(frame.target).or_default();
+        *total = total.saturating_add(call_value_total(&frame.updates));
+    }
+    for (target, required) in call_values {
+        fund_value_calls(cache_db, target, required);
+    }
+
     // Once per contract: injecting again would stash the estimator itself as the original code.
     let mut injected = HashSet::new();
     for frame in frames {
@@ -1480,6 +1556,169 @@ mod tests {
             value: U256::ZERO,
             callargs: Bytes::from_static(&[0x01]),
         })
+    }
+
+    fn value_call(target: Address, value: U256) -> StateUpdate {
+        StateUpdate::Call(IStateUpdateTypes::Call {
+            target,
+            value,
+            callargs: Bytes::new(),
+        })
+    }
+
+    const ONE_ETH: u128 = 10u128.pow(18);
+
+    /// A contract that held no ETH at the forked block still prices a `Call` update that sends
+    /// ETH (#127), where the unfunded estimate halts with `OutOfFunds`.
+    #[test]
+    fn test_value_call_from_unfunded_contract_is_priced() {
+        let root = address!("0x00000000000000000000000000000000000a0000");
+        let recipient = address!("0x00000000000000000000000000000000000c0000");
+        let caller = address!("0x000000000000000000000000000000000000beef");
+        let sim_env = sim_env_with_spec(SpecId::CANCUN);
+        let updates = vec![value_call(recipient, U256::from(ONE_ETH))];
+
+        let mut unfunded = CacheDB::new(EmptyDB::default());
+        let calldata = build_gas_estimation_calldata(&updates).unwrap();
+        assert!(
+            estimate_gas_raw(&mut unfunded, root, caller, calldata, &sim_env).is_err(),
+            "without funding the value call must fail, or this test proves nothing"
+        );
+
+        let mut cache_db = CacheDB::new(EmptyDB::default());
+        let gas = estimate_state_changes_gas(&mut cache_db, root, caller, &updates, &sim_env)
+            .expect("the value call is priced");
+        assert!(gas > 0);
+    }
+
+    /// As above, through the frame-tree path, summing the calls a contract sends across frames.
+    #[test]
+    fn test_frame_tree_value_calls_from_unfunded_contract_are_priced() {
+        let root = address!("0x00000000000000000000000000000000000a0000");
+        let child = address!("0x00000000000000000000000000000000000b0000");
+        let recipient = address!("0x00000000000000000000000000000000000c0000");
+        let caller = address!("0x000000000000000000000000000000000000beef");
+        let sim_env = sim_env_with_spec(SpecId::CANCUN);
+        let frames = [
+            frame(
+                root,
+                vec![
+                    value_call(recipient, U256::from(ONE_ETH)),
+                    nested(child),
+                    value_call(recipient, U256::from(2 * ONE_ETH)),
+                ],
+                vec![1],
+            ),
+            frame(
+                child,
+                vec![value_call(recipient, U256::from(ONE_ETH))],
+                vec![],
+            ),
+        ];
+
+        let mut cache_db = CacheDB::new(EmptyDB::default());
+        let frame_gas =
+            estimate_frame_tree_gas(&mut cache_db, &frames, caller, U256::ZERO, &sim_env)
+                .expect("every frame's value calls are priced");
+        assert!(frame_gas.iter().all(|&g| g > 0));
+    }
+
+    /// Funding only tops up: a contract already holding enough keeps its real balance, so a
+    /// balance check against it reads what it read on chain.
+    #[test]
+    fn test_fund_value_calls_only_tops_up() {
+        use revm::database_interface::DatabaseRef;
+
+        let funded = address!("0x00000000000000000000000000000000000a0000");
+        let empty = address!("0x00000000000000000000000000000000000b0000");
+        let mut cache_db = CacheDB::new(EmptyDB::default());
+        cache_db.insert_account_info(
+            funded,
+            AccountInfo {
+                balance: U256::from(5 * ONE_ETH),
+                ..Default::default()
+            },
+        );
+
+        fund_value_calls(&mut cache_db, funded, U256::from(ONE_ETH));
+        fund_value_calls(&mut cache_db, empty, U256::from(ONE_ETH));
+
+        let balance = |addr| {
+            cache_db
+                .basic_ref(addr)
+                .unwrap()
+                .unwrap_or_default()
+                .balance
+        };
+        assert_eq!(balance(funded), U256::from(5 * ONE_ETH));
+        assert_eq!(balance(empty), U256::from(ONE_ETH));
+    }
+
+    /// A backend whose every read fails.
+    struct FailingDb;
+
+    #[derive(Debug)]
+    struct ReadFailed;
+
+    impl std::fmt::Display for ReadFailed {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("read failed")
+        }
+    }
+
+    impl std::error::Error for ReadFailed {}
+    impl revm::database_interface::DBErrorMarker for ReadFailed {}
+
+    impl revm::database_interface::DatabaseRef for FailingDb {
+        type Error = ReadFailed;
+
+        fn basic_ref(&self, _: Address) -> Result<Option<AccountInfo>, ReadFailed> {
+            Err(ReadFailed)
+        }
+
+        fn code_by_hash_ref(&self, _: B256) -> Result<revm::state::Bytecode, ReadFailed> {
+            Err(ReadFailed)
+        }
+
+        fn storage_ref(&self, _: Address, _: U256) -> Result<U256, ReadFailed> {
+            Err(ReadFailed)
+        }
+
+        fn block_hash_ref(&self, _: u64) -> Result<B256, ReadFailed> {
+            Err(ReadFailed)
+        }
+    }
+
+    /// An account that can't be read is not funded: writing a guessed account over it would
+    /// replace its real balance and nonce, and hide the read failure behind a clean estimate.
+    #[test]
+    fn test_fund_value_calls_skips_an_unreadable_account() {
+        let contract = address!("0x00000000000000000000000000000000000a0000");
+        let mut cache_db = CacheDB::new(FailingDb);
+
+        fund_value_calls(&mut cache_db, contract, U256::from(ONE_ETH));
+
+        assert!(
+            !cache_db.cache.accounts.contains_key(&contract),
+            "no account is written over a failed read"
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "takes a flat program")]
+    fn test_flat_estimate_rejects_nested_ops() {
+        let root = address!("0x00000000000000000000000000000000000a0000");
+        let child = address!("0x00000000000000000000000000000000000b0000");
+        let caller = address!("0x000000000000000000000000000000000000beef");
+        let mut cache_db = CacheDB::new(EmptyDB::default());
+        let _ = estimate_state_changes_gas(
+            &mut cache_db,
+            root,
+            caller,
+            &[nested(child)],
+            &sim_env_with_spec(SpecId::CANCUN),
+        );
     }
 
     fn nested(target: Address) -> StateUpdate {
