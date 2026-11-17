@@ -34,6 +34,8 @@ use alloy_eips::BlockNumberOrTag;
 enum Commands {
     Transaction(String),
     Request(String),
+    /// `o <HASH>`: opcode usage report (#161).
+    Opcodes(String),
 }
 
 struct CliArgs {
@@ -92,6 +94,7 @@ fn parse_args_from(args: &[String]) -> CliArgs {
             "t" | "tx" => Some(Commands::Transaction(value)),
             "r" | "request" => Some(Commands::Request(value)),
             "d" | "debug" => Some(Commands::Transaction(value)),
+            "o" | "opcodes" => Some(Commands::Opcodes(value)),
             _ => None,
         }
     };
@@ -601,6 +604,13 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             }
         }
 
+        Some(Commands::Opcodes(hash)) => {
+            let provider = ProviderBuilder::new().connect_http(rpc_url);
+            let bytes: [u8; 32] = hex::const_decode_to_array(hash.as_bytes())
+                .map_err(|e| anyhow::anyhow!("`{hash}` is not a transaction hash: {e}"))?;
+            opcodes::run(&provider, bytes.into()).await?;
+        }
+
         Some(Commands::Request(_file)) => {
             // Note: The request command (for simulating unexecuted transactions) has been removed.
             // Use the transaction command to analyze existing transactions via their tx hash.
@@ -617,6 +627,10 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             println!("Usage:\n");
             println!("  {} for accepted transactions", "t/tx <HASH>".bold());
             println!("  {} alias for t <HASH> --debug", "debug <HASH>".bold());
+            println!(
+                "  {} opcode usage by category, and the gas Gas Killer can remove",
+                "o/opcodes <HASH>".bold()
+            );
             println!(
                 "  {} for transaction requests",
                 "r/request <JSON_FILE>".bold()
@@ -642,9 +656,123 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             println!("  cargo run --features anvil -- --anvil t <TX_HASH>");
             println!("\n  # What the root and C would have saved together as one nested tree:");
             println!("  cargo run -- t <TX_HASH> --owned <C_ADDRESS>");
+            println!("\n  # Which opcodes the transaction spent its gas on:");
+            println!("  cargo run -- o <TX_HASH>");
         }
     }
     Ok(())
+}
+
+/// `o <HASH>`: opcode usage by category, and how much of it a settlement keeps (#161).
+mod opcodes {
+    use alloy::primitives::FixedBytes;
+    use alloy::rpc::types::trace::geth::{
+        GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace,
+    };
+    use alloy_provider::Provider;
+    use alloy_provider::ext::DebugApi;
+    use anyhow::{Result, anyhow};
+    use colored::Colorize;
+    use gas_analyzer_core::opcode_report::{Usage, opcode_report};
+
+    pub async fn run<P: Provider + DebugApi>(provider: &P, tx_hash: FixedBytes<32>) -> Result<()> {
+        let receipt = provider
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .ok_or_else(|| anyhow!("no receipt for {tx_hash}"))?;
+        // Only opcodes, depth and gas are needed: no memory, stack or storage.
+        let options = GethDebugTracingOptions {
+            config: GethDefaultTracingOptions {
+                disable_stack: Some(true),
+                disable_storage: Some(true),
+                enable_memory: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let GethTrace::Default(trace) = provider.debug_trace_transaction(tx_hash, options).await?
+        else {
+            return Err(anyhow!("expected a struct-log trace"));
+        };
+        let report = opcode_report(&trace.struct_logs);
+        let total = report.total();
+        let share = |gas: u64| {
+            if total.gas == 0 {
+                0.0
+            } else {
+                gas as f64 * 100.0 / total.gas as f64
+            }
+        };
+
+        println!("\n{}", "=== Opcode Usage ===".blue().bold());
+        println!("Transaction: {tx_hash}");
+        println!(
+            "Gas used: {} ({} executing {} steps)",
+            receipt.gas_used, total.gas, total.count
+        );
+        if !receipt.status() {
+            println!("{}", "The transaction reverted.".yellow());
+        }
+        if trace.struct_logs.is_empty() {
+            println!(
+                "{}",
+                "The trace has no steps: either no code ran, or the node does not record them \
+                 (start anvil with --steps-tracing)."
+                    .yellow()
+            );
+            return Ok(());
+        }
+
+        println!(
+            "\n  {:<38} {:>9} {:>12} {:>7}  Opcodes",
+            "Category", "Count", "Gas", "Share"
+        );
+        for category in &report.categories {
+            let opcodes = category
+                .opcodes
+                .iter()
+                .map(|(op, u)| format!("{op}x{}", u.count))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!(
+                "  {:<38} {:>9} {:>12} {:>6.1}%  {opcodes}",
+                category.category.label(),
+                category.total.count,
+                category.total.gas,
+                share(category.total.gas)
+            );
+        }
+
+        println!("\n{}", "Gas Killer view".bold());
+        let line = |label: &str, u: Usage, note: &str| {
+            println!(
+                "  {label:<38} {:>9} {:>12} {:>6.1}%  {note}",
+                u.count,
+                u.gas,
+                share(u.gas)
+            )
+        };
+        line(
+            "Kept",
+            report.kept,
+            "SSTORE, LOG, CALL and CREATE in the contract's own context",
+        );
+        line(
+            "Replayed",
+            report.replayed,
+            "executed inside the calls the settlement makes again",
+        );
+        line(
+            "Optimizable",
+            report.optimizable,
+            "reads, hashing and compute the settlement replaces",
+        );
+        println!(
+            "\n  A quick signal, not an estimate: the settlement also pays for its payload and \
+             signature check.\n  Run `t <HASH>` for the measured estimate."
+        );
+        Ok(())
+    }
 }
 
 /// `t <HASH> --owned ...`: what a historical transaction would have cost settled as a nested
@@ -837,6 +965,15 @@ mod tests {
                 "{args:?}"
             );
         }
+    }
+
+    #[test]
+    fn opcodes_takes_a_hash() {
+        let args: Vec<String> = ["cli", "o", HASH].iter().map(|a| a.to_string()).collect();
+        assert!(matches!(
+            parse_args_from(&args).command,
+            Some(Commands::Opcodes(h)) if h == HASH
+        ));
     }
 
     #[test]
