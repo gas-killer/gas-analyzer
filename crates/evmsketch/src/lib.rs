@@ -154,8 +154,8 @@ use gas_analyzer_core::{
     encode_state_updates_to_abi, estimate_gas_from_operations, extract_operation_counts_from_trace,
     frame_failure, validate_unbounded_cost, validate_unbounded_tree_cost,
 };
-pub use gas_analyzer_estimator::PrecedingTx;
 use gas_analyzer_estimator::SimEnvOpts;
+pub use gas_analyzer_estimator::{PrecedingTx, reverting_context};
 use gas_analyzer_rpc::{
     MuxedTraces, get_call_frame_from_call_with_profile,
     get_prestate_diff_and_call_frame_with_profile, get_prestate_diff_from_call_with_profile,
@@ -808,10 +808,10 @@ impl GasKillerEvmSketchDefault {
 
     /// Estimate gas for state changes, replaying preceding transactions first.
     ///
-    /// Creates a single CacheDB, replays all preceding transactions to bring
-    /// it to the correct mid-block state, then runs gas estimation on that
-    /// state. This ensures the simulation sees the same state the original
-    /// transaction executed against.
+    /// Replays all preceding transactions to bring the state to the correct mid-block point, then
+    /// runs gas estimation on that state. This ensures the simulation sees the same state the
+    /// original transaction executed against. To keep the replayed state, e.g. to trace a failed
+    /// estimate, use [`Self::mid_block_state`].
     ///
     /// If `preceding_txs` is empty (first-in-block), this behaves identically
     /// to `estimate_state_changes_gas`.
@@ -823,41 +823,22 @@ impl GasKillerEvmSketchDefault {
         preceding_txs: &[PrecedingTx],
         original: OriginalTx,
     ) -> Result<u64> {
-        let (mut cache_db, sim_env) = self.state_after_preceding(preceding_txs, original)?;
-        gas_analyzer_estimator::estimate_state_changes_gas(
-            &mut cache_db,
-            contract_address,
-            caller_address,
-            state_updates,
-            &sim_env,
-        )
+        self.mid_block_state(preceding_txs, original)?
+            .estimate_state_changes_gas(contract_address, caller_address, state_updates)
     }
 
-    /// Re-run [`Self::estimate_state_changes_gas_with_preceding`] under a call tracer and return
-    /// its call tree, e.g. to find the CALL behind a `RevertingContext` with
-    /// [`revert_trace::render_failed_call`].
-    pub fn trace_state_changes_with_preceding(
+    /// Replay `preceding_txs` once, for any number of estimates (and traced re-runs of failed
+    /// ones) against the state they leave.
+    pub fn mid_block_state(
         &self,
-        contract_address: Address,
-        caller_address: Address,
-        state_updates: &[StateUpdate],
         preceding_txs: &[PrecedingTx],
         original: OriginalTx,
-    ) -> Result<revm_inspectors::tracing::CallTraceArena> {
-        use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
-
-        let (mut cache_db, sim_env) = self.state_after_preceding(preceding_txs, original)?;
-        let inspector =
-            TracingInspector::new(TracingInspectorConfig::default_parity().set_record_logs(true));
-        let (_, inspector) = gas_analyzer_estimator::inspect_state_changes(
-            &mut cache_db,
-            contract_address,
-            caller_address,
-            state_updates,
-            &sim_env,
-            inspector,
-        )?;
-        Ok(inspector.into_traces())
+    ) -> Result<MidBlockState> {
+        let (db, sim_env) = self.state_after_preceding(preceding_txs, original)?;
+        Ok(MidBlockState {
+            db: std::sync::Arc::new(db),
+            sim_env,
+        })
     }
 
     /// The mid-block state `preceding_txs` leave, and the environment `original` ran in.
@@ -1053,9 +1034,8 @@ pub struct FrameTreeGas {
 }
 
 impl GasKillerEvmSketchDefault {
-    /// Prices `frames` (root first) against the mid-block state `preceding_txs` leave, the way
-    /// [`call_to_frame_tree_with_evmsketch`] prices a live tree: the frames run in execution order
-    /// on one state, and the per-frame nesting overhead is added for every frame past the root.
+    /// Prices `frames` (root first) against the mid-block state `preceding_txs` leave: see
+    /// [`MidBlockState::estimate_frame_tree_gas`].
     pub fn estimate_frame_tree_gas_with_preceding(
         &self,
         frames: &[FrameProgram],
@@ -1064,16 +1044,100 @@ impl GasKillerEvmSketchDefault {
         original: OriginalTx,
         cost: &NestingCostModel,
     ) -> Result<FrameTreeGas> {
-        let (mut cache_db, sim_env) = self.state_after_preceding(preceding_txs, original)?;
+        self.mid_block_state(preceding_txs, original)?
+            .estimate_frame_tree_gas(frames, sender, cost)
+    }
+}
+
+/// The state the transactions before the analyzed one leave, and the environment it ran in.
+///
+/// Built once by [`GasKillerEvmSketchDefault::mid_block_state`]. Every run here works on its own
+/// layer over it, so runs never see each other's writes, and a failed estimate can be re-run under
+/// a tracer without replaying the block again.
+pub struct MidBlockState {
+    /// Shared, not borrowed, so a layer over it is `'static` as revm's inspectors need.
+    db: std::sync::Arc<CacheDB<SimpleRpcDb>>,
+    sim_env: SimEnvOpts,
+}
+
+impl MidBlockState {
+    /// A fresh layer for one run.
+    fn layer(&self) -> CacheDB<std::sync::Arc<CacheDB<SimpleRpcDb>>> {
+        CacheDB::new(std::sync::Arc::clone(&self.db))
+    }
+
+    /// Gas to apply the flat program `state_updates` from `contract_address`: see
+    /// [`gas_analyzer_estimator::estimate_state_changes_gas`].
+    pub fn estimate_state_changes_gas(
+        &self,
+        contract_address: Address,
+        caller_address: Address,
+        state_updates: &[StateUpdate],
+    ) -> Result<u64> {
+        gas_analyzer_estimator::estimate_state_changes_gas(
+            &mut self.layer(),
+            contract_address,
+            caller_address,
+            state_updates,
+            &self.sim_env,
+        )
+    }
+
+    /// The call tree of the transaction [`Self::estimate_state_changes_gas`] runs, e.g. to find
+    /// the CALL behind a `RevertingContext` with [`revert_trace::render_failed_call`].
+    pub fn trace_state_changes(
+        &self,
+        contract_address: Address,
+        caller_address: Address,
+        state_updates: &[StateUpdate],
+    ) -> Result<revm_inspectors::tracing::CallTraceArena> {
+        let (_, inspector) = gas_analyzer_estimator::inspect_state_changes(
+            &mut self.layer(),
+            contract_address,
+            caller_address,
+            state_updates,
+            &self.sim_env,
+            revert_trace::tracer(),
+        )?;
+        Ok(inspector.into_traces())
+    }
+
+    /// Prices `frames` (root first) the way [`call_to_frame_tree_with_evmsketch`] prices a live
+    /// tree: the frames run in execution order on one state, and the per-frame nesting overhead is
+    /// added for every frame past the root.
+    pub fn estimate_frame_tree_gas(
+        &self,
+        frames: &[FrameProgram],
+        sender: Address,
+        cost: &NestingCostModel,
+    ) -> Result<FrameTreeGas> {
         let frame_gas = gas_analyzer_estimator::estimate_frame_tree_gas(
-            &mut cache_db,
+            &mut self.layer(),
             frames,
             sender,
-            sim_env.value,
-            &sim_env,
+            self.sim_env.value,
+            &self.sim_env,
         )?;
         let total = frame_tree_total(&frame_gas, cost);
         Ok(FrameTreeGas { frame_gas, total })
+    }
+
+    /// The call tree of the piece that failed when [`Self::estimate_frame_tree_gas`] ran
+    /// `frames`, or `None` if no piece failed.
+    pub fn trace_frame_tree_failure(
+        &self,
+        frames: &[FrameProgram],
+        sender: Address,
+    ) -> Option<revm_inspectors::tracing::CallTraceArena> {
+        gas_analyzer_estimator::inspect_frame_tree_failure(
+            &mut self.layer(),
+            frames,
+            sender,
+            self.sim_env.value,
+            &self.sim_env,
+            revert_trace::tracer,
+        )
+        .map(|inspector| inspector.into_traces())
     }
 }
 

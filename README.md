@@ -46,7 +46,7 @@ cargo run -- t 0x9add9d0f26bc6d867c1d6d41dda6287d9721a377cea42440250884f76d2a0fa
 ```
 When a replayed CALL reverts (`RevertingContext`), `--debug` also re-runs the estimate under a call
 tracer and prints that CALL's trace: every subcall it made, down to the frame the revert came from,
-with revert reasons decoded.
+with revert reasons decoded. With `--owned`, it traces the frame-tree piece that failed.
 
 ### Price a transaction as a nested settlement
 Pass `--owned` with the contracts that would integrate the SDK alongside the root (the
