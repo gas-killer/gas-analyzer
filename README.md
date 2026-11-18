@@ -17,7 +17,8 @@ This repository contains two surfaces:
    - create a smart contract
 
 ## Setup
-1. Clone the repository
+1. Clone the repository. The Rust crates don't need the submodules; the Solidity contracts do
+   (see [contracts/README.md](contracts/README.md), including a note for Windows).
 2. Copy the example environment file:
    ```bash
    cp .env.example .env

@@ -13,6 +13,25 @@ Solidity contracts used by the Gas Analyzer for on-chain gas estimation and inte
 ## Prerequisites
 
 - [Foundry](https://book.getfoundry.sh/getting-started/installation)
+- The git submodules: `git submodule update --init --recursive` (or clone with `--recursive`)
+
+### Windows
+
+The submodules nest six levels deep (solidity-sdk → eigenlayer-middleware → … → ds-test), and git
+keeps its own copy of each one under `.git/modules/`. The longest of those paths is 266 characters
+before the folder you cloned into, past Windows' 260-character `MAX_PATH`, so a recursive clone fails
+with `Filename too long`. Either:
+
+- let git use long paths, before cloning:
+  ```bash
+  git config --global core.longpaths true
+  ```
+  Other tools may still trip on the deepest checked-out files (up to 201 characters below the repo
+  root), so clone into a short folder such as `C:\src\gas-analyzer`. If they do, also enable long
+  paths in Windows (`LongPathsEnabled`, needs admin).
+- or work in WSL, which has no such limit.
+
+Building the Rust crates needs none of this: Cargo never fetches these submodules.
 
 ## Usage
 
