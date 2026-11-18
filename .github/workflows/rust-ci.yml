@@ -129,8 +129,8 @@ jobs:
       - name: cargo clippy (wasm crate)
         run: cargo clippy -p gas-killer-wasm --lib --tests -- -D warnings
 
-      - name: cargo test (wasm crate, native unit tests)
-        run: cargo test -p gas-killer-wasm --lib
+      - name: cargo test (wasm crate, native unit tests and recorded Geth traces)
+        run: cargo test -p gas-killer-wasm --lib --test geth_fixtures
 
       - name: wasm-pack test (node)
         run: wasm-pack test --node crates/wasm
