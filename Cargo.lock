@@ -9057,7 +9057,7 @@ dependencies = [
 [[package]]
 name = "sp1-cc-client-executor"
 version = "0.1.0"
-source = "git+https://github.com/BreadchainCoop/sp1-contract-call?rev=1f04b99f89df07a54e5c1f7e3b816dff75803850#1f04b99f89df07a54e5c1f7e3b816dff75803850"
+source = "git+https://github.com/BreadchainCoop/sp1-contract-call?rev=78ca0fa8c2df70e0f4c872301a932a3dd40e69bd#78ca0fa8c2df70e0f4c872301a932a3dd40e69bd"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9092,7 +9092,7 @@ dependencies = [
 [[package]]
 name = "sp1-cc-host-executor"
 version = "0.1.0"
-source = "git+https://github.com/BreadchainCoop/sp1-contract-call?rev=1f04b99f89df07a54e5c1f7e3b816dff75803850#1f04b99f89df07a54e5c1f7e3b816dff75803850"
+source = "git+https://github.com/BreadchainCoop/sp1-contract-call?rev=78ca0fa8c2df70e0f4c872301a932a3dd40e69bd#78ca0fa8c2df70e0f4c872301a932a3dd40e69bd"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
