@@ -2949,8 +2949,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         #[ignore = "spawns a local anvil; run with --ignored"]
         async fn test_nested_chain_splits_into_one_frame_per_consumer() {
-            let anvil =
-                LocalAnvil::spawn_with(&["--chain-id", &SEPOLIA_CHAIN_ID.to_string()]).await;
+            let anvil = spawn_as_sepolia().await;
             let chain = deploy_chain(&anvil.provider(), 5, None).await;
             let tree = frame_tree(&anvil, process_request(chain.router, 5), &FREE_NESTING).await;
 
@@ -3024,12 +3023,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         #[ignore = "spawns a local anvil; run with --ignored"]
         async fn test_historical_transaction_priced_with_an_owned_set() {
-            let anvil = LocalAnvil::spawn_with(&[
-                "--chain-id",
-                &SEPOLIA_CHAIN_ID.to_string(),
-                "--steps-tracing",
-            ])
-            .await;
+            let anvil = spawn_as_sepolia_with(&["--steps-tracing"]).await;
             let provider = anvil.provider();
             let chain = deploy_chain(&provider, 5, None).await;
             let hash = send(&provider, process_request(chain.router, 5)).await;
@@ -3099,8 +3093,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         #[ignore = "spawns a local anvil; run with --ignored"]
         async fn test_historical_replay_runs_at_the_original_gas_price() {
-            let anvil =
-                LocalAnvil::spawn_with(&["--chain-id", &SEPOLIA_CHAIN_ID.to_string()]).await;
+            let anvil = spawn_as_sepolia().await;
             let provider = anvil.provider();
             let gate = Address::repeat_byte(0x6a);
             // if GASPRICE < 1 gwei: REVERT
@@ -3162,15 +3155,8 @@ mod tests {
             use revm::database_interface::DatabaseRef;
             use revm::state::{AccountInfo, Bytecode};
 
-            // The estimator prices Sepolia under Osaka (see `runs_unsupported_hardfork`); pin
-            // anvil to it so chain and replay charge the same fork whatever anvil's default.
-            let anvil = LocalAnvil::spawn_with(&[
-                "--chain-id",
-                &SEPOLIA_CHAIN_ID.to_string(),
-                "--hardfork",
-                "osaka",
-            ])
-            .await;
+            // Pinned to Osaka, so chain and replay charge the same fork: see `spawn_as_sepolia`.
+            let anvil = spawn_as_sepolia().await;
             let provider = anvil.provider();
             let probe = Address::repeat_byte(0x5a);
             // SSTORE(0, 1); SSTORE(1, GAS); STOP
@@ -3291,8 +3277,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         #[ignore = "spawns a local anvil; run with --ignored"]
         async fn test_callee_on_another_registry_stays_a_call() {
-            let anvil =
-                LocalAnvil::spawn_with(&["--chain-id", &SEPOLIA_CHAIN_ID.to_string()]).await;
+            let anvil = spawn_as_sepolia().await;
             let other_registry = deploy_registry(&anvil.provider()).await;
             let chain = deploy_chain(&anvil.provider(), 5, Some(other_registry)).await;
             let tree = frame_tree(&anvil, process_request(chain.router, 5), &FREE_NESTING).await;
@@ -3314,8 +3299,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         #[ignore = "spawns a local anvil; run with --ignored"]
         async fn test_cheap_callees_stay_calls() {
-            let anvil =
-                LocalAnvil::spawn_with(&["--chain-id", &SEPOLIA_CHAIN_ID.to_string()]).await;
+            let anvil = spawn_as_sepolia().await;
             let chain = deploy_chain(&anvil.provider(), 1, None).await;
             let tree = frame_tree(
                 &anvil,
@@ -3567,8 +3551,22 @@ mod tests {
         /// [`chain_id_to_genesis_and_spec`] only knows mainnet, Sepolia, and Gnosis — anvil's
         /// default 31337 has no genesis or hardfork schedule to anchor a `SpecId` against.
         /// Tests that stop at extraction do not need this; ones that go through the estimate do.
+        ///
+        /// Pinned to Osaka, the fork the estimator prices Sepolia under (see
+        /// `runs_unsupported_hardfork`). Anvil's default follows Sepolia's schedule, which from
+        /// foundry 1.9 includes Amsterdam: its state-creation repricing makes the node charge
+        /// several times the replay's gas for new slots, so a call that fits its gas limit under
+        /// Osaka runs out of gas on the node.
         async fn spawn_as_sepolia() -> LocalAnvil {
-            LocalAnvil::spawn_with(&["--chain-id", &SEPOLIA_CHAIN_ID.to_string()]).await
+            spawn_as_sepolia_with(&[]).await
+        }
+
+        /// [`spawn_as_sepolia`] with extra anvil flags.
+        async fn spawn_as_sepolia_with(extra_args: &[&str]) -> LocalAnvil {
+            let chain_id = SEPOLIA_CHAIN_ID.to_string();
+            let mut args = vec!["--chain-id", chain_id.as_str(), "--hardfork", "osaka"];
+            args.extend_from_slice(extra_args);
+            LocalAnvil::spawn_with(&args).await
         }
 
         /// Run the full profiled entry point against anvil, so the assembled phase timings are
