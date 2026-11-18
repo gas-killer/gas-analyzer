@@ -311,46 +311,49 @@ where
         .map_err(|e| anyhow!("Failed to write IMPL_SLOT: {:?}", e))
 }
 
-/// Call the estimator at `contract_address` with `calldata`, committing its writes when `commit`.
-fn run_estimator<DB>(
-    cache_db: &mut CacheDB<DB>,
-    contract_address: Address,
-    caller_address: Address,
-    calldata: Bytes,
-    value: U256,
-    sim_env: &SimEnvOpts,
-    commit: bool,
-) -> Result<u64>
+/// Credit the caller with `value` on top of its balance.
+///
+/// disable_balance_check skips the *pre-flight* check on the caller, but revm still debits the
+/// caller during the call's value transfer. If the caller's balance can't cover `value`, the proxy
+/// ends up under-credited and any pass-through CALL with `value > 0` halts with OutOfFunds. Top up
+/// the caller so the transfer is always well-defined.
+fn top_up_caller<DB>(cache_db: &mut CacheDB<DB>, caller_address: Address, value: U256)
 where
     DB: revm::database_interface::DatabaseRef,
     <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
 {
-    use revm::context::{Context, TxEnv};
     use revm::database_interface::DatabaseRef;
-    use revm::{ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext};
 
-    // disable_balance_check skips the *pre-flight* check on the caller, but
-    // revm still debits the caller during the call's value transfer. If the
-    // caller's balance can't cover `value`, the proxy ends up
-    // under-credited and any pass-through CALL with `value > 0` halts with
-    // OutOfFunds. Top up the caller so the transfer is always well-defined.
-    if !value.is_zero() {
-        let caller_account = cache_db
-            .basic_ref(caller_address)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        cache_db.insert_account_info(
-            caller_address,
-            AccountInfo {
-                balance: caller_account.balance.saturating_add(value),
-                ..caller_account
-            },
-        );
+    if value.is_zero() {
+        return;
     }
+    let caller_account = cache_db
+        .basic_ref(caller_address)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    cache_db.insert_account_info(
+        caller_address,
+        AccountInfo {
+            balance: caller_account.balance.saturating_add(value),
+            ..caller_account
+        },
+    );
+}
 
-    let ctx = Context::mainnet()
-        .with_db(&mut *cache_db)
+/// The block and config the estimator runs under, over `cache_db`.
+fn estimator_context<'a, DB>(
+    cache_db: &'a mut CacheDB<DB>,
+    sim_env: &SimEnvOpts,
+) -> revm::handler::MainnetContext<&'a mut CacheDB<DB>>
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+{
+    use revm::{Context, MainContext};
+
+    Context::mainnet()
+        .with_db(cache_db)
         .modify_cfg_chained(|cfg| {
             cfg.disable_nonce_check = true;
             cfg.disable_balance_check = true;
@@ -366,21 +369,47 @@ where
             block.prevrandao = Some(sim_env.prevrandao);
             block.basefee = sim_env.basefee;
             block.difficulty = sim_env.difficulty;
-        });
+        })
+}
 
-    let mut evm = ctx.build_mainnet();
-
-    let tx_gas_limit = effective_tx_gas_limit(sim_env.gas_limit, sim_env.spec);
-
-    let tx = TxEnv::builder()
+/// The transaction calling the estimator at `contract_address` with `calldata`.
+fn estimator_tx(
+    contract_address: Address,
+    caller_address: Address,
+    calldata: Bytes,
+    value: U256,
+    sim_env: &SimEnvOpts,
+) -> Result<revm::context::TxEnv> {
+    revm::context::TxEnv::builder()
         .caller(caller_address)
-        .kind(revm::primitives::TxKind::Call(contract_address))
+        .kind(TxKind::Call(contract_address))
         .data(calldata)
         .value(value)
-        .gas_limit(tx_gas_limit)
+        .gas_limit(effective_tx_gas_limit(sim_env.gas_limit, sim_env.spec))
         .gas_price(sim_env.gas_price)
         .build()
-        .map_err(|e| anyhow!("Failed to build tx env: {:?}", e))?;
+        .map_err(|e| anyhow!("Failed to build tx env: {:?}", e))
+}
+
+/// Call the estimator at `contract_address` with `calldata`, committing its writes when `commit`.
+fn run_estimator<DB>(
+    cache_db: &mut CacheDB<DB>,
+    contract_address: Address,
+    caller_address: Address,
+    calldata: Bytes,
+    value: U256,
+    sim_env: &SimEnvOpts,
+    commit: bool,
+) -> Result<u64>
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+{
+    use revm::{ExecuteCommitEvm, ExecuteEvm, MainBuilder};
+
+    top_up_caller(cache_db, caller_address, value);
+    let tx = estimator_tx(contract_address, caller_address, calldata, value, sim_env)?;
+    let mut evm = estimator_context(cache_db, sim_env).build_mainnet();
 
     let result = if commit {
         evm.transact_commit(tx)
@@ -406,6 +435,46 @@ where
             reason
         )),
     }
+}
+
+/// Run the transaction [`estimate_state_changes_gas`] runs, under `inspector`, and return its
+/// result with the inspector.
+///
+/// Used to see why an estimate failed (e.g. a trace of the CALL behind a `RevertingContext`).
+/// `cache_db` gets the same funding and estimator injection; the transaction's own writes are not
+/// committed.
+pub fn inspect_state_changes<DB, I>(
+    cache_db: &mut CacheDB<DB>,
+    contract_address: Address,
+    caller_address: Address,
+    state_updates: &[StateUpdate],
+    sim_env: &SimEnvOpts,
+    inspector: I,
+) -> Result<(ExecutionResult, I)>
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+    I: for<'a> revm::Inspector<revm::handler::MainnetContext<&'a mut CacheDB<DB>>>,
+{
+    use revm::{InspectEvm, MainBuilder};
+
+    let calldata = build_gas_estimation_calldata(state_updates)?;
+    fund_value_calls(cache_db, contract_address, call_value_total(state_updates));
+    inject_estimator(cache_db, contract_address)?;
+    top_up_caller(cache_db, caller_address, sim_env.value);
+    let tx = estimator_tx(
+        contract_address,
+        caller_address,
+        calldata,
+        sim_env.value,
+        sim_env,
+    )?;
+    let mut evm = estimator_context(cache_db, sim_env).build_mainnet_with_inspector(inspector);
+    let result = evm
+        .inspect_tx(tx)
+        .map_err(|e| anyhow!("Gas estimation failed: {:?}", e))?
+        .result;
+    Ok((result, evm.inspector))
 }
 
 /// Estimate gas for executing a set of state updates.

@@ -32,6 +32,50 @@ fn decode_reverting_context(e: &anyhow::Error) -> Option<RevertingContext> {
 #[cfg(feature = "evmsketch")]
 use alloy_eips::BlockNumberOrTag;
 
+/// With `--debug`: re-run the failed estimate under a call tracer and print the trace of the
+/// CALL behind `ctx`, so the user sees where the revert starts. Failures here only print a note:
+/// the estimate has already fallen back to the heuristic.
+#[cfg(feature = "evmsketch")]
+fn print_failed_call_trace(
+    gk: &gas_analyzer_evmsketch::GasKillerEvmSketchDefault,
+    ctx: &RevertingContext,
+    contract_address: alloy::primitives::Address,
+    caller_address: alloy::primitives::Address,
+    state_updates: &[gas_analyzer_core::StateUpdate],
+    preceding_txs: &[gas_analyzer_evmsketch::PrecedingTx],
+    original: gas_analyzer_evmsketch::OriginalTx,
+) {
+    use gas_analyzer_evmsketch::revert_trace::render_failed_call;
+
+    let arena = match gk.trace_state_changes_with_preceding(
+        contract_address,
+        caller_address,
+        state_updates,
+        preceding_txs,
+        original,
+    ) {
+        Ok(arena) => arena,
+        Err(e) => {
+            println!(
+                "   Could not trace the failing call: {}",
+                redact_rpc_url(&format!("{e:#}"))
+            );
+            return;
+        }
+    };
+    let colors = colored::control::SHOULD_COLORIZE.should_colorize();
+    match render_failed_call(&arena, ctx.target, &ctx.callargs, colors) {
+        Some(trace) => {
+            println!("\n{}", "=== Failing Call Trace ===".red().bold());
+            print!("{trace}");
+        }
+        None => println!(
+            "   Could not trace the failing call: the traced re-run made no failed CALL to {}",
+            ctx.target
+        ),
+    }
+}
+
 enum Commands {
     Transaction(String),
     Request(String),
@@ -572,6 +616,15 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                                         println!(
                                             "   Call args:   0x{}",
                                             hex::encode(&ctx.callargs)
+                                        );
+                                        print_failed_call_trace(
+                                            &gk,
+                                            &ctx,
+                                            to,
+                                            tx_sender,
+                                            &extract.state_updates,
+                                            &preceding_txs,
+                                            original_tx,
                                         );
                                     }
                                 }

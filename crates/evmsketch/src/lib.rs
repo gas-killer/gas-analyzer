@@ -133,6 +133,7 @@ fn warn_if_unsupported_hardfork(chain_id: u64, hardforks: &EthereumChainHardfork
     }
 }
 
+pub mod revert_trace;
 pub mod simple_rpc_db;
 use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
 
@@ -153,7 +154,8 @@ use gas_analyzer_core::{
     encode_state_updates_to_abi, estimate_gas_from_operations, extract_operation_counts_from_trace,
     frame_failure, validate_unbounded_cost, validate_unbounded_tree_cost,
 };
-use gas_analyzer_estimator::{PrecedingTx, SimEnvOpts};
+pub use gas_analyzer_estimator::PrecedingTx;
+use gas_analyzer_estimator::SimEnvOpts;
 use gas_analyzer_rpc::{
     MuxedTraces, get_call_frame_from_call_with_profile,
     get_prestate_diff_and_call_frame_with_profile, get_prestate_diff_from_call_with_profile,
@@ -829,6 +831,33 @@ impl GasKillerEvmSketchDefault {
             state_updates,
             &sim_env,
         )
+    }
+
+    /// Re-run [`Self::estimate_state_changes_gas_with_preceding`] under a call tracer and return
+    /// its call tree, e.g. to find the CALL behind a `RevertingContext` with
+    /// [`revert_trace::render_failed_call`].
+    pub fn trace_state_changes_with_preceding(
+        &self,
+        contract_address: Address,
+        caller_address: Address,
+        state_updates: &[StateUpdate],
+        preceding_txs: &[PrecedingTx],
+        original: OriginalTx,
+    ) -> Result<revm_inspectors::tracing::CallTraceArena> {
+        use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
+
+        let (mut cache_db, sim_env) = self.state_after_preceding(preceding_txs, original)?;
+        let inspector =
+            TracingInspector::new(TracingInspectorConfig::default_parity().set_record_logs(true));
+        let (_, inspector) = gas_analyzer_estimator::inspect_state_changes(
+            &mut cache_db,
+            contract_address,
+            caller_address,
+            state_updates,
+            &sim_env,
+            inspector,
+        )?;
+        Ok(inspector.into_traces())
     }
 
     /// The mid-block state `preceding_txs` leave, and the environment `original` ran in.
