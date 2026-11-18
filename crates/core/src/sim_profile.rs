@@ -137,6 +137,9 @@ impl From<SimProfile> for sp1_cc_client_executor::EnvOverrides {
         Self {
             block_gas_limit: profile.block_gas_limit_override(),
             tx_gas_limit: profile.tx_gas_limit_override(),
+            // No environment commitment: the hash stays the gas-limits-only form, bit-identical
+            // to the one produced before sp1-contract-call added the field.
+            env_commitment: None,
         }
     }
 }
@@ -548,6 +551,7 @@ mod tests {
         let unbounded: EnvOverrides = SimProfile::Unbounded.into();
         assert_eq!(unbounded.block_gas_limit, Some(UNBOUNDED_BLOCK_GAS_LIMIT));
         assert_eq!(unbounded.tx_gas_limit, Some(UNBOUNDED_TX_GAS_LIMIT));
+        assert_eq!(unbounded.env_commitment, None);
 
         // What the EVM and the chainConfigHash both end up using. Pinned
         // against a realistic header limit so a future divergence between the
