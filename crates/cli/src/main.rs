@@ -1,8 +1,6 @@
 #[cfg(feature = "evmsketch")]
 use alloy::consensus::Transaction as _;
 use alloy::primitives::B256;
-#[cfg(feature = "evmsketch")]
-use alloy::sol_types::SolError;
 use alloy::{hex, providers::ProviderBuilder};
 use alloy_provider::Provider;
 use anyhow::{Context as _, Result};
@@ -12,25 +10,40 @@ use gas_analyzer_core::RevertingContext;
 use std::env;
 use url::Url;
 
-/// Try to decode a `RevertingContext` error from an anyhow error.
-///
-/// Looks for hex-encoded revert data in the error message (the format revm
-/// produces: "Gas estimation reverted (gas: N): 0x...") and attempts to
-/// ABI-decode it as a `RevertingContext`.
-#[cfg(feature = "evmsketch")]
-fn decode_reverting_context(e: &anyhow::Error) -> Option<RevertingContext> {
-    let msg = format!("{e:?}");
-    let hex_start = msg.rfind("0x")?;
-    let hex_body = &msg[hex_start + 2..];
-    let hex_end = hex_body
-        .find(|c: char| !c.is_ascii_hexdigit())
-        .unwrap_or(hex_body.len());
-    let bytes = hex::decode(&hex_body[..hex_end]).ok()?;
-    RevertingContext::abi_decode(&bytes).ok()
-}
-
 #[cfg(feature = "evmsketch")]
 use alloy_eips::BlockNumberOrTag;
+
+/// With `--debug`: print the trace of the CALL behind `ctx` from `arena`, a traced re-run of the
+/// failed estimate, so the user sees where the revert starts. Failures here only print a note.
+#[cfg(feature = "evmsketch")]
+fn print_failed_call_trace(
+    arena: Result<gas_analyzer_evmsketch::revert_trace::CallTraceArena>,
+    ctx: &RevertingContext,
+) {
+    use gas_analyzer_evmsketch::revert_trace::render_failed_call;
+
+    let arena = match arena {
+        Ok(arena) => arena,
+        Err(e) => {
+            println!(
+                "   Could not trace the failing call: {}",
+                redact_rpc_url(&format!("{e:#}"))
+            );
+            return;
+        }
+    };
+    let colors = colored::control::SHOULD_COLORIZE.should_colorize();
+    match render_failed_call(&arena, ctx.target, &ctx.callargs, colors) {
+        Some(trace) => {
+            println!("\n{}", "=== Failing Call Trace ===".red().bold());
+            print!("{trace}");
+        }
+        None => println!(
+            "   Could not trace the failing call: the traced re-run made no failed CALL to {}",
+            ctx.target
+        ),
+    }
+}
 
 enum Commands {
     Transaction(String),
@@ -312,6 +325,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     tx_index,
                     gas_used,
                     owned: &owned,
+                    debug: cli_args.debug,
                 })
                 .await;
                 #[cfg(not(feature = "evmsketch"))]
@@ -539,14 +553,21 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                         );
                     }
 
-                    // Try measured gas estimation with preceding tx replay
-                    match gk.estimate_state_changes_gas_with_preceding(
-                        to,
-                        tx_sender,
-                        &extract.state_updates,
-                        &preceding_txs,
-                        original_tx,
-                    ) {
+                    // Try measured gas estimation with preceding tx replay. The replayed state
+                    // is kept so `--debug` can trace a failed estimate without replaying again.
+                    let (mid_block, estimate) =
+                        match gk.mid_block_state(&preceding_txs, original_tx) {
+                            Ok(mid_block) => {
+                                let estimate = mid_block.estimate_state_changes_gas(
+                                    to,
+                                    tx_sender,
+                                    &extract.state_updates,
+                                );
+                                (Some(mid_block), estimate)
+                            }
+                            Err(e) => (None, Err(e)),
+                        };
+                    match estimate {
                         Ok(gas) => (gas, false),
                         Err(e) => {
                             // Fall back to heuristic estimation
@@ -554,7 +575,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                                 "{}",
                                 "Warning: Measured gas estimation failed, using heuristic".yellow()
                             );
-                            match decode_reverting_context(&e) {
+                            match gas_analyzer_evmsketch::reverting_context(&e) {
                                 Some(ctx) => {
                                     println!(
                                         "   Reason: {} CALL #{} to {} reverted",
@@ -573,6 +594,18 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                                             "   Call args:   0x{}",
                                             hex::encode(&ctx.callargs)
                                         );
+                                        // A RevertingContext comes from the estimate, which
+                                        // ran on the replayed state.
+                                        if let Some(mid_block) = &mid_block {
+                                            print_failed_call_trace(
+                                                mid_block.trace_state_changes(
+                                                    to,
+                                                    tx_sender,
+                                                    &extract.state_updates,
+                                                ),
+                                                &ctx,
+                                            );
+                                        }
                                     }
                                 }
                                 None => {
@@ -862,7 +895,7 @@ mod what_if {
     use colored::Colorize;
     use gas_analyzer_core::SignatureType;
     use gas_analyzer_core::nested::{
-        NESTING_COST_MODEL_V1, compute_frame_tree_hypothetical, unnested_owned,
+        FrameProgram, NESTING_COST_MODEL_V1, compute_frame_tree_hypothetical, unnested_owned,
     };
     use gas_analyzer_evmsketch::{GasKillerEvmSketchDefault, OriginalTx};
     use std::collections::BTreeSet;
@@ -879,6 +912,8 @@ mod what_if {
         pub tx_index: u64,
         pub gas_used: u64,
         pub owned: &'a [Address],
+        /// Trace the CALL behind a failed estimate.
+        pub debug: bool,
     }
 
     pub async fn run<P: Provider + DebugApi>(inputs: Inputs<'_, P>) -> Result<()> {
@@ -894,6 +929,7 @@ mod what_if {
             tx_index,
             gas_used,
             owned,
+            debug,
         } = inputs;
         let owned: BTreeSet<Address> = owned.iter().copied().filter(|a| *a != root).collect();
         let cost = NESTING_COST_MODEL_V1;
@@ -917,20 +953,32 @@ mod what_if {
                          (tx index {tx_index})"
                     )
                 })?;
-        let flat_gas = gk.estimate_frame_tree_gas_with_preceding(
-            &flat.frames,
-            sender,
-            &preceding,
-            original,
-            &cost,
-        )?;
-        let nested_gas = gk.estimate_frame_tree_gas_with_preceding(
-            &nested.frames,
-            sender,
-            &preceding,
-            original,
-            &cost,
-        )?;
+        // Replayed once: both trees, and a traced re-run of a failed one, start from this state.
+        let mid_block = gk.mid_block_state(&preceding, original)?;
+        let estimate = |frames: &[FrameProgram]| {
+            mid_block
+                .estimate_frame_tree_gas(frames, sender, &cost)
+                .inspect_err(|e| {
+                    if !debug {
+                        return;
+                    }
+                    let Some(ctx) = gas_analyzer_evmsketch::reverting_context(e) else {
+                        return;
+                    };
+                    println!(
+                        "{}: CALL #{} to {} reverted",
+                        "RevertingContext".red(),
+                        ctx.index,
+                        ctx.target
+                    );
+                    let arena = mid_block
+                        .trace_frame_tree_failure(frames, sender)
+                        .ok_or_else(|| anyhow::anyhow!("no piece failed in the traced re-run"));
+                    super::print_failed_call_trace(arena, &ctx);
+                })
+        };
+        let flat_gas = estimate(&flat.frames)?;
+        let nested_gas = estimate(&nested.frames)?;
 
         println!("\n{}", "=== Nested Settlement What-If ===".blue().bold());
         println!("Transaction: {tx_hash}");

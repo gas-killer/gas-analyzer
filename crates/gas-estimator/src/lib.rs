@@ -14,6 +14,7 @@ use std::sync::{LazyLock, OnceLock};
 use alloy_dyn_abi::DynSolValue;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use anyhow::{Result, anyhow};
+use revm::context::TxEnv;
 use revm::context::result::ExecutionResult;
 use revm::context_interface::transaction::{AccessList, SignedAuthorization};
 use revm::database::CacheDB;
@@ -24,7 +25,7 @@ use revm::state::AccountInfo;
 use gas_analyzer_core::encoding::encode_state_updates_to_sol;
 use gas_analyzer_core::heuristic::BASE_TX_COST;
 use gas_analyzer_core::nested::FrameProgram;
-use gas_analyzer_core::types::StateUpdate;
+use gas_analyzer_core::types::{RevertingContext, StateUpdate};
 
 /// EIP-7825 per-tx gas cap, activated in Osaka (Fusaka). The block gas limit
 /// can exceed this, but a single tx cannot use more than `2^24` gas.
@@ -311,46 +312,49 @@ where
         .map_err(|e| anyhow!("Failed to write IMPL_SLOT: {:?}", e))
 }
 
-/// Call the estimator at `contract_address` with `calldata`, committing its writes when `commit`.
-fn run_estimator<DB>(
-    cache_db: &mut CacheDB<DB>,
-    contract_address: Address,
-    caller_address: Address,
-    calldata: Bytes,
-    value: U256,
-    sim_env: &SimEnvOpts,
-    commit: bool,
-) -> Result<u64>
+/// Credit the caller with `value` on top of its balance.
+///
+/// disable_balance_check skips the *pre-flight* check on the caller, but revm still debits the
+/// caller during the call's value transfer. If the caller's balance can't cover `value`, the proxy
+/// ends up under-credited and any pass-through CALL with `value > 0` halts with OutOfFunds. Top up
+/// the caller so the transfer is always well-defined.
+fn top_up_caller<DB>(cache_db: &mut CacheDB<DB>, caller_address: Address, value: U256)
 where
     DB: revm::database_interface::DatabaseRef,
     <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
 {
-    use revm::context::{Context, TxEnv};
     use revm::database_interface::DatabaseRef;
-    use revm::{ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext};
 
-    // disable_balance_check skips the *pre-flight* check on the caller, but
-    // revm still debits the caller during the call's value transfer. If the
-    // caller's balance can't cover `value`, the proxy ends up
-    // under-credited and any pass-through CALL with `value > 0` halts with
-    // OutOfFunds. Top up the caller so the transfer is always well-defined.
-    if !value.is_zero() {
-        let caller_account = cache_db
-            .basic_ref(caller_address)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        cache_db.insert_account_info(
-            caller_address,
-            AccountInfo {
-                balance: caller_account.balance.saturating_add(value),
-                ..caller_account
-            },
-        );
+    if value.is_zero() {
+        return;
     }
+    let caller_account = cache_db
+        .basic_ref(caller_address)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    cache_db.insert_account_info(
+        caller_address,
+        AccountInfo {
+            balance: caller_account.balance.saturating_add(value),
+            ..caller_account
+        },
+    );
+}
 
-    let ctx = Context::mainnet()
-        .with_db(&mut *cache_db)
+/// The block and config the estimator runs under, over `cache_db`.
+fn estimator_context<'a, DB>(
+    cache_db: &'a mut CacheDB<DB>,
+    sim_env: &SimEnvOpts,
+) -> revm::handler::MainnetContext<&'a mut CacheDB<DB>>
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+{
+    use revm::{Context, MainContext};
+
+    Context::mainnet()
+        .with_db(cache_db)
         .modify_cfg_chained(|cfg| {
             cfg.disable_nonce_check = true;
             cfg.disable_balance_check = true;
@@ -366,38 +370,71 @@ where
             block.prevrandao = Some(sim_env.prevrandao);
             block.basefee = sim_env.basefee;
             block.difficulty = sim_env.difficulty;
-        });
+        })
+}
 
-    let mut evm = ctx.build_mainnet();
-
-    let tx_gas_limit = effective_tx_gas_limit(sim_env.gas_limit, sim_env.spec);
-
-    let tx = TxEnv::builder()
+/// The transaction calling the estimator at `contract_address` with `calldata`.
+fn estimator_tx(
+    contract_address: Address,
+    caller_address: Address,
+    calldata: Bytes,
+    value: U256,
+    sim_env: &SimEnvOpts,
+) -> Result<TxEnv> {
+    TxEnv::builder()
         .caller(caller_address)
-        .kind(revm::primitives::TxKind::Call(contract_address))
+        .kind(TxKind::Call(contract_address))
         .data(calldata)
         .value(value)
-        .gas_limit(tx_gas_limit)
+        .gas_limit(effective_tx_gas_limit(sim_env.gas_limit, sim_env.spec))
         .gas_price(sim_env.gas_price)
         .build()
-        .map_err(|e| anyhow!("Failed to build tx env: {:?}", e))?;
+        .map_err(|e| anyhow!("Failed to build tx env: {:?}", e))
+}
 
-    let result = if commit {
-        evm.transact_commit(tx)
-    } else {
-        evm.transact(tx).map(|r| r.result)
+/// The estimator transaction reverted.
+///
+/// Displays as `Gas estimation reverted (gas: N): 0x<output>`. [`reverting_context`] reads
+/// `output` back from an error chain, so callers need not parse that message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EstimateReverted {
+    pub gas_used: u64,
+    /// The revert data: a `RevertingContext` when a replayed CALL reverted.
+    pub output: Bytes,
+}
+
+impl std::fmt::Display for EstimateReverted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Gas estimation reverted (gas: {}): {}",
+            self.gas_used, self.output
+        )
     }
-    .map_err(|e| anyhow!("Gas estimation failed: {:?}", e))?;
+}
 
+impl std::error::Error for EstimateReverted {}
+
+/// The `RevertingContext` an estimate failed with, when a replayed CALL reverted.
+///
+/// Looks through `err`'s whole chain, so context added on top (e.g. a frame tree's frame and
+/// piece) does not hide it.
+pub fn reverting_context(err: &anyhow::Error) -> Option<RevertingContext> {
+    use alloy_sol_types::SolError;
+
+    let reverted = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<EstimateReverted>())?;
+    RevertingContext::abi_decode(&reverted.output).ok()
+}
+
+/// The estimator run's gas, or why it failed.
+fn estimator_outcome(result: ExecutionResult) -> Result<u64> {
     match result {
         ExecutionResult::Success { gas_used, .. } => Ok(gas_used),
-        ExecutionResult::Revert {
-            output, gas_used, ..
-        } => Err(anyhow!(
-            "Gas estimation reverted (gas: {}): {}",
-            gas_used,
-            output
-        )),
+        ExecutionResult::Revert { output, gas_used } => {
+            Err(EstimateReverted { gas_used, output }.into())
+        }
         ExecutionResult::Halt {
             reason, gas_used, ..
         } => Err(anyhow!(
@@ -408,10 +445,148 @@ where
     }
 }
 
+/// Run the estimator transaction `tx`, committing its writes when `commit`.
+fn execute_estimator<DB>(
+    cache_db: &mut CacheDB<DB>,
+    tx: TxEnv,
+    sim_env: &SimEnvOpts,
+    commit: bool,
+) -> Result<u64>
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+{
+    use revm::{ExecuteCommitEvm, ExecuteEvm, MainBuilder};
+
+    let mut evm = estimator_context(cache_db, sim_env).build_mainnet();
+    let result = if commit {
+        evm.transact_commit(tx)
+    } else {
+        evm.transact(tx).map(|r| r.result)
+    }
+    .map_err(|e| anyhow!("Gas estimation failed: {:?}", e))?;
+    estimator_outcome(result)
+}
+
+/// Top up the caller for `value` and build the transaction calling the estimator at
+/// `contract_address` with `calldata`.
+fn prepare_estimator_tx<DB>(
+    cache_db: &mut CacheDB<DB>,
+    contract_address: Address,
+    caller_address: Address,
+    calldata: Bytes,
+    value: U256,
+    sim_env: &SimEnvOpts,
+) -> Result<TxEnv>
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+{
+    top_up_caller(cache_db, caller_address, value);
+    estimator_tx(contract_address, caller_address, calldata, value, sim_env)
+}
+
+/// Call the estimator at `contract_address` with `calldata`, committing its writes when `commit`.
+fn run_estimator<DB>(
+    cache_db: &mut CacheDB<DB>,
+    contract_address: Address,
+    caller_address: Address,
+    calldata: Bytes,
+    value: U256,
+    sim_env: &SimEnvOpts,
+    commit: bool,
+) -> Result<u64>
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+{
+    let tx = prepare_estimator_tx(
+        cache_db,
+        contract_address,
+        caller_address,
+        calldata,
+        value,
+        sim_env,
+    )?;
+    execute_estimator(cache_db, tx, sim_env, commit)
+}
+
+/// Prepare `cache_db` for the transaction applying `state_updates` (fund the value calls, inject
+/// the estimator, top up the caller) and return that transaction.
+///
+/// [`estimate_state_changes_gas`] and [`inspect_state_changes`] both start here, so a traced
+/// re-run always runs the transaction that failed.
+fn prepare_state_changes<DB>(
+    cache_db: &mut CacheDB<DB>,
+    contract_address: Address,
+    caller_address: Address,
+    state_updates: &[StateUpdate],
+    sim_env: &SimEnvOpts,
+) -> Result<TxEnv>
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+{
+    debug_assert!(
+        !state_updates
+            .iter()
+            .any(|update| matches!(update, StateUpdate::Nested(_))),
+        "estimate_state_changes_gas takes a flat program; price nested trees with \
+         estimate_frame_tree_gas"
+    );
+    let calldata = build_gas_estimation_calldata(state_updates)?;
+    fund_value_calls(cache_db, contract_address, call_value_total(state_updates));
+    inject_estimator(cache_db, contract_address)?;
+    prepare_estimator_tx(
+        cache_db,
+        contract_address,
+        caller_address,
+        calldata,
+        sim_env.value,
+        sim_env,
+    )
+}
+
+/// Run the transaction [`estimate_state_changes_gas`] runs, under `inspector`, and return its
+/// result with the inspector.
+///
+/// Used to see why an estimate failed (e.g. a trace of the CALL behind a `RevertingContext`).
+/// `cache_db` gets the same funding and estimator injection; the transaction's own writes are not
+/// committed.
+pub fn inspect_state_changes<DB, I>(
+    cache_db: &mut CacheDB<DB>,
+    contract_address: Address,
+    caller_address: Address,
+    state_updates: &[StateUpdate],
+    sim_env: &SimEnvOpts,
+    inspector: I,
+) -> Result<(ExecutionResult, I)>
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+    I: for<'a> revm::Inspector<revm::handler::MainnetContext<&'a mut CacheDB<DB>>>,
+{
+    use revm::{InspectEvm, MainBuilder};
+
+    let tx = prepare_state_changes(
+        cache_db,
+        contract_address,
+        caller_address,
+        state_updates,
+        sim_env,
+    )?;
+    let mut evm = estimator_context(cache_db, sim_env).build_mainnet_with_inspector(inspector);
+    let result = evm
+        .inspect_tx(tx)
+        .map_err(|e| anyhow!("Gas estimation failed: {:?}", e))?
+        .result;
+    Ok((result, evm.inspector))
+}
+
 /// Estimate gas for executing a set of state updates.
 ///
-/// This is a convenience function that builds the calldata from state updates
-/// and then calls `estimate_gas_raw`.
+/// This is a convenience function that builds the calldata from state updates and runs it the
+/// way [`estimate_gas_raw`] does, after funding the contract for its value calls.
 ///
 /// # Arguments
 /// * `cache_db` - A CacheDB wrapping any database backend
@@ -433,23 +608,14 @@ where
     DB: revm::database_interface::DatabaseRef,
     <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
 {
-    debug_assert!(
-        !state_updates
-            .iter()
-            .any(|update| matches!(update, StateUpdate::Nested(_))),
-        "estimate_state_changes_gas takes a flat program; price nested trees with \
-         estimate_frame_tree_gas"
-    );
-    let calldata = build_gas_estimation_calldata(state_updates)?;
-    fund_value_calls(cache_db, contract_address, call_value_total(state_updates));
-
-    estimate_gas_raw(
+    let tx = prepare_state_changes(
         cache_db,
         contract_address,
         caller_address,
-        calldata,
+        state_updates,
         sim_env,
-    )
+    )?;
+    execute_estimator(cache_db, tx, sim_env, false)
 }
 
 // ============================================================================
@@ -479,6 +645,74 @@ where
     DB: revm::database_interface::DatabaseRef,
     <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
 {
+    run_frame_tree(
+        cache_db,
+        frames,
+        caller_address,
+        root_value,
+        sim_env,
+        |db, tx| execute_estimator(db, tx, sim_env, true),
+    )
+}
+
+/// Run the pieces [`estimate_frame_tree_gas`] runs, each under a fresh inspector from
+/// `new_inspector`, and return the inspector of the piece that reverted or halted.
+///
+/// `None` if no piece failed (the tree ran, or it was rejected before a piece failed). Used to see
+/// why a frame tree's estimate failed, e.g. a trace of the CALL behind a `RevertingContext`.
+pub fn inspect_frame_tree_failure<DB, I>(
+    cache_db: &mut CacheDB<DB>,
+    frames: &[FrameProgram],
+    caller_address: Address,
+    root_value: U256,
+    sim_env: &SimEnvOpts,
+    mut new_inspector: impl FnMut() -> I,
+) -> Option<I>
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+    I: for<'a> revm::Inspector<revm::handler::MainnetContext<&'a mut CacheDB<DB>>>,
+{
+    use revm::{InspectCommitEvm, MainBuilder};
+
+    let mut failed = None;
+    let _ = run_frame_tree(
+        cache_db,
+        frames,
+        caller_address,
+        root_value,
+        sim_env,
+        |db, tx| {
+            let mut evm =
+                estimator_context(db, sim_env).build_mainnet_with_inspector(new_inspector());
+            let result = evm
+                .inspect_tx_commit(tx)
+                .map_err(|e| anyhow!("Gas estimation failed: {:?}", e))?;
+            let outcome = estimator_outcome(result);
+            if outcome.is_err() {
+                failed = Some(evm.inspector);
+            }
+            outcome
+        },
+    );
+    failed
+}
+
+/// Fund and inject every frame's contract, then run the tree's pieces in order with `exec`, which
+/// runs one prepared estimator transaction and commits its writes.
+fn run_frame_tree<DB, X>(
+    cache_db: &mut CacheDB<DB>,
+    frames: &[FrameProgram],
+    caller_address: Address,
+    root_value: U256,
+    sim_env: &SimEnvOpts,
+    exec: X,
+) -> Result<Vec<u64>>
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+    X: FnMut(&mut CacheDB<DB>, TxEnv) -> Result<u64>,
+{
     if frames.is_empty() {
         return Err(anyhow!("a frame tree needs a root frame"));
     }
@@ -501,24 +735,27 @@ where
     }
 
     let mut frame_gas = vec![0; frames.len()];
-    let tree = FrameTreeRun {
+    let mut tree = FrameTreeRun {
         frames,
         caller_address,
         sim_env,
+        exec,
     };
     tree.run(cache_db, 0, root_value, &mut frame_gas)?;
     Ok(frame_gas)
 }
 
-struct FrameTreeRun<'a> {
+struct FrameTreeRun<'a, X> {
     frames: &'a [FrameProgram],
     caller_address: Address,
     sim_env: &'a SimEnvOpts,
+    /// Runs one prepared piece and commits its writes.
+    exec: X,
 }
 
-impl FrameTreeRun<'_> {
+impl<X> FrameTreeRun<'_, X> {
     fn run<DB>(
-        &self,
+        &mut self,
         cache_db: &mut CacheDB<DB>,
         index: usize,
         value: U256,
@@ -527,6 +764,7 @@ impl FrameTreeRun<'_> {
     where
         DB: revm::database_interface::DatabaseRef,
         <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+        X: FnMut(&mut CacheDB<DB>, TxEnv) -> Result<u64>,
     {
         let frame = self
             .frames
@@ -571,7 +809,7 @@ impl FrameTreeRun<'_> {
 
     /// Run one piece of frame `index`, returning its gas less the base cost after the first piece.
     fn piece<DB>(
-        &self,
+        &mut self,
         cache_db: &mut CacheDB<DB>,
         index: usize,
         piece_index: usize,
@@ -581,19 +819,20 @@ impl FrameTreeRun<'_> {
     where
         DB: revm::database_interface::DatabaseRef,
         <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+        X: FnMut(&mut CacheDB<DB>, TxEnv) -> Result<u64>,
     {
         let frame = &self.frames[index];
         let calldata = build_gas_estimation_calldata(updates)?;
         let value = if piece_index == 0 { value } else { U256::ZERO };
-        let gas = run_estimator(
+        let gas = prepare_estimator_tx(
             cache_db,
             frame.target,
             self.caller_address,
             calldata,
             value,
             self.sim_env,
-            true,
         )
+        .and_then(|tx| (self.exec)(cache_db, tx))
         .map_err(|e| {
             e.context(format!(
                 "frame {index} ({}), piece {piece_index}",
@@ -754,58 +993,23 @@ mod tests {
     );
 
     use SimEnvOptsStructs::EnvironmentMismatch;
-    use StateChangeHandlerGasEstimator::RevertingContext;
 
-    /// Try to decode an EnvironmentMismatch from a gas estimation error.
-    ///
-    /// The error chain is: estimate_state_changes_gas returns an anyhow error
-    /// whose message contains the hex-encoded revert data. The revert is
-    /// RevertingContext(index, target, revertData, callargs) where revertData
-    /// is EnvironmentMismatch(expected, actual, explanation).
+    /// Try to decode an EnvironmentMismatch from a gas estimation error: the revertData of the
+    /// estimator's RevertingContext, or the revert itself.
     fn format_sim_env_error(err: &anyhow::Error) -> String {
-        let msg = err.to_string();
-
-        // The error message format is:
-        // "Gas estimation reverted (gas: N): 0x<hex>"
-        // Find the last "0x" which is the revert data
-        let Some(hex_start) = msg.rfind("0x") else {
-            return msg;
-        };
-        let hex_body = &msg[hex_start + 2..];
-        // Take only hex chars
-        let hex_end = hex_body
-            .find(|c: char| !c.is_ascii_hexdigit())
-            .unwrap_or(hex_body.len());
-        let hex_str = &hex_body[..hex_end];
-
-        let Ok(bytes) = hex::decode(hex_str) else {
-            return msg;
-        };
-
-        if bytes.len() < 4 {
-            return msg;
-        }
-
-        // Try decoding as RevertingContext first (outer error from estimator)
-        if let Ok(ctx) = RevertingContext::abi_decode(&bytes)
-            && ctx.revertData.len() >= 4
-            && let Ok(env_err) = EnvironmentMismatch::abi_decode(&ctx.revertData)
-        {
-            return format!(
+        let mismatch = reverting_context(err)
+            .and_then(|ctx| EnvironmentMismatch::abi_decode(&ctx.revertData).ok())
+            .or_else(|| {
+                let reverted = err.downcast_ref::<EstimateReverted>()?;
+                EnvironmentMismatch::abi_decode(&reverted.output).ok()
+            });
+        match mismatch {
+            Some(env_err) => format!(
                 "EnvironmentMismatch: {}\n  expected: {:?}\n  actual:   {:?}",
                 env_err.explanation, env_err.expected, env_err.actual
-            );
+            ),
+            None => err.to_string(),
         }
-
-        // Try decoding as EnvironmentMismatch directly
-        if let Ok(env_err) = EnvironmentMismatch::abi_decode(&bytes) {
-            return format!(
-                "EnvironmentMismatch: {}\n  expected: {:?}\n  actual:   {:?}",
-                env_err.explanation, env_err.expected, env_err.actual
-            );
-        }
-
-        msg
     }
 
     const SIM_ENV_TEST_MAIN_JSON: &str = include_str!("../../../abis/SimEnvOptsTestMain.json");
