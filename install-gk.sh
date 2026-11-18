@@ -14,7 +14,8 @@
 # then uses ubuntu:24.04 + apt-get, slower but identical bytes).
 #
 # Env: GK_HOME, GK_RELEASE_TAG (pin a release; default: newest gk-run-* pre-release),
-#      GK_TOOLCHAIN_IMAGE (default ghcr.io/gas-killer/gk-toolchain:v1), GK_NO_DOCKER=1.
+#      GK_TOOLCHAIN_IMAGE (default ghcr.io/gas-killer/gk-toolchain:v1), GK_NO_DOCKER=1,
+#      GK_NO_MODIFY_PATH=1 (don't add $GK_HOME/bin to your shell profile; print the line instead).
 set -eu
 
 REPO="gas-killer/gas-analyzer"
@@ -100,10 +101,43 @@ else
   say "  docker not found: gk build needs it (or a host riscv64-unknown-elf-gcc)"
 fi
 
-case ":$PATH:" in
-  *":$BIN:"*) ;;
-  *) say ""; say "Add to your shell profile:  export PATH=\"$BIN:\$PATH\"" ;;
-esac
+# Put $BIN on PATH in the profile of the user's login shell, as rustup and foundryup do (#200):
+# piped into sh, this script can't prompt, and it can't change the calling shell's PATH, so a
+# fresh `gk` is otherwise "command not found". Idempotent; GK_NO_MODIFY_PATH=1 opts out.
+add_to_path() {
+  case ":$PATH:" in *":$BIN:"*) return 0 ;; esac
+  # The default location goes in as $HOME/..., so the line survives a moved home directory.
+  case "$BIN" in
+    "$HOME/.gk/bin") shown='$HOME/.gk/bin' ;;
+    *) shown="$BIN" ;;
+  esac
+  now="export PATH=\"$BIN:\$PATH\""
+  case "$(basename "${SHELL:-sh}")" in
+    zsh)  profile="${ZDOTDIR:-$HOME}/.zshenv"; line="export PATH=\"$shown:\$PATH\"" ;;
+    # macOS terminals start bash as a login shell, which reads .bash_profile, not .bashrc.
+    bash) if [ "$os" = Darwin ]; then profile="$HOME/.bash_profile"; else profile="$HOME/.bashrc"; fi
+          line="export PATH=\"$shown:\$PATH\"" ;;
+    fish) profile="$HOME/.config/fish/config.fish"; line="fish_add_path -a \"$shown\""
+          now="set -gx PATH \"$BIN\" \$PATH" ;;
+    *)    profile="$HOME/.profile"; line="export PATH=\"$shown:\$PATH\"" ;;
+  esac
+  say ""
+  if [ "${GK_NO_MODIFY_PATH:-0}" = "1" ]; then
+    say "Add $BIN to PATH, e.g. in $profile:  $line"
+    return 0
+  fi
+  if [ -f "$profile" ] && grep -qxF "$line" "$profile"; then
+    say "PATH: $profile already adds $BIN"
+  elif (mkdir -p "$(dirname "$profile")" &&
+         printf '\n# gk (gaskiller.xyz/bash)\n%s\n' "$line" >>"$profile") 2>/dev/null; then
+    say "PATH: added $BIN in $profile"
+  else
+    say "PATH: could not write $profile; add this line yourself:  $line"
+    return 0
+  fi
+  say "  New shells pick it up. For this one:  $now"
+}
+add_to_path
 say ""
 say "Done. Next, in a forge project:"
 say "  forge install gas-killer/solidity-sdk@gkvm-preview   # the tag that carries tools/gk (plain install once it is on main)"
