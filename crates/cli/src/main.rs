@@ -722,6 +722,19 @@ mod opcodes {
             );
             return Ok(());
         }
+        // `gasUsed` is after the refund; the steps are before it.
+        let refund = trace
+            .struct_logs
+            .iter()
+            .rev()
+            .find_map(|step| step.refund_counter)
+            .unwrap_or(0);
+        if refund > 0 {
+            println!(
+                "Refund earned: {refund} (capped at a fifth of the gas used). `Gas used` is net \
+                 of it; the rows below are before it."
+            );
+        }
 
         println!(
             "\n  {:<38} {:>9} {:>12} {:>7}  Opcodes",

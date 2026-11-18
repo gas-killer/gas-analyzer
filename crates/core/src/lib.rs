@@ -25,7 +25,7 @@ pub use heuristic::{
     estimate_gas_from_operations, estimate_gas_from_state_updates,
     extract_operation_counts_from_trace,
 };
-pub use opcode_report::{OpcodeCategory, OpcodeReport, opcode_report};
+pub use opcode_report::{OpcodeCategory, OpcodeReport, Treatment, Usage, opcode_report};
 pub use prestate::{
     PrestateEligibility, build_state_updates_from_prestate, classify_prestate_eligibility,
     frame_failure,

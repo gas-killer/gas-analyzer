@@ -384,6 +384,28 @@ mod tests {
     }
 
     #[test]
+    fn nested_calls_telescope() {
+        // The root CALLs B, which CALLs C. 1000 gas in, 500 left.
+        let steps = vec![
+            step("CALL", 1, 1000),  // 1000 - 500 = 500 inclusive, 202 in B's frame
+            step("CALL", 2, 600),   // 600 - 400 = 200 inclusive, 20 in C's frame
+            step("SSTORE", 3, 300), // 20
+            step("STOP", 3, 280),   // frame end
+            step("POP", 2, 400),    // 2
+            step("STOP", 2, 398),   // frame end
+            step("STOP", 1, 500),   // trace end
+        ];
+        // B's frame used its CALL's 180, C's 20 and its own 2.
+        assert_eq!(own_gas(&steps), vec![298, 180, 20, 0, 2, 0, 0]);
+        let report = opcode_report(&steps);
+        assert_eq!(report.total().gas, 500);
+        assert_eq!(report.kept, Usage { count: 1, gas: 298 });
+        // Everything below the root's CALL, at any depth, is replayed.
+        assert_eq!(report.replayed, Usage { count: 5, gas: 202 });
+        assert_eq!(report.optimizable, Usage { count: 1, gas: 0 });
+    }
+
+    #[test]
     fn empty_trace() {
         assert_eq!(opcode_report(&[]), OpcodeReport::default());
     }
