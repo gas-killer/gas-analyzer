@@ -32,10 +32,13 @@ forge test
 The compiled ABI artifacts (in `out/`) are referenced by the Rust `gas-analyzer-anvil` crate via the `abis/` directory at the workspace root.
 
 The wasm crate's anvil integration tests (`crates/wasm/tests/anvil_integration.rs`) deploy
-`SimpleStorage`, `DelegateCallTestMain` and `AccessControlTestMain` from creation bytecode in
+`DelegateCallTestMain` and `AccessControlTestMain` from creation bytecode in
 `crates/wasm/tests/fixtures/`. After changing one of them, regenerate its fixture:
 
 ```bash
 cd contracts
-forge inspect SimpleStorage bytecode > ../crates/wasm/tests/fixtures/SimpleStorage.hex
+forge inspect DelegateCallTestMain bytecode > ../crates/wasm/tests/fixtures/DelegateCallTestMain.hex
 ```
+
+`SimpleStorage` is deployed from the bytecode embedded in `crates/core/src/types.rs` (the
+`#[sol(bytecode = ...)]` on its `sol!` block), so there is one copy to keep in step with the source.
