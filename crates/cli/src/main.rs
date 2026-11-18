@@ -1,10 +1,11 @@
 #[cfg(feature = "evmsketch")]
 use alloy::consensus::Transaction as _;
+use alloy::primitives::B256;
 #[cfg(feature = "evmsketch")]
 use alloy::sol_types::SolError;
 use alloy::{hex, providers::ProviderBuilder};
 use alloy_provider::Provider;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use colored::Colorize;
 #[cfg(feature = "evmsketch")]
 use gas_analyzer_core::RevertingContext;
@@ -40,6 +41,9 @@ enum Commands {
 
 struct CliArgs {
     command: Option<Commands>,
+    /// Arguments were given but did not form a command (`cli t` with no hash, `cli x <HASH>`).
+    /// Distinct from no arguments at all, which just asks for the usage text.
+    unrecognized: bool,
     use_anvil: bool,
     debug: bool,
     /// `--owned`: contracts priced as if they had integrated the SDK alongside the root.
@@ -116,6 +120,7 @@ fn parse_args_from(args: &[String]) -> CliArgs {
             .is_some_and(|s| *s == "debug" || *s == "d");
 
     CliArgs {
+        unrecognized: command.is_none() && positional.len() > 1,
         command,
         use_anvil,
         debug,
@@ -136,17 +141,98 @@ async fn main() {
         )
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
         .with_target(false)
+        // alloy's transport span records the request URL, so `--debug` logs would print it.
+        .with_writer(|| RedactingWriter(std::io::stdout()))
         .init();
 
     let debug = cli_args.debug;
     let result = execute_command(cli_args).await;
     if let Err(e) = result {
-        if debug {
-            println!("{}", format!("{e:?}").red());
+        // `{e:#}` keeps the cause chain on one line; `{e:?}` adds the full "Caused by:" list.
+        let msg = if debug {
+            format!("{e:?}")
         } else {
-            println!("{}", format!("{e}").red());
-        }
+            format!("{e:#}")
+        };
+        eprintln!("{}", redact_rpc_url(&msg).red());
+        std::process::exit(1);
     }
+}
+
+/// `RPC_URL`, read only by the commands that talk to a node. Its value is never put in an
+/// error message here, and errors from the HTTP client (which quote the full request URL)
+/// pass through [`redact_rpc_url`] before they are printed: node URLs often embed an API key.
+fn rpc_url_from_env() -> Result<Url> {
+    let raw = env::var("RPC_URL").context(
+        "RPC_URL is not set: point it at a node with the debug API for the transaction's \
+         network (see .env.example)",
+    )?;
+    raw.parse().context("RPC_URL is not a valid URL")
+}
+
+/// `msg` with every occurrence of the `RPC_URL` value replaced by its scheme and host alone.
+fn redact_rpc_url(msg: &str) -> String {
+    match env::var("RPC_URL") {
+        Ok(raw) => redact_url(msg, raw.trim()),
+        Err(_) => msg.to_owned(),
+    }
+}
+
+/// Log output with the `RPC_URL` value redacted. The fmt layer writes each event with a single
+/// `write_all` of the whole formatted line, so a URL is never split across two writes.
+struct RedactingWriter<W>(W);
+
+impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let line = redact_rpc_url(&String::from_utf8_lossy(buf));
+        self.0.write_all(line.as_bytes())?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+fn redact_url(msg: &str, raw: &str) -> String {
+    // Only a value that parses as a URL can reach the HTTP client, and matching anything
+    // shorter could mangle unrelated text.
+    let Ok(url) = Url::parse(raw) else {
+        return msg.to_owned();
+    };
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    let shown = format!(
+        "{}://{}{port}/<redacted>",
+        url.scheme(),
+        url.host_str().unwrap_or("")
+    );
+    // The parsed form can differ from the raw one (a trailing `/`, a lowercased host), and
+    // the client quotes the parsed form. Replace the longer first so neither leaves a tail,
+    // through a placeholder so the second pass can't match inside the first's replacement
+    // (`http://host:8545` is a prefix of `http://host:8545/<redacted>`).
+    let (first, second) = if url.as_str().len() >= raw.len() {
+        (url.as_str(), raw)
+    } else {
+        (raw, url.as_str())
+    };
+    const PLACEHOLDER: &str = "\u{1}";
+    msg.replace(first, PLACEHOLDER)
+        .replace(second, PLACEHOLDER)
+        .replace(PLACEHOLDER, &shown)
+}
+
+/// A 32-byte transaction hash, with or without `0x`.
+fn parse_tx_hash(hash: &str) -> Result<B256> {
+    hex::const_decode_to_array(hash.as_bytes())
+        .map(B256::from)
+        .with_context(|| format!("`{hash}` is not a transaction hash"))
+}
+
+fn no_receipt(tx_hash: B256) -> anyhow::Error {
+    anyhow::anyhow!(
+        "no receipt for {tx_hash} on this RPC: check that RPC_URL is on the transaction's \
+         network, or the transaction may still be pending"
+    )
 }
 
 async fn execute_command(cli_args: CliArgs) -> Result<()> {
@@ -155,40 +241,34 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
         .clone()
         .map_err(anyhow::Error::msg)?
         .unwrap_or_default();
-    let rpc_url: Url = std::env::var("RPC_URL")
-        .expect("RPC_URL must be set")
-        .parse()
-        .expect("unable to parse rpc url");
-
     match cli_args.command {
         Some(Commands::Transaction(hash)) => {
+            let tx_hash = parse_tx_hash(&hash)?;
+            let rpc_url = rpc_url_from_env()?;
             let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
-            let bytes: [u8; 32] = hex::const_decode_to_array(hash.as_bytes())
-                .expect("failed to decode transaction hash");
 
             // Get the receipt to find the block and gas used
             let receipt = provider
-                .get_transaction_receipt(bytes.into())
+                .get_transaction_receipt(tx_hash)
                 .await?
-                .expect("couldn't fetch tx receipt for tx");
+                .ok_or_else(|| no_receipt(tx_hash))?;
             // A contract creation has no existing contract to settle against (#32), as the
             // indexer's `SkipReason::ContractCreation` treats it.
-            if receipt.to.is_none() {
+            let Some(to) = receipt.to else {
                 println!(
-                    "{} 0x{} is a contract-creation transaction; Gas Killer settles calls to \
-                     existing contracts, so there is nothing to analyze.",
+                    "{} {tx_hash} is a contract-creation transaction; Gas Killer settles calls \
+                     to existing contracts, so there is nothing to analyze.",
                     "Skipped:".yellow(),
-                    hex::encode(bytes)
                 );
                 return Ok(());
-            }
+            };
             let block_number = receipt
                 .block_number
-                .expect("couldn't retrieve block number");
+                .ok_or_else(|| anyhow::anyhow!("the receipt for {tx_hash} has no block number"))?;
             #[cfg(feature = "evmsketch")]
-            let tx_index = receipt
-                .transaction_index
-                .expect("couldn't retrieve transaction index");
+            let tx_index = receipt.transaction_index.ok_or_else(|| {
+                anyhow::anyhow!("the receipt for {tx_hash} has no transaction index")
+            })?;
             let gas_used = receipt.gas_used;
             let original_status = receipt.status();
             #[cfg(feature = "evmsketch")]
@@ -200,12 +280,11 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             // CALL state updates halt with OutOfFunds.
             #[cfg(feature = "evmsketch")]
             let tx = provider
-                .get_transaction_by_hash(bytes.into())
+                .get_transaction_by_hash(tx_hash)
                 .await?
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "tx 0x{} present in receipt but missing from eth_getTransactionByHash",
-                        hex::encode(bytes)
+                        "tx {tx_hash} present in receipt but missing from eth_getTransactionByHash"
                     )
                 })?;
             // Its effective gas price too: contracts that check `tx.gasprice`
@@ -224,11 +303,9 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 return what_if::run(what_if::Inputs {
                     provider: &provider,
                     rpc_url: rpc_url.clone(),
-                    tx_hash: bytes.into(),
+                    tx_hash,
                     status: original_status,
-                    root: receipt
-                        .to
-                        .ok_or_else(|| anyhow::anyhow!("Transaction has no 'to' address"))?,
+                    root: to,
                     sender: tx_sender,
                     original: original_tx,
                     block_number,
@@ -252,15 +329,15 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 // Initialize GasKiller with Anvil
                 let gk = GasKillerDefault::new(rpc_url.clone(), Some(block_number - 1))
                     .await
-                    .expect("Failed to initialize GasKiller");
+                    .context("failed to start the Anvil backend")?;
 
                 // Get trace and compute state updates
-                let trace = get_tx_trace(&provider, bytes.into(), original_status).await?;
+                let trace = get_tx_trace(&provider, tx_hash, original_status).await?;
                 let gas_analyzer_core::TraceExtract {
                     state_updates,
                     skipped_opcodes,
                     ..
-                } = compute_state_updates(trace, receipt.to)?;
+                } = compute_state_updates(trace, Some(to))?;
 
                 // Print state updates
                 println!("\n{}", "=== State Updates ===".green().bold());
@@ -277,13 +354,13 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 }
 
                 // Get full gas estimate
-                let report = gas_estimate_tx(provider, bytes.into(), &gk).await?;
+                let report = gas_estimate_tx(provider, tx_hash, &gk).await?;
 
                 // Print gas analysis
                 use gas_analyzer_core::SignatureType;
 
                 println!("\n{}", "=== Gas Analysis ===".blue().bold());
-                println!("Transaction: 0x{}", hex::encode(bytes));
+                println!("Transaction: {tx_hash}");
                 println!(
                     "Block: {} ({})",
                     block_number,
@@ -320,6 +397,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     println!("  Gas savings: {} ({:.2}%)", gas_savings, percent_savings);
                 }
                 if let Some(error) = &report.error_log {
+                    let error = redact_rpc_url(error);
                     if cli_args.debug {
                         println!("{}: {}", "Error".red(), error);
                     } else {
@@ -336,11 +414,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
 
             #[cfg(not(feature = "anvil"))]
             if cli_args.use_anvil {
-                println!(
-                    "{}",
-                    "Error: Anvil feature not enabled. Rebuild with --features anvil".red()
-                );
-                return Ok(());
+                anyhow::bail!("Anvil feature not enabled. Rebuild with --features anvil");
             }
 
             // Default: Use EvmSketch
@@ -351,13 +425,9 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 // Use shared trace function from rpc crate
                 use gas_analyzer_rpc::compute_state_updates_from_tx;
 
-                let state_updates_result = compute_state_updates_from_tx(
-                    &provider,
-                    bytes.into(),
-                    original_status,
-                    receipt.to,
-                )
-                .await;
+                let state_updates_result =
+                    compute_state_updates_from_tx(&provider, tx_hash, original_status, Some(to))
+                        .await;
 
                 let (extract, use_fallback) = match state_updates_result {
                     Ok(extract) => (extract, false),
@@ -371,11 +441,14 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                                         .yellow()
                                 );
                             if cli_args.debug {
-                                println!("   Reason: {e:?}");
+                                println!("   Reason: {}", redact_rpc_url(&format!("{e:?}")));
                             } else {
                                 println!(
                                     "   Reason: {}",
-                                    format!("{e}").split('\n').next().unwrap_or("Unknown error")
+                                    redact_rpc_url(&format!("{e}"))
+                                        .split('\n')
+                                        .next()
+                                        .unwrap_or("Unknown error")
                                 );
                             }
 
@@ -413,7 +486,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
 
                     // Try trace-based heuristic estimation
                     let fallback_estimate = match gk
-                        .estimate_gas_from_trace(&provider, bytes.into(), original_status)
+                        .estimate_gas_from_trace(&provider, tx_hash, original_status)
                         .await
                     {
                         Ok(estimate) => {
@@ -436,11 +509,6 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                     (fallback_estimate, true)
                 } else {
                     // Normal path: try measured gas estimation using extracted state updates
-                    // Get the contract address from the receipt
-                    let contract_address = receipt
-                        .to
-                        .ok_or_else(|| anyhow::Error::msg("Transaction has no 'to' address"))?;
-
                     // Build EvmSketch for gas estimation (injecting StateChangeHandler contract)
                     let gk = GasKillerEvmSketchDefault::builder(rpc_url.clone())
                         .at_block(BlockNumberOrTag::Number(block_number))
@@ -457,11 +525,11 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                         tx_index,
                     )
                     .await
-                    .map_err(|e| {
-                        anyhow::Error::msg(format!(
-                            "Failed to fetch preceding transactions for block {} (tx index {}): {}",
-                            block_number, tx_index, e
-                        ))
+                    .with_context(|| {
+                        format!(
+                            "Failed to fetch preceding transactions for block {block_number} \
+                             (tx index {tx_index})"
+                        )
                     })?;
 
                     if !preceding_txs.is_empty() {
@@ -473,7 +541,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
 
                     // Try measured gas estimation with preceding tx replay
                     match gk.estimate_state_changes_gas_with_preceding(
-                        contract_address,
+                        to,
                         tx_sender,
                         &extract.state_updates,
                         &preceding_txs,
@@ -509,11 +577,14 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                                 }
                                 None => {
                                     if cli_args.debug {
-                                        println!("   Reason: {e:?}");
+                                        println!(
+                                            "   Reason: {}",
+                                            redact_rpc_url(&format!("{e:?}"))
+                                        );
                                     } else {
                                         println!(
                                             "   Reason: {}",
-                                            format!("{e}")
+                                            redact_rpc_url(&format!("{e}"))
                                                 .split('\n')
                                                 .next()
                                                 .unwrap_or("Unknown error")
@@ -552,7 +623,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
 
                 // Print gas analysis
                 println!("\n{}", "=== Gas Analysis ===".blue().bold());
-                println!("Transaction: 0x{}", hex::encode(bytes));
+                println!("Transaction: {tx_hash}");
                 println!(
                     "Block: {} ({}) | Tx Index: {}",
                     block_number,
@@ -596,71 +667,62 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
             }
 
             #[cfg(not(feature = "evmsketch"))]
-            {
-                println!(
-                    "{}",
-                    "Error: No execution backend available. Rebuild with --features evmsketch or --features anvil".red()
-                );
-            }
+            anyhow::bail!(
+                "No execution backend available. Rebuild with --features evmsketch or --features anvil"
+            );
         }
 
         Some(Commands::Opcodes(hash)) => {
-            let provider = ProviderBuilder::new().connect_http(rpc_url);
-            let bytes: [u8; 32] = hex::const_decode_to_array(hash.as_bytes())
-                .map_err(|e| anyhow::anyhow!("`{hash}` is not a transaction hash: {e}"))?;
-            opcodes::run(&provider, bytes.into()).await?;
+            let tx_hash = parse_tx_hash(&hash)?;
+            let provider = ProviderBuilder::new().connect_http(rpc_url_from_env()?);
+            opcodes::run(&provider, tx_hash).await?;
         }
 
-        Some(Commands::Request(_file)) => {
-            // Note: The request command (for simulating unexecuted transactions) has been removed.
-            // Use the transaction command to analyze existing transactions via their tx hash.
-            println!(
-                "{}",
-                "Error: The request command is no longer supported.\n\
-                Use the transaction command to analyze existing transactions: cli t <tx_hash>"
-                    .red()
-            );
+        // The request command (for simulating unexecuted transactions) has been removed; it
+        // still parses so that old scripts get this message and a failing exit status.
+        Some(Commands::Request(_file)) => anyhow::bail!(
+            "The request command is no longer supported.\n\
+             Use the transaction command to analyze existing transactions: cli t <tx_hash>"
+        ),
+
+        None if cli_args.unrecognized => {
+            eprint!("{}", usage());
+            anyhow::bail!("expected a command and its argument, such as `t <TX_HASH>`");
         }
 
-        None => {
-            println!("Gas Killer Analyzer\n");
-            println!("Usage:\n");
-            println!("  {} for accepted transactions", "t/tx <HASH>".bold());
-            println!("  {} alias for t <HASH> --debug", "debug <HASH>".bold());
-            println!(
-                "  {} opcode usage by category, and the gas Gas Killer can remove",
-                "o/opcodes <HASH>".bold()
-            );
-            println!(
-                "  {} for transaction requests",
-                "r/request <JSON_FILE>".bold()
-            );
-            println!("\nFlags:\n");
-            println!(
-                "  {} Use Anvil-based implementation (requires --features anvil)",
-                "--anvil".bold()
-            );
-            println!(
-                "  {} Print full error details including RPC errors",
-                "--debug".bold()
-            );
-            println!(
-                "  {} Price the transaction as a nested settlement in which these\n           \
-                 contracts, beside the root, had integrated the SDK",
-                "--owned <ADDR,...>".bold()
-            );
-            println!("\nExamples:\n");
-            println!("  # Default (EvmSketch - Anvil-free):");
-            println!("  cargo run -- t <TX_HASH>");
-            println!("\n  # With Anvil (legacy, more accurate gas estimates):");
-            println!("  cargo run --features anvil -- --anvil t <TX_HASH>");
-            println!("\n  # What the root and C would have saved together as one nested tree:");
-            println!("  cargo run -- t <TX_HASH> --owned <C_ADDRESS>");
-            println!("\n  # Which opcodes the transaction spent its gas on:");
-            println!("  cargo run -- o <TX_HASH>");
-        }
+        None => print!("{}", usage()),
     }
     Ok(())
+}
+
+fn usage() -> String {
+    format!(
+        "Gas Killer Analyzer\n\n\
+         Usage:\n\n  \
+         {} for accepted transactions\n  \
+         {} alias for t <HASH> --debug\n  \
+         {} opcode usage by category, and the gas Gas Killer can remove\n\
+         \nFlags:\n\n  \
+         {} Use Anvil-based implementation (requires --features anvil)\n  \
+         {} Print full error details including RPC errors\n  \
+         {} Price the transaction as a nested settlement in which these\n           \
+         contracts, beside the root, had integrated the SDK\n\
+         \nExamples:\n\n  \
+         # Default (EvmSketch - Anvil-free):\n  \
+         cargo run -- t <TX_HASH>\n\n  \
+         # With Anvil (legacy, more accurate gas estimates):\n  \
+         cargo run --features anvil -- --anvil t <TX_HASH>\n\n  \
+         # What the root and C would have saved together as one nested tree:\n  \
+         cargo run -- t <TX_HASH> --owned <C_ADDRESS>\n\n  \
+         # Which opcodes the transaction spent its gas on:\n  \
+         cargo run -- o <TX_HASH>\n",
+        "t/tx <HASH>".bold(),
+        "debug <HASH>".bold(),
+        "o/opcodes <HASH>".bold(),
+        "--anvil".bold(),
+        "--debug".bold(),
+        "--owned <ADDR,...>".bold(),
+    )
 }
 
 /// `o <HASH>`: opcode usage by category, and how much of it a settlement keeps (#161).
@@ -679,7 +741,7 @@ mod opcodes {
         let receipt = provider
             .get_transaction_receipt(tx_hash)
             .await?
-            .ok_or_else(|| anyhow!("no receipt for {tx_hash}"))?;
+            .ok_or_else(|| super::no_receipt(tx_hash))?;
         // Only opcodes, depth and gas are needed: no memory, stack or storage.
         let options = GethDebugTracingOptions {
             config: GethDefaultTracingOptions {
@@ -796,7 +858,7 @@ mod what_if {
     use alloy_eips::BlockNumberOrTag;
     use alloy_provider::Provider;
     use alloy_provider::ext::DebugApi;
-    use anyhow::Result;
+    use anyhow::{Context as _, Result};
     use colored::Colorize;
     use gas_analyzer_core::SignatureType;
     use gas_analyzer_core::nested::{
@@ -849,10 +911,10 @@ mod what_if {
         let preceding =
             gas_analyzer_rpc::get_preceding_transactions(provider, block_number, tx_index)
                 .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
+                .with_context(|| {
+                    format!(
                         "Failed to fetch preceding transactions for block {block_number} \
-                         (tx index {tx_index}): {e}"
+                         (tx index {tx_index})"
                     )
                 })?;
         let flat_gas = gk.estimate_frame_tree_gas_with_preceding(
@@ -981,6 +1043,31 @@ mod tests {
     }
 
     #[test]
+    fn tx_hash_parses_with_or_without_0x() {
+        assert!(parse_tx_hash(HASH).is_ok());
+        assert_eq!(
+            parse_tx_hash(HASH).unwrap(),
+            parse_tx_hash(HASH.trim_start_matches("0x")).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_bad_tx_hash_is_an_error() {
+        for bad in [
+            "",
+            "0x",
+            "0x1234",
+            &HASH[..HASH.len() - 1],
+            &format!("{HASH}00"),
+        ] {
+            let err = parse_tx_hash(bad).unwrap_err().to_string();
+            assert!(err.contains("is not a transaction hash"), "{bad}: {err}");
+        }
+        let zz = format!("0x{}", "zz".repeat(32));
+        assert!(parse_tx_hash(&zz).is_err());
+    }
+
+    #[test]
     fn opcodes_takes_a_hash() {
         let args: Vec<String> = ["cli", "o", HASH].iter().map(|a| a.to_string()).collect();
         assert!(matches!(
@@ -1001,6 +1088,51 @@ mod tests {
                 .unwrap_err()
                 .contains("only applies")
         );
+    }
+
+    fn unrecognized(args: &[&str]) -> bool {
+        let args: Vec<String> = ["cli"].iter().chain(args).map(|a| a.to_string()).collect();
+        parse_args_from(&args).unrecognized
+    }
+
+    #[test]
+    fn an_incomplete_or_unknown_command_is_unrecognized() {
+        assert!(!unrecognized(&[]));
+        assert!(!unrecognized(&["--debug"]));
+        assert!(!unrecognized(&["t", HASH]));
+        assert!(unrecognized(&["t"]));
+        assert!(unrecognized(&["tx", "--debug"]));
+        assert!(unrecognized(&["x", HASH]));
+    }
+
+    #[test]
+    fn the_rpc_url_is_redacted_from_messages() {
+        let raw = "https://eth-mainnet.g.alchemy.com/v2/SECRET";
+        let msg = format!("error sending request for url ({raw}): connection refused");
+        let out = redact_url(&msg, raw);
+        assert!(!out.contains("SECRET"), "{out}");
+        assert!(
+            out.contains("https://eth-mainnet.g.alchemy.com/<redacted>"),
+            "{out}"
+        );
+
+        // The client quotes the parsed form, which adds a `/` to a bare host with a key in
+        // the query, and keeps the port.
+        let raw = "http://Node.example:8545?key=SECRET";
+        let parsed = Url::parse(raw).unwrap();
+        let out = redact_url(&format!("url ({parsed})"), raw);
+        assert_eq!(out, "url (http://node.example:8545/<redacted>)");
+
+        // A bare host is a prefix of its own redacted form; it is redacted once.
+        let raw = "http://127.0.0.1:8545";
+        let parsed = Url::parse(raw).unwrap();
+        let out = redact_url(&format!("url ({parsed}), raw {raw}"), raw);
+        assert_eq!(
+            out,
+            "url (http://127.0.0.1:8545/<redacted>), raw http://127.0.0.1:8545/<redacted>"
+        );
+
+        assert_eq!(redact_url("unchanged", "not a url"), "unchanged");
     }
 
     #[test]
