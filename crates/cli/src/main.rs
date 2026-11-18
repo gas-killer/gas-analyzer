@@ -207,13 +207,18 @@ fn redact_url(msg: &str, raw: &str) -> String {
         url.host_str().unwrap_or("")
     );
     // The parsed form can differ from the raw one (a trailing `/`, a lowercased host), and
-    // the client quotes the parsed form. Replace the longer first so neither leaves a tail.
+    // the client quotes the parsed form. Replace the longer first so neither leaves a tail,
+    // through a placeholder so the second pass can't match inside the first's replacement
+    // (`http://host:8545` is a prefix of `http://host:8545/<redacted>`).
     let (first, second) = if url.as_str().len() >= raw.len() {
         (url.as_str(), raw)
     } else {
         (raw, url.as_str())
     };
-    msg.replace(first, &shown).replace(second, &shown)
+    const PLACEHOLDER: &str = "\u{1}";
+    msg.replace(first, PLACEHOLDER)
+        .replace(second, PLACEHOLDER)
+        .replace(PLACEHOLDER, &shown)
 }
 
 /// A 32-byte transaction hash, with or without `0x`.
@@ -1117,6 +1122,15 @@ mod tests {
         let parsed = Url::parse(raw).unwrap();
         let out = redact_url(&format!("url ({parsed})"), raw);
         assert_eq!(out, "url (http://node.example:8545/<redacted>)");
+
+        // A bare host is a prefix of its own redacted form; it is redacted once.
+        let raw = "http://127.0.0.1:8545";
+        let parsed = Url::parse(raw).unwrap();
+        let out = redact_url(&format!("url ({parsed}), raw {raw}"), raw);
+        assert_eq!(
+            out,
+            "url (http://127.0.0.1:8545/<redacted>), raw http://127.0.0.1:8545/<redacted>"
+        );
 
         assert_eq!(redact_url("unchanged", "not a url"), "unchanged");
     }
