@@ -8,6 +8,7 @@ pub mod constants;
 pub mod encoding;
 pub mod heuristic;
 pub mod nested;
+pub mod opcode_report;
 pub mod prestate;
 pub mod sim_profile;
 pub mod trace;
@@ -24,6 +25,7 @@ pub use heuristic::{
     estimate_gas_from_operations, estimate_gas_from_state_updates,
     extract_operation_counts_from_trace,
 };
+pub use opcode_report::{OpcodeCategory, OpcodeReport, Treatment, Usage, opcode_report};
 pub use prestate::{
     PrestateEligibility, build_state_updates_from_prestate, classify_prestate_eligibility,
     frame_failure,

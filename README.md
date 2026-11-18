@@ -61,6 +61,25 @@ program with the nested tree, per signature scheme, and says why any owned contr
 The contracts never integrated the SDK, so this is an estimate: each frame is measured from the state
 before the transaction, and the cost model's fixed overhead stands in for proofs and witnesses.
 
+### Opcode usage report
+```bash
+cargo run -- o <TX_HASH>
+```
+Groups the transaction's opcodes into categories (storage writes and reads, logs, external calls,
+hashing, ...) with count, gas and share, then splits the same gas by what a Gas Killer settlement
+does with it:
+- **Kept**: `SSTORE`, `LOG*`, `CALL`, `CREATE*` and `SELFDESTRUCT` in the contract's own context
+  (depth 1, or reached through `DELEGATECALL`), which the settlement still executes;
+- **Replayed**: everything inside a `CALL`/`CREATE` from that context, since the settlement makes
+  the same call;
+- **Optimizable**: everything else in that context (reads, hashing, compute, library code and whole
+  `STATICCALL` subtrees), which the settlement replaces with precomputed state updates.
+
+Gas is each opcode's own cost: a call's row excludes the gas its callee spent, so the rows add up to
+the receipt's `gasUsed` minus intrinsic gas (before refunds). It is a quick signal rather than an
+estimate, since the settlement also pays for its payload and signature check; `t <TX_HASH>` measures that.
+On a local anvil, start it with `--steps-tracing` or the trace has no steps.
+
 ### Analyze a transaction request
 ```bash
 cargo run -- r path/to/file.json
