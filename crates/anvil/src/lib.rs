@@ -736,6 +736,10 @@ mod tests {
     use csv::Writer;
     use std::fs::File;
 
+    /// A fixed Sepolia block after Glamsterdam (active from 11_856_337). Gas figures depend on
+    /// the fork's rules as well as state, so forking at head would let either move a pinned value.
+    const FORK_BLOCK: u64 = 11_870_719;
+
     /// Decode (uint256[], bytes[]) ABI tuple used for state update transport
     fn decode_state_updates_tuple(data: &[u8]) -> Result<(Vec<U256>, Vec<Bytes>)> {
         fn read_u256_as_usize(word: &[u8]) -> usize {
@@ -873,7 +877,7 @@ mod tests {
             .expect("RPC_URL must be set")
             .parse()?;
         let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
-        let gk = GasKillerDefault::new(rpc_url, None).await?;
+        let gk = GasKillerDefault::new(rpc_url, Some(FORK_BLOCK)).await?;
         let report = gas_estimate_tx(provider, SIMPLE_ARRAY_ITERATION_TX_HASH, &gk).await?;
 
         let _ = File::create("test.csv")?;
@@ -901,11 +905,11 @@ mod tests {
         let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let (state_updates, _, _) = compute_state_updates(trace)?;
 
-        let gk = GasKillerDefault::new(rpc_url, None).await?;
+        let gk = GasKillerDefault::new(rpc_url, Some(FORK_BLOCK)).await?;
         let gas_estimate = gk
             .estimate_state_changes_gas(SIMPLE_STORAGE_ADDRESS, &state_updates)
             .await?;
-        assert_eq!(gas_estimate, 32525);
+        assert_eq!(gas_estimate, 48024);
         Ok(())
     }
 
@@ -926,11 +930,12 @@ mod tests {
         let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let (state_updates, _, _) = compute_state_updates(trace)?;
 
-        let gk = GasKillerDefault::new(rpc_url, None).await?;
+        let gk = GasKillerDefault::new(rpc_url, Some(FORK_BLOCK)).await?;
         let gas_estimate = gk
             .estimate_state_changes_gas(ACCESS_CONTROL_MAIN_ADDRESS, &state_updates)
             .await?;
-        assert_eq!(gas_estimate, 37161);
+        // Glamsterdam's calldata floor exceeds execution here, so this pins the floor, not the payload.
+        assert_eq!(gas_estimate, 39832);
         Ok(())
     }
 
@@ -951,7 +956,7 @@ mod tests {
         let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
         let (state_updates, _, _) = compute_state_updates(trace)?;
 
-        let gk = GasKillerDefault::new(rpc_url, None).await?;
+        let gk = GasKillerDefault::new(rpc_url, Some(FORK_BLOCK)).await?;
         let gas_estimate = gk
             .estimate_state_changes_gas(FAKE_ADDRESS, &state_updates)
             .await;
@@ -1180,7 +1185,7 @@ mod tests {
             SimpleStorage::SimpleStorageInstance::new(SIMPLE_STORAGE_ADDRESS, &provider);
         let tx_request = simple_storage.set(U256::from(1)).into_transaction_request();
 
-        let trace = get_trace_from_call(rpc_url, tx_request, None).await?;
+        let trace = get_trace_from_call(rpc_url, tx_request, Some(FORK_BLOCK)).await?;
         let (state_updates, _, _) = compute_state_updates(trace)?;
 
         assert_eq!(state_updates.len(), 2);
