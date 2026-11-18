@@ -135,9 +135,15 @@ jobs:
       - name: wasm-pack test (node)
         run: wasm-pack test --node crates/wasm
 
-      - name: cargo test --ignored (wasm RPC integration)
-        if: env.RPC_URL != ''
-        run: cargo test -p gas-killer-wasm -- --ignored
+      - name: Install foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        # Pinned with test-native's: gas figures depend on which hardforks anvil knows.
+        with:
+          version: v1.8.5
+
+      # `#[ignore]`d so a `cargo test` without foundry skips rather than fails.
+      - name: cargo test (wasm anvil integration)
+        run: cargo test -p gas-killer-wasm --test anvil_integration -- --ignored
 
       - name: Build WASM package (for JS RPC test)
         if: env.RPC_URL != ''
