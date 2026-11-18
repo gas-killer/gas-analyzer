@@ -146,7 +146,34 @@ async fn main() {
         } else {
             println!("{}", format!("{e}").red());
         }
+        std::process::exit(1);
     }
+}
+
+/// `RPC_URL`, read only by the commands that talk to a node. The value is left out of errors:
+/// node URLs often embed an API key.
+fn rpc_url_from_env() -> Result<Url> {
+    let raw = env::var("RPC_URL").map_err(|_| {
+        anyhow::anyhow!(
+            "RPC_URL is not set: point it at a node with the debug API for the transaction's \
+             network (see .env.example)"
+        )
+    })?;
+    raw.parse()
+        .map_err(|e| anyhow::anyhow!("RPC_URL is not a valid URL: {e}"))
+}
+
+/// A 32-byte transaction hash, with or without `0x`.
+fn parse_tx_hash(hash: &str) -> Result<[u8; 32]> {
+    hex::const_decode_to_array(hash.as_bytes())
+        .map_err(|e| anyhow::anyhow!("`{hash}` is not a transaction hash: {e}"))
+}
+
+fn no_receipt(tx_hash: alloy::primitives::FixedBytes<32>) -> anyhow::Error {
+    anyhow::anyhow!(
+        "no receipt for {tx_hash} on this RPC: check that RPC_URL is on the transaction's \
+         network, or the transaction may still be pending"
+    )
 }
 
 async fn execute_command(cli_args: CliArgs) -> Result<()> {
@@ -155,22 +182,17 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
         .clone()
         .map_err(anyhow::Error::msg)?
         .unwrap_or_default();
-    let rpc_url: Url = std::env::var("RPC_URL")
-        .expect("RPC_URL must be set")
-        .parse()
-        .expect("unable to parse rpc url");
-
     match cli_args.command {
         Some(Commands::Transaction(hash)) => {
+            let bytes = parse_tx_hash(&hash)?;
+            let rpc_url = rpc_url_from_env()?;
             let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
-            let bytes: [u8; 32] = hex::const_decode_to_array(hash.as_bytes())
-                .expect("failed to decode transaction hash");
 
             // Get the receipt to find the block and gas used
             let receipt = provider
                 .get_transaction_receipt(bytes.into())
                 .await?
-                .expect("couldn't fetch tx receipt for tx");
+                .ok_or_else(|| no_receipt(bytes.into()))?;
             // A contract creation has no existing contract to settle against (#32), as the
             // indexer's `SkipReason::ContractCreation` treats it.
             if receipt.to.is_none() {
@@ -182,13 +204,19 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 );
                 return Ok(());
             }
-            let block_number = receipt
-                .block_number
-                .expect("couldn't retrieve block number");
+            let block_number = receipt.block_number.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the receipt for 0x{} has no block number",
+                    hex::encode(bytes)
+                )
+            })?;
             #[cfg(feature = "evmsketch")]
-            let tx_index = receipt
-                .transaction_index
-                .expect("couldn't retrieve transaction index");
+            let tx_index = receipt.transaction_index.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the receipt for 0x{} has no transaction index",
+                    hex::encode(bytes)
+                )
+            })?;
             let gas_used = receipt.gas_used;
             let original_status = receipt.status();
             #[cfg(feature = "evmsketch")]
@@ -252,7 +280,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 // Initialize GasKiller with Anvil
                 let gk = GasKillerDefault::new(rpc_url.clone(), Some(block_number - 1))
                     .await
-                    .expect("Failed to initialize GasKiller");
+                    .map_err(|e| anyhow::anyhow!("failed to start the Anvil backend: {e}"))?;
 
                 // Get trace and compute state updates
                 let trace = get_tx_trace(&provider, bytes.into(), original_status).await?;
@@ -605,9 +633,8 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
         }
 
         Some(Commands::Opcodes(hash)) => {
-            let provider = ProviderBuilder::new().connect_http(rpc_url);
-            let bytes: [u8; 32] = hex::const_decode_to_array(hash.as_bytes())
-                .map_err(|e| anyhow::anyhow!("`{hash}` is not a transaction hash: {e}"))?;
+            let bytes = parse_tx_hash(&hash)?;
+            let provider = ProviderBuilder::new().connect_http(rpc_url_from_env()?);
             opcodes::run(&provider, bytes.into()).await?;
         }
 
@@ -679,7 +706,7 @@ mod opcodes {
         let receipt = provider
             .get_transaction_receipt(tx_hash)
             .await?
-            .ok_or_else(|| anyhow!("no receipt for {tx_hash}"))?;
+            .ok_or_else(|| super::no_receipt(tx_hash))?;
         // Only opcodes, depth and gas are needed: no memory, stack or storage.
         let options = GethDebugTracingOptions {
             config: GethDefaultTracingOptions {
@@ -978,6 +1005,31 @@ mod tests {
                 "{args:?}"
             );
         }
+    }
+
+    #[test]
+    fn tx_hash_parses_with_or_without_0x() {
+        assert!(parse_tx_hash(HASH).is_ok());
+        assert_eq!(
+            parse_tx_hash(HASH).unwrap(),
+            parse_tx_hash(HASH.trim_start_matches("0x")).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_bad_tx_hash_is_an_error() {
+        for bad in [
+            "",
+            "0x",
+            "0x1234",
+            &HASH[..HASH.len() - 1],
+            &format!("{HASH}00"),
+        ] {
+            let err = parse_tx_hash(bad).unwrap_err().to_string();
+            assert!(err.contains("is not a transaction hash"), "{bad}: {err}");
+        }
+        let zz = format!("0x{}", "zz".repeat(32));
+        assert!(parse_tx_hash(&zz).is_err());
     }
 
     #[test]
