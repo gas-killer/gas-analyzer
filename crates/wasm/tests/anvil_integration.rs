@@ -16,7 +16,7 @@
 
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, mpsc};
 use std::time::Duration;
 
 use gas_killer_wasm::{
@@ -28,6 +28,8 @@ use common::{test_caller_address, test_estimator_address};
 
 /// anvil's first dev account, unlocked by default.
 const DEV: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+/// How long anvil gets to start, and each RPC call to answer, before the test fails.
+const TIMEOUT: Duration = Duration::from_secs(30);
 /// Under Osaka's per-transaction cap (EIP-7825: 2^24), and ample for these contracts.
 const TX_GAS: &str = "0xf42400"; // 16,000,000
 
@@ -49,7 +51,25 @@ struct Traces {
     access_control: String,
 }
 
-static TRACES: LazyLock<Traces> = LazyLock::new(|| {
+/// Recorded on first use. A failure is kept as its message, so every test reports the real
+/// cause rather than all but the first failing on a poisoned lock.
+static TRACES: LazyLock<Result<Traces, String>> = LazyLock::new(|| {
+    std::panic::catch_unwind(record_traces).map_err(|panic| {
+        panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_else(|| "unknown panic".to_owned())
+    })
+});
+
+fn traces() -> &'static Traces {
+    TRACES
+        .as_ref()
+        .unwrap_or_else(|e| panic!("recording the anvil traces failed: {e}"))
+}
+
+fn record_traces() -> Traces {
     let anvil = LocalAnvil::spawn();
     let simple_storage = anvil.deploy(&gas_analyzer_core::SimpleStorage::BYTECODE.to_string());
     let delegatecall_main = anvil.deploy(DELEGATECALL_MAIN);
@@ -61,8 +81,8 @@ static TRACES: LazyLock<Traces> = LazyLock::new(|| {
         delegatecall: anvil.trace_of_call(&delegatecall_main, RUN, 0),
         access_control: anvil.trace_of_call(&access_control_main, RUN, 0),
     }
-    // `anvil` is dropped, and killed, here.
-});
+    // `anvil` is dropped, and killed, here (also when a step above panics).
+}
 
 /// A local anvil, killed on drop. Steps tracing is on so `debug_traceTransaction` returns
 /// struct logs.
@@ -93,36 +113,50 @@ impl LocalAnvil {
                 "failed to spawn `anvil`: these tests need foundry (https://getfoundry.sh) on \
                  PATH; CI installs it via foundry-toolchain",
             );
-        let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout")).lines();
-        let mut url = None;
-        for line in stdout.by_ref() {
-            let Ok(line) = line else { break };
-            if let Some(addr) = line.trim().strip_prefix("Listening on ") {
-                url = Some(format!("http://{addr}"));
-                break;
+        // Wait for the ready line on another thread, so a silent anvil times out instead of
+        // hanging the test. The thread then keeps draining stdout: a closed pipe would fail
+        // anvil's writes, a full one block them.
+        let stdout = child.stdout.take().expect("piped stdout");
+        let (ready, listening) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut lines = BufReader::new(stdout).lines();
+            for line in lines.by_ref().map_while(Result::ok) {
+                if let Some(addr) = line.trim().strip_prefix("Listening on ") {
+                    let _ = ready.send(format!("http://{addr}"));
+                    break;
+                }
             }
-        }
-        let Some(url) = url else {
-            // stdout closed without the ready line: anvil exited. Say why.
-            let status = child.wait().expect("wait for anvil");
-            let mut stderr = String::new();
-            if let Some(mut err) = child.stderr.take() {
-                let _ = err.read_to_string(&mut stderr);
+            // Dropping `ready` without sending tells the waiter stdout closed first.
+            lines.for_each(drop);
+        });
+        let url = match listening.recv_timeout(TIMEOUT) {
+            Ok(url) => url,
+            Err(why) => {
+                let what = match why {
+                    mpsc::RecvTimeoutError::Disconnected => "exited before it was ready",
+                    mpsc::RecvTimeoutError::Timeout => {
+                        let _ = child.kill();
+                        "printed no `Listening on` line in time and was killed"
+                    }
+                };
+                let status = child.wait().expect("wait for anvil");
+                let mut stderr = String::new();
+                if let Some(mut err) = child.stderr.take() {
+                    let _ = err.read_to_string(&mut stderr);
+                }
+                panic!("anvil {what} ({status}): {}", stderr.trim());
             }
-            panic!(
-                "anvil exited before it was ready ({status}): {}",
-                stderr.trim()
-            );
         };
-        // Keep draining anvil's output: a closed pipe would fail its writes, a full one block them.
-        std::thread::spawn(move || stdout.for_each(drop));
         if let Some(stderr) = child.stderr.take() {
             std::thread::spawn(move || BufReader::new(stderr).lines().for_each(drop));
         }
         LocalAnvil {
             child,
             url,
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::blocking::Client::builder()
+                .timeout(TIMEOUT)
+                .build()
+                .expect("HTTP client"),
         }
     }
 
@@ -214,7 +248,7 @@ fn analyze(trace: &str) -> AnalyzeTraceResult {
 #[test]
 #[ignore = "spawns anvil"]
 fn test_simple_storage_set() {
-    let result = analyze(&TRACES.set);
+    let result = analyze(&traces().set);
 
     // SSTORE + LOG1
     assert_eq!(result.state_update_count, 2);
@@ -233,7 +267,7 @@ fn test_simple_storage_set() {
 #[test]
 #[ignore = "spawns anvil"]
 fn test_simple_storage_deposit() {
-    let result = analyze(&TRACES.deposit);
+    let result = analyze(&traces().deposit);
 
     // SSTORE + LOG2
     assert_eq!(result.state_update_count, 2);
@@ -252,7 +286,7 @@ fn test_simple_storage_deposit() {
 #[test]
 #[ignore = "spawns anvil"]
 fn test_simple_storage_call_external() {
-    let result = analyze(&TRACES.call_external);
+    let result = analyze(&traces().call_external);
 
     // The CALL to DummyExternal; its write happens inside the call
     assert_eq!(result.state_update_count, 1);
@@ -271,7 +305,7 @@ fn test_simple_storage_call_external() {
 #[test]
 #[ignore = "spawns anvil"]
 fn test_delegatecall() {
-    let result = analyze(&TRACES.delegatecall);
+    let result = analyze(&traces().delegatecall);
 
     // 3 SSTOREs in main's context (two through DELEGATECALL) + the CALL to A
     assert_eq!(result.state_update_count, 4);
@@ -290,7 +324,7 @@ fn test_delegatecall() {
 #[test]
 #[ignore = "spawns anvil"]
 fn test_access_control() {
-    let result = analyze(&TRACES.access_control);
+    let result = analyze(&traces().access_control);
 
     // The CALL to AccessControlA
     assert_eq!(result.state_update_count, 1);
@@ -309,7 +343,7 @@ fn test_access_control() {
 #[test]
 #[ignore = "spawns anvil"]
 fn test_all_paths_agree_on_simple_storage_set() {
-    let trace = &TRACES.set;
+    let trace = &traces().set;
 
     let analyze = analyze(trace);
     let encode = encode_trace_inner(trace).unwrap();
@@ -331,7 +365,7 @@ fn test_all_paths_agree_on_simple_storage_set() {
 #[test]
 #[ignore = "spawns anvil"]
 fn test_encode_real_trace() {
-    let result = encode_trace_inner(&TRACES.deposit).unwrap();
+    let result = encode_trace_inner(&traces().deposit).unwrap();
 
     assert!(result.encoded_updates.starts_with("0x"));
     assert!(result.encoded_updates.len() > 2);
@@ -355,7 +389,7 @@ fn test_encode_real_trace() {
 #[test]
 #[ignore = "spawns anvil"]
 fn test_heuristic_real_trace() {
-    let result = estimate_gas_heuristic_inner(&TRACES.set, None).unwrap();
+    let result = estimate_gas_heuristic_inner(&traces().set, None).unwrap();
 
     assert!(
         result.gas_estimate >= 21_000,
