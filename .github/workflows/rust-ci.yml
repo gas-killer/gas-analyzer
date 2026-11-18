@@ -129,15 +129,22 @@ jobs:
       - name: cargo clippy (wasm crate)
         run: cargo clippy -p gas-killer-wasm --lib --tests -- -D warnings
 
-      - name: cargo test (wasm crate, native unit tests)
-        run: cargo test -p gas-killer-wasm --lib
+      - name: cargo test (wasm crate, native unit tests and recorded Geth traces)
+        run: cargo test -p gas-killer-wasm --lib --test geth_fixtures
 
       - name: wasm-pack test (node)
         run: wasm-pack test --node crates/wasm
 
-      - name: cargo test --ignored (wasm RPC integration)
-        if: env.RPC_URL != ''
-        run: cargo test -p gas-killer-wasm -- --ignored
+      - name: Install foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        # Pinned with test-native's: gas figures depend on which hardforks anvil knows.
+        with:
+          version: v1.8.5
+
+      # The tests are `#[ignore]`d only for local `cargo test` runs without foundry; it is
+      # installed above, so `--ignored` runs them here.
+      - name: cargo test (wasm anvil integration)
+        run: cargo test -p gas-killer-wasm --test anvil_integration -- --ignored
 
       - name: Build WASM package (for JS RPC test)
         if: env.RPC_URL != ''

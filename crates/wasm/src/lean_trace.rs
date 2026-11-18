@@ -233,7 +233,7 @@ mod tests {
     #[test]
     #[ignore]
     fn fixture_extraction_matches_full_parse() {
-        // CI runs every ignored test when RPC_URL is set; this one only runs when asked for.
+        // No CI step runs this; it only runs when asked for, against a fixture you supply.
         let Ok(path) = std::env::var("GAS_ANALYZER_STRUCT_LOG_FIXTURE") else {
             eprintln!("GAS_ANALYZER_STRUCT_LOG_FIXTURE not set, skipping");
             return;
