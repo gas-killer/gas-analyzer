@@ -285,6 +285,7 @@ impl Replay {
 
     fn sim_env(&self, block_number: Option<u64>, value: U256) -> SimEnvOpts {
         SimEnvOpts {
+            format: gas_analyzer_estimator::SignedFormat::V0_1,
             gas_price: self.gas_price,
             timestamp: self.timestamp,
             ..sim_env(block_number, value)
@@ -732,6 +733,7 @@ fn parse_wei(name: &str, wei: Option<&str>) -> Result<U256, String> {
 /// `msg.value`: a payload that forwards it in a `CALL` halts unfunded without it.
 fn sim_env(block_number: Option<u64>, value: U256) -> SimEnvOpts {
     SimEnvOpts {
+        format: gas_analyzer_estimator::SignedFormat::V0_1,
         number: block_number.unwrap_or(0),
         timestamp: 0,
         gas_limit: 30_000_000,

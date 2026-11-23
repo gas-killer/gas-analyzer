@@ -4,3 +4,6 @@
 [submodule "contracts/lib/solidity-sdk"]
 	path = contracts/lib/solidity-sdk
 	url = https://github.com/gas-killer/solidity-sdk
+[submodule "contracts/lib/solidity-sdk-v0.2"]
+	path = contracts/lib/solidity-sdk-v0.2
+	url = https://github.com/gas-killer/solidity-sdk

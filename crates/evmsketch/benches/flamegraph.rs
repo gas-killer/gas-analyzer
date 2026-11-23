@@ -82,6 +82,7 @@ fn canned_state_updates() -> Vec<StateUpdate> {
 
 fn sim_env() -> SimEnvOpts {
     SimEnvOpts {
+        format: gas_analyzer_estimator::SignedFormat::V0_1,
         number: 22_000_000,
         timestamp: 1_700_000_000,
         gas_limit: 30_000_000,

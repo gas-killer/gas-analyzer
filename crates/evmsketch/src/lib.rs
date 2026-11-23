@@ -662,6 +662,7 @@ impl DefaultEvmSketchExecutor {
         let prefetch = prefetch_started.elapsed();
 
         let sim_env = SimEnvOpts {
+            format: gas_analyzer_estimator::SignedFormat::V0_1,
             value,
             ..self.sim_env()
         };
@@ -692,6 +693,7 @@ impl DefaultEvmSketchExecutor {
     pub fn sim_env(&self) -> SimEnvOpts {
         let header = self.sketch.anchor.header();
         SimEnvOpts {
+            format: gas_analyzer_estimator::SignedFormat::V0_1,
             number: header.number,
             timestamp: header.timestamp,
             gas_limit: header.gas_limit,
@@ -866,6 +868,7 @@ impl GasKillerEvmSketchDefault {
         let simple_db = SimpleRpcDb::new(self.executor.sketch.provider.clone(), state_block);
         let mut cache_db = CacheDB::new(simple_db);
         let sim_env = SimEnvOpts {
+            format: gas_analyzer_estimator::SignedFormat::V0_1,
             value: original.value,
             gas_price: original.gas_price,
             ..self.executor.sim_env()

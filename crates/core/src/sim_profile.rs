@@ -211,7 +211,14 @@ const CALLDATA_FLOOR_NONZERO_TOKENS: u64 = 4;
 /// op's raw EVM price and what it costs to *dispatch* that op out of an ABI-encoded payload — a
 /// term the reporting estimators never needed, because revm charges it automatically when it
 /// executes real calldata.
-pub const UNBOUNDED_APPLY_BASE_GAS: u64 = 2_000;
+///
+/// solidity-sdk v0.2.0 settlement also checks every STORE against the consumer's protected
+/// ranges. Measured on the v0.2.0 estimator with the SDK's two default ranges, that costs about
+/// 3,400 gas per program above v0.1.0, plus about 375 per STORE, which the per-byte term already
+/// covers. The SDK's benchmarks put each further range at about 500 gas, and a consumer behind a
+/// proxy protects three more. 10,000 covers the defaults plus about nine further ranges, for
+/// either format: the gate doesn't know which one a payload lands in.
+pub const UNBOUNDED_APPLY_BASE_GAS: u64 = 10_000;
 
 /// Cost of decoding and dispatching one byte of encoded payload inside `verifyAndUpdate`:
 /// `calldataload`ing it, copying it into memory, and walking the element it belongs to.

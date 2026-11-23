@@ -49,6 +49,7 @@ pub struct SimEnvJson {
 impl From<SimEnvJson> for SimEnvOpts {
     fn from(e: SimEnvJson) -> Self {
         SimEnvOpts {
+            format: gas_analyzer_estimator::SignedFormat::V0_1,
             number: e.number,
             timestamp: e.timestamp,
             gas_limit: e.gas_limit,
