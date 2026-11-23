@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 
 pub use crate::encoding::encode_state_updates_to_abi as encoded_program;
 use crate::heuristic::BASE_TX_COST;
+use crate::signed_format::SignedFormat;
 use crate::sim_profile::STATE_TRACKER_SLOT;
 use crate::trace::{append_state_update_from_struct_log, callee_gas};
 use crate::types::Opcode;
@@ -65,8 +66,9 @@ fn sha256(data: &[u8]) -> B256 {
     B256::from_slice(&Sha256::digest(data))
 }
 
-/// The root frame's leaf: the single-transition digest for the `msg.value` the tree settles
-/// with. A zero value keeps the four-field encoding, so it hashes exactly as before.
+/// The root frame's leaf for a solidity-sdk v0.1.0 consumer: the single-transition digest for the
+/// `msg.value` the tree settles with. A zero value keeps the four-field encoding, so it hashes
+/// exactly as before. A v0.2.0 consumer binds the chain id: see [`chain_bound_root_leaf`].
 pub fn root_leaf(
     transition_index: U256,
     target: Address,
@@ -78,6 +80,42 @@ pub fn root_leaf(
         return sha256(&(transition_index, target, selector, program.clone()).abi_encode_params());
     }
     sha256(&(transition_index, target, selector, program.clone(), value).abi_encode_params())
+}
+
+/// The root frame's leaf for a solidity-sdk v0.2.0 consumer: [`root_leaf`] with the chain id
+/// after the transition index, as in the v0.2.0 single-transition digest.
+pub fn chain_bound_root_leaf(
+    transition_index: U256,
+    chain_id: u64,
+    target: Address,
+    selector: FixedBytes<4>,
+    program: &Bytes,
+    value: U256,
+) -> B256 {
+    let chain_id = U256::from(chain_id);
+    if value.is_zero() {
+        return sha256(
+            &(
+                transition_index,
+                chain_id,
+                target,
+                selector,
+                program.clone(),
+            )
+                .abi_encode_params(),
+        );
+    }
+    sha256(
+        &(
+            transition_index,
+            chain_id,
+            target,
+            selector,
+            program.clone(),
+            value,
+        )
+            .abi_encode_params(),
+    )
 }
 
 /// A callee frame's leaf.
@@ -1292,13 +1330,15 @@ pub struct EncodedTree {
 /// program), build the tree, then build witnesses bottom-up (a witness carries its children's).
 ///
 /// `root_value` is the `msg.value` the tree settles with. The trace can't supply it, which is why
-/// the root frame's own `value` is always zero.
+/// the root frame's own `value` is always zero. `format` is the root consumer's: it decides whether
+/// the root leaf binds `chain_id`.
 pub fn encode_frame_tree(
     frames: &[FrameProgram],
     root_selector: FixedBytes<4>,
     root_value: U256,
     chain_id: u64,
     expiry_block: u64,
+    format: SignedFormat,
 ) -> Result<EncodedTree> {
     let n = frames.len();
     if n == 0 {
@@ -1330,7 +1370,19 @@ pub fn encode_frame_tree(
             .transition_index
             .ok_or_else(|| anyhow::anyhow!("frame {i} has no transition index"))?;
         frame_leaves[i] = if i == 0 {
-            root_leaf(index, frame.target, root_selector, &programs[0], root_value)
+            match format {
+                SignedFormat::V0_1 => {
+                    root_leaf(index, frame.target, root_selector, &programs[0], root_value)
+                }
+                SignedFormat::V0_2 => chain_bound_root_leaf(
+                    index,
+                    chain_id,
+                    frame.target,
+                    root_selector,
+                    &programs[0],
+                    root_value,
+                ),
+            }
         } else {
             nested_leaf(
                 chain_id,
@@ -1421,6 +1473,29 @@ mod tests {
                 U256::from(5)
             ),
             b256!("0x9e2758ecd6d0b8e5563e02127be8e49b5cb8bcbe907e0d44d24968d955d0d6eb")
+        );
+    }
+
+    /// Against solidity-sdk v0.2.0's `NestedFrames.rootLeaf` at chain id 1, with the inputs above.
+    #[test]
+    fn chain_bound_root_leaf_matches_solidity() {
+        let leaf = |value| {
+            chain_bound_root_leaf(
+                U256::from(7),
+                1,
+                A11CE,
+                FixedBytes::from([0x12, 0x34, 0x56, 0x78]),
+                &bytes!("c0ffee"),
+                value,
+            )
+        };
+        assert_eq!(
+            leaf(U256::ZERO),
+            b256!("0x562537256ea398ca1c8f242715abcff06a6ea9d6f28669ff0ae5f61b2e19ba6c")
+        );
+        assert_eq!(
+            leaf(U256::from(5)),
+            b256!("0x6156e09524b304a42cdb28f61833d32ae9cd019196bb907f05bf29d263fdc6fe")
         );
     }
 
@@ -2308,7 +2383,15 @@ mod tests {
             &[B, C],
         );
         let selector = FixedBytes::from([0xde, 0xad, 0xbe, 0xef]);
-        let encoded = encode_frame_tree(&tree.frames, selector, U256::ZERO, 1, 1060).unwrap();
+        let encoded = encode_frame_tree(
+            &tree.frames,
+            selector,
+            U256::ZERO,
+            1,
+            1060,
+            SignedFormat::V0_1,
+        )
+        .unwrap();
 
         assert_eq!(encoded.leaves.len(), 4);
         assert_eq!(encoded.leaves[0], expiry_leaf(1, ROOT, 1060));
@@ -2363,8 +2446,17 @@ mod tests {
         let tree = split(root_calls(B, 0, 1_000_000, 100_000), &[B]);
         let selector = FixedBytes::from([0xde, 0xad, 0xbe, 0xef]);
         let value = U256::from(10).pow(U256::from(18));
-        let unvalued = encode_frame_tree(&tree.frames, selector, U256::ZERO, 1, 1060).unwrap();
-        let valued = encode_frame_tree(&tree.frames, selector, value, 1, 1060).unwrap();
+        let unvalued = encode_frame_tree(
+            &tree.frames,
+            selector,
+            U256::ZERO,
+            1,
+            1060,
+            SignedFormat::V0_1,
+        )
+        .unwrap();
+        let valued =
+            encode_frame_tree(&tree.frames, selector, value, 1, 1060, SignedFormat::V0_1).unwrap();
 
         assert_eq!(
             valued.frame_leaves[0],
@@ -2377,9 +2469,43 @@ mod tests {
     }
 
     #[test]
+    fn a_v0_2_tree_binds_the_chain_id_in_the_root_leaf_only() {
+        let tree = split(root_calls(B, 0, 1_000_000, 100_000), &[B]);
+        let selector = FixedBytes::from([0xde, 0xad, 0xbe, 0xef]);
+        let encode = |chain_id, format| {
+            encode_frame_tree(&tree.frames, selector, U256::ZERO, chain_id, 1060, format).unwrap()
+        };
+        let v1 = encode(1, SignedFormat::V0_1);
+        let v2 = encode(1, SignedFormat::V0_2);
+
+        assert_eq!(
+            v2.frame_leaves[0],
+            chain_bound_root_leaf(U256::ZERO, 1, ROOT, selector, &v2.programs[0], U256::ZERO)
+        );
+        assert_ne!(v2.root, v1.root);
+        assert_eq!(v2.frame_leaves[1..], v1.frame_leaves[1..]);
+        assert_eq!(v2.programs, v1.programs);
+        assert!(verify(&v2.root_proof, v2.root, v2.frame_leaves[0]));
+        assert_ne!(
+            encode(2, SignedFormat::V0_2).frame_leaves[0],
+            v2.frame_leaves[0]
+        );
+    }
+
+    #[test]
     fn encoding_rejects_a_frame_without_an_index() {
         let mut tree = split(root_calls(B, 0, 1_000_000, 100_000), &[B]);
         tree.frames[1].transition_index = None;
-        assert!(encode_frame_tree(&tree.frames, FixedBytes::ZERO, U256::ZERO, 1, 1060).is_err());
+        assert!(
+            encode_frame_tree(
+                &tree.frames,
+                FixedBytes::ZERO,
+                U256::ZERO,
+                1,
+                1060,
+                SignedFormat::V0_1
+            )
+            .is_err()
+        );
     }
 }

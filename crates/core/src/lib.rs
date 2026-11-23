@@ -10,6 +10,7 @@ pub mod heuristic;
 pub mod nested;
 pub mod opcode_report;
 pub mod prestate;
+pub mod signed_format;
 pub mod sim_profile;
 pub mod trace;
 pub mod types;
@@ -30,6 +31,7 @@ pub use prestate::{
     PrestateEligibility, build_state_updates_from_prestate, classify_prestate_eligibility,
     frame_failure,
 };
+pub use signed_format::SignedFormat;
 pub use sim_profile::{
     SimProfile, UNBOUNDED_BLOCK_GAS_LIMIT, UNBOUNDED_COLD_SSTORE_COST,
     UNBOUNDED_PAYLOAD_GAS_BUDGET, UNBOUNDED_TX_GAS_LIMIT, UnboundedCost, UnboundedCostViolation,
