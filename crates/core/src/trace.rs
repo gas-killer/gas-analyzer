@@ -380,7 +380,7 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
                 } else {
                     Default::default()
                 };
-                pin.resolve(&mut state_updates, top, &returndata);
+                pin.resolve(&mut state_updates, top, &returndata)?;
             }
         }
 
@@ -454,6 +454,20 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
                     state_updates.push(check);
                     let index = state_updates.len() - 1;
                     awaiting.push((depth, Await::Static { index }, false));
+                    // Settlement runs the read again: its gas counts like a CALL's, tracked the
+                    // same way until the trace returns from it.
+                    let call_index_1based = state_updates.len();
+                    call_stack.push((depth, call_index_1based));
+                    call_gas_tracking.insert(
+                        call_index_1based,
+                        CallGas {
+                            gas: struct_log.gas,
+                            gas_cost: struct_log.gas_cost,
+                            entry_gas: None,
+                        },
+                    );
+                    awaiting_entry = Some((depth, call_index_1based));
+                    target_depth = depth + 1;
                 }
             } else if let Some(read) = PendingRead::of(&struct_log, origin) {
                 pending_read = Some((depth, read));
@@ -1427,6 +1441,47 @@ mod tests {
             log("JUMPDEST", 2, 900_000, &[], &[], None),
             log("STOP", 2, 870_000, &[], &[], None),
             resume(1, 1_000_000 - 902_600 + 870_000, true),
+        ];
+        for gas in call_and_callee_gas(logs) {
+            assert_eq!(gas, (32_600, 30_000));
+        }
+    }
+
+    /// Settlement runs a checked read again, so both walks count its gas like a `CALL`'s.
+    #[test]
+    fn a_checked_static_read_counts_like_a_call() {
+        let y = Address::new([0x44; 20]);
+        let mut read = log(
+            "STATICCALL",
+            1,
+            1_000_000,
+            &[
+                U256::from(900_000u64),
+                addr_word(y),
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+            ],
+            &[],
+            None,
+        );
+        read.gas_cost = 902_600;
+        let logs = vec![
+            read,
+            log("JUMPDEST", 2, 900_000, &[], &[], None),
+            log("STOP", 2, 870_000, &[], &[], None),
+            resume(1, 1_000_000 - 902_600 + 870_000, true),
+            // The read's result is stored, so the program depends on it.
+            log("PUSH1", 1, 960_000, &[U256::from(1u64)], &[], None),
+            log(
+                "SSTORE",
+                1,
+                959_000,
+                &[U256::from(7u64), U256::from(1u64)],
+                &[],
+                None,
+            ),
         ];
         for gas in call_and_callee_gas(logs) {
             assert_eq!(gas, (32_600, 30_000));

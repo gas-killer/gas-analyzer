@@ -28,6 +28,7 @@ use gas_analyzer_core::heuristic::{
 };
 use gas_analyzer_core::nested::FrameProgram;
 use gas_analyzer_core::sim_profile::default_protected_slots;
+use gas_analyzer_core::sim_profile::protected_ranges_well_formed;
 use gas_analyzer_core::types::{RevertingContext, StateUpdate};
 
 /// EIP-7825 per-tx gas cap, activated in Osaka (Fusaka). The block gas limit
@@ -164,12 +165,11 @@ pub fn default_protected_ranges() -> Vec<ProtectedRange> {
         .collect()
 }
 
-/// Whether `ranges` is a list the SDK's constructor would accept: each range ordered, and each
-/// starting after the one before ends. A contract that answers `gasKillerProtectedRanges()` with
-/// anything else isn't a consumer, and the guard would fail open on it.
+/// Whether `ranges` is a list the SDK's constructor would accept (see
+/// [`protected_ranges_well_formed`]).
 fn well_formed(ranges: &[ProtectedRange]) -> bool {
-    ranges.iter().all(|r| r.start <= r.end)
-        && ranges.windows(2).all(|pair| pair[0].end < pair[1].start)
+    let bounds: Vec<_> = ranges.iter().map(|r| (r.start, r.end)).collect();
+    protected_ranges_well_formed(&bounds)
 }
 
 /// The ranges `target`'s settlement checks STOREs against, read from its code before the
@@ -204,6 +204,49 @@ where
     reported.unwrap_or_else(default_protected_ranges)
 }
 
+/// What the `STATICCALL_CHECK`s in `updates` cost to run past their account access, each read
+/// run from `reader` against `cache_db` without committing. A pricer that leaves the checks out
+/// (see [`unpinned_for_pricing`]) adds it, since settlement runs every read again. Run before the
+/// estimator replaces `reader`'s code, as a read of the contract itself must see its real code.
+fn static_reads_gas<DB>(
+    cache_db: &mut CacheDB<DB>,
+    reader: Address,
+    updates: &[StateUpdate],
+    sim_env: &SimEnvOpts,
+) -> u64
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+{
+    use revm::{ExecuteEvm, MainBuilder};
+
+    updates
+        .iter()
+        .filter_map(|update| match update {
+            StateUpdate::StaticCallCheck(check) => Some(check),
+            _ => None,
+        })
+        .map(|check| {
+            let intrinsic = BASE_TX_COST + calldata_gas(&check.data);
+            estimator_tx(
+                check.target,
+                reader,
+                check.data.clone(),
+                U256::ZERO,
+                sim_env,
+            )
+            .ok()
+            .and_then(|tx| {
+                let mut evm = estimator_context(cache_db, sim_env).build_mainnet();
+                evm.transact(tx).ok()
+            })
+            .map_or(0, |outcome| {
+                outcome.result.gas_used().saturating_sub(intrinsic)
+            })
+        })
+        .sum()
+}
+
 /// Build the calldata for `StateChangeHandlerGasEstimator`'s
 /// `runStateUpdatesCall(uint8[], bytes[], (uint256,uint256,bytes32)[])`, which applies
 /// `state_updates` checking every STORE against `ranges`, as the consumer's settlement does.
@@ -231,19 +274,22 @@ impl Handler {
     ///
     /// - less the gas of the bytes settlement doesn't send: the ranges, which a consumer builds
     ///   in memory;
-    /// - plus, when `sim_env` doesn't verify observations, what the checks left out cost.
-    fn calldata(&self, updates: &[StateUpdate], sim_env: &SimEnvOpts) -> (Bytes, GasAdjust) {
-        let (unpinned, checks);
+    /// - plus, when `sim_env` doesn't verify observations, what the program left out costs: each
+    ///   check's cold account access, and the calldata of the pins and checks settlement sends.
+    ///   A check's read is measured separately (see [`static_reads_gas`]).
+    fn calldata(&self, program: &[StateUpdate], sim_env: &SimEnvOpts) -> (Bytes, GasAdjust) {
+        let (unpinned, mut plus);
         let updates = if sim_env.verify_observations {
-            checks = 0;
-            updates
+            plus = 0;
+            program
         } else {
-            (unpinned, checks) = unpinned_for_pricing(updates);
+            (unpinned, plus) = unpinned_for_pricing(program);
+            plus += program_calldata_gas(program).saturating_sub(program_calldata_gas(&unpinned));
             &unpinned
         };
         let data = build_gas_estimation_calldata(updates, &self.0);
         let less = calldata_gas(&data).saturating_sub(program_calldata_gas(updates));
-        (data, GasAdjust { less, plus: checks })
+        (data, GasAdjust { less, plus })
     }
 }
 
@@ -319,6 +365,9 @@ fn call_value_total(state_updates: &[StateUpdate]) -> U256 {
 /// whatever the sender's balance. Only pricing is affected: a contract already holding enough is
 /// left untouched, so balance checks against it read what they read on chain. Runs before
 /// injection, which carries the balance over.
+///
+/// Not when the estimate verifies observations: it then runs on the state the trace ran on, which
+/// settlement sees too, and a raised balance would fail a pinned balance check of the contract.
 ///
 /// If the account can't be read, nothing is funded: writing over an account that was never read
 /// could lower its real balance and zero its nonce, and would hide the backend failure behind a
@@ -727,10 +776,15 @@ where
         "estimate_state_changes_gas takes a flat program; price nested trees with \
          estimate_frame_tree_gas"
     );
-    fund_value_calls(cache_db, contract_address, call_value_total(state_updates));
+    let mut static_gas = 0;
+    if !sim_env.verify_observations {
+        fund_value_calls(cache_db, contract_address, call_value_total(state_updates));
+        static_gas = static_reads_gas(cache_db, contract_address, state_updates, sim_env);
+    }
     let handler = handler_for(cache_db, contract_address, caller_address, sim_env);
     inject_estimator(cache_db, contract_address)?;
-    let (calldata, adjust) = handler.calldata(state_updates, sim_env);
+    let (calldata, mut adjust) = handler.calldata(state_updates, sim_env);
+    adjust.plus += static_gas;
     let tx = prepare_estimator_tx(
         cache_db,
         contract_address,
@@ -912,14 +966,27 @@ where
         return Err(anyhow!("a frame tree needs a root frame"));
     }
     // A contract can appear in several frames; fund it for every call it sends across them.
-    let mut call_values: HashMap<Address, U256> = HashMap::new();
-    for frame in frames {
-        let total = call_values.entry(frame.target).or_default();
-        *total = total.saturating_add(call_value_total(&frame.updates));
+    if !sim_env.verify_observations {
+        let mut call_values: HashMap<Address, U256> = HashMap::new();
+        for frame in frames {
+            let total = call_values.entry(frame.target).or_default();
+            *total = total.saturating_add(call_value_total(&frame.updates));
+        }
+        for (target, required) in call_values {
+            fund_value_calls(cache_db, target, required);
+        }
     }
-    for (target, required) in call_values {
-        fund_value_calls(cache_db, target, required);
-    }
+    // Before injection, so each read sees the code it read in the trace.
+    let static_gas: Vec<u64> = frames
+        .iter()
+        .map(|frame| {
+            if sim_env.verify_observations {
+                0
+            } else {
+                static_reads_gas(cache_db, frame.target, &frame.updates, sim_env)
+            }
+        })
+        .collect();
 
     // Once per contract: injecting again would stash the estimator itself as the original code.
     let mut handlers = HashMap::new();
@@ -939,6 +1006,9 @@ where
         exec,
     };
     tree.run(cache_db, 0, root_value, &mut frame_gas)?;
+    for (gas, reads) in frame_gas.iter_mut().zip(static_gas) {
+        *gas += reads;
+    }
     Ok(frame_gas)
 }
 
@@ -2001,7 +2071,11 @@ mod tests {
         let root = address!("0x00000000000000000000000000000000000a0000");
         let recipient = address!("0x00000000000000000000000000000000000c0000");
         let caller = address!("0x000000000000000000000000000000000000beef");
-        let sim_env = sim_env_with_spec(SpecId::CANCUN);
+        // Priced at a forked block, where observations aren't verified.
+        let sim_env = SimEnvOpts {
+            verify_observations: false,
+            ..sim_env_with_spec(SpecId::CANCUN)
+        };
         let updates = vec![value_call(recipient, U256::from(ONE_ETH))];
 
         let mut unfunded = CacheDB::new(EmptyDB::default());
@@ -2024,7 +2098,11 @@ mod tests {
         let child = address!("0x00000000000000000000000000000000000b0000");
         let recipient = address!("0x00000000000000000000000000000000000c0000");
         let caller = address!("0x000000000000000000000000000000000000beef");
-        let sim_env = sim_env_with_spec(SpecId::CANCUN);
+        // Priced at a forked block, where observations aren't verified.
+        let sim_env = SimEnvOpts {
+            verify_observations: false,
+            ..sim_env_with_spec(SpecId::CANCUN)
+        };
         let frames = [
             frame(
                 root,
@@ -2047,6 +2125,52 @@ mod tests {
             estimate_frame_tree_gas(&mut cache_db, &frames, caller, U256::ZERO, &sim_env)
                 .expect("every frame's value calls are priced");
         assert!(frame_gas.iter().all(|&g| g > 0));
+    }
+
+    /// Verifying observations, the estimate runs on the traced state and funds nothing: ETH the
+    /// program's own CALL brings in covers its value call, and a pinned balance check of the
+    /// contract reads what the trace read rather than a topped-up balance.
+    #[test]
+    fn verified_estimates_fund_no_value_calls() {
+        use revm::database_interface::DatabaseRef;
+
+        let root = address!("0x00000000000000000000000000000000000a0000");
+        let payer = address!("0x00000000000000000000000000000000000d0000");
+        let recipient = address!("0x00000000000000000000000000000000000c0000");
+        let caller = address!("0x000000000000000000000000000000000000beef");
+        // Sends its caller 1 ETH: CALL(gas, CALLER, 1e18, 0, 0, 0, 0).
+        let mut payer_code = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x67];
+        payer_code.extend_from_slice(&ONE_ETH.to_be_bytes()[8..]);
+        payer_code.extend_from_slice(&[0x33, 0x5a, 0xf1, 0x00]);
+        let mut cache_db = CacheDB::new(EmptyDB::default());
+        with_code(&mut cache_db, payer, &payer_code);
+        cache_db.insert_account_info(
+            payer,
+            AccountInfo {
+                balance: U256::from(ONE_ETH),
+                ..cache_db.basic_ref(payer).unwrap().unwrap()
+            },
+        );
+        let updates = vec![
+            pinned_call(
+                payer,
+                B256::ZERO,
+                gas_analyzer_core::types::CALL_GAS_UNCAPPED,
+            ),
+            StateUpdate::BalanceCheck(IStateUpdateTypes::BalanceCheck {
+                account: root,
+                balance: U256::from(ONE_ETH),
+            }),
+            value_call(recipient, U256::from(ONE_ETH)),
+        ];
+        estimate_state_changes_gas(
+            &mut cache_db,
+            root,
+            caller,
+            &updates,
+            &sim_env_with_spec(SpecId::CANCUN),
+        )
+        .expect("the balance the trace saw holds");
     }
 
     /// Funding only tops up: a contract already holding enough keeps its real balance, so a
@@ -2547,7 +2671,8 @@ mod tests {
     }
 
     /// Where observations can't be verified, the program is priced unpinned: a pin that no longer
-    /// holds doesn't fail the estimate, and each check left out is charged a cold account access.
+    /// holds doesn't fail the estimate, and each check left out is charged a cold account access
+    /// and the calldata settlement sends for it. A pin's calldata is charged too.
     #[test]
     fn pricing_without_verifying_leaves_pins_out_and_charges_the_checks() {
         let account = address!("0x00000000000000000000000000000000000c0003");
@@ -2580,11 +2705,66 @@ mod tests {
             )
             .is_err()
         );
-        let bare = price(&[store_slot0(), moved_call.clone()]).unwrap();
-        let checked = price(&[store_slot0(), moved_call, check]).unwrap();
+        let bare = [store_slot0(), moved_call.clone()];
+        let with_check = [store_slot0(), moved_call.clone(), check];
         assert_eq!(
-            checked,
-            bare + gas_analyzer_core::heuristic::COLD_ACCOUNT_ACCESS_COST
+            price(&with_check).unwrap(),
+            price(&bare).unwrap()
+                + gas_analyzer_core::heuristic::COLD_ACCOUNT_ACCESS_COST
+                + program_calldata_gas(&with_check)
+                - program_calldata_gas(&bare)
+        );
+
+        let unpinned_call = pinned_call(
+            account,
+            B256::ZERO,
+            gas_analyzer_core::types::CALL_GAS_UNCAPPED,
+        );
+        assert_eq!(
+            price(std::slice::from_ref(&moved_call)).unwrap(),
+            price(std::slice::from_ref(&unpinned_call)).unwrap()
+                + program_calldata_gas(&[moved_call])
+                - program_calldata_gas(&[unpinned_call]),
+            "the pin's calldata"
+        );
+    }
+
+    /// A check left out of a priced program is still charged its read: settlement runs the
+    /// `STATICCALL` again.
+    #[test]
+    fn pricing_without_verifying_charges_each_static_reads_execution() {
+        let view = address!("0x00000000000000000000000000000000000c0004");
+        // Burns gas in a loop, then returns: i = 200; loop { i -= 1; if i == 0 break }.
+        let burner = [
+            0x60, 0xc8, 0x5b, 0x60, 0x01, 0x90, 0x03, 0x80, 0x60, 0x02, 0x57, 0x00,
+        ];
+        let read = |target| {
+            StateUpdate::StaticCallCheck(IStateUpdateTypes::StaticCallCheck {
+                target,
+                data: Bytes::new(),
+                resultHash: B256::ZERO,
+            })
+        };
+        let pricing = SimEnvOpts {
+            verify_observations: false,
+            ..guarded_env()
+        };
+        let price = |target| {
+            let mut cache_db = CacheDB::new(EmptyDB::default());
+            with_code(&mut cache_db, view, &burner);
+            estimate_state_changes_gas(
+                &mut cache_db,
+                GUARDED_ROOT,
+                GUARDED_CALLER,
+                &[store_slot0(), read(target)],
+                &pricing,
+            )
+            .unwrap()
+        };
+        let empty = address!("0x00000000000000000000000000000000000c0005");
+        assert!(
+            price(view) > price(empty) + 200 * 10,
+            "the loop's ~200 iterations are charged"
         );
     }
 }

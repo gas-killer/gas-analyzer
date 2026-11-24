@@ -21,6 +21,7 @@ use alloy_rpc_types::TransactionTrait;
 use anyhow::{Result, anyhow, bail};
 
 use gas_analyzer_core::trace::{TraceExtract, compute_state_updates, ensure_call_succeeded};
+use gas_analyzer_core::types::StateUpdate;
 use gas_analyzer_core::{
     OBSERVATION_SCAN_STEP_LIMIT, OBSERVATION_TRACER, SimProfile, opcode_observation,
 };
@@ -571,6 +572,26 @@ pub async fn get_preceding_transactions<P: Provider>(
         .collect();
 
     Ok(preceding)
+}
+
+/// Fill in the code hash of every account whose `EXTCODESIZE` a program pins: the trace
+/// shows the size, so the code is fetched at the traced `block` and checked against it (see
+/// [`gas_analyzer_core::observe::resolve_code_sizes`]).
+pub async fn resolve_code_hashes<P: Provider>(
+    provider: &P,
+    block: BlockId,
+    updates: &mut [StateUpdate],
+) -> Result<()> {
+    let mut code = std::collections::HashMap::new();
+    for (account, _) in gas_analyzer_core::observe::unresolved_code_sizes(updates) {
+        let bytes = provider
+            .get_code_at(account)
+            .block_id(block)
+            .await
+            .map_err(|e| anyhow!("fetching the code of {account}, read by EXTCODESIZE: {e}"))?;
+        code.insert(account, bytes);
+    }
+    gas_analyzer_core::observe::resolve_code_sizes(updates, &code)
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 
+use alloy::eips::BlockId;
 use alloy::{
     contract,
     dyn_abi::DynSolValue,
@@ -56,7 +57,7 @@ use gas_analyzer_core::{
     Opcode, RevertingContext, SignatureType, StateUpdate, TURETZKY_UPPER_GAS_LIMIT_SCHNORR,
     TraceExtract, compute_state_updates, encode_state_updates_to_abi, encode_state_updates_to_sol,
 };
-use gas_analyzer_rpc::get_tx_trace;
+use gas_analyzer_rpc::{get_tx_trace, resolve_code_hashes};
 
 // ============================================================================
 // Report Types
@@ -238,7 +239,8 @@ alloy::sol! {
 }
 
 /// The ranges `target`'s settlement checks STOREs against: what it reports, or the defaults for a
-/// contract that doesn't (one that isn't a consumer yet is priced as one would be).
+/// contract that doesn't report a well-formed list (one that isn't a consumer yet is priced as one
+/// would be, and a junk list can't make the guard fail open).
 async fn protected_ranges<P: Provider>(
     provider: &P,
     target: Address,
@@ -257,6 +259,10 @@ async fn protected_ranges<P: Provider>(
                     mask: r.mask,
                 })
                 .collect::<Vec<_>>()
+        })
+        .filter(|ranges| {
+            let bounds: Vec<_> = ranges.iter().map(|r| (r.start, r.end)).collect();
+            gas_analyzer_core::sim_profile::protected_ranges_well_formed(&bounds)
         });
     reported.unwrap_or_else(|| {
         gas_analyzer_core::sim_profile::default_protected_slots()
@@ -727,12 +733,20 @@ pub async fn call_to_encoded_state_updates_with_gas_estimate(
             TxKind::Create => None,
         })
         .ok_or_else(|| anyhow!("receipt does not have to address"))?;
-    let trace = get_trace_from_call(url, tx_request, block_height).await?;
+    let trace = get_trace_from_call(url.clone(), tx_request, block_height).await?;
     let TraceExtract {
-        state_updates,
+        mut state_updates,
         skipped_opcodes,
         ..
     } = compute_state_updates(trace, None)?;
+    // The program pins a code size as its code's hash, read at the block the call was traced at.
+    let block = block_height.map_or(BlockId::latest(), BlockId::number);
+    resolve_code_hashes(
+        &ProviderBuilder::new().connect_http(url),
+        block,
+        &mut state_updates,
+    )
+    .await?;
     let gas_estimate = gk
         .estimate_state_changes_gas(contract_address, &state_updates)
         .await?;
@@ -758,6 +772,18 @@ impl<P: Provider + DebugApi> TxStateExtractor<P> {
         Self { provider }
     }
 
+    /// Pin each code size the program read as its code's hash, at the transaction's block.
+    async fn resolve_code_hashes(
+        &self,
+        receipt: &TransactionReceipt,
+        updates: &mut [StateUpdate],
+    ) -> Result<()> {
+        let block = receipt
+            .block_number
+            .map_or(BlockId::latest(), BlockId::number);
+        resolve_code_hashes(&self.provider, block, updates).await
+    }
+
     /// Extract state updates from a transaction hash
     pub async fn extract_state_updates(&self, tx_hash: FixedBytes<32>) -> Result<Vec<StateUpdate>> {
         let receipt = self
@@ -767,8 +793,9 @@ impl<P: Provider + DebugApi> TxStateExtractor<P> {
             .ok_or_else(|| anyhow!("could not get receipt for tx {}", tx_hash))?;
         let trace = get_tx_trace(&self.provider, tx_hash, receipt.status()).await?;
 
-        // Use existing compute_state_updates function
-        let state_updates = compute_state_updates(trace, None)?.state_updates;
+        let mut state_updates = compute_state_updates(trace, None)?.state_updates;
+        self.resolve_code_hashes(&receipt, &mut state_updates)
+            .await?;
 
         Ok(state_updates)
     }
@@ -795,7 +822,9 @@ impl<P: Provider + DebugApi> TxStateExtractor<P> {
         }
 
         let trace = get_tx_trace(&self.provider, tx_hash, receipt.status()).await?;
-        let state_updates = compute_state_updates(trace, None)?.state_updates;
+        let mut state_updates = compute_state_updates(trace, None)?.state_updates;
+        self.resolve_code_hashes(&receipt, &mut state_updates)
+            .await?;
 
         Ok(StateUpdateReport {
             tx_hash,

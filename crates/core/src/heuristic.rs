@@ -155,10 +155,12 @@ pub fn estimate_gas_from_state_updates(extract: &TraceExtract) -> u64 {
             }
             // Covered by create_gas_total above.
             StateUpdate::Create(_) | StateUpdate::Create2(_) => 0,
-            // The access a check repeats; a STATICCALL_CHECK's callee runs on top.
-            StateUpdate::StaticCallCheck(_)
-            | StateUpdate::BalanceCheck(_)
-            | StateUpdate::CodehashCheck(_) => COLD_ACCOUNT_ACCESS_COST,
+            // A STATICCALL_CHECK's read, access included, is in call_gas_total like a CALL's.
+            StateUpdate::StaticCallCheck(_) => 0,
+            // The access a check repeats.
+            StateUpdate::BalanceCheck(_) | StateUpdate::CodehashCheck(_) => {
+                COLD_ACCOUNT_ACCESS_COST
+            }
         };
     }
 

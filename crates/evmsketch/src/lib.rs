@@ -152,15 +152,14 @@ use gas_analyzer_core::{
     Opcode, PrestateEligibility, SignatureType, StateUpdate, build_state_updates_from_prestate,
     classify_prestate_eligibility, compute_state_updates, compute_state_updates_canonical,
     encode_state_updates_to_abi, estimate_gas_from_operations, extract_operation_counts_from_trace,
-    frame_failure, resolve_code_sizes, static_observation, unresolved_code_sizes,
-    validate_unbounded_cost, validate_unbounded_tree_cost,
+    frame_failure, static_observation, validate_unbounded_cost, validate_unbounded_tree_cost,
 };
 use gas_analyzer_estimator::SimEnvOpts;
 pub use gas_analyzer_estimator::{PrecedingTx, reverting_context};
 use gas_analyzer_rpc::{
     MuxedTraces, get_call_frame_from_call_with_profile, get_observation_from_call_with_profile,
     get_prestate_diff_and_call_frame_with_profile, get_prestate_diff_from_call_with_profile,
-    get_trace_from_call_with_profile,
+    get_trace_from_call_with_profile, resolve_code_hashes,
 };
 
 // ============================================================================
@@ -1263,26 +1262,6 @@ pub struct EncodedStateUpdates {
     pub executor_cache_hit: bool,
     /// What each phase of this run cost.
     pub timings: EncodePhaseTimings,
-}
-
-/// Fill in the code hash of every account whose `EXTCODESIZE` a v0.2.0 program pins: the trace
-/// shows the size, so the code is fetched at the traced `block` and checked against it (see
-/// [`gas_analyzer_core::observe::resolve_code_sizes`]).
-async fn resolve_code_hashes<P: Provider>(
-    provider: &P,
-    block: BlockId,
-    updates: &mut [StateUpdate],
-) -> Result<()> {
-    let mut code = HashMap::new();
-    for (account, _) in unresolved_code_sizes(updates) {
-        let bytes = provider
-            .get_code_at(account)
-            .block_id(block)
-            .await
-            .with_context(|| format!("fetching the code of {account}, read by EXTCODESIZE"))?;
-        code.insert(account, bytes);
-    }
-    resolve_code_sizes(updates, &code)
 }
 
 /// Compute encoded state updates and gas estimate for a transaction call using EvmSketch.
@@ -3779,11 +3758,6 @@ mod tests {
             )
         }
 
-        /// The gas estimate must replay the payload with the call's `msg.value`. A consumer that
-        /// checks the ETH a call brought in (a deposit that must stay backed) otherwise reverts in
-        /// the estimate — an analysis failure for a call that settles fine when sent with its value.
-        // `SimpleRpcDb` reads uncached state through `block_in_place`, which panics on a
-        // current-thread runtime.
         /// Returns one word, 0x2a.
         fn returner_code() -> Bytes {
             hex_code("602a 6000 52 6020 6000 f3")
@@ -3943,6 +3917,11 @@ mod tests {
             }
         }
 
+        /// The gas estimate must replay the payload with the call's `msg.value`. A consumer that
+        /// checks the ETH a call brought in (a deposit that must stay backed) otherwise reverts in
+        /// the estimate — an analysis failure for a call that settles fine when sent with its value.
+        // `SimpleRpcDb` reads uncached state through `block_in_place`, which panics on a
+        // current-thread runtime.
         #[tokio::test(flavor = "multi_thread")]
         #[ignore = "spawns a local anvil; requires foundry on PATH"]
         async fn test_estimate_replays_with_the_calls_value() {

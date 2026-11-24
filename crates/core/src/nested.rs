@@ -813,7 +813,7 @@ fn split_frame_tree(
                     && let Some(top) = stack_top(&struct_log, 0)
                 {
                     let caller = frames.last_mut().expect("root frame must remain");
-                    pin.resolve(&mut caller.out, top, &[]);
+                    pin.resolve(&mut caller.out, top, &[])?;
                 }
                 if p.emitted_create {
                     let deployed = struct_log.stack.as_ref().and_then(|s| s.last());
@@ -866,7 +866,7 @@ fn split_frame_tree(
                 let top = *stack.last().expect("checked above");
                 let returndata = exits.take(closing_depth);
                 let caller = frames.last_mut().expect("root frame must remain");
-                pin.resolve(&mut caller.out, top, &returndata);
+                pin.resolve(&mut caller.out, top, &returndata)?;
             }
             let parent_program = frames.last().and_then(|f| f.program);
             if !success {
@@ -1043,15 +1043,17 @@ fn split_frame_tree(
                             index: frames[idx].out.len() - 1,
                         });
                     }
+                    // Settlement runs a checked read again, so its gas counts like a `CALL`'s.
+                    let checked = pin.is_some();
                     pending = Some(PendingFrame {
                         parent_depth: depth,
                         storage_ctx: callee,
                         program: None,
                         emitted_view: BTreeMap::new(),
-                        emitted_call_gas: None,
+                        emitted_call_gas: checked.then_some(struct_log.gas),
                         emitted_create: false,
                         nested_start_gas: None,
-                        call_gas_cost: 0,
+                        call_gas_cost: if checked { struct_log.gas_cost } else { 0 },
                         pin,
                     });
                 }
@@ -1144,11 +1146,6 @@ fn split_frame_tree(
             "CREATE" | "CREATE2" => {
                 let emitted = cur_emitting && !op_errored;
                 let gas_at_opcode = struct_log.gas;
-                // A `CREATE`'s address depends on the deployer's nonce, so it is pinned.
-                let pin =
-                    (emitted && op == "CREATE" && usage.used(log_index)).then(|| Await::Create {
-                        index: frames[idx].out.len(),
-                    });
                 if emitted {
                     // Initcode can call back into the target: boundary here too.
                     flush_slice(&mut frames, &programs);
@@ -1158,6 +1155,12 @@ fn split_frame_tree(
                         unreachable!("CREATE/CREATE2 are never skipped opcodes");
                     }
                 }
+                // A `CREATE`'s address depends on the deployer's nonce, so it is pinned. Indexed
+                // after the flush, which can put the target's pending STOREs ahead of it.
+                let pin =
+                    (emitted && op == "CREATE" && usage.used(log_index)).then(|| Await::Create {
+                        index: frames[idx].out.len() - 1,
+                    });
                 if !op_errored {
                     pending = Some(PendingFrame {
                         parent_depth: depth,
@@ -1940,6 +1943,32 @@ mod tests {
             &[],
         );
         let StateUpdate::Create(create) = &tree.frames[0].updates[0] else {
+            panic!("a CREATE");
+        };
+        assert_eq!(create.expected, deployed);
+    }
+
+    /// A STORE flushed ahead of the `CREATE` doesn't take its pin.
+    #[test]
+    fn a_create_after_a_store_pins_its_address() {
+        let deployed = Address::repeat_byte(0xde);
+        let tree = split(
+            vec![
+                sstore(1, slot(1), 10),
+                log(
+                    "CREATE",
+                    1,
+                    1_000_000,
+                    &[U256::ZERO, U256::ZERO, U256::ZERO],
+                    0,
+                ),
+                stop(2, 900_000),
+                log("JUMPDEST", 1, 800_000, &[word(deployed)], 0),
+            ],
+            &[],
+        );
+        assert_eq!(kinds(&tree.frames[0].updates), ["STORE", "CREATE"]);
+        let StateUpdate::Create(create) = &tree.frames[0].updates[1] else {
             panic!("a CREATE");
         };
         assert_eq!(create.expected, deployed);

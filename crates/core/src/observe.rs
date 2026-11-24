@@ -138,7 +138,16 @@ impl Await {
     /// Complete the awaited op in `out` from the resume log: `success` (or, for a `CREATE`, the
     /// deployed address) is on top of its stack, and `returndata` is what the callee handed
     /// back, empty if it opened no frame.
-    pub(crate) fn resolve(self, out: &mut [StateUpdate], resume_top: U256, returndata: &[u8]) {
+    ///
+    /// Fails for a read the program depends on that failed without data (out of gas, a halt,
+    /// the call depth): settlement re-runs a check with all its gas and rejects such a failure,
+    /// so no check can pin it.
+    pub(crate) fn resolve(
+        self,
+        out: &mut [StateUpdate],
+        resume_top: U256,
+        returndata: &[u8],
+    ) -> Result<()> {
         let success = !resume_top.is_zero();
         match self {
             Self::Call {
@@ -159,10 +168,18 @@ impl Await {
             }
             Self::Static { index } => {
                 if let Some(StateUpdate::StaticCallCheck(check)) = out.get_mut(index) {
+                    if !success && returndata.is_empty() {
+                        bail!(
+                            "the program depends on a STATICCALL to {} that failed without data, \
+                             which settlement can't check",
+                            check.target
+                        );
+                    }
                     check.resultHash = result_hash(success, returndata);
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -441,6 +458,34 @@ mod tests {
         exits.step(&log("INVALID", 2, vec![], vec![])).unwrap();
         exits.step(&log("POP", 1, vec![], vec![])).unwrap();
         assert!(exits.take(2).is_empty());
+    }
+
+    #[test]
+    fn a_static_read_failing_without_data_cannot_be_checked() {
+        let check = || {
+            vec![StateUpdate::StaticCallCheck(
+                IStateUpdateTypes::StaticCallCheck {
+                    target: Address::repeat_byte(1),
+                    data: Bytes::new(),
+                    resultHash: B256::ZERO,
+                },
+            )]
+        };
+        let pin = Await::Static { index: 0 };
+
+        let mut out = check();
+        pin.resolve(&mut out, U256::ZERO, &[7]).unwrap();
+        let StateUpdate::StaticCallCheck(c) = &out[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            c.resultHash,
+            result_hash(false, &[7]),
+            "a revert with data is pinned"
+        );
+
+        assert!(pin.resolve(&mut check(), U256::ZERO, &[]).is_err());
+        pin.resolve(&mut check(), U256::from(1), &[]).unwrap();
     }
 
     #[test]

@@ -74,6 +74,16 @@ pub fn default_protected_slots() -> [(B256, B256); 2] {
     ]
 }
 
+/// Whether protected ranges, as `(start, end)` bounds in list order, form a list the SDK's
+/// constructor would accept: each range ordered, and each starting after the one before ends. A
+/// contract that reports anything else isn't a consumer, and the guard would fail open on it.
+pub fn protected_ranges_well_formed(
+    bounds: &[(alloy_primitives::U256, alloy_primitives::U256)],
+) -> bool {
+    bounds.iter().all(|(start, end)| start <= end)
+        && bounds.windows(2).all(|pair| pair[0].1 < pair[1].0)
+}
+
 /// Block gas limit for the `Unbounded` profile: 2^40 ≈ 1.1 Tgas,
 /// ~24,000× a 45M-gas mainnet block.
 ///
@@ -382,11 +392,13 @@ pub fn estimate_applied_payload_gas(
             // Charged through `external_call_gas`, which a create's analytic cost would
             // understate: it leaves out the initcode's execution and the code deposit.
             StateUpdate::Create(_) | StateUpdate::Create2(_) => 0,
-            // The cold access a check repeats. A STATICCALL_CHECK's callee is charged through
-            // `external_call_gas`, as a `CALL`'s is.
-            StateUpdate::StaticCallCheck(_)
-            | StateUpdate::BalanceCheck(_)
-            | StateUpdate::CodehashCheck(_) => COLD_ACCOUNT_ACCESS_COST,
+            // A STATICCALL_CHECK's read, access included, is charged through
+            // `external_call_gas`, as a `CALL` is.
+            StateUpdate::StaticCallCheck(_) => 0,
+            // The cold access a check repeats.
+            StateUpdate::BalanceCheck(_) | StateUpdate::CodehashCheck(_) => {
+                COLD_ACCOUNT_ACCESS_COST
+            }
         });
     }
 
