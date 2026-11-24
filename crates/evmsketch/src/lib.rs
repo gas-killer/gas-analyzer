@@ -1588,15 +1588,19 @@ async fn try_prestate_net<P: Provider + DebugApi>(
             // read anything outside the consumer goes to the struct-log encoder.
             let observed = match static_observation(&frame) {
                 Some(reason) => Some(reason),
-                None => {
-                    get_observation_from_call_with_profile(
-                        provider,
-                        tx_request.clone(),
-                        block,
-                        profile,
-                    )
-                    .await?
-                }
+                // A scan that fails says nothing either way: the struct-log encoder pins what
+                // the call read, so it takes the call instead of failing the encode.
+                None => match get_observation_from_call_with_profile(
+                    provider,
+                    tx_request.clone(),
+                    block,
+                    profile,
+                )
+                .await
+                {
+                    Ok(observed) => observed,
+                    Err(e) => Some(format!("the observation scan failed: {e:#}")),
+                },
             };
             if let Some(reason) = observed {
                 tracing::debug!(reason = %reason, "call observes outside the consumer; using struct-log encoder");

@@ -27,7 +27,7 @@ pub use heuristic::{
     estimate_gas_from_operations, estimate_gas_from_state_updates,
     extract_operation_counts_from_trace,
 };
-pub use observe::{resolve_code_sizes, unresolved_code_sizes};
+pub use observe::{drop_unresolved_code_sizes, resolve_code_sizes, unresolved_code_sizes};
 pub use opcode_report::{OpcodeCategory, OpcodeReport, Treatment, Usage, opcode_report};
 pub use prestate::{
     OBSERVATION_SCAN_STEP_LIMIT, OBSERVATION_TRACER, PrestateEligibility,

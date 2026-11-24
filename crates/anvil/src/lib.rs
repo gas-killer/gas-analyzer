@@ -52,7 +52,9 @@ fn impl_slot() -> U256 {
     )) - U256::from(1)
 }
 
-use gas_analyzer_core::heuristic::{calldata_gas, program_calldata_gas, unpinned_for_pricing};
+use gas_analyzer_core::heuristic::{
+    BASE_TX_COST, calldata_gas, program_calldata_gas, unpinned_for_pricing,
+};
 use gas_analyzer_core::{
     Opcode, RevertingContext, SignatureType, StateUpdate, TURETZKY_UPPER_GAS_LIMIT_SCHNORR,
     TraceExtract, compute_state_updates, encode_state_updates_to_abi, encode_state_updates_to_sol,
@@ -261,7 +263,7 @@ async fn protected_ranges<P: Provider>(
                 .collect::<Vec<_>>()
         })
         .filter(|ranges| {
-            let bounds: Vec<_> = ranges.iter().map(|r| (r.start, r.end)).collect();
+            let bounds: Vec<_> = ranges.iter().map(|r| (r.start, r.end, r.mask)).collect();
             gas_analyzer_core::sim_profile::protected_ranges_well_formed(&bounds)
         });
     reported.unwrap_or_else(|| {
@@ -350,6 +352,8 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
         let original_code = self.provider.get_code_at(contract_address).await?;
         // Read before the estimator replaces the code that answers it.
         let ranges = protected_ranges(&self.provider, contract_address).await;
+        // Measured before then too: a read of the contract itself must run its real code.
+        let static_gas = self.static_reads_gas(contract_address, state_updates).await;
 
         // Stash the original bytecode at a synthetic backup address so the proxy's
         // fallback can DELEGATECALL to it when external protocols (oracles, AMMs)
@@ -375,8 +379,12 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
         let target_contract = StateChangeHandlerGasEstimator::new(contract_address, &self.provider);
 
         // A fork's state needn't match what the observations saw: price the program unpinned,
-        // charging the checks it leaves out.
-        let (state_updates, check_gas) = unpinned_for_pricing(state_updates);
+        // charging what it leaves out: each check's account access and read, and the calldata of
+        // the pins and checks settlement sends.
+        let (unpinned, check_gas) = unpinned_for_pricing(state_updates);
+        let left_out_calldata =
+            program_calldata_gas(state_updates).saturating_sub(program_calldata_gas(&unpinned));
+        let state_updates = unpinned;
         let (types, args) = encode_state_updates_to_sol(&state_updates);
         let types = types.iter().map(|x| *x as u8).collect::<Vec<_>>();
         let call = target_contract.runStateUpdatesCall(types, args, ranges);
@@ -409,7 +417,34 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
             initial_block_number, final_block_number,
             "block number should revert to initial state"
         );
-        Ok(receipt.gas_used - ranges_calldata_gas + check_gas)
+        Ok(receipt.gas_used - ranges_calldata_gas + check_gas + left_out_calldata + static_gas)
+    }
+
+    /// What the `STATICCALL_CHECK`s in `updates` cost to run past their account access, each read
+    /// estimated from `reader`. The node's estimate is the gas limit the read needs, a little above
+    /// what it uses. A read that can't be estimated is logged and not charged.
+    async fn static_reads_gas(&self, reader: Address, updates: &[StateUpdate]) -> u64 {
+        let mut gas = 0;
+        for update in updates {
+            let StateUpdate::StaticCallCheck(check) = update else {
+                continue;
+            };
+            let request = TransactionRequest::default()
+                .from(reader)
+                .to(check.target)
+                .input(check.data.clone().into());
+            match self.provider.estimate_gas(request).await {
+                Ok(estimate) => {
+                    gas += estimate.saturating_sub(BASE_TX_COST + calldata_gas(&check.data));
+                }
+                Err(e) => tracing::warn!(
+                    target = %check.target,
+                    error = %e,
+                    "could not estimate a dropped STATICCALL_CHECK's read; not charged"
+                ),
+            }
+        }
+        gas
     }
 
     async fn process_simulation_error(error: contract::Error) -> Error {
@@ -686,7 +721,7 @@ pub async fn gaskiller_reporter(
         state_updates,
         skipped_opcodes: skipped_opcodes_set,
         ..
-    } = compute_state_updates(trace, None)?;
+    } = compute_state_updates(trace, receipt.to)?;
     let skipped_opcodes = skipped_opcodes_set
         .into_iter()
         .collect::<Vec<_>>()
@@ -738,7 +773,7 @@ pub async fn call_to_encoded_state_updates_with_gas_estimate(
         mut state_updates,
         skipped_opcodes,
         ..
-    } = compute_state_updates(trace, None)?;
+    } = compute_state_updates(trace, Some(contract_address))?;
     // The program pins a code size as its code's hash, read at the block the call was traced at.
     let block = block_height.map_or(BlockId::latest(), BlockId::number);
     resolve_code_hashes(
@@ -793,7 +828,7 @@ impl<P: Provider + DebugApi> TxStateExtractor<P> {
             .ok_or_else(|| anyhow!("could not get receipt for tx {}", tx_hash))?;
         let trace = get_tx_trace(&self.provider, tx_hash, receipt.status()).await?;
 
-        let mut state_updates = compute_state_updates(trace, None)?.state_updates;
+        let mut state_updates = compute_state_updates(trace, receipt.to)?.state_updates;
         self.resolve_code_hashes(&receipt, &mut state_updates)
             .await?;
 
@@ -822,7 +857,7 @@ impl<P: Provider + DebugApi> TxStateExtractor<P> {
         }
 
         let trace = get_tx_trace(&self.provider, tx_hash, receipt.status()).await?;
-        let mut state_updates = compute_state_updates(trace, None)?.state_updates;
+        let mut state_updates = compute_state_updates(trace, receipt.to)?.state_updates;
         self.resolve_code_hashes(&receipt, &mut state_updates)
             .await?;
 

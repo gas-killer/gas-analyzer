@@ -13,7 +13,7 @@ use gas_analyzer_core::nested::{
 use gas_analyzer_core::{
     PrestateEligibility, StateUpdate, TURETZKY_UPPER_GAS_LIMIT_SCHNORR, TraceExtract,
     build_state_updates_from_prestate, classify_prestate_eligibility, compute_state_updates,
-    encode_state_updates_to_abi, estimate_gas_from_state_updates,
+    drop_unresolved_code_sizes, encode_state_updates_to_abi, estimate_gas_from_state_updates,
 };
 use gas_analyzer_estimator::{SimEnvOpts, estimate_frame_tree_gas, estimate_state_changes_gas};
 use revm::database::{CacheDB, EmptyDB};
@@ -58,6 +58,9 @@ pub struct AnalyzeTraceResult {
     pub replay_error: Option<String>,
     /// See [`SIGNATURE_VERIFICATION_GAS`]; not included in `gas_estimate`.
     pub signature_verification_gas: u64,
+    /// Accounts whose code size the program read but whose code hash this crate can't fetch:
+    /// their checks are left out of `encoded_updates`, which pins less than settlement could.
+    pub unpinned_code_reads: Vec<String>,
 }
 
 /// The outcome of [`analyze_prestate`]: a result when the call has a prestate net form, otherwise
@@ -74,6 +77,8 @@ pub struct EncodeTraceResult {
     pub encoded_updates: String,
     pub state_update_count: usize,
     pub skipped_opcodes: Vec<String>,
+    /// See [`AnalyzeTraceResult::unpinned_code_reads`].
+    pub unpinned_code_reads: Vec<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -658,7 +663,9 @@ fn analyze_extract(
 ) -> Result<AnalyzeTraceResult, String> {
     let state_updates: &[StateUpdate] = &extract.state_updates;
 
-    let encoded = encode_state_updates_to_abi(state_updates);
+    let mut program = state_updates.to_vec();
+    let unpinned_code_reads = addresses(drop_unresolved_code_sizes(&mut program));
+    let encoded = encode_state_updates_to_abi(&program);
 
     let addr: Address = estimator_address
         .parse()
@@ -700,13 +707,14 @@ fn analyze_extract(
         encoded_updates: format!("0x{}", hex::encode(&encoded)),
         gas_estimate,
         is_heuristic,
-        state_update_count: state_updates.len(),
+        state_update_count: program.len(),
         skipped_opcodes: skipped,
         reentered: extract.reentered,
         native_call_gas: extract.callee_gas_total,
         callees_executed,
         replay_error,
         signature_verification_gas: SIGNATURE_VERIFICATION_GAS,
+        unpinned_code_reads,
     })
 }
 
@@ -977,6 +985,8 @@ pub fn encode_trace_inner(trace_json: &str) -> Result<EncodeTraceResult, String>
         ..
     } = parse_and_compute(trace_json, None)?.0;
 
+    let mut state_updates = state_updates;
+    let unpinned_code_reads = addresses(drop_unresolved_code_sizes(&mut state_updates));
     let encoded = encode_state_updates_to_abi(&state_updates);
     let mut skipped = skipped_opcodes.into_iter().collect::<Vec<_>>();
     skipped.sort();
@@ -985,7 +995,12 @@ pub fn encode_trace_inner(trace_json: &str) -> Result<EncodeTraceResult, String>
         encoded_updates: format!("0x{}", hex::encode(&encoded)),
         state_update_count: state_updates.len(),
         skipped_opcodes: skipped,
+        unpinned_code_reads,
     })
+}
+
+fn addresses(accounts: Vec<Address>) -> Vec<String> {
+    accounts.iter().map(|a| format!("{a:#x}")).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1262,6 +1277,7 @@ export interface AnalyzeTraceResult {
     callees_executed: boolean;
     replay_error: string | null;
     signature_verification_gas: number;
+    unpinned_code_reads: string[];
 }
 
 export interface PrestateAnalysis {
@@ -1274,6 +1290,7 @@ export interface EncodeTraceResult {
     encoded_updates: string;
     state_update_count: number;
     skipped_opcodes: string[];
+    unpinned_code_reads: string[];
 }
 
 export interface EstimateGasResult {

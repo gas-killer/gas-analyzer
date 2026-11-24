@@ -168,7 +168,7 @@ pub fn default_protected_ranges() -> Vec<ProtectedRange> {
 /// Whether `ranges` is a list the SDK's constructor would accept (see
 /// [`protected_ranges_well_formed`]).
 fn well_formed(ranges: &[ProtectedRange]) -> bool {
-    let bounds: Vec<_> = ranges.iter().map(|r| (r.start, r.end)).collect();
+    let bounds: Vec<_> = ranges.iter().map(|r| (r.start, r.end, r.mask)).collect();
     protected_ranges_well_formed(&bounds)
 }
 
@@ -228,21 +228,32 @@ where
         })
         .map(|check| {
             let intrinsic = BASE_TX_COST + calldata_gas(&check.data);
-            estimator_tx(
+            let outcome = estimator_tx(
                 check.target,
                 reader,
                 check.data.clone(),
                 U256::ZERO,
                 sim_env,
             )
-            .ok()
             .and_then(|tx| {
-                let mut evm = estimator_context(cache_db, sim_env).build_mainnet();
-                evm.transact(tx).ok()
-            })
-            .map_or(0, |outcome| {
-                outcome.result.gas_used().saturating_sub(intrinsic)
-            })
+                // Sent from the consumer, which has code: EIP-3607 would refuse it.
+                let mut evm = estimator_context(cache_db, sim_env)
+                    .modify_cfg_chained(|cfg| cfg.disable_eip3607 = true)
+                    .build_mainnet();
+                evm.transact(tx)
+                    .map_err(|e| anyhow!("running the read: {e:?}"))
+            });
+            match outcome {
+                Ok(outcome) => outcome.result.gas_used().saturating_sub(intrinsic),
+                Err(e) => {
+                    tracing::warn!(
+                        target = %check.target,
+                        error = %e,
+                        "could not measure a dropped STATICCALL_CHECK's read; not charged"
+                    );
+                    0
+                }
+            }
         })
         .sum()
 }
@@ -2466,6 +2477,18 @@ mod tests {
         assert!(well_formed(&ranges));
         assert!(ranges.contains(&single(STATE_TRACKER_SLOT)));
         assert!(!well_formed(&[ranges[1].clone(), ranges[0].clone()]));
+
+        // The masks the SDK's validateRanges rejects.
+        let with_mask = |r: &ProtectedRange, mask| ProtectedRange { mask, ..r.clone() };
+        assert!(!well_formed(&[with_mask(&ranges[0], B256::ZERO)]));
+        assert!(
+            !well_formed(&[with_mask(&ranges[0], B256::with_last_byte(0xff))]),
+            "a partial mask over more than one slot"
+        );
+        assert!(
+            well_formed(&[with_mask(&ranges[1], B256::with_last_byte(0xff))]),
+            "a partial mask on a single slot"
+        );
     }
 
     /// A target that doesn't report ranges is priced with the defaults: the guard costs more than
@@ -2752,6 +2775,8 @@ mod tests {
         let price = |target| {
             let mut cache_db = CacheDB::new(EmptyDB::default());
             with_code(&mut cache_db, view, &burner);
+            // A consumer has code, and the read is sent from it.
+            with_code(&mut cache_db, GUARDED_ROOT, &[0x00]);
             estimate_state_changes_gas(
                 &mut cache_db,
                 GUARDED_ROOT,

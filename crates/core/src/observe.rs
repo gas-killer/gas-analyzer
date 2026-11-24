@@ -337,6 +337,19 @@ fn same_check(a: &StateUpdate, b: &StateUpdate) -> bool {
     }
 }
 
+/// `updates` without the code-size checks still waiting for a code hash, for a caller that can't
+/// fetch code: a program carrying one could never settle. Returns the accounts left unpinned.
+pub fn drop_unresolved_code_sizes(updates: &mut Vec<StateUpdate>) -> Vec<Address> {
+    let unresolved = unresolved_code_sizes(updates)
+        .into_iter()
+        .map(|(account, _)| account)
+        .collect();
+    updates.retain(|update| {
+        !matches!(update, StateUpdate::CodehashCheck(check) if marked_size(check.codehash).is_some())
+    });
+    unresolved
+}
+
 /// The accounts whose code hash `updates` still need, each with the code size the trace saw:
 /// the `EXTCODESIZE` reads of nonzero size.
 pub fn unresolved_code_sizes(updates: &[StateUpdate]) -> Vec<(Address, u64)> {
@@ -502,6 +515,20 @@ mod tests {
             B256::ZERO,
             "a failure without data"
         );
+    }
+
+    #[test]
+    fn unresolved_code_sizes_can_be_dropped() {
+        let account = Address::repeat_byte(3);
+        let mut updates = vec![
+            PendingRead::CodeSize(account).check(U256::from(3)).unwrap(),
+            PendingRead::CodeSize(Address::repeat_byte(1))
+                .check(U256::ZERO)
+                .unwrap(),
+        ];
+        assert_eq!(drop_unresolved_code_sizes(&mut updates), vec![account]);
+        assert_eq!(updates.len(), 1, "the zero size is already a hash");
+        assert!(unresolved_code_sizes(&updates).is_empty());
     }
 
     #[test]

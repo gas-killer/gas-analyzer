@@ -45,7 +45,7 @@
 
 use crate::heuristic::COLD_ACCOUNT_ACCESS_COST;
 use crate::types::StateUpdate;
-use alloy_primitives::{B256, b256};
+use alloy_primitives::{B256, U256, b256};
 
 /// The Gas Killer SDK's `StateTracker` transition-counter slot
 /// (`keccak256("gasKiller.stateTracker") - 1`, see solidity-sdk
@@ -74,14 +74,14 @@ pub fn default_protected_slots() -> [(B256, B256); 2] {
     ]
 }
 
-/// Whether protected ranges, as `(start, end)` bounds in list order, form a list the SDK's
-/// constructor would accept: each range ordered, and each starting after the one before ends. A
-/// contract that reports anything else isn't a consumer, and the guard would fail open on it.
-pub fn protected_ranges_well_formed(
-    bounds: &[(alloy_primitives::U256, alloy_primitives::U256)],
-) -> bool {
-    bounds.iter().all(|(start, end)| start <= end)
-        && bounds.windows(2).all(|pair| pair[0].1 < pair[1].0)
+/// Whether protected ranges, as `(start, end, mask)` in list order, form a list the SDK's
+/// `StorageGuard.validateRanges` accepts: each range ordered, each starting after the one before
+/// ends, a nonzero mask, and a partial mask only on a single slot. A contract that reports anything
+/// else isn't a consumer, and the guard would fail open on it.
+pub fn protected_ranges_well_formed(ranges: &[(U256, U256, B256)]) -> bool {
+    ranges.iter().all(|(start, end, mask)| {
+        start <= end && !mask.is_zero() && (*mask == B256::repeat_byte(0xff) || start == end)
+    }) && ranges.windows(2).all(|pair| pair[0].1 < pair[1].0)
 }
 
 /// Block gas limit for the `Unbounded` profile: 2^40 ≈ 1.1 Tgas,

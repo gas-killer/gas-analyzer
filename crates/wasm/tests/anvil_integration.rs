@@ -307,9 +307,11 @@ fn test_simple_storage_call_external() {
 fn test_delegatecall() {
     let result = analyze(&traces().delegatecall);
 
-    // 3 SSTOREs in main's context (two through DELEGATECALL) + the CALL to A, and the
-    // CODEHASH_CHECK pinning the code size Solidity checks before that call
-    assert_eq!(result.state_update_count, 5);
+    // 3 SSTOREs in main's context (two through DELEGATECALL) + the CALL to A. The code size
+    // Solidity checks before that call can't be pinned without fetching A's code, so it's
+    // reported rather than encoded.
+    assert_eq!(result.state_update_count, 4);
+    assert_eq!(result.unpinned_code_reads.len(), 1);
     assert!(
         !result.is_heuristic,
         "priced by execution, the check left out"
@@ -331,9 +333,9 @@ fn test_delegatecall() {
 fn test_access_control() {
     let result = analyze(&traces().access_control);
 
-    // The CALL to AccessControlA, and the CODEHASH_CHECK pinning the code size Solidity checks
-    // before it
-    assert_eq!(result.state_update_count, 2);
+    // The CALL to AccessControlA; the code size Solidity checks before it is reported, not encoded
+    assert_eq!(result.state_update_count, 1);
+    assert_eq!(result.unpinned_code_reads.len(), 1);
     assert!(
         !result.is_heuristic,
         "priced by execution, the check left out"
