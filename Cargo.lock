@@ -3899,6 +3899,7 @@ dependencies = [
  "revm 31.0.2",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

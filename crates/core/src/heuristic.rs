@@ -37,9 +37,8 @@
 
 use std::collections::HashMap;
 
-use crate::signed_format::SignedFormat;
 use crate::trace::TraceExtract;
-use crate::types::StateUpdate;
+use crate::types::{IStateUpdateTypes, StateUpdate};
 
 /// Heuristic gas costs for different operations
 pub const BASE_TX_COST: u64 = 21_000;
@@ -101,11 +100,9 @@ pub fn estimate_gas_from_state_updates(extract: &TraceExtract) -> u64 {
     let mut gas = BASE_TX_COST;
 
     // The replay ships the state updates to the estimator as ABI-encoded
-    // calldata — real gas the on-chain GasKiller call pays. Priced in the v0.2.0 layout, a
-    // superset of v0.1.0's, so neither format is underestimated.
+    // calldata — real gas the on-chain GasKiller call pays.
     gas += calldata_gas(&crate::encoding::encode_state_updates_to_abi(
         &extract.state_updates,
-        SignedFormat::V0_2,
     ));
 
     // Add actual gas used by external calls (cannot be optimized)
@@ -151,6 +148,35 @@ pub fn estimate_gas_from_state_updates(extract: &TraceExtract) -> u64 {
     }
 
     apply_refund(gas, extract.refund_counter)
+}
+
+/// A program as a pricer runs it on state its observations may not hold against (a block before
+/// the trace, a synthetic state): every `CALL` and `CREATE` unpinned and every check left out.
+/// Returns it with the gas the checks would have cost, a cold account access each, as
+/// [`estimate_gas_from_state_updates`] prices them.
+///
+/// An unpinned caught revert must then succeed, as it had to before programs could pin.
+pub fn unpinned_for_pricing(updates: &[StateUpdate]) -> (Vec<StateUpdate>, u64) {
+    let mut checks = 0u64;
+    let program = updates
+        .iter()
+        .filter_map(|update| match update {
+            _ if update.is_check() => {
+                checks += 1;
+                None
+            }
+            StateUpdate::Call(call) => Some(StateUpdate::Call(IStateUpdateTypes::Call {
+                resultHash: alloy_primitives::B256::ZERO,
+                ..call.clone()
+            })),
+            StateUpdate::Create(create) => Some(StateUpdate::Create(IStateUpdateTypes::Create {
+                expected: alloy_primitives::Address::ZERO,
+                ..create.clone()
+            })),
+            other => Some(other.clone()),
+        })
+        .collect();
+    (program, checks * COLD_ACCOUNT_ACCESS_COST)
 }
 
 /// Estimate gas from trace operations using heuristic costs.
@@ -353,10 +379,7 @@ mod refund_tests {
     /// Calldata cost of shipping an empty state-update set to the estimator
     /// (the ABI framing alone is nonzero).
     fn empty_calldata() -> u64 {
-        calldata_gas(&crate::encoding::encode_state_updates_to_abi(
-            &[],
-            SignedFormat::V0_2,
-        ))
+        calldata_gas(&crate::encoding::encode_state_updates_to_abi(&[]))
     }
 
     #[test]
@@ -414,7 +437,6 @@ mod refund_tests {
         };
         let calldata = calldata_gas(&crate::encoding::encode_state_updates_to_abi(
             &e.state_updates,
-            SignedFormat::V0_2,
         ));
         assert_eq!(
             estimate_gas_from_state_updates(&e),

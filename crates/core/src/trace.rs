@@ -13,7 +13,6 @@ use anyhow::{Result, bail};
 use crate::observe::{
     Await, ExitData, PendingRead, dedupe_checks, is_precompile, stack_top, static_check,
 };
-use crate::signed_format::SignedFormat;
 use crate::taint::Usage;
 use crate::types::{CALL_GAS_UNCAPPED, IStateUpdateTypes, Opcode, StateUpdate};
 
@@ -315,20 +314,10 @@ struct CallGas {
 /// code executing at depth 1). When supplied, calls from deeper frames back
 /// into it set [`TraceExtract::reentered`]; pass `None` to skip detection.
 ///
-/// The updates are a solidity-sdk v0.1.0 program's; see [`compute_state_updates_for`].
-pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Result<TraceExtract> {
-    compute_state_updates_for(trace, origin, SignedFormat::V0_1)
-}
-
-/// [`compute_state_updates`] for a program signed in `format`. For v0.2.0 it also records what
-/// the consumer observed and the program's effects depend on: call results, `CREATE` addresses
-/// and read checks, in trace order. For v0.1.0, which can't carry them, it records none.
+/// Alongside the writes it records what the consumer observed and the program's effects depend
+/// on: call results, `CREATE` addresses and read checks, in trace order.
 #[tracing::instrument(name = "gas.trace_parse", skip_all, fields(state_update_count = tracing::field::Empty))]
-pub fn compute_state_updates_for(
-    trace: DefaultFrame,
-    origin: Option<Address>,
-    format: SignedFormat,
-) -> Result<TraceExtract> {
+pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Result<TraceExtract> {
     // Transaction-global cumulative counter; the final step holds the tx
     // total. Geth omits the field when it is zero.
     let refund_counter = trace
@@ -361,16 +350,13 @@ pub fn compute_state_updates_for(
     let mut awaiting: Vec<(u64, Await, bool)> = Vec::new();
     let mut pending_read: Option<(u64, PendingRead)> = None;
     // Which observations the program's effects depend on; the rest stay unpinned.
-    let observing = format == SignedFormat::V0_2;
-    let usage = Usage::for_format(&trace.struct_logs, format);
+    let usage = Usage::of(&trace.struct_logs);
 
     for (step, struct_log) in trace.struct_logs.into_iter().enumerate() {
         let depth = struct_log.depth;
         let op = struct_log.op.as_ref().to_string();
 
-        if observing {
-            exits.step(&struct_log)?;
-        }
+        exits.step(&struct_log)?;
         if let Some((read_depth, read)) = pending_read.take()
             && depth == read_depth
             && let Some(check) = stack_top(&struct_log, 0).and_then(|result| read.check(result))
@@ -455,7 +441,10 @@ pub fn compute_state_updates_for(
         }
 
         // Reads an emitting frame makes and its effects depend on, pinned where they happen.
-        if depth == target_depth
+        if matches!(
+            op.as_str(),
+            "STATICCALL" | "BALANCE" | "SELFBALANCE" | "EXTCODEHASH" | "EXTCODESIZE"
+        ) && depth == target_depth
             && call_stack.is_empty()
             && struct_log.error.is_none()
             && usage.used(step)
@@ -520,7 +509,6 @@ pub fn compute_state_updates_for(
                         awaiting.push((depth, Await::Create { index }, false));
                     }
                     if op == "CALL"
-                        && observing
                         && let Some(StateUpdate::Call(call)) = state_updates.last()
                         && !is_precompile(call.target)
                     {
@@ -620,27 +608,16 @@ pub fn compute_state_updates_for(
 /// image, so the next slice (or the final one) re-asserts them.
 ///
 /// Returns the same tuple as [`compute_state_updates`].
+#[tracing::instrument(name = "gas.trace_parse_canonical", skip_all, fields(state_update_count = tracing::field::Empty))]
 pub fn compute_state_updates_canonical(
     trace: DefaultFrame,
     target: Address,
-) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64)> {
-    compute_state_updates_canonical_for(trace, target, SignedFormat::V0_1)
-}
-
-/// [`compute_state_updates_canonical`] for a program signed in `format`, recording observations
-/// for v0.2.0 as [`compute_state_updates_for`] does.
-#[tracing::instrument(name = "gas.trace_parse_canonical", skip_all, fields(state_update_count = tracing::field::Empty))]
-pub fn compute_state_updates_canonical_for(
-    trace: DefaultFrame,
-    target: Address,
-    format: SignedFormat,
 ) -> Result<(Vec<StateUpdate>, HashSet<Opcode>, u64)> {
     let tree = crate::nested::compute_frame_tree_canonical(
         trace,
         target,
         &|_| false,
         &crate::nested::NESTING_COST_MODEL_V1,
-        format,
     )?;
     let root = tree
         .frames
@@ -763,7 +740,7 @@ mod tests {
             return_value: Default::default(),
             struct_logs: logs,
         };
-        compute_state_updates_for(trace, Some(ORIGIN), SignedFormat::V0_2)
+        compute_state_updates(trace, Some(ORIGIN))
             .unwrap()
             .state_updates
     }
@@ -841,48 +818,6 @@ mod tests {
             panic!("a CREATE");
         };
         assert_eq!(create.expected, deployed);
-    }
-
-    /// A v0.1.0 program can't carry a pin, so the walk records none: the same reads and caught
-    /// revert as above extract to what they did before v0.2.0.
-    #[test]
-    fn a_v0_1_journal_records_no_observations() {
-        let trace = DefaultFrame {
-            gas: 0,
-            failed: false,
-            return_value: Default::default(),
-            struct_logs: vec![
-                at("SSTORE", 1, &[U256::from(1u64), U256::from(10u64)]),
-                at(
-                    "STATICCALL",
-                    1,
-                    &[
-                        U256::from(50_000u64),
-                        addr_word(CALLEE),
-                        U256::ZERO,
-                        U256::ZERO,
-                        U256::ZERO,
-                        U256::ZERO,
-                    ],
-                ),
-                returning("RETURN", 2, 0x07),
-                at("JUMPDEST", 1, &[U256::from(1u64)]),
-                at("SELFBALANCE", 1, &[]),
-                at("JUMPDEST", 1, &[U256::from(9u64)]),
-                call_to(1, CALLEE),
-                returning("REVERT", 2, 0x01),
-                at("JUMPDEST", 1, &[U256::ZERO]),
-            ],
-        };
-        let updates = compute_state_updates(trace, Some(ORIGIN))
-            .unwrap()
-            .state_updates;
-        assert_eq!(updates.len(), 2, "{updates:?}");
-        assert!(matches!(&updates[0], StateUpdate::Store(_)));
-        let StateUpdate::Call(call) = &updates[1] else {
-            panic!("a CALL, got {:?}", updates[1]);
-        };
-        assert_eq!(call.resultHash, B256::ZERO);
     }
 
     #[test]
@@ -1468,7 +1403,6 @@ mod tests {
             TARGET_ADDR,
             &|_| false,
             &crate::nested::NESTING_COST_MODEL_V1,
-            SignedFormat::V0_1,
         )
         .expect("frame tree");
         [

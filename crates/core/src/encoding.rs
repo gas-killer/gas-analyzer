@@ -6,8 +6,7 @@
 use alloy_primitives::Bytes;
 use alloy_sol_types::SolValue;
 
-use crate::signed_format::SignedFormat;
-use crate::types::{IStateUpdateTypesV0_1, StateUpdate, StateUpdateType};
+use crate::types::{StateUpdate, StateUpdateType};
 
 /// The Turetzky upper gas limit for BLS-verified attestations - the floor gas cost
 /// for executing a GasKiller transaction, i.e. the minimum StateChangeHandler
@@ -86,45 +85,21 @@ impl SignatureType {
     }
 }
 
-/// Encode state updates to Solidity types (for contract calls), in `format`'s layouts.
-///
-/// A v0.1.0 program is the v0.2.0 one without what v0.1.0 can't carry: `CALL` loses `resultHash`
-/// and `gasLimit`, `CREATE` loses `expected`, and the read checks are left out. That is exactly
-/// what an unpinned v0.1.0 program settles.
+/// Encode state updates to Solidity types (for contract calls), in solidity-sdk v0.2.0's layouts.
 pub fn encode_state_updates_to_sol(
     state_updates: &[StateUpdate],
-    format: SignedFormat,
 ) -> (Vec<StateUpdateType>, Vec<Bytes>) {
-    let v0_1 = format == SignedFormat::V0_1;
     state_updates
         .iter()
-        .filter(|update| !(v0_1 && update.is_check()))
         .map(|state_update| {
             let (kind, data) = match state_update {
                 StateUpdate::Store(x) => (StateUpdateType::STORE, x.abi_encode_sequence()),
-                StateUpdate::Call(x) if v0_1 => (
-                    StateUpdateType::CALL,
-                    IStateUpdateTypesV0_1::Call {
-                        target: x.target,
-                        value: x.value,
-                        callargs: x.callargs.clone(),
-                    }
-                    .abi_encode_sequence(),
-                ),
                 StateUpdate::Call(x) => (StateUpdateType::CALL, x.abi_encode_sequence()),
                 StateUpdate::Log0(x) => (StateUpdateType::LOG0, x.abi_encode_sequence()),
                 StateUpdate::Log1(x) => (StateUpdateType::LOG1, x.abi_encode_sequence()),
                 StateUpdate::Log2(x) => (StateUpdateType::LOG2, x.abi_encode_sequence()),
                 StateUpdate::Log3(x) => (StateUpdateType::LOG3, x.abi_encode_sequence()),
                 StateUpdate::Log4(x) => (StateUpdateType::LOG4, x.abi_encode_sequence()),
-                StateUpdate::Create(x) if v0_1 => (
-                    StateUpdateType::CREATE,
-                    IStateUpdateTypesV0_1::Create {
-                        value: x.value,
-                        initcode: x.initcode.clone(),
-                    }
-                    .abi_encode_sequence(),
-                ),
                 StateUpdate::Create(x) => (StateUpdateType::CREATE, x.abi_encode_sequence()),
                 StateUpdate::Create2(x) => (StateUpdateType::CREATE2, x.abi_encode_sequence()),
                 StateUpdate::Nested(x) => (StateUpdateType::NESTED, x.abi_encode_sequence()),
@@ -143,10 +118,9 @@ pub fn encode_state_updates_to_sol(
         .unzip()
 }
 
-/// Encode state updates to ABI format for transport, in `format`'s layouts (see
-/// [`encode_state_updates_to_sol`]).
-pub fn encode_state_updates_to_abi(state_updates: &[StateUpdate], format: SignedFormat) -> Bytes {
-    let (state_update_types, datas) = encode_state_updates_to_sol(state_updates, format);
+/// Encode state updates to ABI format for transport (see [`encode_state_updates_to_sol`]).
+pub fn encode_state_updates_to_abi(state_updates: &[StateUpdate]) -> Bytes {
+    let (state_update_types, datas) = encode_state_updates_to_sol(state_updates);
 
     // Encode as tuple (StateUpdateType[], bytes[])
     fn write_u256_word(buf: &mut Vec<u8>, value: usize) {
@@ -229,7 +203,7 @@ mod tests {
     /// left to infer it from the payload.
     #[test]
     fn no_updates_encode_to_two_empty_arrays() {
-        let encoded = encode_state_updates_to_abi(&[], SignedFormat::V0_2);
+        let encoded = encode_state_updates_to_abi(&[]);
         assert_eq!(encoded.len(), 128);
         assert_eq!(&encoded[31..32], &[0x40]); // offset: types
         assert_eq!(&encoded[63..64], &[0x60]); // offset: datas
@@ -242,12 +216,9 @@ mod tests {
             slot: B256::ZERO,
             value: B256::with_last_byte(1),
         });
-        let encoded = encode_state_updates_to_abi(&[store], SignedFormat::V0_2);
+        let encoded = encode_state_updates_to_abi(&[store]);
         assert!(encoded.len() > 128);
-        assert_ne!(
-            encoded,
-            encode_state_updates_to_abi(&[], SignedFormat::V0_2)
-        );
+        assert_ne!(encoded, encode_state_updates_to_abi(&[]));
     }
 
     fn pinned_call() -> StateUpdate {
@@ -293,9 +264,8 @@ mod tests {
     }
 
     #[test]
-    fn v0_2_layouts_match_the_sdks_canonical_offsets() {
-        let (types, args) =
-            encode_state_updates_to_sol(&[pinned_call(), pinned_create()], SignedFormat::V0_2);
+    fn layouts_match_the_sdks_canonical_offsets() {
+        let (types, args) = encode_state_updates_to_sol(&[pinned_call(), pinned_create()]);
         assert_eq!(
             types.iter().map(|t| *t as u8).collect::<Vec<_>>(),
             [StateUpdateType::CALL as u8, StateUpdateType::CREATE as u8]
@@ -308,32 +278,8 @@ mod tests {
     }
 
     #[test]
-    fn v0_1_drops_what_it_cannot_carry() {
-        let mut program = vec![pinned_call(), pinned_create()];
-        program.extend(checks());
-        let (types, args) = encode_state_updates_to_sol(&program, SignedFormat::V0_1);
-        assert_eq!(
-            types.iter().map(|t| *t as u8).collect::<Vec<_>>(),
-            [StateUpdateType::CALL as u8, StateUpdateType::CREATE as u8]
-        );
-        assert_eq!(
-            args[0].as_ref(),
-            (
-                Address::repeat_byte(0xaa),
-                U256::from(7),
-                Bytes::from_static(&[1, 2, 3])
-            )
-                .abi_encode_sequence()
-        );
-        assert_eq!(
-            args[1].as_ref(),
-            (U256::ZERO, Bytes::from_static(&[0x60, 0x00])).abi_encode_sequence()
-        );
-    }
-
-    #[test]
     fn check_ops_take_the_sdks_enum_values() {
-        let (types, args) = encode_state_updates_to_sol(&checks(), SignedFormat::V0_2);
+        let (types, args) = encode_state_updates_to_sol(&checks());
         assert_eq!(
             types.iter().map(|t| *t as u8).collect::<Vec<_>>(),
             [10, 11, 12]

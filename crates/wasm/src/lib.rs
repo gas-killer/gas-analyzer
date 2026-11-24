@@ -15,9 +15,7 @@ use gas_analyzer_core::{
     build_state_updates_from_prestate, classify_prestate_eligibility, compute_state_updates,
     encode_state_updates_to_abi, estimate_gas_from_state_updates,
 };
-use gas_analyzer_estimator::{
-    SignedFormat, SimEnvOpts, estimate_frame_tree_gas, estimate_state_changes_gas,
-};
+use gas_analyzer_estimator::{SimEnvOpts, estimate_frame_tree_gas, estimate_state_changes_gas};
 use revm::database::{CacheDB, EmptyDB};
 use revm::primitives::KECCAK_EMPTY;
 use revm::primitives::hardfork::SpecId;
@@ -287,7 +285,6 @@ impl Replay {
 
     fn sim_env(&self, block_number: Option<u64>, value: U256) -> SimEnvOpts {
         SimEnvOpts {
-            format: gas_analyzer_estimator::SignedFormat::V0_1,
             gas_price: self.gas_price,
             timestamp: self.timestamp,
             ..sim_env(block_number, value)
@@ -661,7 +658,7 @@ fn analyze_extract(
 ) -> Result<AnalyzeTraceResult, String> {
     let state_updates: &[StateUpdate] = &extract.state_updates;
 
-    let encoded = encode_state_updates_to_abi(state_updates, SignedFormat::V0_1);
+    let encoded = encode_state_updates_to_abi(state_updates);
 
     let addr: Address = estimator_address
         .parse()
@@ -735,7 +732,6 @@ fn parse_wei(name: &str, wei: Option<&str>) -> Result<U256, String> {
 /// `msg.value`: a payload that forwards it in a `CALL` halts unfunded without it.
 fn sim_env(block_number: Option<u64>, value: U256) -> SimEnvOpts {
     SimEnvOpts {
-        format: gas_analyzer_estimator::SignedFormat::V0_1,
         number: block_number.unwrap_or(0),
         timestamp: 0,
         gas_limit: 30_000_000,
@@ -749,6 +745,7 @@ fn sim_env(block_number: Option<u64>, value: U256) -> SimEnvOpts {
         // spec so post-Pectra opcodes don't halt with `NotActivated`.
         spec: SpecId::OSAKA,
         value,
+        verify_observations: false,
     }
 }
 
@@ -980,7 +977,7 @@ pub fn encode_trace_inner(trace_json: &str) -> Result<EncodeTraceResult, String>
         ..
     } = parse_and_compute(trace_json, None)?.0;
 
-    let encoded = encode_state_updates_to_abi(&state_updates, SignedFormat::V0_1);
+    let encoded = encode_state_updates_to_abi(&state_updates);
     let mut skipped = skipped_opcodes.into_iter().collect::<Vec<_>>();
     skipped.sort();
 

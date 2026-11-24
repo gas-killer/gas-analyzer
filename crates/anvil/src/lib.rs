@@ -52,9 +52,8 @@ fn impl_slot() -> U256 {
 }
 
 use gas_analyzer_core::{
-    Opcode, RevertingContext, SignatureType, SignedFormat, StateUpdate,
-    TURETZKY_UPPER_GAS_LIMIT_SCHNORR, TraceExtract, compute_state_updates,
-    encode_state_updates_to_abi, encode_state_updates_to_sol,
+    Opcode, RevertingContext, SignatureType, StateUpdate, TURETZKY_UPPER_GAS_LIMIT_SCHNORR,
+    TraceExtract, compute_state_updates, encode_state_updates_to_abi, encode_state_updates_to_sol,
 };
 use gas_analyzer_rpc::get_tx_trace;
 
@@ -223,6 +222,53 @@ alloy::sol!(
     "../../abis/StateChangeHandlerGasEstimator.json"
 );
 
+alloy::sol! {
+    #[sol(rpc)]
+    interface IProtectedRanges {
+        struct Range {
+            uint256 start;
+            uint256 end;
+            bytes32 mask;
+        }
+
+        /// A consumer's protected ranges, as its settlement checks them.
+        function gasKillerProtectedRanges() external view returns (Range[] memory);
+    }
+}
+
+/// The ranges `target`'s settlement checks STOREs against: what it reports, or the defaults for a
+/// contract that doesn't (one that isn't a consumer yet is priced as one would be).
+async fn protected_ranges<P: Provider>(
+    provider: &P,
+    target: Address,
+) -> Vec<StorageGuard::ProtectedRange> {
+    let reported = IProtectedRanges::new(target, provider)
+        .gasKillerProtectedRanges()
+        .call()
+        .await
+        .ok()
+        .map(|ranges| {
+            ranges
+                .into_iter()
+                .map(|r| StorageGuard::ProtectedRange {
+                    start: r.start,
+                    end: r.end,
+                    mask: r.mask,
+                })
+                .collect::<Vec<_>>()
+        });
+    reported.unwrap_or_else(|| {
+        gas_analyzer_core::sim_profile::default_protected_slots()
+            .into_iter()
+            .map(|(start, end)| StorageGuard::ProtectedRange {
+                start: start.into(),
+                end: end.into(),
+                mask: alloy::primitives::B256::repeat_byte(0xff),
+            })
+            .collect()
+    })
+}
+
 // Provider type alias
 type ConnectHTTPDefaultProvider = FillProvider<
     JoinFill<
@@ -295,6 +341,8 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
         let initial_block_number = self.provider.get_block_number().await?;
         let snapshot_id: U256 = self.provider.raw_request("evm_snapshot".into(), ()).await?;
         let original_code = self.provider.get_code_at(contract_address).await?;
+        // Read before the estimator replaces the code that answers it.
+        let ranges = protected_ranges(&self.provider, contract_address).await;
 
         // Stash the original bytecode at a synthetic backup address so the proxy's
         // fallback can DELEGATECALL to it when external protocols (oracles, AMMs)
@@ -319,10 +367,10 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
 
         let target_contract = StateChangeHandlerGasEstimator::new(contract_address, &self.provider);
 
-        let (types, args) = encode_state_updates_to_sol(state_updates, SignedFormat::V0_1);
+        let (types, args) = encode_state_updates_to_sol(state_updates);
         let types = types.iter().map(|x| *x as u8).collect::<Vec<_>>();
         let tx = target_contract
-            .runStateUpdatesCall(types, args)
+            .runStateUpdatesCall(types, args, ranges)
             .send()
             .await;
         let tx = match tx {
@@ -682,7 +730,7 @@ pub async fn call_to_encoded_state_updates_with_gas_estimate(
         .estimate_state_changes_gas(contract_address, &state_updates)
         .await?;
     Ok((
-        encode_state_updates_to_abi(&state_updates, SignedFormat::V0_1),
+        encode_state_updates_to_abi(&state_updates),
         gas_estimate,
         skipped_opcodes,
     ))
@@ -860,13 +908,13 @@ mod tests {
             }),
         ];
 
-        let encoded = encode_state_updates_to_abi(&state_updates, SignedFormat::V0_1);
+        let encoded = encode_state_updates_to_abi(&state_updates);
         let (types, data) = decode_state_updates_tuple(&encoded)?;
         assert_eq!(
             types,
             vec![U256::from(0u8), U256::from(2u8), U256::from(3u8),]
         );
-        let (_, expected_data) = encode_state_updates_to_sol(&state_updates, SignedFormat::V0_1);
+        let (_, expected_data) = encode_state_updates_to_sol(&state_updates);
         assert_eq!(data.len(), expected_data.len());
         for (i, (decoded, expected)) in data.iter().zip(expected_data.iter()).enumerate() {
             assert_eq!(
@@ -894,7 +942,7 @@ mod tests {
             }),
         ];
 
-        let encoded = encode_state_updates_to_abi(&state_updates, SignedFormat::V0_1);
+        let encoded = encode_state_updates_to_abi(&state_updates);
 
         let (types, data) = decode_state_updates_tuple(&encoded)?;
         assert_eq!(types.len(), 3, "Should have 3 state updates");
@@ -904,7 +952,7 @@ mod tests {
         assert_eq!(types[2], U256::from(StateUpdateType::LOG1 as u8));
 
         // Verify decoded data matches the original ABI-encoded state updates
-        let (_, expected_data) = encode_state_updates_to_sol(&state_updates, SignedFormat::V0_1);
+        let (_, expected_data) = encode_state_updates_to_sol(&state_updates);
         for (i, (decoded, expected)) in data.iter().zip(expected_data.iter()).enumerate() {
             assert_eq!(
                 decoded, expected,

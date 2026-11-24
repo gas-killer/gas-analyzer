@@ -307,8 +307,13 @@ fn test_simple_storage_call_external() {
 fn test_delegatecall() {
     let result = analyze(&traces().delegatecall);
 
-    // 3 SSTOREs in main's context (two through DELEGATECALL) + the CALL to A
-    assert_eq!(result.state_update_count, 4);
+    // 3 SSTOREs in main's context (two through DELEGATECALL) + the CALL to A, and the
+    // CODEHASH_CHECK pinning the code size Solidity checks before that call
+    assert_eq!(result.state_update_count, 5);
+    assert!(
+        !result.is_heuristic,
+        "priced by execution, the check left out"
+    );
     assert!(result.gas_estimate > 0);
 
     eprintln!(
@@ -326,8 +331,13 @@ fn test_delegatecall() {
 fn test_access_control() {
     let result = analyze(&traces().access_control);
 
-    // The CALL to AccessControlA
-    assert_eq!(result.state_update_count, 1);
+    // The CALL to AccessControlA, and the CODEHASH_CHECK pinning the code size Solidity checks
+    // before it
+    assert_eq!(result.state_update_count, 2);
+    assert!(
+        !result.is_heuristic,
+        "priced by execution, the check left out"
+    );
     assert!(result.gas_estimate > 0);
 
     eprintln!(

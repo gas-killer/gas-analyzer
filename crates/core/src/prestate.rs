@@ -123,23 +123,62 @@ fn scan_target_depth(frame: &CallFrame) -> Option<String> {
     None
 }
 
-/// Why a call the net form could encode still needs the struct-log encoder for a solidity-sdk
-/// v0.2.0 consumer: its target-depth context observed something outside the consumer that the
-/// program must pin, and the prestate and call tracers can't show the result. `None` if it
-/// observed nothing.
+/// Why a call the net form could encode still needs the struct-log encoder: its target-depth
+/// context made a `STATICCALL` to a contract, whose result the program must pin. `None` if it
+/// made none (a read of a precompile pins nothing).
 ///
-/// `frame` is the call's `callTracer` frame, which shows each `STATICCALL`'s target (a read of a
-/// precompile pins nothing). `opcodes` is a struct-log trace of the same call with stack and
-/// memory off, which is enough to find `BALANCE`, `SELFBALANCE`, `EXTCODEHASH` and
-/// `EXTCODESIZE` in the target-depth context.
-pub fn v0_2_observation(frame: &CallFrame, opcodes: &DefaultFrame) -> Option<String> {
-    if let Some(to) = static_read_at_target_depth(frame) {
-        return Some(format!(
-            "STATICCALL to {to} at target depth (needs a STATICCALL_CHECK)"
-        ));
+/// `frame` is the call's `callTracer` frame. The reads the call frame can't show (`BALANCE`,
+/// `SELFBALANCE`, `EXTCODEHASH`, `EXTCODESIZE`) are found with [`OBSERVATION_TRACER`], or, where
+/// an endpoint won't run it, [`opcode_observation`].
+pub fn static_observation(frame: &CallFrame) -> Option<String> {
+    static_read_at_target_depth(frame)
+        .map(|to| format!("STATICCALL to {to} at target depth (needs a STATICCALL_CHECK)"))
+}
+
+/// A `debug_traceCall` JavaScript tracer that returns the first `BALANCE`, `SELFBALANCE`,
+/// `EXTCODEHASH` or `EXTCODESIZE` the target-depth context ran, or `null`: the scan
+/// [`opcode_observation`] makes, done on the node so the response stays a few bytes however long
+/// the call runs.
+///
+/// The target-depth context is depth 1 and the `DELEGATECALL`/`CALLCODE` frames it opens, at any
+/// depth, but nothing a `CALL`, `STATICCALL` or `CREATE` opens.
+pub const OBSERVATION_TRACER: &str = r#"{
+  emitting: [false, true],
+  opened: null,
+  found: null,
+  step: function(log, db) {
+    if (this.found !== null) return;
+    var depth = log.getDepth();
+    if (this.opened !== null) {
+      var parent = this.opened[0];
+      if (depth === parent + 1) {
+        this.emitting.length = depth;
+        this.emitting.push(this.emitting[parent] && this.opened[1]);
+      }
+      this.opened = null;
     }
-    // The target-depth context: depth 1 and the DELEGATECALL/CALLCODE frames it opens, at any
-    // depth, but nothing a CALL, STATICCALL or CREATE opens. Indexed by depth.
+    while (this.emitting.length < depth + 1) this.emitting.push(false);
+    this.emitting.length = depth + 1;
+    if (!this.emitting[depth]) return;
+    var op = log.op.toString();
+    if (op === "DELEGATECALL" || op === "CALLCODE") this.opened = [depth, true];
+    else if (op === "CALL" || op === "STATICCALL" || op === "CREATE" || op === "CREATE2") this.opened = [depth, false];
+    else if (op === "BALANCE" || op === "SELFBALANCE" || op === "EXTCODEHASH" || op === "EXTCODESIZE") this.found = op;
+  },
+  fault: function(log, db) {},
+  result: function(ctx, db) { return this.found; }
+}"#;
+
+/// How many steps of a call [`opcode_observation`] reads at most: past this, the call may have
+/// observed something, so it goes to the struct-log encoder.
+pub const OBSERVATION_SCAN_STEP_LIMIT: u64 = 500_000;
+
+/// Why a call needs the struct-log encoder, from a struct-log trace of it with stack and memory
+/// off and at most `limit` steps: its target-depth context ran a `BALANCE`, `SELFBALANCE`,
+/// `EXTCODEHASH` or `EXTCODESIZE`, or the trace stopped at `limit` before it could tell. `None` if
+/// it observed nothing. [`OBSERVATION_TRACER`] makes the same scan on the node.
+pub fn opcode_observation(opcodes: &DefaultFrame, limit: u64) -> Option<String> {
+    // The target-depth context, indexed by depth.
     let mut emitting = vec![false, true];
     let mut opened: Option<(usize, bool)> = None;
     for log in &opcodes.struct_logs {
@@ -164,7 +203,8 @@ pub fn v0_2_observation(frame: &CallFrame, opcodes: &DefaultFrame) -> Option<Str
             _ => {}
         }
     }
-    None
+    (opcodes.struct_logs.len() as u64 >= limit)
+        .then(|| format!("the call ran past the {limit}-step observation scan"))
 }
 
 /// The target of the first `STATICCALL` the target-depth context makes to a contract.
@@ -816,7 +856,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod v0_2_observation_tests {
+mod observation_tests {
     use super::*;
     use alloy_rpc_types::trace::geth::StructLog;
 
@@ -860,7 +900,7 @@ mod v0_2_observation_tests {
     #[test]
     fn a_static_read_of_a_contract_needs_a_check() {
         let root = frame("CALL", ROOT, vec![frame("STATICCALL", OTHER, vec![])]);
-        assert!(v0_2_observation(&root, &ops(&[])).is_some());
+        assert!(static_observation(&root).is_some());
     }
 
     #[test]
@@ -871,7 +911,7 @@ mod v0_2_observation_tests {
             vec![frame("STATICCALL", OTHER, vec![])],
         );
         let root = frame("CALL", ROOT, vec![lib]);
-        assert!(v0_2_observation(&root, &ops(&[])).is_some());
+        assert!(static_observation(&root).is_some());
     }
 
     #[test]
@@ -881,22 +921,28 @@ mod v0_2_observation_tests {
             ROOT,
             vec![frame("STATICCALL", Address::with_last_byte(1), vec![])],
         );
-        assert_eq!(v0_2_observation(&root, &ops(&[])), None);
+        assert_eq!(static_observation(&root), None);
     }
 
     #[test]
     fn balance_reads_at_target_depth_need_a_check() {
-        let root = frame("CALL", ROOT, vec![]);
-        assert!(v0_2_observation(&root, &ops(&[("PUSH1", 1), ("SELFBALANCE", 1)])).is_some());
+        assert!(opcode_observation(&ops(&[("PUSH1", 1), ("SELFBALANCE", 1)]), 100).is_some());
         let through_library = ops(&[("DELEGATECALL", 1), ("EXTCODESIZE", 2), ("STOP", 2)]);
-        assert!(v0_2_observation(&root, &through_library).is_some());
+        assert!(opcode_observation(&through_library, 100).is_some());
     }
 
     /// What a static callee reads replays natively; only the call itself is the program's.
     #[test]
     fn reads_inside_another_contract_need_nothing() {
-        let root = frame("CALL", ROOT, vec![]);
         let inside = ops(&[("STATICCALL", 1), ("BALANCE", 2), ("STOP", 2), ("POP", 1)]);
-        assert_eq!(v0_2_observation(&root, &inside), None);
+        assert_eq!(opcode_observation(&inside, 100), None);
+    }
+
+    /// A trace cut off at the limit can't show what came after, so it counts as observing.
+    #[test]
+    fn a_trace_at_the_limit_may_have_observed() {
+        let quiet = ops(&[("PUSH1", 1), ("POP", 1), ("STOP", 1)]);
+        assert_eq!(opcode_observation(&quiet, 4), None);
+        assert!(opcode_observation(&quiet, 3).is_some());
     }
 }

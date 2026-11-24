@@ -9,8 +9,8 @@
 //! The struct-log walks ([`crate::compute_state_updates`] and
 //! [`crate::nested::compute_frame_tree_canonical`]) record each observation an emitting frame
 //! makes that the program's effects depend on (the `taint` module decides which), and drop
-//! repeated reads; this module holds what they share. A v0.1.0 encoding drops the pins again (see
-//! [`crate::encode_state_updates_to_sol`]).
+//! repeated reads; this module holds what they share. A pricer running on state the pins may not
+//! hold against leaves them out (see [`crate::heuristic::unpinned_for_pricing`]).
 
 use std::collections::HashMap;
 
@@ -170,8 +170,7 @@ impl Await {
 ///
 /// solidity-sdk v0.2.0 lets a pinned failure stand only when the call sent no value and reverted
 /// with data: an empty failure can also be the EVM's own (a value shortfall, the call depth),
-/// which the trace didn't see. Any other failure stays unpinned, so settlement reverts on it, as
-/// it does for a v0.1.0 program.
+/// which the trace didn't see. Any other failure stays unpinned, so settlement reverts on it.
 pub(crate) fn call_pin(success: bool, value_sent: bool, returndata: &[u8]) -> B256 {
     if success || (!value_sent && !returndata.is_empty()) {
         result_hash(success, returndata)

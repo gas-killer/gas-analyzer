@@ -29,7 +29,7 @@ sol! {
             bytes32 value;
         }
 
-        /// solidity-sdk v0.2.0's `CALL`. A v0.1.0 program carries only the first three fields.
+        /// solidity-sdk v0.2.0's `CALL`.
         struct Call {
             address target;
             uint256 value;
@@ -71,7 +71,7 @@ sol! {
             bytes32 topic4;
         }
 
-        /// solidity-sdk v0.2.0's `CREATE`. A v0.1.0 program carries only the first two fields.
+        /// solidity-sdk v0.2.0's `CREATE`.
         struct Create {
             uint256 value;
             bytes initcode;
@@ -111,19 +111,6 @@ sol! {
         }
     }
 
-    /// The v0.1.0 layouts of the ops v0.2.0 extended, for encoding a v0.1.0 program.
-    interface IStateUpdateTypesV0_1 {
-        struct Call {
-            address target;
-            uint256 value;
-            bytes callargs;
-        }
-
-        struct Create {
-            uint256 value;
-            bytes initcode;
-        }
-    }
 }
 
 /// `gasLimit` of a `CALL` that forwards all remaining gas, unchecked: the SDK's fallback, and what
@@ -216,6 +203,11 @@ sol! {
     error RevertingContext(uint256 index, address target, bytes revertData, bytes callargs);
 }
 
+/// The `IGasKillerSDK` interface ID a solidity-sdk v0.2.0 consumer reports through ERC-165: the
+/// release whose programs and digests this crate produces.
+pub const GAS_KILLER_SDK_INTERFACE_ID: alloy_primitives::FixedBytes<4> =
+    alloy_primitives::FixedBytes([0x57, 0xa9, 0xb0, 0x02]);
+
 /// Opcode type alias
 pub type Opcode = String;
 
@@ -236,8 +228,7 @@ pub enum StateUpdate {
     /// `childLeaf` zeroed; it is filled in when the frame tree is encoded, because a leaf
     /// hashes its frame's encoded program.
     Nested(IStateUpdateTypes::Nested),
-    /// The read checks solidity-sdk v0.2.0 added. A v0.1.0 program has no way to carry them, so
-    /// encoding one for v0.1.0 leaves them out.
+    /// The read checks: what the consumer observed, re-checked where it sits in the program.
     StaticCallCheck(IStateUpdateTypes::StaticCallCheck),
     BalanceCheck(IStateUpdateTypes::BalanceCheck),
     CodehashCheck(IStateUpdateTypes::CodehashCheck),

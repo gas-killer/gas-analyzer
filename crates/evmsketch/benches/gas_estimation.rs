@@ -11,7 +11,9 @@ use std::time::Instant;
 use alloy::primitives::{Address, B256, Bytes, U256, address};
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use gas_analyzer_core::types::{IStateUpdateTypes, StateUpdate};
-use gas_analyzer_estimator::{SimEnvOpts, build_gas_estimation_calldata, estimate_gas_raw};
+use gas_analyzer_estimator::{
+    SimEnvOpts, build_gas_estimation_calldata, default_protected_ranges, estimate_gas_raw,
+};
 use revm::database::{CacheDB, EmptyDB};
 use revm::primitives::hardfork::SpecId;
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
@@ -46,7 +48,6 @@ fn canned_state_updates() -> Vec<StateUpdate> {
 
 fn sim_env() -> SimEnvOpts {
     SimEnvOpts {
-        format: gas_analyzer_estimator::SignedFormat::V0_1,
         number: 22_000_000,
         timestamp: 1_700_000_000,
         gas_limit: 30_000_000,
@@ -57,6 +58,7 @@ fn sim_env() -> SimEnvOpts {
         difficulty: U256::ZERO,
         spec: SpecId::CANCUN,
         value: U256::ZERO,
+        verify_observations: false,
     }
 }
 
@@ -64,13 +66,16 @@ fn bench_build_calldata(c: &mut Criterion) {
     let state_updates = canned_state_updates();
 
     let mut group = c.benchmark_group("build_calldata");
+    let ranges = default_protected_ranges();
     group.bench_function("build_gas_estimation_calldata", |b| {
         b.iter_custom(|iters| {
             let region = Region::new(GLOBAL);
             let start = Instant::now();
             for _ in 0..iters {
-                let _ =
-                    black_box(build_gas_estimation_calldata(black_box(&state_updates)).unwrap());
+                let _ = black_box(build_gas_estimation_calldata(
+                    black_box(&state_updates),
+                    &ranges,
+                ));
             }
             let elapsed = start.elapsed();
             let stats = region.change();
@@ -87,7 +92,7 @@ fn bench_build_calldata(c: &mut Criterion) {
 
 fn bench_estimate_gas_raw(c: &mut Criterion) {
     let state_updates = canned_state_updates();
-    let calldata = build_gas_estimation_calldata(&state_updates).unwrap();
+    let calldata = build_gas_estimation_calldata(&state_updates, &default_protected_ranges());
     let env = sim_env();
 
     let mut group = c.benchmark_group("estimate_gas_raw");

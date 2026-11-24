@@ -23,7 +23,6 @@ use crate::heuristic::BASE_TX_COST;
 use crate::observe::{
     Await, ExitData, PendingRead, call_pin, dedupe_checks, is_precompile, stack_top, static_check,
 };
-use crate::signed_format::SignedFormat;
 use crate::sim_profile::STATE_TRACKER_SLOT;
 use crate::taint::Usage;
 use crate::trace::{append_state_update_from_struct_log, callee_gas};
@@ -70,25 +69,10 @@ fn sha256(data: &[u8]) -> B256 {
     B256::from_slice(&Sha256::digest(data))
 }
 
-/// The root frame's leaf for a solidity-sdk v0.1.0 consumer: the single-transition digest for the
-/// `msg.value` the tree settles with. A zero value keeps the four-field encoding, so it hashes
-/// exactly as before. A v0.2.0 consumer binds the chain id: see [`chain_bound_root_leaf`].
+/// The root frame's leaf: the single-transition digest for the `msg.value` the tree settles
+/// with, with the chain id after the transition index. A zero value keeps the five-field
+/// encoding, as solidity-sdk v0.2.0's `NestedFrames.rootLeaf` does.
 pub fn root_leaf(
-    transition_index: U256,
-    target: Address,
-    selector: FixedBytes<4>,
-    program: &Bytes,
-    value: U256,
-) -> B256 {
-    if value.is_zero() {
-        return sha256(&(transition_index, target, selector, program.clone()).abi_encode_params());
-    }
-    sha256(&(transition_index, target, selector, program.clone(), value).abi_encode_params())
-}
-
-/// The root frame's leaf for a solidity-sdk v0.2.0 consumer: [`root_leaf`] with the chain id
-/// after the transition index, as in the v0.2.0 single-transition digest.
-pub fn chain_bound_root_leaf(
     transition_index: U256,
     chain_id: u64,
     target: Address,
@@ -597,15 +581,8 @@ pub fn compute_frame_tree_canonical(
     root: Address,
     is_nestable: &dyn Fn(Address) -> bool,
     cost: &NestingCostModel,
-    format: SignedFormat,
 ) -> Result<FrameTreeExtract> {
-    split_frame_tree(
-        trace,
-        root,
-        Eligibility::Consumers(is_nestable),
-        cost,
-        format,
-    )
+    split_frame_tree(trace, root, Eligibility::Consumers(is_nestable), cost)
 }
 
 /// [`compute_frame_tree_canonical`] for code that never integrated the SDK: what a historical
@@ -624,14 +601,7 @@ pub fn compute_frame_tree_hypothetical(
     owned: &BTreeSet<Address>,
     cost: &NestingCostModel,
 ) -> Result<FrameTreeExtract> {
-    // A what-if split for sizing, not a program anyone signs: no observations.
-    split_frame_tree(
-        trace,
-        root,
-        Eligibility::Hypothetical(owned),
-        cost,
-        SignedFormat::V0_1,
-    )
+    split_frame_tree(trace, root, Eligibility::Hypothetical(owned), cost)
 }
 
 /// A program without its `NESTED` ops, for pricers that cannot execute them.
@@ -741,7 +711,6 @@ fn split_frame_tree(
     root: Address,
     eligibility: Eligibility<'_>,
     cost: &NestingCostModel,
-    format: SignedFormat,
 ) -> Result<FrameTreeExtract> {
     let (candidates, root_index) = scan_candidates(&trace.struct_logs, root)?;
     let mut skipped_opcodes = HashSet::new();
@@ -789,16 +758,13 @@ fn split_frame_tree(
     let mut exits = ExitData::default();
     let mut pending_read: Option<(u64, PendingRead)> = None;
     // Which observations each program's effects depend on; the rest stay unpinned.
-    let observing = format == SignedFormat::V0_2;
-    let usage = Usage::for_format(&trace.struct_logs, format);
+    let usage = Usage::of(&trace.struct_logs);
 
     for (log_index, struct_log) in trace.struct_logs.into_iter().enumerate() {
         let depth = struct_log.depth;
         let op = struct_log.op.as_ref().to_string();
 
-        if observing {
-            exits.step(&struct_log)?;
-        }
+        exits.step(&struct_log)?;
         if let Some((read_depth, read)) = pending_read.take()
             && depth == read_depth
             && let Some(check) = stack_top(&struct_log, 0).and_then(|result| read.check(result))
@@ -931,7 +897,6 @@ fn split_frame_tree(
                 let returndata = exits.take(closing_depth);
                 let fallback_used = programs[id].fallback_used;
                 if let Some(fallback) = programs[id].fallback.as_mut()
-                    && observing
                     && (fallback_used || !success)
                 {
                     fallback.resultHash = call_pin(success, !fallback.value.is_zero(), &returndata);
@@ -1158,7 +1123,6 @@ fn split_frame_tree(
                         }
                         (_, Some(update)) => {
                             if let StateUpdate::Call(call) = &update
-                                && observing
                                 && !is_precompile(call.target)
                             {
                                 next.pin = Some(Await::Call {
@@ -1307,12 +1271,8 @@ fn prune_unprofitable(programs: &mut [ProgramState], cost: &NestingCostModel) {
         if programs[id].dropped {
             continue;
         }
-        // Sized in the v0.2.0 layout, a superset of v0.1.0's.
-        let program_bytes = encoded_program(
-            programs[id].updates.as_deref().unwrap_or_default(),
-            SignedFormat::V0_2,
-        )
-        .len();
+        let program_bytes =
+            encoded_program(programs[id].updates.as_deref().unwrap_or_default()).len();
         let children_bytes: usize = programs[id]
             .children
             .iter()
@@ -1448,15 +1408,13 @@ pub struct EncodedTree {
 /// program), build the tree, then build witnesses bottom-up (a witness carries its children's).
 ///
 /// `root_value` is the `msg.value` the tree settles with. The trace can't supply it, which is why
-/// the root frame's own `value` is always zero. `format` is the root consumer's: it decides whether
-/// the root leaf binds `chain_id`.
+/// the root frame's own `value` is always zero.
 pub fn encode_frame_tree(
     frames: &[FrameProgram],
     root_selector: FixedBytes<4>,
     root_value: U256,
     chain_id: u64,
     expiry_block: u64,
-    format: SignedFormat,
 ) -> Result<EncodedTree> {
     let n = frames.len();
     if n == 0 {
@@ -1483,24 +1441,19 @@ pub fn encode_frame_tree(
         if children.next().is_some() {
             bail!("frame {i} has more children than NESTED ops");
         }
-        programs[i] = encoded_program(&updates, format);
+        programs[i] = encoded_program(&updates);
         let index = frame
             .transition_index
             .ok_or_else(|| anyhow::anyhow!("frame {i} has no transition index"))?;
         frame_leaves[i] = if i == 0 {
-            match format {
-                SignedFormat::V0_1 => {
-                    root_leaf(index, frame.target, root_selector, &programs[0], root_value)
-                }
-                SignedFormat::V0_2 => chain_bound_root_leaf(
-                    index,
-                    chain_id,
-                    frame.target,
-                    root_selector,
-                    &programs[0],
-                    root_value,
-                ),
-            }
+            root_leaf(
+                index,
+                chain_id,
+                frame.target,
+                root_selector,
+                &programs[0],
+                root_value,
+            )
         } else {
             nested_leaf(
                 chain_id,
@@ -1567,39 +1520,11 @@ mod tests {
     const A11CE: Address = address!("0x00000000000000000000000000000000000a11ce");
     const B0B: Address = address!("0x0000000000000000000000000000000000000b0b");
 
+    /// Against solidity-sdk v0.2.0's `NestedFrames.rootLeaf` at chain id 1.
     #[test]
     fn root_leaf_matches_solidity() {
-        assert_eq!(
-            root_leaf(
-                U256::from(7),
-                A11CE,
-                FixedBytes::from([0x12, 0x34, 0x56, 0x78]),
-                &bytes!("c0ffee"),
-                U256::ZERO
-            ),
-            b256!("0x18fece75dabcbe169342c5e311d4af162b89a28a80cb659d125f7fe70e191b2b")
-        );
-    }
-
-    #[test]
-    fn valued_root_leaf_matches_solidity() {
-        assert_eq!(
-            root_leaf(
-                U256::from(7),
-                A11CE,
-                FixedBytes::from([0x12, 0x34, 0x56, 0x78]),
-                &bytes!("c0ffee"),
-                U256::from(5)
-            ),
-            b256!("0x9e2758ecd6d0b8e5563e02127be8e49b5cb8bcbe907e0d44d24968d955d0d6eb")
-        );
-    }
-
-    /// Against solidity-sdk v0.2.0's `NestedFrames.rootLeaf` at chain id 1, with the inputs above.
-    #[test]
-    fn chain_bound_root_leaf_matches_solidity() {
         let leaf = |value| {
-            chain_bound_root_leaf(
+            root_leaf(
                 U256::from(7),
                 1,
                 A11CE,
@@ -1780,7 +1705,6 @@ mod tests {
             ROOT,
             &move |a| nestable.contains(&a),
             &NESTING_COST_MODEL_V1,
-            SignedFormat::V0_2,
         )
         .expect("frame tree")
     }
@@ -2056,18 +1980,14 @@ mod tests {
     #[test]
     fn without_a_nestable_callee_the_root_program_is_the_canonical_program() {
         let logs = root_calls(B, 0, 1_000_000, 100_000);
-        let canonical = crate::trace::compute_state_updates_canonical_for(
-            trace(logs.clone()),
-            ROOT,
-            SignedFormat::V0_2,
-        )
-        .unwrap()
-        .0;
+        let canonical = crate::trace::compute_state_updates_canonical(trace(logs.clone()), ROOT)
+            .unwrap()
+            .0;
         let tree = split(logs, &[]);
         assert_eq!(tree.frames.len(), 1);
         assert_eq!(
-            encoded_program(&tree.frames[0].updates, SignedFormat::V0_2),
-            encoded_program(&canonical, SignedFormat::V0_2)
+            encoded_program(&tree.frames[0].updates),
+            encoded_program(&canonical)
         );
         assert_eq!(kinds(&canonical), ["STORE", "STORE", "CALL"]);
         assert_eq!(tree.call_gas_total, 900_000);
@@ -2196,15 +2116,9 @@ mod tests {
     }
 
     fn split_err(logs: Vec<StructLog>) -> String {
-        compute_frame_tree_canonical(
-            trace(logs),
-            ROOT,
-            &|_| false,
-            &NESTING_COST_MODEL_V1,
-            SignedFormat::V0_2,
-        )
-        .expect_err("a failed emitted create cannot settle")
-        .to_string()
+        compute_frame_tree_canonical(trace(logs), ROOT, &|_| false, &NESTING_COST_MODEL_V1)
+            .expect_err("a failed emitted create cannot settle")
+            .to_string()
     }
 
     #[test]
@@ -2624,8 +2538,8 @@ mod tests {
         let tree = what_if(logs, &[]);
         assert_eq!(tree.frames.len(), 1);
         assert_eq!(
-            encoded_program(&tree.frames[0].updates, SignedFormat::V0_2),
-            encoded_program(&canonical, SignedFormat::V0_2)
+            encoded_program(&tree.frames[0].updates),
+            encoded_program(&canonical)
         );
     }
 
@@ -2692,7 +2606,7 @@ mod tests {
         let enc = |t: &FrameTreeExtract| -> Vec<Bytes> {
             t.frames
                 .iter()
-                .map(|f| encoded_program(&f.updates, SignedFormat::V0_2))
+                .map(|f| encoded_program(&f.updates))
                 .collect()
         };
         assert_eq!(enc(&a), enc(&b));
@@ -2717,15 +2631,7 @@ mod tests {
             &[B, C],
         );
         let selector = FixedBytes::from([0xde, 0xad, 0xbe, 0xef]);
-        let encoded = encode_frame_tree(
-            &tree.frames,
-            selector,
-            U256::ZERO,
-            1,
-            1060,
-            SignedFormat::V0_1,
-        )
-        .unwrap();
+        let encoded = encode_frame_tree(&tree.frames, selector, U256::ZERO, 1, 1060).unwrap();
 
         assert_eq!(encoded.leaves.len(), 4);
         assert_eq!(encoded.leaves[0], expiry_leaf(1, ROOT, 1060));
@@ -2741,7 +2647,14 @@ mod tests {
         ));
         assert_eq!(
             encoded.frame_leaves[0],
-            root_leaf(U256::ZERO, ROOT, selector, &encoded.programs[0], U256::ZERO)
+            root_leaf(
+                U256::ZERO,
+                1,
+                ROOT,
+                selector,
+                &encoded.programs[0],
+                U256::ZERO
+            )
         );
 
         // The root's NESTED op names B's leaf; B's witness carries C's.
@@ -2780,21 +2693,12 @@ mod tests {
         let tree = split(root_calls(B, 0, 1_000_000, 100_000), &[B]);
         let selector = FixedBytes::from([0xde, 0xad, 0xbe, 0xef]);
         let value = U256::from(10).pow(U256::from(18));
-        let unvalued = encode_frame_tree(
-            &tree.frames,
-            selector,
-            U256::ZERO,
-            1,
-            1060,
-            SignedFormat::V0_1,
-        )
-        .unwrap();
-        let valued =
-            encode_frame_tree(&tree.frames, selector, value, 1, 1060, SignedFormat::V0_1).unwrap();
+        let unvalued = encode_frame_tree(&tree.frames, selector, U256::ZERO, 1, 1060).unwrap();
+        let valued = encode_frame_tree(&tree.frames, selector, value, 1, 1060).unwrap();
 
         assert_eq!(
             valued.frame_leaves[0],
-            root_leaf(U256::ZERO, ROOT, selector, &valued.programs[0], value)
+            root_leaf(U256::ZERO, 1, ROOT, selector, &valued.programs[0], value)
         );
         assert_ne!(valued.frame_leaves[0], unvalued.frame_leaves[0]);
         assert_ne!(valued.root, unvalued.root);
@@ -2803,43 +2707,25 @@ mod tests {
     }
 
     #[test]
-    fn a_v0_2_tree_binds_the_chain_id_in_the_root_leaf_only() {
+    fn the_root_leaf_binds_the_chain_id() {
         let tree = split(root_calls(B, 0, 1_000_000, 100_000), &[B]);
         let selector = FixedBytes::from([0xde, 0xad, 0xbe, 0xef]);
-        let encode = |chain_id, format| {
-            encode_frame_tree(&tree.frames, selector, U256::ZERO, chain_id, 1060, format).unwrap()
+        let encode = |chain_id| {
+            encode_frame_tree(&tree.frames, selector, U256::ZERO, chain_id, 1060).unwrap()
         };
-        let v1 = encode(1, SignedFormat::V0_1);
-        let v2 = encode(1, SignedFormat::V0_2);
-
+        let one = encode(1);
         assert_eq!(
-            v2.frame_leaves[0],
-            chain_bound_root_leaf(U256::ZERO, 1, ROOT, selector, &v2.programs[0], U256::ZERO)
+            one.frame_leaves[0],
+            root_leaf(U256::ZERO, 1, ROOT, selector, &one.programs[0], U256::ZERO)
         );
-        assert_ne!(v2.root, v1.root);
-        assert_eq!(v2.frame_leaves[1..], v1.frame_leaves[1..]);
-        assert_eq!(v2.programs, v1.programs);
-        assert!(verify(&v2.root_proof, v2.root, v2.frame_leaves[0]));
-        assert_ne!(
-            encode(2, SignedFormat::V0_2).frame_leaves[0],
-            v2.frame_leaves[0]
-        );
+        assert!(verify(&one.root_proof, one.root, one.frame_leaves[0]));
+        assert_ne!(encode(2).frame_leaves[0], one.frame_leaves[0]);
     }
 
     #[test]
     fn encoding_rejects_a_frame_without_an_index() {
         let mut tree = split(root_calls(B, 0, 1_000_000, 100_000), &[B]);
         tree.frames[1].transition_index = None;
-        assert!(
-            encode_frame_tree(
-                &tree.frames,
-                FixedBytes::ZERO,
-                U256::ZERO,
-                1,
-                1060,
-                SignedFormat::V0_1
-            )
-            .is_err()
-        );
+        assert!(encode_frame_tree(&tree.frames, FixedBytes::ZERO, U256::ZERO, 1, 1060,).is_err());
     }
 }

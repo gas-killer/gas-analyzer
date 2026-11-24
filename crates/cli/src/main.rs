@@ -482,8 +482,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
 
                 // Get gas estimate using the state updates extracted from the actual trace
                 use gas_analyzer_core::{
-                    SignatureType, SignedFormat, encode_state_updates_to_abi,
-                    estimate_gas_from_state_updates,
+                    SignatureType, encode_state_updates_to_abi, estimate_gas_from_state_updates,
                 };
                 use gas_analyzer_evmsketch::GasKillerEvmSketchDefault;
 
@@ -633,8 +632,7 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 };
 
                 // Encode the state updates
-                let _encoded =
-                    encode_state_updates_to_abi(&extract.state_updates, SignedFormat::V0_1);
+                let _encoded = encode_state_updates_to_abi(&extract.state_updates);
 
                 // Print state updates (debug only)
                 if cli_args.debug {

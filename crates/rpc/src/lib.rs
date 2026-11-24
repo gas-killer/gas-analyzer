@@ -8,7 +8,7 @@ use alloy::primitives::{Address, FixedBytes};
 use alloy::rpc::types::BlockOverrides;
 use alloy::rpc::types::trace::geth::mux::{MuxConfig, MuxFrame};
 use alloy::rpc::types::trace::geth::{
-    CallConfig, CallFrame, DefaultFrame, DiffMode, GethDebugBuiltInTracerType,
+    CallConfig, CallFrame, DefaultFrame, DiffMode, GethDebugBuiltInTracerType, GethDebugTracerType,
     GethDebugTracingCallOptions, GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace,
     PreStateConfig, PreStateFrame,
 };
@@ -20,8 +20,10 @@ use alloy_provider::ext::DebugApi;
 use alloy_rpc_types::TransactionTrait;
 use anyhow::{Result, anyhow, bail};
 
-use gas_analyzer_core::SimProfile;
 use gas_analyzer_core::trace::{TraceExtract, compute_state_updates, ensure_call_succeeded};
+use gas_analyzer_core::{
+    OBSERVATION_SCAN_STEP_LIMIT, OBSERVATION_TRACER, SimProfile, opcode_observation,
+};
 use gas_analyzer_estimator::PrecedingTx;
 
 /// Apply a [`SimProfile`]'s environment overrides to a `debug_traceCall`
@@ -145,44 +147,69 @@ where
     Ok(trace)
 }
 
-/// [`get_trace_from_call_with_profile`] with stack, memory and storage all off: each step's opcode
-/// and depth only. Enough to find which opcodes the call ran where, at a fraction of the full trace's
-/// size, for calls heavy enough that the prestate encoder is used to avoid that trace.
-pub async fn get_opcode_trace_from_call_with_profile<P, Req>(
+/// Why a call needs the struct-log encoder because of what its target-depth context read: the
+/// `BALANCE`, `SELFBALANCE`, `EXTCODEHASH` or `EXTCODESIZE` it ran, which the prestate and call
+/// tracers can't show. `None` if it read none.
+///
+/// Runs [`OBSERVATION_TRACER`] on the node, so the response stays a few bytes however many steps
+/// the call takes. An endpoint that won't run a custom tracer gets a struct-log trace instead,
+/// opcodes only and capped at [`OBSERVATION_SCAN_STEP_LIMIT`] steps; a call longer than that may
+/// have observed something, so it counts as observing.
+pub async fn get_observation_from_call_with_profile<P, Req>(
     provider: &P,
     tx_request: Req,
     block: BlockId,
     profile: SimProfile,
-) -> Result<DefaultFrame>
+) -> Result<Option<String>>
 where
     P: Provider + DebugApi,
     Req: Into<alloy::rpc::types::eth::TransactionRequest>,
 {
-    let mut tx_request = tx_request.into();
+    let tx_request = tx_request.into();
+    let mut js_request = tx_request.clone();
+    let mut options = GethDebugTracingCallOptions {
+        tracing_options: GethDebugTracingOptions {
+            tracer: Some(GethDebugTracerType::JsTracer(
+                OBSERVATION_TRACER.to_string(),
+            )),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    apply_sim_profile(&mut js_request, &mut options, profile);
+    match provider.debug_trace_call(js_request, block, options).await {
+        Ok(GethTrace::JS(found)) => {
+            return Ok(found
+                .as_str()
+                .map(|op| format!("{op} at target depth (needs a check op)")));
+        }
+        Ok(other) => tracing::debug!(?other, "observation tracer returned no JS result"),
+        Err(e) => tracing::debug!(error = %e, "observation tracer unavailable; scanning opcodes"),
+    }
+
+    let mut scan_request = tx_request;
     let mut options = GethDebugTracingCallOptions {
         tracing_options: GethDebugTracingOptions {
             config: GethDefaultTracingOptions {
                 disable_stack: Some(true),
                 disable_storage: Some(true),
                 enable_memory: Some(false),
+                limit: Some(OBSERVATION_SCAN_STEP_LIMIT),
                 ..Default::default()
             },
             ..Default::default()
         },
         ..Default::default()
     };
-    apply_sim_profile(&mut tx_request, &mut options, profile);
-
+    apply_sim_profile(&mut scan_request, &mut options, profile);
     let GethTrace::Default(trace) = provider
-        .debug_trace_call(tx_request, block, options)
+        .debug_trace_call(scan_request, block, options)
         .await
-        .map_err(|e| anyhow!("debug_trace_call (opcodes only) failed: {}", e))?
+        .map_err(|e| anyhow!("debug_trace_call (opcode scan) failed: {}", e))?
     else {
         return Err(anyhow!("Expected default trace from debug_trace_call"));
     };
-    ensure_call_succeeded(&trace)?;
-
-    Ok(trace)
+    Ok(opcode_observation(&trace, OBSERVATION_SCAN_STEP_LIMIT))
 }
 
 /// Simulate a call and return the `prestateTracer` diff (`diffMode`): per-account pre/post storage.

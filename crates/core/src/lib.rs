@@ -11,7 +11,6 @@ pub mod nested;
 pub mod observe;
 pub mod opcode_report;
 pub mod prestate;
-pub mod signed_format;
 pub mod sim_profile;
 mod taint;
 pub mod trace;
@@ -31,21 +30,20 @@ pub use heuristic::{
 pub use observe::{resolve_code_sizes, unresolved_code_sizes};
 pub use opcode_report::{OpcodeCategory, OpcodeReport, Treatment, Usage, opcode_report};
 pub use prestate::{
-    PrestateEligibility, build_state_updates_from_prestate, classify_prestate_eligibility,
-    frame_failure, v0_2_observation,
+    OBSERVATION_SCAN_STEP_LIMIT, OBSERVATION_TRACER, PrestateEligibility,
+    build_state_updates_from_prestate, classify_prestate_eligibility, frame_failure,
+    opcode_observation, static_observation,
 };
-pub use signed_format::SignedFormat;
 pub use sim_profile::{
     SimProfile, UNBOUNDED_BLOCK_GAS_LIMIT, UNBOUNDED_COLD_SSTORE_COST,
     UNBOUNDED_PAYLOAD_GAS_BUDGET, UNBOUNDED_TX_GAS_LIMIT, UnboundedCost, UnboundedCostViolation,
     estimate_applied_payload_gas, validate_unbounded_cost, validate_unbounded_tree_cost,
 };
 pub use trace::{
-    EvmFailure, TraceExtract, compute_state_updates, compute_state_updates_canonical,
-    compute_state_updates_canonical_for, compute_state_updates_for, copy_memory,
+    EvmFailure, TraceExtract, compute_state_updates, compute_state_updates_canonical, copy_memory,
     ensure_call_succeeded, parse_trace_memory,
 };
 pub use types::{
-    DummyExternal, IStateUpdateTypes, Opcode, RevertingContext, SimpleStorage, StateUpdate,
-    StateUpdateType, StateUpdates,
+    DummyExternal, GAS_KILLER_SDK_INTERFACE_ID, IStateUpdateTypes, Opcode, RevertingContext,
+    SimpleStorage, StateUpdate, StateUpdateType, StateUpdates,
 };

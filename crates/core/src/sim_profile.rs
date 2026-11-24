@@ -44,7 +44,6 @@
 //! land in a real transaction. Only the *signed payload* must fit on-chain.
 
 use crate::heuristic::COLD_ACCOUNT_ACCESS_COST;
-use crate::signed_format::SignedFormat;
 use crate::types::StateUpdate;
 use alloy_primitives::{B256, b256};
 
@@ -57,6 +56,23 @@ use alloy_primitives::{B256, b256};
 /// state size — so it is reported separately from the consumer's own writes.
 pub const STATE_TRACKER_SLOT: B256 =
     b256!("0xdebfdfd5a50ad117c10898d68b5ccf0893c6b40d4f443f902e2e7646601bdeaf");
+
+/// solidity-sdk v0.2.0's `GasKillerSDK` ERC-7201 configuration namespace, which settlement
+/// protects whole (the low byte spans it).
+pub const SDK_CONFIG_NAMESPACE: B256 =
+    b256!("0x1d6f9f139320a34a32f3b29eb8638270178e831962a74100c9e8b433f21e1200");
+
+/// The slot ranges, inclusive, that every consumer not behind a proxy protects from its programs:
+/// the SDK's configuration namespace and the transition counter. A pricer uses them for a target
+/// that doesn't report its own, so a contract that isn't a consumer yet is priced as one would be.
+pub fn default_protected_slots() -> [(B256, B256); 2] {
+    let mut config_end = SDK_CONFIG_NAMESPACE;
+    config_end.0[31] = 0xff;
+    [
+        (SDK_CONFIG_NAMESPACE, config_end),
+        (STATE_TRACKER_SLOT, STATE_TRACKER_SLOT),
+    ]
+}
 
 /// Block gas limit for the `Unbounded` profile: 2^40 ≈ 1.1 Tgas,
 /// ~24,000× a 45M-gas mainnet block.
@@ -214,12 +230,11 @@ const CALLDATA_FLOOR_NONZERO_TOKENS: u64 = 4;
 /// term the reporting estimators never needed, because revm charges it automatically when it
 /// executes real calldata.
 ///
-/// solidity-sdk v0.2.0 settlement also checks every STORE against the consumer's protected
-/// ranges. Measured on the v0.2.0 estimator with the SDK's two default ranges, that costs about
-/// 3,400 gas per program above v0.1.0, plus about 375 per STORE, which the per-byte term already
-/// covers. The SDK's benchmarks put each further range at about 500 gas, and a consumer behind a
-/// proxy protects three more. 10,000 covers the defaults plus about nine further ranges, for
-/// either format: the gate doesn't know which one a payload lands in.
+/// Settlement also checks every STORE against the consumer's protected ranges. Measured on the
+/// estimator with the SDK's two default ranges, that costs about 3,400 gas per program above an
+/// unguarded apply, plus about 375 per STORE, which the per-byte term already covers. The SDK's
+/// benchmarks put each further range at about 500 gas, and a consumer behind a proxy protects
+/// three more. 10,000 covers the defaults plus about nine further ranges.
 pub const UNBOUNDED_APPLY_BASE_GAS: u64 = 10_000;
 
 /// Cost of decoding and dispatching one byte of encoded payload inside `verifyAndUpdate`:
@@ -379,8 +394,7 @@ pub fn estimate_applied_payload_gas(
     // approximation: that keeps dense and sparse slot values honest, covers a log's data bytes,
     // and stays correct if the encoding changes. The payload is what a `verifyAndUpdate`
     // transaction carries, bar the selector and attestation, which ride inside `signature_floor`.
-    // Sized in the v0.2.0 layout, a superset of v0.1.0's: the gate doesn't know which one lands.
-    let payload = crate::encoding::encode_state_updates_to_abi(updates, SignedFormat::V0_2);
+    let payload = crate::encoding::encode_state_updates_to_abi(updates);
     gas = gas.saturating_add(
         (payload.len() as u64).saturating_mul(UNBOUNDED_APPLY_GAS_PER_PAYLOAD_BYTE),
     );

@@ -28,8 +28,6 @@ use std::rc::Rc;
 
 use alloy_rpc_types::trace::geth::StructLog;
 
-use crate::signed_format::SignedFormat;
-
 /// The observations that reach an effect, by struct-log index.
 #[derive(Debug, Clone)]
 pub(crate) struct Usage(Option<HashSet<usize>>);
@@ -44,19 +42,6 @@ impl Usage {
                 tracing::debug!(why, "taint tracking gave up; pinning every observation");
                 Self(None)
             }
-        }
-    }
-
-    /// No observation recorded at all: a v0.1.0 program has no way to carry a pin.
-    pub(crate) fn off() -> Self {
-        Self(Some(HashSet::new()))
-    }
-
-    /// Follow `logs` for a v0.2.0 program; record nothing for a v0.1.0 one.
-    pub(crate) fn for_format(logs: &[StructLog], format: SignedFormat) -> Self {
-        match format {
-            SignedFormat::V0_1 => Self::off(),
-            SignedFormat::V0_2 => Self::of(logs),
         }
     }
 
@@ -907,23 +892,20 @@ pub(crate) mod tests {
             }
         }
 
-        fn journal(steps: &[(u64, &str, &[u64])], format: SignedFormat) -> Vec<StateUpdate> {
-            crate::compute_state_updates_for(trace(steps), Some(TARGET), format)
+        fn journal(steps: &[(u64, &str, &[u64])]) -> Vec<StateUpdate> {
+            crate::compute_state_updates(trace(steps), Some(TARGET))
                 .expect("journal walk")
                 .state_updates
         }
 
-        fn canonical(steps: &[(u64, &str, &[u64])], format: SignedFormat) -> Vec<StateUpdate> {
-            crate::compute_state_updates_canonical_for(trace(steps), TARGET, format)
+        fn canonical(steps: &[(u64, &str, &[u64])]) -> Vec<StateUpdate> {
+            crate::compute_state_updates_canonical(trace(steps), TARGET)
                 .expect("canonical walk")
                 .0
         }
 
         fn both(steps: &[(u64, &str, &[u64])]) -> [Vec<StateUpdate>; 2] {
-            [
-                journal(steps, SignedFormat::V0_2),
-                canonical(steps, SignedFormat::V0_2),
-            ]
+            [journal(steps), canonical(steps)]
         }
 
         fn checks(updates: &[StateUpdate]) -> usize {
@@ -1045,51 +1027,6 @@ pub(crate) mod tests {
             for updates in both(&steps) {
                 assert_eq!(call_hash(&updates), pinned, "{updates:?}");
             }
-        }
-
-        /// A v0.1.0 program can't carry a pin, so neither walk records one, and the canonical
-        /// walk adds no slice before a `STATICCALL`: the output is what it was before v0.2.0.
-        #[test]
-        fn a_v0_1_program_records_no_observations() {
-            // SSTORE(0, 1); a STATICCALL whose success is stored; SSTORE(1, SELFBALANCE); a CALL
-            // whose output is stored.
-            let mut steps: Vec<(u64, &str, &[u64])> = vec![
-                (1, "PUSH1", &[]),
-                (1, "PUSH1", &[1]),
-                (1, "SSTORE", &[0, 1]),
-            ];
-            steps.extend(call6_steps(1, "STATICCALL"));
-            steps.extend(returning(2));
-            steps.extend([
-                (1, "PUSH1", &[1][..]),
-                (1, "SSTORE", &[2, 1]),
-                (1, "SELFBALANCE", &[]),
-                (1, "PUSH1", &[100]),
-                (1, "SSTORE", &[1, 100]),
-            ]);
-            steps.extend(call_steps(1, "CALL"));
-            steps.extend(returning(2));
-            steps.extend([
-                (1, "POP", &[1][..]),
-                (1, "PUSH1", &[]),
-                (1, "MLOAD", &[0]),
-                (1, "PUSH1", &[0x2a]),
-                (1, "SSTORE", &[3, 0x2a]),
-                (1, "STOP", &[]),
-            ]);
-            let journal_v1 = journal(&steps, SignedFormat::V0_1);
-            let canonical_v1 = canonical(&steps, SignedFormat::V0_1);
-            for updates in [&journal_v1, &canonical_v1] {
-                assert_eq!(checks(updates), 0, "{updates:?}");
-                assert_eq!(call_hash(updates), B256::ZERO, "{updates:?}");
-            }
-            // The journal replays its writes in order; the canonical walk slices once before the
-            // CALL (three slots) and once at the end.
-            assert_eq!(journal_v1.len(), 5, "{journal_v1:?}");
-            assert_eq!(canonical_v1.len(), 5, "{canonical_v1:?}");
-            assert!(matches!(canonical_v1[3], StateUpdate::Call(_)));
-            // The same trace signed for v0.2.0 does pin.
-            assert_eq!(checks(&journal(&steps, SignedFormat::V0_2)), 2);
         }
 
         #[test]
