@@ -1577,6 +1577,15 @@ async fn local_observation<P: Provider + DebugApi>(
     block: BlockId,
     profile: SimProfile,
 ) -> Option<Option<String>> {
+    // A tag such as `latest` can move between requests, pairing the traces with another block's
+    // header, so only a fixed block is replayed. The signed path always names one.
+    if !matches!(
+        block,
+        BlockId::Hash(_) | BlockId::Number(BlockNumberOrTag::Number(_))
+    ) {
+        tracing::debug!(%block, "can't replay a call at a block tag; asking the node to scan it");
+        return None;
+    }
     let fetched = tokio::try_join!(
         get_prestate_from_call_with_profile(provider, tx_request.clone(), block, profile),
         async {
@@ -3971,7 +3980,8 @@ mod tests {
                 hex_code("602a 6001 55 6007 6000 6000 a1 00"),
             )
             .await;
-            let block = BlockId::latest();
+            // A fixed block: the local scan doesn't replay at a tag.
+            let block = BlockId::number(provider.get_block_number().await.expect("block number"));
 
             for (to, expected) in [
                 (reader, Some("BALANCE")),

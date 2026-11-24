@@ -71,6 +71,62 @@ pub(crate) fn scan_observations(
     env: &ScanEnv,
     profile: SimProfile,
 ) -> Result<LocalScan> {
+    if let Some(reason) = unreplayable_request(tx) {
+        return Ok(LocalScan::Diverged(reason));
+    }
+    Ok(judge(&replay(pre, tx, env, profile)?, frame, diff))
+}
+
+/// Why the replay can't reproduce `tx` as the node runs it, or `None`. It drops blobs, access
+/// lists and EIP-7702 authorizations, each of which changes what the node runs.
+fn unreplayable_request(tx: &TransactionRequest) -> Option<String> {
+    if tx
+        .blob_versioned_hashes
+        .as_ref()
+        .is_some_and(|h| !h.is_empty())
+    {
+        return Some("the call carries blobs".into());
+    }
+    if tx.access_list.as_ref().is_some_and(|l| !l.0.is_empty()) {
+        return Some("the call carries an access list".into());
+    }
+    if tx
+        .authorization_list
+        .as_ref()
+        .is_some_and(|l| !l.is_empty())
+    {
+        return Some("the call carries EIP-7702 authorizations".into());
+    }
+    None
+}
+
+/// A replay of the call: how it ended, the state it left and what its inspector saw.
+struct Replay {
+    result: ExecutionResult,
+    state: revm::state::EvmState,
+    inspector: ObservationInspector,
+}
+
+/// Whether `replay` ran the call the node traced and, if it did, what its target-depth context
+/// read.
+fn judge(replay: &Replay, frame: &CallFrame, diff: &DiffMode) -> LocalScan {
+    if let Some(reason) = divergence(replay, frame, diff) {
+        return LocalScan::Diverged(reason);
+    }
+    LocalScan::Observed(
+        replay
+            .inspector
+            .found
+            .map(|op| format!("{op} at target depth (needs a check op)")),
+    )
+}
+
+fn replay(
+    pre: &PreStateMode,
+    tx: &TransactionRequest,
+    env: &ScanEnv,
+    profile: SimProfile,
+) -> Result<Replay> {
     let mut db = CacheDB::new(EmptyDB::default());
     for (address, account) in &pre.0 {
         let code = account
@@ -93,9 +149,8 @@ pub(crate) fn scan_observations(
         }
     }
 
-    let to = match tx.to {
-        Some(TxKind::Call(to)) => to,
-        _ => return Ok(LocalScan::Diverged("the call has no target".into())),
+    let Some(TxKind::Call(to)) = tx.to else {
+        return Err(anyhow!("the call has no target"));
     };
     let gas_limit = profile
         .tx_gas_limit_override()
@@ -143,29 +198,43 @@ pub(crate) fn scan_observations(
     let outcome = evm
         .inspect_tx(tx_env)
         .map_err(|e| anyhow!("replaying the call: {e:?}"))?;
-    let inspector = evm.inspector;
-
-    if let Some(reason) = divergence(&outcome.result, &outcome.state, &inspector, frame, diff) {
-        return Ok(LocalScan::Diverged(reason));
-    }
-    Ok(LocalScan::Observed(inspector.found.map(|op| {
-        format!("{op} at target depth (needs a check op)")
-    })))
+    Ok(Replay {
+        result: outcome.result,
+        state: outcome.state,
+        inspector: evm.inspector,
+    })
 }
 
 /// Why the replay isn't the run the node traced, or `None` if it is.
-fn divergence(
-    result: &ExecutionResult,
-    state: &revm::state::EvmState,
-    inspector: &ObservationInspector,
-    frame: &CallFrame,
-    diff: &DiffMode,
-) -> Option<String> {
+///
+/// Gas used is the broadest check: a different path almost always costs different gas, even one
+/// that changes nothing else compared here, such as a branch that only reads a balance.
+fn divergence(replay: &Replay, frame: &CallFrame, diff: &DiffMode) -> Option<String> {
+    let Replay {
+        result,
+        state,
+        inspector,
+    } = replay;
+    if let Some(op) = inspector.unreplayable {
+        return Some(format!(
+            "the call ran {op}, whose value the replay can't match to the node's"
+        ));
+    }
+    if let Some(error) = &frame.error {
+        return Some(format!("the node's run failed: {error}"));
+    }
     let ExecutionResult::Success { output, logs, .. } = result else {
         return Some(format!(
             "the replay failed where the node's run succeeded: {result:?}"
         ));
     };
+    if U256::from(result.gas_used()) != frame.gas_used {
+        return Some(format!(
+            "the replay used {} gas against the node's {}",
+            result.gas_used(),
+            frame.gas_used
+        ));
+    }
     if frame.output.as_ref().unwrap_or(&Bytes::new()) != output.data() {
         return Some("the replay returned different output".into());
     }
@@ -248,6 +317,11 @@ struct SeenCall {
 /// whether they show them).
 fn collect_calls(frame: &CallFrame, out: &mut Vec<SeenCall>) {
     for call in &frame.calls {
+        // A SELFDESTRUCT is a frame to `callTracer` but not a call to revm, and its effects are
+        // in the storage, logs and gas compared anyway.
+        if call.typ == "SELFDESTRUCT" {
+            continue;
+        }
         let kind = match call.typ.as_str() {
             "CALL" => "CALL",
             "STATICCALL" => "STATICCALL",
@@ -298,15 +372,30 @@ struct ObservationInspector {
     emitting: Vec<bool>,
     /// The first observation opcode the context ran.
     found: Option<&'static str>,
+    /// The first opcode, at any depth, whose value the replay can't be sure matches the node's:
+    /// `BLOCKHASH` (the replay has no block hashes), and the fee and blob values nodes set
+    /// differently for a simulated call.
+    unreplayable: Option<&'static str>,
     calls: Vec<SeenCall>,
 }
 
 impl<CTX: ContextTr> Inspector<CTX> for ObservationInspector {
     fn step(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
+        let op = interp.bytecode.opcode();
+        if self.unreplayable.is_none() {
+            self.unreplayable = match op {
+                opcode::BLOCKHASH => Some("BLOCKHASH"),
+                opcode::BASEFEE => Some("BASEFEE"),
+                opcode::GASPRICE => Some("GASPRICE"),
+                opcode::BLOBHASH => Some("BLOBHASH"),
+                opcode::BLOBBASEFEE => Some("BLOBBASEFEE"),
+                _ => None,
+            };
+        }
         if self.found.is_some() || self.emitting.last() != Some(&true) {
             return;
         }
-        self.found = match interp.bytecode.opcode() {
+        self.found = match op {
             opcode::BALANCE => Some("BALANCE"),
             opcode::SELFBALANCE => Some("SELFBALANCE"),
             opcode::EXTCODEHASH => Some("EXTCODEHASH"),
@@ -421,16 +510,29 @@ mod tests {
             .gas_limit(1_000_000)
     }
 
+    fn replayed(code: &str) -> Replay {
+        replay(&prestate(code), &tx(), &env(), SimProfile::Chain).expect("the replay runs")
+    }
+
+    /// The node's frame for a run that matches the replay's gas.
+    fn frame_like(replay: &Replay) -> CallFrame {
+        CallFrame {
+            gas_used: U256::from(replay.result.gas_used()),
+            ..frame()
+        }
+    }
+
+    /// Judges the replay of `code` against a node run with the same gas and `diff`.
     fn scan(code: &str, diff: &DiffMode) -> LocalScan {
-        scan_observations(
-            &prestate(code),
-            &frame(),
-            diff,
-            &tx(),
-            &env(),
-            SimProfile::Chain,
-        )
-        .expect("the replay runs")
+        let replay = replayed(code);
+        judge(&replay, &frame_like(&replay), diff)
+    }
+
+    fn diverges(scan: LocalScan, why: &str) {
+        let LocalScan::Diverged(reason) = scan else {
+            panic!("expected a divergence, got {scan:?}");
+        };
+        assert!(reason.contains(why), "{reason}");
     }
 
     #[test]
@@ -487,5 +589,70 @@ mod tests {
             panic!("expected a divergence");
         };
         assert!(reason.contains("calls"), "{reason}");
+    }
+
+    #[test]
+    fn different_gas_is_a_divergence() {
+        // ADDRESS; BALANCE; POP; STOP, against a node run that used a unit more gas: a branch
+        // that changed nothing else compared.
+        let replay = replayed("30 31 50 00");
+        let node = CallFrame {
+            gas_used: U256::from(replay.result.gas_used() + 1),
+            ..frame()
+        };
+        diverges(judge(&replay, &node, &DiffMode::default()), "gas");
+    }
+
+    #[test]
+    fn a_blockhash_read_is_a_divergence() {
+        // BLOCKHASH(1); POP; STOP. The replay has no block hashes.
+        diverges(scan("6001 40 50 00", &DiffMode::default()), "BLOCKHASH");
+    }
+
+    #[test]
+    fn a_basefee_read_is_a_divergence() {
+        // BASEFEE; POP; STOP. Nodes set it differently for a simulated call.
+        diverges(scan("48 50 00", &DiffMode::default()), "BASEFEE");
+    }
+
+    #[test]
+    fn a_failed_node_run_is_a_divergence() {
+        let replay = replayed("6001 50 00");
+        let node = CallFrame {
+            error: Some("execution reverted".into()),
+            ..frame_like(&replay)
+        };
+        diverges(judge(&replay, &node, &DiffMode::default()), "failed");
+    }
+
+    #[test]
+    fn a_call_with_blobs_or_authorizations_is_not_replayed() {
+        let blobs = TransactionRequest {
+            blob_versioned_hashes: Some(vec![B256::repeat_byte(1)]),
+            ..tx()
+        };
+        let scanned = scan_observations(
+            &prestate("00"),
+            &frame(),
+            &DiffMode::default(),
+            &blobs,
+            &env(),
+            SimProfile::Chain,
+        )
+        .expect("the request is checked");
+        diverges(scanned, "blobs");
+    }
+
+    #[test]
+    fn a_selfdestruct_frame_isnt_a_call() {
+        let mut node = frame();
+        node.calls.push(CallFrame {
+            typ: "SELFDESTRUCT".into(),
+            to: Some(CALLER),
+            ..Default::default()
+        });
+        let mut calls = Vec::new();
+        collect_calls(&node, &mut calls);
+        assert!(calls.is_empty(), "{calls:?}");
     }
 }
