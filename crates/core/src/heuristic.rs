@@ -77,6 +77,21 @@ pub fn calldata_gas(data: &[u8]) -> u64 {
         .sum()
 }
 
+/// The calldata gas of `updates` as `runStateUpdatesCall(uint8[], bytes[])` would carry them:
+/// the program, without the ranges argument settlement never sends. An estimator run sends the
+/// ranges too; what that adds is its [`calldata_gas`] less this.
+pub fn program_calldata_gas(updates: &[StateUpdate]) -> u64 {
+    use alloy_sol_types::{SolType, sol_data};
+    let (types, args) = crate::encoding::encode_state_updates_to_sol(updates);
+    let types: Vec<u8> = types.iter().map(|t| *t as u8).collect();
+    let params = <(
+        sol_data::Array<sol_data::Uint<8>>,
+        sol_data::Array<sol_data::Bytes>,
+    )>::abi_encode_params(&(types, args));
+    // A selector's four bytes, as nonzero as the estimator's.
+    4 * CALLDATA_NONZERO_BYTE_COST + calldata_gas(&params)
+}
+
 /// Net EIP-3529 refunds out of a gross (pre-refund) gas estimate.
 ///
 /// Struct-log gas deltas are pre-refund while receipt `gasUsed` is

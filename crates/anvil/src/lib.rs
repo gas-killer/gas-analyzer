@@ -51,6 +51,7 @@ fn impl_slot() -> U256 {
     )) - U256::from(1)
 }
 
+use gas_analyzer_core::heuristic::{calldata_gas, program_calldata_gas, unpinned_for_pricing};
 use gas_analyzer_core::{
     Opcode, RevertingContext, SignatureType, StateUpdate, TURETZKY_UPPER_GAS_LIMIT_SCHNORR,
     TraceExtract, compute_state_updates, encode_state_updates_to_abi, encode_state_updates_to_sol,
@@ -367,12 +368,16 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
 
         let target_contract = StateChangeHandlerGasEstimator::new(contract_address, &self.provider);
 
-        let (types, args) = encode_state_updates_to_sol(state_updates);
+        // A fork's state needn't match what the observations saw: price the program unpinned,
+        // charging the checks it leaves out.
+        let (state_updates, check_gas) = unpinned_for_pricing(state_updates);
+        let (types, args) = encode_state_updates_to_sol(&state_updates);
         let types = types.iter().map(|x| *x as u8).collect::<Vec<_>>();
-        let tx = target_contract
-            .runStateUpdatesCall(types, args, ranges)
-            .send()
-            .await;
+        let call = target_contract.runStateUpdatesCall(types, args, ranges);
+        // Settlement builds the ranges in memory rather than sending them: take off their calldata.
+        let ranges_calldata_gas =
+            calldata_gas(call.calldata()).saturating_sub(program_calldata_gas(&state_updates));
+        let tx = call.send().await;
         let tx = match tx {
             Ok(tx) => tx,
             Err(e) => return Err(Self::process_simulation_error(e).await),
@@ -396,7 +401,7 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
             initial_block_number, final_block_number,
             "block number should revert to initial state"
         );
-        Ok(receipt.gas_used)
+        Ok(receipt.gas_used - ranges_calldata_gas + check_gas)
     }
 
     async fn process_simulation_error(error: contract::Error) -> Error {
@@ -1194,8 +1199,13 @@ mod tests {
             .await?
             .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
         let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
-        let state_updates = compute_state_updates(trace, None)?.state_updates;
+        let (checks, state_updates): (Vec<_>, Vec<_>) = compute_state_updates(trace, None)?
+            .state_updates
+            .into_iter()
+            .partition(StateUpdate::is_check);
 
+        // The code size Solidity checks before the CALL to A, pinned
+        assert_eq!(checks.len(), 1);
         assert_eq!(state_updates.len(), 4);
         let StateUpdate::Store(IStateUpdateTypes::Store { slot, value }) = &state_updates[0] else {
             bail!("Expected Store, got {:?}", state_updates[0]);

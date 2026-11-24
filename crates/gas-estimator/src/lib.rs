@@ -11,7 +11,6 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use alloy_dyn_abi::DynSolValue;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_sol_types::{SolCall, SolError};
 use anyhow::{Result, anyhow};
@@ -24,7 +23,9 @@ use revm::primitives::hardfork::SpecId;
 use revm::state::AccountInfo;
 
 use gas_analyzer_core::encoding::encode_state_updates_to_sol;
-use gas_analyzer_core::heuristic::{BASE_TX_COST, calldata_gas, unpinned_for_pricing};
+use gas_analyzer_core::heuristic::{
+    BASE_TX_COST, calldata_gas, program_calldata_gas, unpinned_for_pricing,
+};
 use gas_analyzer_core::nested::FrameProgram;
 use gas_analyzer_core::sim_profile::default_protected_slots;
 use gas_analyzer_core::types::{RevertingContext, StateUpdate};
@@ -218,25 +219,6 @@ pub fn build_gas_estimation_calldata(
     }
     .abi_encode()
     .into()
-}
-
-/// The calldata gas of `updates` as `runStateUpdatesCall(uint8[], bytes[])` would carry them:
-/// the program, without the ranges argument settlement never sends.
-fn program_calldata_gas(updates: &[StateUpdate]) -> u64 {
-    let (types, args) = encode_state_updates_to_sol(updates);
-    let types = DynSolValue::Array(
-        types
-            .iter()
-            .map(|t| DynSolValue::Uint(U256::from(*t as u8), 8))
-            .collect(),
-    );
-    let args = DynSolValue::Array(
-        args.iter()
-            .map(|b| DynSolValue::Bytes(b.to_vec()))
-            .collect(),
-    );
-    // A selector's four bytes, as nonzero as the estimator's.
-    4 * 16 + calldata_gas(&DynSolValue::Tuple(vec![types, args]).abi_encode_params())
 }
 
 /// How a target injected by [`inject_estimator`] applies a program: against its protected
