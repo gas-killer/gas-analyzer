@@ -27,8 +27,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use alloy_primitives::{Address, B256};
-use alloy_rpc_types::trace::geth::{CallFrame, CallLogFrame, DiffMode};
+use alloy_rpc_types::trace::geth::{CallFrame, CallLogFrame, DefaultFrame, DiffMode};
 
+use crate::observe::is_precompile;
 use crate::types::{IStateUpdateTypes, StateUpdate};
 
 /// Whether a call has a net form, or must be encoded from its struct-log trace instead.
@@ -120,6 +121,59 @@ fn scan_target_depth(frame: &CallFrame) -> Option<String> {
         }
     }
     None
+}
+
+/// Why a call the net form could encode still needs the struct-log encoder for a solidity-sdk
+/// v0.2.0 consumer: its target-depth context observed something outside the consumer that the
+/// program must pin, and the prestate and call tracers can't show the result. `None` if it
+/// observed nothing.
+///
+/// `frame` is the call's `callTracer` frame, which shows each `STATICCALL`'s target (a read of a
+/// precompile pins nothing). `opcodes` is a struct-log trace of the same call with stack and
+/// memory off, which is enough to find `BALANCE`, `SELFBALANCE`, `EXTCODEHASH` and
+/// `EXTCODESIZE` in the target-depth context.
+pub fn v0_2_observation(frame: &CallFrame, opcodes: &DefaultFrame) -> Option<String> {
+    if let Some(to) = static_read_at_target_depth(frame) {
+        return Some(format!(
+            "STATICCALL to {to} at target depth (needs a STATICCALL_CHECK)"
+        ));
+    }
+    // The target-depth context: depth 1 and the DELEGATECALL/CALLCODE frames it opens, at any
+    // depth, but nothing a CALL, STATICCALL or CREATE opens. Indexed by depth.
+    let mut emitting = vec![false, true];
+    let mut opened: Option<(usize, bool)> = None;
+    for log in &opcodes.struct_logs {
+        let depth = log.depth as usize;
+        if let Some((parent, delegated)) = opened.take()
+            && depth == parent + 1
+        {
+            emitting.truncate(depth);
+            emitting.push(emitting[parent] && delegated);
+        }
+        emitting.resize(depth + 1, false);
+        emitting.truncate(depth + 1);
+        if !emitting[depth] {
+            continue;
+        }
+        match log.op.as_ref() {
+            "DELEGATECALL" | "CALLCODE" => opened = Some((depth, true)),
+            "CALL" | "STATICCALL" | "CREATE" | "CREATE2" => opened = Some((depth, false)),
+            op @ ("BALANCE" | "SELFBALANCE" | "EXTCODEHASH" | "EXTCODESIZE") => {
+                return Some(format!("{op} at target depth (needs a check op)"));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The target of the first `STATICCALL` the target-depth context makes to a contract.
+fn static_read_at_target_depth(frame: &CallFrame) -> Option<Address> {
+    frame.calls.iter().find_map(|c| match c.typ.as_str() {
+        "STATICCALL" => c.to.filter(|to| !is_precompile(*to)),
+        "DELEGATECALL" | "CALLCODE" => static_read_at_target_depth(c),
+        _ => None,
+    })
 }
 
 /// The failure reason a `callTracer` frame carries, or `None` if it completed successfully.
@@ -758,5 +812,91 @@ mod tests {
         assert!(is_eligible(classify_prestate_eligibility(
             &f, &diff, CONSUMER
         )));
+    }
+}
+
+#[cfg(test)]
+mod v0_2_observation_tests {
+    use super::*;
+    use alloy_rpc_types::trace::geth::StructLog;
+
+    fn frame(typ: &str, to: Address, calls: Vec<CallFrame>) -> CallFrame {
+        CallFrame {
+            typ: typ.to_string(),
+            to: Some(to),
+            calls,
+            ..Default::default()
+        }
+    }
+
+    fn ops(steps: &[(&str, u64)]) -> DefaultFrame {
+        DefaultFrame {
+            failed: false,
+            gas: 0,
+            return_value: Default::default(),
+            struct_logs: steps
+                .iter()
+                .map(|(op, depth)| StructLog {
+                    pc: 0,
+                    op: op.to_string().into(),
+                    gas: 0,
+                    gas_cost: 0,
+                    depth: *depth,
+                    error: None,
+                    stack: None,
+                    return_data: None,
+                    memory: None,
+                    memory_size: None,
+                    storage: None,
+                    refund_counter: None,
+                })
+                .collect(),
+        }
+    }
+
+    const ROOT: Address = Address::new([0x77; 20]);
+    const OTHER: Address = Address::new([0xcc; 20]);
+
+    #[test]
+    fn a_static_read_of_a_contract_needs_a_check() {
+        let root = frame("CALL", ROOT, vec![frame("STATICCALL", OTHER, vec![])]);
+        assert!(v0_2_observation(&root, &ops(&[])).is_some());
+    }
+
+    #[test]
+    fn a_static_read_through_a_delegatecall_needs_a_check() {
+        let lib = frame(
+            "DELEGATECALL",
+            OTHER,
+            vec![frame("STATICCALL", OTHER, vec![])],
+        );
+        let root = frame("CALL", ROOT, vec![lib]);
+        assert!(v0_2_observation(&root, &ops(&[])).is_some());
+    }
+
+    #[test]
+    fn a_precompile_read_needs_nothing() {
+        let root = frame(
+            "CALL",
+            ROOT,
+            vec![frame("STATICCALL", Address::with_last_byte(1), vec![])],
+        );
+        assert_eq!(v0_2_observation(&root, &ops(&[])), None);
+    }
+
+    #[test]
+    fn balance_reads_at_target_depth_need_a_check() {
+        let root = frame("CALL", ROOT, vec![]);
+        assert!(v0_2_observation(&root, &ops(&[("PUSH1", 1), ("SELFBALANCE", 1)])).is_some());
+        let through_library = ops(&[("DELEGATECALL", 1), ("EXTCODESIZE", 2), ("STOP", 2)]);
+        assert!(v0_2_observation(&root, &through_library).is_some());
+    }
+
+    /// What a static callee reads replays natively; only the call itself is the program's.
+    #[test]
+    fn reads_inside_another_contract_need_nothing() {
+        let root = frame("CALL", ROOT, vec![]);
+        let inside = ops(&[("STATICCALL", 1), ("BALANCE", 2), ("STOP", 2), ("POP", 1)]);
+        assert_eq!(v0_2_observation(&root, &inside), None);
     }
 }

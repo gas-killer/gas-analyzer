@@ -142,10 +142,24 @@ mod v0_2 {
         /// A STORE at `index` would change a protected slot.
         #[derive(Debug, PartialEq, Eq)]
         error ProtectedSlotWrite(uint256 index, bytes32 slot);
+
+        /// What the op at `index` pinned isn't what it observes now.
+        #[derive(Debug, PartialEq, Eq)]
+        error ObservationMismatch(uint256 index, bytes32 expected, bytes32 actual);
+
+        /// The `CALL` at `index` can't give its callee all of `gasLimit`.
+        #[derive(Debug, PartialEq, Eq)]
+        error InsufficientCallGas(uint256 index, uint256 gasLimit);
+
+        /// The op at `index` isn't in its canonical layout.
+        #[derive(Debug, PartialEq, Eq)]
+        error MalformedOp(uint256 index);
     }
 }
 
-pub use v0_2::{ProtectedRange, ProtectedSlotWrite};
+pub use v0_2::{
+    InsufficientCallGas, MalformedOp, ObservationMismatch, ProtectedRange, ProtectedSlotWrite,
+};
 
 /// solidity-sdk v0.2.0's `GasKillerSDK` ERC-7201 configuration namespace, which settlement
 /// protects whole (the low byte spans it).
@@ -572,12 +586,37 @@ pub struct EstimateReverted {
 
 impl std::fmt::Display for EstimateReverted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let gas = self.gas_used;
         if let Ok(write) = ProtectedSlotWrite::abi_decode(&self.output) {
             return write!(
                 f,
-                "Gas estimation reverted (gas: {}): update {} writes protected slot {} \
+                "Gas estimation reverted (gas: {gas}): update {} writes protected slot {} \
                  (ProtectedSlotWrite), so the program can never settle",
-                self.gas_used, write.index, write.slot
+                write.index, write.slot
+            );
+        }
+        if let Ok(e) = ObservationMismatch::abi_decode(&self.output) {
+            return write!(
+                f,
+                "Gas estimation reverted (gas: {gas}): update {} pinned {} but observes {} \
+                 (ObservationMismatch): what the trace saw has changed",
+                e.index, e.expected, e.actual
+            );
+        }
+        if let Ok(e) = InsufficientCallGas::abi_decode(&self.output) {
+            return write!(
+                f,
+                "Gas estimation reverted (gas: {gas}): update {} can't give its callee its \
+                 gasLimit of {} (InsufficientCallGas)",
+                e.index, e.gasLimit
+            );
+        }
+        if let Ok(e) = MalformedOp::abi_decode(&self.output) {
+            return write!(
+                f,
+                "Gas estimation reverted (gas: {gas}): update {} isn't in the handler's layout \
+                 (MalformedOp): the program's format doesn't match the estimator's",
+                e.index
             );
         }
         write!(
@@ -612,6 +651,15 @@ pub fn protected_slot_write(err: &anyhow::Error) -> Option<ProtectedSlotWrite> {
         .chain()
         .find_map(|e| e.downcast_ref::<EstimateReverted>())?;
     ProtectedSlotWrite::abi_decode(&reverted.output).ok()
+}
+
+/// The `ObservationMismatch` an estimate failed with: an op's pin no longer holds against the
+/// state the estimate ran on. Looks through `err`'s whole chain, as [`reverting_context`] does.
+pub fn observation_mismatch(err: &anyhow::Error) -> Option<ObservationMismatch> {
+    let reverted = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<EstimateReverted>())?;
+    ObservationMismatch::abi_decode(&reverted.output).ok()
 }
 
 /// The estimator run's gas, or why it failed.
@@ -2521,12 +2569,11 @@ mod tests {
         let target = address!("0x00000000000000000000000000000000000c0002");
         let updates = vec![pinned_call(target, B256::repeat_byte(0x42), U256::MAX)];
         let err = estimate(&mut CacheDB::new(EmptyDB::default()), &updates).unwrap_err();
-        let reverted = err
-            .chain()
-            .find_map(|e| e.downcast_ref::<EstimateReverted>())
-            .expect("an estimator revert");
-        let selector = alloy_primitives::keccak256("ObservationMismatch(uint256,bytes32,bytes32)");
-        assert_eq!(reverted.output[..4], selector[..4]);
+        let mismatch = observation_mismatch(&err).expect("an ObservationMismatch");
+        assert_eq!(mismatch.index, U256::ZERO);
+        assert_eq!(mismatch.expected, B256::repeat_byte(0x42));
+        assert_eq!(mismatch.actual, empty_success_hash());
+        assert!(err.to_string().contains("ObservationMismatch"), "{err}");
     }
 
     #[test]

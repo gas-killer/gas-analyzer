@@ -20,6 +20,9 @@ use sha2::{Digest, Sha256};
 
 pub use crate::encoding::encode_state_updates_to_abi as encoded_program;
 use crate::heuristic::BASE_TX_COST;
+use crate::observe::{
+    Await, ExitData, PendingRead, call_pin, is_precompile, stack_top, static_check,
+};
 use crate::signed_format::SignedFormat;
 use crate::sim_profile::STATE_TRACKER_SLOT;
 use crate::trace::{append_state_update_from_struct_log, callee_gas};
@@ -509,6 +512,8 @@ struct WalkFrame {
     /// Programs with this id or above were opened inside this frame, and are dropped with
     /// it if it reverts.
     first_program: usize,
+    /// The op in the caller's output this frame's outcome pins.
+    pin: Option<Await>,
 }
 
 struct PendingFrame {
@@ -520,6 +525,8 @@ struct PendingFrame {
     emitted_create: bool,
     nested_start_gas: Option<u64>,
     call_gas_cost: u64,
+    /// The op in the caller's output the call's outcome pins.
+    pin: Option<Await>,
 }
 
 /// The canonical storage image of `target` visible right now: every open frame's journal
@@ -757,12 +764,27 @@ fn split_frame_tree(
         emitted_create: false,
         nested_start_gas: None,
         first_program: 0,
+        pin: None,
     }];
     let mut pending: Option<PendingFrame> = None;
+    let mut exits = ExitData::default();
+    let mut pending_read: Option<(u64, PendingRead)> = None;
 
     for (log_index, struct_log) in trace.struct_logs.into_iter().enumerate() {
         let depth = struct_log.depth;
         let op = struct_log.op.as_ref().to_string();
+
+        exits.step(&struct_log)?;
+        if let Some((read_depth, read)) = pending_read.take()
+            && depth == read_depth
+            && let Some(check) = stack_top(&struct_log, 0).and_then(|result| read.check(result))
+        {
+            frames
+                .last_mut()
+                .expect("root frame must remain")
+                .out
+                .push(check);
+        }
 
         if let Some(p) = pending.take() {
             if depth == p.parent_depth + 1 {
@@ -786,6 +808,7 @@ fn split_frame_tree(
                     emitted_create: p.emitted_create,
                     nested_start_gas: p.nested_start_gas,
                     first_program,
+                    pin: p.pin,
                 });
             } else {
                 if p.nested_start_gas.is_some() {
@@ -795,7 +818,13 @@ fn split_frame_tree(
                     );
                 }
                 // No frame was entered (EOA / precompile / failed call): the call completed
-                // inline. Account its gas now if it was emitted.
+                // inline, returning nothing. Pin it, and account its gas if it was emitted.
+                if let Some(pin) = p.pin
+                    && let Some(top) = stack_top(&struct_log, 0)
+                {
+                    let caller = frames.last_mut().expect("root frame must remain");
+                    pin.resolve(&mut caller.out, top, &[]);
+                }
                 if p.emitted_create {
                     let deployed = struct_log.stack.as_ref().and_then(|s| s.last());
                     if deployed.is_none_or(|address| address.is_zero()) {
@@ -843,6 +872,12 @@ fn split_frame_tree(
             if frame.emitted_create && !success {
                 bail!(failed_create(depth));
             }
+            if let Some(pin) = frame.pin {
+                let top = *stack.last().expect("checked above");
+                let returndata = exits.take(closing_depth);
+                let caller = frames.last_mut().expect("root frame must remain");
+                pin.resolve(&mut caller.out, top, &returndata);
+            }
             let parent_program = frames.last().and_then(|f| f.program);
             if !success {
                 for program in &mut programs[frame.first_program..] {
@@ -867,6 +902,12 @@ fn split_frame_tree(
 
             if let Some(start_gas) = nested_root {
                 let id = frame.program.expect("a nested frame emits");
+                // If pruning turns the frame back into a `CALL`, that `CALL` is pinned like any
+                // other.
+                let returndata = exits.take(closing_depth);
+                if let Some(fallback) = programs[id].fallback.as_mut() {
+                    fallback.resultHash = call_pin(success, !fallback.value.is_zero(), &returndata);
+                }
                 if success {
                     let native = start_gas.saturating_sub(struct_log.gas);
                     programs[id].native_gas = native;
@@ -929,6 +970,13 @@ fn split_frame_tree(
         let cur_ctx = frames[idx].storage_ctx;
         let op_errored = struct_log.error.is_some();
 
+        if cur_emitting
+            && !op_errored
+            && let Some(read) = PendingRead::of(&struct_log, cur_ctx)
+        {
+            pending_read = Some((depth, read));
+        }
+
         match op.as_str() {
             "SSTORE" => {
                 if let Some(ctx) = cur_ctx
@@ -974,6 +1022,7 @@ fn split_frame_tree(
                         emitted_create: false,
                         nested_start_gas: None,
                         call_gas_cost: 0,
+                        pin: None,
                     });
                 }
             }
@@ -986,6 +1035,17 @@ fn split_frame_tree(
                     let callee = stack
                         .get(stack.len().wrapping_sub(2))
                         .map(|v| Address::from_word((*v).into()));
+                    // A read an emitting frame makes is pinned where it happens. Its callee runs
+                    // code, which can read the target, so the target's storage is brought to the
+                    // canonical image first, as at a `CALL`.
+                    let mut pin = None;
+                    if cur_emitting && let Some(check) = static_check(&struct_log)? {
+                        flush_slice(&mut frames, &programs);
+                        frames[idx].out.push(check);
+                        pin = Some(Await::Static {
+                            index: frames[idx].out.len() - 1,
+                        });
+                    }
                     pending = Some(PendingFrame {
                         parent_depth: depth,
                         storage_ctx: callee,
@@ -995,6 +1055,7 @@ fn split_frame_tree(
                         emitted_create: false,
                         nested_start_gas: None,
                         call_gas_cost: 0,
+                        pin,
                     });
                 }
             }
@@ -1016,6 +1077,7 @@ fn split_frame_tree(
                     emitted_create: false,
                     nested_start_gas: None,
                     call_gas_cost: struct_log.gas_cost,
+                    pin: None,
                 };
                 if cur_emitting && !op_errored {
                     // Boundary: external code is about to observe the current target's
@@ -1062,6 +1124,14 @@ fn split_frame_tree(
                             next.nested_start_gas = Some(gas_after_opcode);
                         }
                         (_, Some(update)) => {
+                            if let StateUpdate::Call(call) = &update
+                                && !is_precompile(call.target)
+                            {
+                                next.pin = Some(Await::Call {
+                                    index: frames[idx].out.len(),
+                                    value_sent: !call.value.is_zero(),
+                                });
+                            }
                             frames[idx].out.push(update);
                             next.emitted_call_gas = Some(gas_after_opcode);
                         }
@@ -1075,6 +1145,10 @@ fn split_frame_tree(
             "CREATE" | "CREATE2" => {
                 let emitted = cur_emitting && !op_errored;
                 let gas_at_opcode = struct_log.gas;
+                // A `CREATE`'s address depends on the deployer's nonce, so it is pinned.
+                let pin = (emitted && op == "CREATE").then(|| Await::Create {
+                    index: frames[idx].out.len(),
+                });
                 if emitted {
                     // Initcode can call back into the target: boundary here too.
                     flush_slice(&mut frames, &programs);
@@ -1098,6 +1172,7 @@ fn split_frame_tree(
                         emitted_create: emitted,
                         nested_start_gas: None,
                         call_gas_cost: 0,
+                        pin,
                     });
                 }
             }
@@ -1443,6 +1518,7 @@ mod tests {
     use alloy_sol_types::SolType;
 
     use super::*;
+    use crate::observe::result_hash;
     use crate::trace::compute_state_updates_canonical;
 
     // ------------------------------------------------------------------------
@@ -1708,6 +1784,210 @@ mod tests {
             sstore(2, slot(5), 50),
             resume(1, resume_gas, true),
         ]
+    }
+
+    // ── Observation pins (solidity-sdk v0.2.0) ──────────────────────────
+
+    const DATA: u64 = 0x2a;
+
+    /// A callee's `RETURN` or `REVERT` of one word holding [`DATA`].
+    fn exit(op: &str, depth: u64) -> StructLog {
+        let mut l = log(op, depth, 900_000, &[U256::ZERO, U256::from(32)], 0);
+        l.memory = Some(vec![format!("{:064x}", DATA)]);
+        l
+    }
+
+    fn data_word() -> Vec<u8> {
+        B256::from(U256::from(DATA)).to_vec()
+    }
+
+    fn staticcall(depth: u64, callee: Address) -> StructLog {
+        let args = [
+            U256::from(100_000),
+            word(callee),
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+        ];
+        log("STATICCALL", depth, 1_000_000, &args, 0)
+    }
+
+    /// The log after a frameless read, with the read's result on its stack.
+    fn result(depth: u64, value: U256) -> StructLog {
+        log("JUMPDEST", depth, 900_000, &[value], 0)
+    }
+
+    fn only_call(updates: &[StateUpdate]) -> &IStateUpdateTypes::Call {
+        let calls: Vec<_> = updates
+            .iter()
+            .filter_map(|u| match u {
+                StateUpdate::Call(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "{updates:?}");
+        calls[0]
+    }
+
+    #[test]
+    fn a_call_pins_what_its_callee_returned() {
+        let tree = split(
+            vec![
+                call(1, 1_000_000, C),
+                exit("RETURN", 2),
+                resume(1, 900_000, true),
+            ],
+            &[],
+        );
+        let call = only_call(&tree.frames[0].updates);
+        assert_eq!(call.resultHash, result_hash(true, &data_word()));
+    }
+
+    #[test]
+    fn a_caught_revert_is_pinned_as_a_failure() {
+        let tree = split(
+            vec![
+                call(1, 1_000_000, C),
+                exit("REVERT", 2),
+                resume(1, 900_000, false),
+            ],
+            &[],
+        );
+        let call = only_call(&tree.frames[0].updates);
+        assert_eq!(call.resultHash, result_hash(false, &data_word()));
+    }
+
+    /// An exceptional halt returns no data, so the SDK can't tell it from its own failures.
+    #[test]
+    fn a_halted_call_stays_unpinned() {
+        let tree = split(
+            vec![
+                call(1, 1_000_000, C),
+                log("INVALID", 2, 900_000, &[], 0),
+                resume(1, 900_000, false),
+            ],
+            &[],
+        );
+        assert_eq!(only_call(&tree.frames[0].updates).resultHash, B256::ZERO);
+    }
+
+    /// A call into an account without code opens no frame and returns nothing.
+    #[test]
+    fn a_frameless_call_pins_an_empty_success() {
+        let tree = split(vec![call(1, 1_000_000, C), resume(1, 900_000, true)], &[]);
+        let call = only_call(&tree.frames[0].updates);
+        assert_eq!(call.resultHash, result_hash(true, &[]));
+    }
+
+    #[test]
+    fn a_read_is_checked_where_it_happened_after_the_target_is_brought_up_to_date() {
+        let tree = split(
+            vec![
+                sstore(1, slot(1), 10),
+                staticcall(1, C),
+                exit("RETURN", 2),
+                resume(1, 900_000, true),
+                sstore(1, slot(2), 20),
+            ],
+            &[],
+        );
+        let updates = &tree.frames[0].updates;
+        assert_eq!(updates.len(), 3, "{updates:?}");
+        assert!(matches!(&updates[0], StateUpdate::Store(s) if s.slot == slot(1)));
+        let StateUpdate::StaticCallCheck(check) = &updates[1] else {
+            panic!("a STATICCALL_CHECK, got {:?}", updates[1]);
+        };
+        assert_eq!(check.target, C);
+        assert_eq!(check.resultHash, result_hash(true, &data_word()));
+        assert!(matches!(&updates[2], StateUpdate::Store(s) if s.slot == slot(2)));
+    }
+
+    #[test]
+    fn reads_of_precompiles_are_not_checked() {
+        let ecrecover = Address::with_last_byte(1);
+        let tree = split(
+            vec![staticcall(1, ecrecover), resume(1, 900_000, true)],
+            &[],
+        );
+        assert!(tree.frames[0].updates.is_empty());
+    }
+
+    #[test]
+    fn balance_and_code_reads_are_checked() {
+        let tree = split(
+            vec![
+                log("BALANCE", 1, 1_000_000, &[word(C)], 0),
+                result(1, U256::from(77)),
+                log("SELFBALANCE", 1, 1_000_000, &[], 0),
+                result(1, U256::from(5)),
+                log("EXTCODEHASH", 1, 1_000_000, &[word(C)], 0),
+                result(1, U256::from(0xabc)),
+                log("EXTCODESIZE", 1, 1_000_000, &[word(B)], 0),
+                result(1, U256::ZERO),
+            ],
+            &[],
+        );
+        let updates = &tree.frames[0].updates;
+        assert!(
+            matches!(&updates[0], StateUpdate::BalanceCheck(b) if b.account == C && b.balance == U256::from(77))
+        );
+        assert!(
+            matches!(&updates[1], StateUpdate::BalanceCheck(b) if b.account == ROOT && b.balance == U256::from(5))
+        );
+        assert!(
+            matches!(&updates[2], StateUpdate::CodehashCheck(c) if c.account == C && c.codehash == B256::from(U256::from(0xabc)))
+        );
+        assert!(
+            matches!(&updates[3], StateUpdate::CodehashCheck(c) if c.account == B && c.codehash.is_zero())
+        );
+    }
+
+    /// Reads inside a callee that replays natively aren't the program's to pin.
+    #[test]
+    fn reads_inside_a_native_call_are_not_checked() {
+        let tree = split(
+            vec![
+                call(1, 1_000_000, C),
+                log("BALANCE", 2, 900_000, &[word(B)], 0),
+                result(2, U256::from(1)),
+                resume(1, 800_000, true),
+            ],
+            &[],
+        );
+        assert_eq!(kinds(&tree.frames[0].updates), ["CALL"]);
+    }
+
+    #[test]
+    fn a_create_pins_its_address() {
+        let deployed = Address::repeat_byte(0xde);
+        let tree = split(
+            vec![
+                log(
+                    "CREATE",
+                    1,
+                    1_000_000,
+                    &[U256::ZERO, U256::ZERO, U256::ZERO],
+                    0,
+                ),
+                stop(2, 900_000),
+                log("JUMPDEST", 1, 800_000, &[word(deployed)], 0),
+            ],
+            &[],
+        );
+        let StateUpdate::Create(create) = &tree.frames[0].updates[0] else {
+            panic!("a CREATE");
+        };
+        assert_eq!(create.expected, deployed);
+    }
+
+    /// A nested frame pruned back into a `CALL` restores a pinned one.
+    #[test]
+    fn a_pruned_frame_restores_a_pinned_call() {
+        let tree = split(root_calls(B, 0, 1_000_000, 995_000), &[B]);
+        assert_eq!(tree.frames.len(), 1);
+        let call = only_call(&tree.frames[0].updates);
+        assert_eq!(call.resultHash, result_hash(true, &[]));
     }
 
     #[test]

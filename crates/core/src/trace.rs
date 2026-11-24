@@ -10,6 +10,7 @@ use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types::trace::geth::{DefaultFrame, StructLog};
 use anyhow::{Result, bail};
 
+use crate::observe::{Await, ExitData, PendingRead, is_precompile, stack_top, static_check};
 use crate::types::{CALL_GAS_UNCAPPED, IStateUpdateTypes, Opcode, StateUpdate};
 
 // ============================================================================
@@ -94,12 +95,24 @@ pub fn traced_call_gas_limit(operand: U256, gas_at_call: u64) -> U256 {
     }
 }
 
-/// Opcodes whose memory [`append_state_update_from_struct_log`] reads; it must cover every
-/// `copy_memory` there, since the wasm crate's lean trace parser drops memory for every other opcode.
+/// Opcodes whose memory the extractors read: [`append_state_update_from_struct_log`]'s ops, plus
+/// what the observation pins read ([`crate::observe`]: a `STATICCALL`'s calldata and the data a
+/// frame returns or reverts with). It must cover every memory read, since the wasm crate's lean
+/// trace parser drops memory for every other opcode.
 pub fn reads_memory(op: &str) -> bool {
     matches!(
         op,
-        "CREATE" | "CREATE2" | "CALL" | "LOG0" | "LOG1" | "LOG2" | "LOG3" | "LOG4"
+        "CREATE"
+            | "CREATE2"
+            | "CALL"
+            | "LOG0"
+            | "LOG1"
+            | "LOG2"
+            | "LOG3"
+            | "LOG4"
+            | "STATICCALL"
+            | "RETURN"
+            | "REVERT"
     )
 }
 
@@ -324,10 +337,44 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
     let mut create_gas_total = 0u64;
     let mut sstore_gas_total = 0u64;
     let mut reentered = false;
+    // What each frame returned, the ops whose pins wait on the trace resuming after them (with
+    // the depth they ran at and whether they opened a frame), and a read whose result is on the
+    // next log's stack.
+    let mut exits = ExitData::default();
+    let mut awaiting: Vec<(u64, Await, bool)> = Vec::new();
+    let mut pending_read: Option<(u64, PendingRead)> = None;
 
     for struct_log in trace.struct_logs {
         let depth = struct_log.depth;
         let op = struct_log.op.as_ref().to_string();
+
+        exits.step(&struct_log)?;
+        if let Some((read_depth, read)) = pending_read.take()
+            && depth == read_depth
+            && let Some(check) = stack_top(&struct_log, 0).and_then(|result| read.check(result))
+        {
+            state_updates.push(check);
+        }
+        if let Some((await_depth, _, entered)) = awaiting.last_mut()
+            && depth == *await_depth + 1
+        {
+            *entered = true;
+        }
+        while let Some(&(await_depth, pin, entered)) = awaiting.last()
+            && depth <= await_depth
+        {
+            awaiting.pop();
+            if depth == await_depth
+                && let Some(top) = stack_top(&struct_log, 0)
+            {
+                let returndata = if entered {
+                    exits.take(depth + 1)
+                } else {
+                    Default::default()
+                };
+                pin.resolve(&mut state_updates, top, &returndata);
+            }
+        }
 
         if let Some((call_depth, idx)) = awaiting_entry.take()
             && depth == call_depth + 1
@@ -385,6 +432,19 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
             target_depth = depth;
         }
 
+        // Reads an emitting frame makes, pinned where they happen.
+        if depth == target_depth && call_stack.is_empty() && struct_log.error.is_none() {
+            if op == "STATICCALL" {
+                if let Some(check) = static_check(&struct_log)? {
+                    state_updates.push(check);
+                    let index = state_updates.len() - 1;
+                    awaiting.push((depth, Await::Static { index }, false));
+                }
+            } else if let Some(read) = PendingRead::of(&struct_log, origin) {
+                pending_read = Some((depth, read));
+            }
+        }
+
         if depth == target_depth {
             if op == "DELEGATECALL" || op == "CALLCODE" {
                 target_depth = depth + 1;
@@ -428,6 +488,18 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
                     }
                     if op == "CREATE" || op == "CREATE2" {
                         pending_create = Some((depth, gas_after_opcode));
+                    }
+                    if op == "CREATE" {
+                        let index = state_updates.len() - 1;
+                        awaiting.push((depth, Await::Create { index }, false));
+                    }
+                    if op == "CALL"
+                        && let Some(StateUpdate::Call(call)) = state_updates.last()
+                        && !is_precompile(call.target)
+                    {
+                        let index = state_updates.len() - 1;
+                        let value_sent = !call.value.is_zero();
+                        awaiting.push((depth, Await::Call { index, value_sent }, false));
                     }
                     if op == "CALL" {
                         let call_index_1based = state_updates.len();
@@ -598,6 +670,141 @@ mod tests {
             storage: None,
             refund_counter: None,
         }
+    }
+
+    // ── Observation pins (solidity-sdk v0.2.0) ──────────────────────────
+
+    const ORIGIN: Address = Address::new([0x77; 20]);
+    const CALLEE: Address = Address::new([0xcc; 20]);
+
+    /// A struct log at `depth` whose stack is `top_first`, top item first.
+    fn at(op: &str, depth: u64, top_first: &[U256]) -> StructLog {
+        let mut stack = top_first.to_vec();
+        stack.reverse();
+        let mut l = make_struct_log(op, stack, vec![]);
+        l.depth = depth;
+        l
+    }
+
+    fn call_to(depth: u64, callee: Address) -> StructLog {
+        at(
+            "CALL",
+            depth,
+            &[
+                U256::from(50_000u64),
+                addr_word(callee),
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+            ],
+        )
+    }
+
+    fn returning(op: &str, depth: u64, data: u8) -> StructLog {
+        let mut l = at(op, depth, &[U256::ZERO, U256::from(1u64)]);
+        l.memory = Some(vec![format!("{:02x}{}", data, "00".repeat(31))]);
+        l
+    }
+
+    fn journal(logs: Vec<StructLog>) -> Vec<StateUpdate> {
+        let trace = DefaultFrame {
+            gas: 0,
+            failed: false,
+            return_value: Default::default(),
+            struct_logs: logs,
+        };
+        compute_state_updates(trace, Some(ORIGIN))
+            .unwrap()
+            .state_updates
+    }
+
+    #[test]
+    fn journal_pins_a_calls_result() {
+        let updates = journal(vec![
+            call_to(1, CALLEE),
+            returning("RETURN", 2, 0x2a),
+            at("JUMPDEST", 1, &[U256::from(1u64)]),
+        ]);
+        let StateUpdate::Call(call) = &updates[0] else {
+            panic!("a CALL");
+        };
+        assert_eq!(call.resultHash, crate::observe::result_hash(true, &[0x2a]));
+    }
+
+    #[test]
+    fn journal_pins_a_caught_revert() {
+        let updates = journal(vec![
+            call_to(1, CALLEE),
+            returning("REVERT", 2, 0x01),
+            at("JUMPDEST", 1, &[U256::ZERO]),
+        ]);
+        let StateUpdate::Call(call) = &updates[0] else {
+            panic!("a CALL");
+        };
+        assert_eq!(call.resultHash, crate::observe::result_hash(false, &[0x01]));
+    }
+
+    #[test]
+    fn journal_checks_reads_in_trace_order() {
+        let updates = journal(vec![
+            at("SSTORE", 1, &[U256::from(1u64), U256::from(10u64)]),
+            at(
+                "STATICCALL",
+                1,
+                &[
+                    U256::from(50_000u64),
+                    addr_word(CALLEE),
+                    U256::ZERO,
+                    U256::ZERO,
+                    U256::ZERO,
+                    U256::ZERO,
+                ],
+            ),
+            returning("RETURN", 2, 0x07),
+            at("JUMPDEST", 1, &[U256::from(1u64)]),
+            at("SELFBALANCE", 1, &[]),
+            at("JUMPDEST", 1, &[U256::from(9u64)]),
+            at("SSTORE", 1, &[U256::from(2u64), U256::from(20u64)]),
+        ]);
+        assert_eq!(updates.len(), 4, "{updates:?}");
+        assert!(matches!(&updates[0], StateUpdate::Store(_)));
+        let StateUpdate::StaticCallCheck(check) = &updates[1] else {
+            panic!("a STATICCALL_CHECK, got {:?}", updates[1]);
+        };
+        assert_eq!(check.target, CALLEE);
+        assert_eq!(check.resultHash, crate::observe::result_hash(true, &[0x07]));
+        assert!(
+            matches!(&updates[2], StateUpdate::BalanceCheck(b) if b.account == ORIGIN && b.balance == U256::from(9u64))
+        );
+        assert!(matches!(&updates[3], StateUpdate::Store(_)));
+    }
+
+    #[test]
+    fn journal_pins_a_creates_address() {
+        let deployed = Address::repeat_byte(0xde);
+        let updates = journal(vec![
+            at("CREATE", 1, &[U256::ZERO, U256::ZERO, U256::ZERO]),
+            at("STOP", 2, &[]),
+            at("JUMPDEST", 1, &[addr_word(deployed)]),
+        ]);
+        let StateUpdate::Create(create) = &updates[0] else {
+            panic!("a CREATE");
+        };
+        assert_eq!(create.expected, deployed);
+    }
+
+    #[test]
+    fn journal_leaves_precompile_calls_unpinned() {
+        let updates = journal(vec![
+            call_to(1, Address::with_last_byte(4)),
+            at("JUMPDEST", 1, &[U256::from(1u64)]),
+        ]);
+        let StateUpdate::Call(call) = &updates[0] else {
+            panic!("a CALL");
+        };
+        assert_eq!(call.resultHash, B256::ZERO);
     }
 
     #[test]

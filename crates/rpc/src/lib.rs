@@ -145,6 +145,46 @@ where
     Ok(trace)
 }
 
+/// [`get_trace_from_call_with_profile`] with stack, memory and storage all off: each step's opcode
+/// and depth only. Enough to find which opcodes the call ran where, at a fraction of the full trace's
+/// size, for calls heavy enough that the prestate encoder is used to avoid that trace.
+pub async fn get_opcode_trace_from_call_with_profile<P, Req>(
+    provider: &P,
+    tx_request: Req,
+    block: BlockId,
+    profile: SimProfile,
+) -> Result<DefaultFrame>
+where
+    P: Provider + DebugApi,
+    Req: Into<alloy::rpc::types::eth::TransactionRequest>,
+{
+    let mut tx_request = tx_request.into();
+    let mut options = GethDebugTracingCallOptions {
+        tracing_options: GethDebugTracingOptions {
+            config: GethDefaultTracingOptions {
+                disable_stack: Some(true),
+                disable_storage: Some(true),
+                enable_memory: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    apply_sim_profile(&mut tx_request, &mut options, profile);
+
+    let GethTrace::Default(trace) = provider
+        .debug_trace_call(tx_request, block, options)
+        .await
+        .map_err(|e| anyhow!("debug_trace_call (opcodes only) failed: {}", e))?
+    else {
+        return Err(anyhow!("Expected default trace from debug_trace_call"));
+    };
+    ensure_call_succeeded(&trace)?;
+
+    Ok(trace)
+}
+
 /// Simulate a call and return the `prestateTracer` diff (`diffMode`): per-account pre/post storage.
 ///
 /// Cost is `O(changed slots)` rather than `O(execution steps)`, so this succeeds on heavy-compute

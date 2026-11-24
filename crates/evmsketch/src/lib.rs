@@ -152,12 +152,13 @@ use gas_analyzer_core::{
     Opcode, PrestateEligibility, SignatureType, StateUpdate, build_state_updates_from_prestate,
     classify_prestate_eligibility, compute_state_updates, compute_state_updates_canonical,
     encode_state_updates_to_abi, estimate_gas_from_operations, extract_operation_counts_from_trace,
-    frame_failure, validate_unbounded_cost, validate_unbounded_tree_cost,
+    frame_failure, resolve_code_sizes, unresolved_code_sizes, v0_2_observation,
+    validate_unbounded_cost, validate_unbounded_tree_cost,
 };
 pub use gas_analyzer_estimator::{PrecedingTx, reverting_context};
 use gas_analyzer_estimator::{SignedFormat, SimEnvOpts};
 use gas_analyzer_rpc::{
-    MuxedTraces, get_call_frame_from_call_with_profile,
+    MuxedTraces, get_call_frame_from_call_with_profile, get_opcode_trace_from_call_with_profile,
     get_prestate_diff_and_call_frame_with_profile, get_prestate_diff_from_call_with_profile,
     get_trace_from_call_with_profile,
 };
@@ -607,6 +608,9 @@ impl DefaultEvmSketchExecutor {
     /// whose updates spend or check the ETH that call brought in prices as it will land instead of
     /// reverting for want of it.
     ///
+    /// State is read at the anchor block itself, the state `debug_traceCall` at that block ran on,
+    /// so the observations the program pins hold against it.
+    ///
     /// `format` is the consumer's signed format, which picks the estimator it is priced with.
     pub async fn estimate_state_changes_gas_with_hints_timed(
         &self,
@@ -617,7 +621,11 @@ impl DefaultEvmSketchExecutor {
         value: U256,
         format: SignedFormat,
     ) -> Result<(u64, EstimateTimings)> {
-        let state_block = self.anchor_block_number().saturating_sub(1);
+        // The state the signed path's trace ran on: `debug_traceCall` at the anchor runs after
+        // its block, so the program, its pins and this estimate all see the same world. (The
+        // historical-transaction estimators read the block before, so a mined transaction doesn't
+        // see its own writes.)
+        let state_block = self.anchor_block_number();
         let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
         let mut cache_db = CacheDB::new(simple_db);
 
@@ -661,7 +669,11 @@ impl DefaultEvmSketchExecutor {
         value: U256,
         format: SignedFormat,
     ) -> Result<(Vec<u64>, EstimateTimings)> {
-        let state_block = self.anchor_block_number().saturating_sub(1);
+        // The state the signed path's trace ran on: `debug_traceCall` at the anchor runs after
+        // its block, so the program, its pins and this estimate all see the same world. (The
+        // historical-transaction estimators read the block before, so a mined transaction doesn't
+        // see its own writes.)
+        let state_block = self.anchor_block_number();
         let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
         let mut cache_db = CacheDB::new(simple_db);
 
@@ -1258,6 +1270,26 @@ pub struct EncodedStateUpdates {
     pub timings: EncodePhaseTimings,
 }
 
+/// Fill in the code hash of every account whose `EXTCODESIZE` a v0.2.0 program pins: the trace
+/// shows the size, so the code is fetched at the traced `block` and checked against it (see
+/// [`gas_analyzer_core::observe::resolve_code_sizes`]).
+async fn resolve_code_hashes<P: Provider>(
+    provider: &P,
+    block: BlockId,
+    updates: &mut [StateUpdate],
+) -> Result<()> {
+    let mut code = HashMap::new();
+    for (account, _) in unresolved_code_sizes(updates) {
+        let bytes = provider
+            .get_code_at(account)
+            .block_id(block)
+            .await
+            .with_context(|| format!("fetching the code of {account}, read by EXTCODESIZE"))?;
+        code.insert(account, bytes);
+    }
+    resolve_code_sizes(updates, &code)
+}
+
 /// Compute encoded state updates and gas estimate for a transaction call using EvmSketch.
 ///
 /// Legacy-encoding convenience wrapper over
@@ -1384,18 +1416,22 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
             block_id,
             contract_address,
             encoding,
-            profile
+            profile,
+            format,
         ),
         cache.get_or_build_timed(rpc_url, block_number),
     )?;
     let Extracted {
-        state_updates,
+        mut state_updates,
         skipped_opcodes,
         call_gas_total,
         extraction,
         trace_fetch,
         parse,
     } = extracted;
+    if format == SignedFormat::V0_2 {
+        resolve_code_hashes(&provider, block_id, &mut state_updates).await?;
+    }
     tracing::Span::current().record("state_update_count", state_updates.len());
 
     // The unbounded profile's whole bargain: compute may be unbounded, the payload that lands
@@ -1480,6 +1516,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
 /// (which the canonical extractor flags) is invisible there. That only affects reporting — transient
 /// storage is discarded at the end of the transaction and eligibility already rules out the external
 /// calls that could observe it, so it cannot change the extracted diff.
+#[allow(clippy::too_many_arguments)]
 async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
     provider: &P,
     mux: &MuxSupport,
@@ -1488,6 +1525,7 @@ async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
     consumer: Address,
     encoding: StateEncoding,
     profile: SimProfile,
+    format: SignedFormat,
 ) -> Result<Extracted> {
     // Time the prestate attempt whether or not it succeeds: on a fallback its tracers were still
     // paid for, and hiding that would make the net form look free when it is not.
@@ -1496,7 +1534,8 @@ async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
     if encoding.signs_prestate_net() {
         attempted_prestate = true;
         let started = Instant::now();
-        let net = try_prestate_net(provider, mux, &tx_request, block, consumer, profile).await?;
+        let net =
+            try_prestate_net(provider, mux, &tx_request, block, consumer, profile, format).await?;
         trace_fetch += started.elapsed();
         if let Some(updates) = net {
             tracing::Span::current().record("extraction", Extraction::PrestateNet.as_str());
@@ -1528,7 +1567,9 @@ async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
         // Re-entry detection is off (`None`): the simulation path never surfaces
         // the flag — only the historical-tx analyzers do.
         StructLogEncoder::Legacy => {
-            let extract = compute_state_updates(trace, None)?;
+            // The consumer as origin, which `SELFBALANCE`'s pin reads; it also turns on re-entry
+            // detection, whose flag this path doesn't surface.
+            let extract = compute_state_updates(trace, Some(consumer))?;
             (
                 extract.state_updates,
                 extract.skipped_opcodes,
@@ -1568,6 +1609,7 @@ async fn try_prestate_net<P: Provider + DebugApi>(
     block: BlockId,
     consumer: Address,
     profile: SimProfile,
+    format: SignedFormat,
 ) -> Result<Option<Vec<StateUpdate>>> {
     let (diff, frame) =
         prestate_diff_and_call_frame(provider, mux, tx_request, block, profile).await?;
@@ -1578,9 +1620,26 @@ async fn try_prestate_net<P: Provider + DebugApi>(
         return Err(anyhow::Error::new(EvmFailure::new(reason)));
     }
     match classify_prestate_eligibility(&frame, &diff, consumer) {
-        PrestateEligibility::Eligible => Ok(Some(build_state_updates_from_prestate(
-            consumer, &diff, &frame,
-        ))),
+        PrestateEligibility::Eligible => {
+            // The net form can't carry the checks a v0.2.0 program pins its reads with, so a call
+            // that read anything outside the consumer goes to the struct-log encoder.
+            if format == SignedFormat::V0_2 {
+                let opcodes = get_opcode_trace_from_call_with_profile(
+                    provider,
+                    tx_request.clone(),
+                    block,
+                    profile,
+                )
+                .await?;
+                if let Some(reason) = v0_2_observation(&frame, &opcodes) {
+                    tracing::debug!(reason = %reason, "call observes outside the consumer; using struct-log encoder");
+                    return Ok(None);
+                }
+            }
+            Ok(Some(build_state_updates_from_prestate(
+                consumer, &diff, &frame,
+            )))
+        }
         PrestateEligibility::Fallback(reason) => {
             tracing::debug!(reason = %reason, "call has no net form; using struct-log encoder");
             Ok(None)
@@ -1801,7 +1860,8 @@ pub async fn call_to_frame_tree_with_evmsketch(
     if encoding.signs_prestate_net() {
         let started = Instant::now();
         let mux = cache.mux_support(rpc_url);
-        let net = try_prestate_net(&provider, &mux, &tx_request, block, root, profile).await?;
+        let net =
+            try_prestate_net(&provider, &mux, &tx_request, block, root, profile, format).await?;
         trace_fetch += started.elapsed();
         extraction = Extraction::PrestateFallback;
         if let Some(updates) = net {
@@ -1857,9 +1917,14 @@ pub async fn call_to_frame_tree_with_evmsketch(
     trace_fetch += started.elapsed();
 
     let started = Instant::now();
-    let tree = compute_frame_tree_canonical(trace, root, &|a| nestable.contains(&a), cost)?;
+    let mut tree = compute_frame_tree_canonical(trace, root, &|a| nestable.contains(&a), cost)?;
     let parse = started.elapsed();
     tracing::Span::current().record("frame_count", tree.frames.len());
+    if format == SignedFormat::V0_2 {
+        for frame in &mut tree.frames {
+            resolve_code_hashes(&provider, block, &mut frame.updates).await?;
+        }
+    }
 
     // The whole tree lands in one transaction, so the unbounded profile's payload budget covers
     // every frame together.
@@ -2694,6 +2759,7 @@ mod tests {
             BlockId::latest(),
             address!("0x0000000000000000000000000000000000001001"),
             SimProfile::Chain,
+            SignedFormat::V0_1,
         )
         .await
         .expect_err("the call reverted");
@@ -3745,6 +3811,81 @@ mod tests {
         /// the estimate — an analysis failure for a call that settles fine when sent with its value.
         // `SimpleRpcDb` reads uncached state through `block_in_place`, which panics on a
         // current-thread runtime.
+        /// Returns one word, 0x2a.
+        fn returner_code() -> Bytes {
+            hex_code("602a 6000 52 6020 6000 f3")
+        }
+
+        /// Reverts with one word, 0x2a.
+        fn data_reverter_code() -> Bytes {
+            hex_code("602a 6000 52 6020 6000 fd")
+        }
+
+        /// A consumer that observes the world every way a v0.2.0 program pins: a CALL with all
+        /// gas, one capped at 2,300, a caught revert with data, a STATICCALL, then BALANCE (stored
+        /// to slot 5), EXTCODESIZE and SELFBALANCE, then SSTORE(4,1).
+        fn observer_code(returner: Address, reverter: Address) -> Bytes {
+            let r = addr_hex(returner);
+            let v = addr_hex(reverter);
+            hex_code(&format!(
+                "6000 6000 6000 6000 6000 73{r} 5a f1 50 \
+                 6000 6000 6000 6000 6000 73{r} 6108fc f1 50 \
+                 6000 6000 6000 6000 6000 73{v} 5a f1 50 \
+                 6000 6000 6000 6000 73{r} 5a fa 50 \
+                 73{r} 31 6005 55 \
+                 73{r} 3b 50 \
+                 47 50 \
+                 6001 6004 55 00"
+            ))
+        }
+
+        /// A real trace, encoded for v0.2.0 and priced by the v0.2.0 handler: every pin the walk
+        /// records (call results, a caught revert, the cap, the read checks, a resolved code hash)
+        /// holds when settlement re-checks it, under both struct-log encoders.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
+        async fn test_v0_2_pins_hold_against_the_v0_2_handler() {
+            use alloy::sol_types::{SolType, sol_data};
+
+            let anvil = spawn_as_sepolia().await;
+            let provider = anvil.provider();
+            let consumer = address!("0x0000000000000000000000000000000000001010");
+            let returner = address!("0x0000000000000000000000000000000000001011");
+            let reverter = address!("0x0000000000000000000000000000000000001012");
+            set_code(&provider, returner, returner_code()).await;
+            set_code(&provider, reverter, data_reverter_code()).await;
+            set_code(&provider, consumer, observer_code(returner, reverter)).await;
+            let block = provider.get_block_number().await.expect("block number");
+            let cache = EvmSketchExecutorCache::new(4);
+
+            for encoding in [StateEncoding::Legacy, StateEncoding::Canonical] {
+                let encoded = call_to_encoded_state_updates_with_evmsketch_profiled(
+                    &cache,
+                    &anvil.url,
+                    call_request(consumer),
+                    block,
+                    encoding,
+                    SimProfile::Chain,
+                    SignedFormat::V0_2,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{encoding:?}: every pin must hold: {e:#}"));
+                assert!(!encoded.is_heuristic, "{encoding:?}: priced by execution");
+
+                type Program = (
+                    sol_data::Array<sol_data::Uint<8>>,
+                    sol_data::Array<sol_data::Bytes>,
+                );
+                let (types, _) =
+                    Program::abi_decode_params(&encoded.storage_updates).expect("a program");
+                let count = |kind: u8| types.iter().filter(|t| **t == kind).count();
+                assert_eq!(count(1), 3, "{encoding:?}: three CALLs: {types:?}");
+                assert_eq!(count(10), 1, "{encoding:?}: one STATICCALL_CHECK");
+                assert_eq!(count(11), 2, "{encoding:?}: BALANCE and SELFBALANCE");
+                assert_eq!(count(12), 1, "{encoding:?}: EXTCODESIZE's CODEHASH_CHECK");
+            }
+        }
+
         #[tokio::test(flavor = "multi_thread")]
         #[ignore = "spawns a local anvil; requires foundry on PATH"]
         async fn test_estimate_replays_with_the_calls_value() {
@@ -4002,6 +4143,7 @@ mod tests {
                 to,
                 encoding,
                 SimProfile::Chain,
+                SignedFormat::V0_1,
             )
             .await
             .expect("extraction failed");
@@ -4022,6 +4164,7 @@ mod tests {
                 to,
                 StateEncoding::PrestateNet,
                 profile,
+                SignedFormat::V0_1,
             )
             .await
             .expect("extraction failed");
@@ -4042,6 +4185,7 @@ mod tests {
                 to,
                 StateEncoding::PrestateNet,
                 profile,
+                SignedFormat::V0_1,
             )
             .await
             {
@@ -4257,7 +4401,8 @@ mod tests {
                         target: callee,
                         value: U256::ZERO,
                         callargs: Bytes::new(),
-                        resultHash: alloy::primitives::B256::ZERO,
+                        // The callee returned nothing: a pinned empty success.
+                        resultHash: gas_analyzer_core::observe::result_hash(true, &[]),
                         gasLimit: alloy::primitives::U256::MAX,
                     }),
                     store_up(4, 1),
@@ -4518,6 +4663,7 @@ mod tests {
                 consumer,
                 StateEncoding::PrestateNet,
                 SimProfile::Unbounded,
+                SignedFormat::V0_1,
             )
             .await
             .expect("unbounded extraction must succeed on a >30M-gas call");
@@ -4556,6 +4702,7 @@ mod tests {
                 consumer,
                 StateEncoding::PrestateNet,
                 SimProfile::Unbounded,
+                SignedFormat::V0_1,
             )
             .await
             .expect("extraction succeeds")
@@ -4595,6 +4742,7 @@ mod tests {
                 consumer,
                 StateEncoding::PrestateNet,
                 SimProfile::Unbounded,
+                SignedFormat::V0_1,
             )
             .await
             .expect("extraction itself succeeds; only the budget gate rejects")
@@ -5231,6 +5379,7 @@ mod tests {
                 BlockId::latest(),
                 shape.consumer,
                 SimProfile::Chain,
+                SignedFormat::V0_1,
             )
             .await
             .unwrap_or_else(|e| panic!("{}: {e:#}", shape.name))
