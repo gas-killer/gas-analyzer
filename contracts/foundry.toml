@@ -3,6 +3,11 @@ src = "src"
 out = "out"
 libs = ["lib"]
 
+# The estimator artifacts in abis/ are built with these, so a rebuild matches what's committed and
+# the bytecode runs on every fork the analyzer simulates from Prague on.
+solc_version = "0.8.30"
+evm_version = "prague"
+
 remappings = [
     "gk/=lib/solidity-sdk/src/"
 ]

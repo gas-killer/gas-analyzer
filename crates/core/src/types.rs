@@ -16,7 +16,10 @@ sol! {
         LOG4,
         CREATE,
         CREATE2,
-        NESTED
+        NESTED,
+        STATICCALL_CHECK,
+        BALANCE_CHECK,
+        CODEHASH_CHECK
     }
 
     #[derive(Debug)]
@@ -26,10 +29,16 @@ sol! {
             bytes32 value;
         }
 
+        /// solidity-sdk v0.2.0's `CALL`.
         struct Call {
             address target;
             uint256 value;
             bytes callargs;
+            /// `keccak256(abi.encodePacked(success, returndata))` the trace observed, or zero
+            /// for unchecked.
+            bytes32 resultHash;
+            /// The gas the callee gets; `type(uint256).max` forwards everything left.
+            uint256 gasLimit;
         }
 
         struct Log0 {
@@ -62,9 +71,12 @@ sol! {
             bytes32 topic4;
         }
 
+        /// solidity-sdk v0.2.0's `CREATE`.
         struct Create {
             uint256 value;
             bytes initcode;
+            /// The address the trace deployed to, or zero for unchecked.
+            address expected;
         }
 
         struct Create2 {
@@ -77,6 +89,58 @@ sol! {
             address target;
             uint256 value;
             bytes32 childLeaf;
+        }
+
+        /// Re-run a read and check its result hash (v0.2.0 only).
+        struct StaticCallCheck {
+            address target;
+            bytes data;
+            bytes32 resultHash;
+        }
+
+        /// Check an account's balance (v0.2.0 only).
+        struct BalanceCheck {
+            address account;
+            uint256 balance;
+        }
+
+        /// Check an account's code hash; zero for an account without code (v0.2.0 only).
+        struct CodehashCheck {
+            address account;
+            bytes32 codehash;
+        }
+    }
+
+}
+
+/// `gasLimit` of a `CALL` that forwards all remaining gas, unchecked: the SDK's fallback, and what
+/// a `CALL` the trace didn't size carries.
+pub const CALL_GAS_UNCAPPED: alloy_primitives::U256 = alloy_primitives::U256::MAX;
+
+impl IStateUpdateTypes::Call {
+    /// A `CALL` with no pinned result and every remaining gas forwarded.
+    pub fn unpinned(
+        target: alloy_primitives::Address,
+        value: alloy_primitives::U256,
+        callargs: alloy_primitives::Bytes,
+    ) -> Self {
+        Self {
+            target,
+            value,
+            callargs,
+            resultHash: alloy_primitives::B256::ZERO,
+            gasLimit: CALL_GAS_UNCAPPED,
+        }
+    }
+}
+
+impl IStateUpdateTypes::Create {
+    /// A `CREATE` with no pinned address.
+    pub fn unpinned(value: alloy_primitives::U256, initcode: alloy_primitives::Bytes) -> Self {
+        Self {
+            value,
+            initcode,
+            expected: alloy_primitives::Address::ZERO,
         }
     }
 }
@@ -139,6 +203,11 @@ sol! {
     error RevertingContext(uint256 index, address target, bytes revertData, bytes callargs);
 }
 
+/// The `IGasKillerSDK` interface ID a solidity-sdk v0.2.0 consumer reports through ERC-165: the
+/// release whose programs and digests this crate produces.
+pub const GAS_KILLER_SDK_INTERFACE_ID: alloy_primitives::FixedBytes<4> =
+    alloy_primitives::FixedBytes([0x57, 0xa9, 0xb0, 0x02]);
+
 /// Opcode type alias
 pub type Opcode = String;
 
@@ -159,4 +228,18 @@ pub enum StateUpdate {
     /// `childLeaf` zeroed; it is filled in when the frame tree is encoded, because a leaf
     /// hashes its frame's encoded program.
     Nested(IStateUpdateTypes::Nested),
+    /// The read checks: what the consumer observed, re-checked where it sits in the program.
+    StaticCallCheck(IStateUpdateTypes::StaticCallCheck),
+    BalanceCheck(IStateUpdateTypes::BalanceCheck),
+    CodehashCheck(IStateUpdateTypes::CodehashCheck),
+}
+
+impl StateUpdate {
+    /// Whether this op only checks an observation and changes no state.
+    pub fn is_check(&self) -> bool {
+        matches!(
+            self,
+            Self::StaticCallCheck(_) | Self::BalanceCheck(_) | Self::CodehashCheck(_)
+        )
+    }
 }

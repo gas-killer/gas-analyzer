@@ -43,8 +43,9 @@
 //! commitment) simulate fine under `Unbounded` even though they could never
 //! land in a real transaction. Only the *signed payload* must fit on-chain.
 
+use crate::heuristic::COLD_ACCOUNT_ACCESS_COST;
 use crate::types::StateUpdate;
-use alloy_primitives::{B256, b256};
+use alloy_primitives::{B256, U256, b256};
 
 /// The Gas Killer SDK's `StateTracker` transition-counter slot
 /// (`keccak256("gasKiller.stateTracker") - 1`, see solidity-sdk
@@ -55,6 +56,33 @@ use alloy_primitives::{B256, b256};
 /// state size — so it is reported separately from the consumer's own writes.
 pub const STATE_TRACKER_SLOT: B256 =
     b256!("0xdebfdfd5a50ad117c10898d68b5ccf0893c6b40d4f443f902e2e7646601bdeaf");
+
+/// solidity-sdk v0.2.0's `GasKillerSDK` ERC-7201 configuration namespace, which settlement
+/// protects whole (the low byte spans it).
+pub const SDK_CONFIG_NAMESPACE: B256 =
+    b256!("0x1d6f9f139320a34a32f3b29eb8638270178e831962a74100c9e8b433f21e1200");
+
+/// The slot ranges, inclusive, that every consumer not behind a proxy protects from its programs:
+/// the SDK's configuration namespace and the transition counter. A pricer uses them for a target
+/// that doesn't report its own, so a contract that isn't a consumer yet is priced as one would be.
+pub fn default_protected_slots() -> [(B256, B256); 2] {
+    let mut config_end = SDK_CONFIG_NAMESPACE;
+    config_end.0[31] = 0xff;
+    [
+        (SDK_CONFIG_NAMESPACE, config_end),
+        (STATE_TRACKER_SLOT, STATE_TRACKER_SLOT),
+    ]
+}
+
+/// Whether protected ranges, as `(start, end, mask)` in list order, form a list the SDK's
+/// `StorageGuard.validateRanges` accepts: each range ordered, each starting after the one before
+/// ends, a nonzero mask, and a partial mask only on a single slot. A contract that reports anything
+/// else isn't a consumer, and the guard would fail open on it.
+pub fn protected_ranges_well_formed(ranges: &[(U256, U256, B256)]) -> bool {
+    ranges.iter().all(|(start, end, mask)| {
+        start <= end && !mask.is_zero() && (*mask == B256::repeat_byte(0xff) || start == end)
+    }) && ranges.windows(2).all(|pair| pair[0].1 < pair[1].0)
+}
 
 /// Block gas limit for the `Unbounded` profile: 2^40 ≈ 1.1 Tgas,
 /// ~24,000× a 45M-gas mainnet block.
@@ -211,7 +239,13 @@ const CALLDATA_FLOOR_NONZERO_TOKENS: u64 = 4;
 /// op's raw EVM price and what it costs to *dispatch* that op out of an ABI-encoded payload — a
 /// term the reporting estimators never needed, because revm charges it automatically when it
 /// executes real calldata.
-pub const UNBOUNDED_APPLY_BASE_GAS: u64 = 2_000;
+///
+/// Settlement also checks every STORE against the consumer's protected ranges. Measured on the
+/// estimator with the SDK's two default ranges, that costs about 3,400 gas per program above an
+/// unguarded apply, plus about 375 per STORE, which the per-byte term already covers. The SDK's
+/// benchmarks put each further range at about 500 gas, and a consumer behind a proxy protects
+/// three more. 10,000 covers the defaults plus about nine further ranges.
+pub const UNBOUNDED_APPLY_BASE_GAS: u64 = 10_000;
 
 /// Cost of decoding and dispatching one byte of encoded payload inside `verifyAndUpdate`:
 /// `calldataload`ing it, copying it into memory, and walking the element it belongs to.
@@ -358,6 +392,13 @@ pub fn estimate_applied_payload_gas(
             // Charged through `external_call_gas`, which a create's analytic cost would
             // understate: it leaves out the initcode's execution and the code deposit.
             StateUpdate::Create(_) | StateUpdate::Create2(_) => 0,
+            // A STATICCALL_CHECK's read, access included, is charged through
+            // `external_call_gas`, as a `CALL` is.
+            StateUpdate::StaticCallCheck(_) => 0,
+            // The cold access a check repeats.
+            StateUpdate::BalanceCheck(_) | StateUpdate::CodehashCheck(_) => {
+                COLD_ACCOUNT_ACCESS_COST
+            }
         });
     }
 
@@ -453,6 +494,10 @@ fn validate(
             StateUpdate::Create(_) | StateUpdate::Create2(_) => {
                 return Err(UnboundedCostViolation::CreateNotAllowed { index });
             }
+            // Reads, which change nothing; counted with the calls that reach other contracts.
+            StateUpdate::StaticCallCheck(_)
+            | StateUpdate::BalanceCheck(_)
+            | StateUpdate::CodehashCheck(_) => cost.calls += 1,
         }
     }
     cost.applied_gas_upper_bound =
@@ -481,11 +526,11 @@ mod tests {
     }
 
     fn call() -> StateUpdate {
-        StateUpdate::Call(IStateUpdateTypes::Call {
-            target: Address::ZERO,
-            value: U256::ZERO,
-            callargs: Bytes::new(),
-        })
+        StateUpdate::Call(IStateUpdateTypes::Call::unpinned(
+            Address::ZERO,
+            U256::ZERO,
+            Bytes::new(),
+        ))
     }
 
     fn log1() -> StateUpdate {
@@ -496,10 +541,10 @@ mod tests {
     }
 
     fn create() -> StateUpdate {
-        StateUpdate::Create(IStateUpdateTypes::Create {
-            value: U256::ZERO,
-            initcode: Bytes::new(),
-        })
+        StateUpdate::Create(IStateUpdateTypes::Create::unpinned(
+            U256::ZERO,
+            Bytes::new(),
+        ))
     }
 
     /// Budget with no signature floor and no call gas, so tests price only the payload ops.

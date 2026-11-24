@@ -8,11 +8,11 @@
 //!
 //! No reth-evm, no sp1-contract-call, no async, no I/O.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, OnceLock};
+use std::collections::HashMap;
+use std::sync::LazyLock;
 
-use alloy_dyn_abi::DynSolValue;
 use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_sol_types::{SolCall, SolError};
 use anyhow::{Result, anyhow};
 use revm::context::TxEnv;
 use revm::context::result::ExecutionResult;
@@ -23,8 +23,12 @@ use revm::primitives::hardfork::SpecId;
 use revm::state::AccountInfo;
 
 use gas_analyzer_core::encoding::encode_state_updates_to_sol;
-use gas_analyzer_core::heuristic::BASE_TX_COST;
+use gas_analyzer_core::heuristic::{
+    BASE_TX_COST, calldata_gas, program_calldata_gas, unpinned_for_pricing,
+};
 use gas_analyzer_core::nested::FrameProgram;
+use gas_analyzer_core::sim_profile::default_protected_slots;
+use gas_analyzer_core::sim_profile::protected_ranges_well_formed;
 use gas_analyzer_core::types::{RevertingContext, StateUpdate};
 
 /// EIP-7825 per-tx gas cap, activated in Osaka (Fusaka). The block gas limit
@@ -63,6 +67,11 @@ pub(crate) fn effective_tx_gas_limit(gas_limit: u64, spec: SpecId) -> u64 {
 /// `value` is the `msg.value` of the proxy invocation. Mirrors the original
 /// transaction's `value` so contracts that pass-through ETH (deposit-then-forward,
 /// intent settlers, swap routers) can fund value-bearing CALL state updates.
+///
+/// `verify_observations` runs the program's pins as settlement does, so an observation that no
+/// longer holds fails the estimate. Set it only where the state is the one the trace ran on, as
+/// on the signed path. Elsewhere (a block before the trace, a synthetic state) the program is
+/// priced unpinned (see [`unpinned_for_pricing`]).
 #[derive(Clone, Debug)]
 pub struct SimEnvOpts {
     pub number: u64,
@@ -75,76 +84,243 @@ pub struct SimEnvOpts {
     pub difficulty: U256,
     pub spec: SpecId,
     pub value: U256,
+    pub verify_observations: bool,
 }
 
 const ESTIMATOR_ABI_JSON: &str = include_str!("../../../abis/StateChangeHandlerGasEstimator.json");
 
-static ESTIMATOR_BYTECODE: OnceLock<Bytes> = OnceLock::new();
-
-/// Returns the StateChangeHandlerGasEstimator deployed bytecode, parsed once per process.
-///
-/// Subsequent calls clone the inner `Arc<[u8]>` — no JSON parse or hex decode.
-fn estimator_bytecode() -> Bytes {
-    ESTIMATOR_BYTECODE
-        .get_or_init(|| {
-            let json: serde_json::Value = serde_json::from_str(ESTIMATOR_ABI_JSON)
-                .expect("embedded estimator JSON is malformed");
-            let hex_str = json["deployedBytecode"]["object"]
-                .as_str()
-                .expect("missing deployedBytecode.object in estimator artifact");
-            let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-            hex::decode(hex_str)
-                .expect("invalid hex in estimator bytecode")
-                .into()
-        })
-        .clone()
+/// The deployed bytecode in a Foundry artifact.
+fn deployed_bytecode(artifact: &str) -> Bytes {
+    let json: serde_json::Value =
+        serde_json::from_str(artifact).expect("embedded estimator JSON is malformed");
+    let hex_str = json["deployedBytecode"]["object"]
+        .as_str()
+        .expect("missing deployedBytecode.object in estimator artifact");
+    let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    hex::decode(hex_str)
+        .expect("invalid hex in estimator bytecode")
+        .into()
 }
 
-/// The estimator's analyzed code and its hash, built once: injection runs per estimate, and
-/// hashing the code there dominated `estimate_gas_raw` against an empty state.
-static ESTIMATOR_CODE: LazyLock<(revm::state::Bytecode, B256)> = LazyLock::new(|| {
-    let code = revm::state::Bytecode::new_raw(estimator_bytecode());
+/// The estimator's analyzed code and its hash.
+fn analyzed_code(artifact: &str) -> (revm::state::Bytecode, B256) {
+    let code = revm::state::Bytecode::new_raw(deployed_bytecode(artifact));
     let hash = code.hash_slow();
     (code, hash)
-});
+}
+
+/// The estimator's analyzed code and hash, built once: injection runs per estimate, and hashing
+/// the code there dominated `estimate_gas_raw` against an empty state.
+static ESTIMATOR_CODE: LazyLock<(revm::state::Bytecode, B256)> =
+    LazyLock::new(|| analyzed_code(ESTIMATOR_ABI_JSON));
+
+mod sdk {
+    alloy_sol_types::sol! {
+        /// solidity-sdk v0.2.0's `StorageGuard.ProtectedRange`.
+        #[derive(Debug, PartialEq, Eq)]
+        struct ProtectedRange {
+            uint256 start;
+            uint256 end;
+            bytes32 mask;
+        }
+
+        /// `StateChangeHandlerGasEstimator`'s entry point.
+        function runStateUpdatesCall(uint8[] types, bytes[] args, ProtectedRange[] ranges);
+
+        /// A consumer's protected ranges, as its settlement checks them.
+        function gasKillerProtectedRanges() external view returns (ProtectedRange[] memory);
+
+        /// A STORE at `index` would change a protected slot.
+        #[derive(Debug, PartialEq, Eq)]
+        error ProtectedSlotWrite(uint256 index, bytes32 slot);
+
+        /// What the op at `index` pinned isn't what it observes now.
+        #[derive(Debug, PartialEq, Eq)]
+        error ObservationMismatch(uint256 index, bytes32 expected, bytes32 actual);
+
+        /// The `CALL` at `index` can't give its callee all of `gasLimit`.
+        #[derive(Debug, PartialEq, Eq)]
+        error InsufficientCallGas(uint256 index, uint256 gasLimit);
+
+        /// The op at `index` isn't in its canonical layout.
+        #[derive(Debug, PartialEq, Eq)]
+        error MalformedOp(uint256 index);
+    }
+}
+
+pub use sdk::{
+    InsufficientCallGas, MalformedOp, ObservationMismatch, ProtectedRange, ProtectedSlotWrite,
+};
+
+/// [`default_protected_slots`] as the ranges settlement checks: every consumer not behind a
+/// proxy protects them. Used for a target that doesn't report its own.
+pub fn default_protected_ranges() -> Vec<ProtectedRange> {
+    default_protected_slots()
+        .into_iter()
+        .map(|(start, end)| ProtectedRange {
+            start: start.into(),
+            end: end.into(),
+            mask: B256::repeat_byte(0xff),
+        })
+        .collect()
+}
+
+/// Whether `ranges` is a list the SDK's constructor would accept (see
+/// [`protected_ranges_well_formed`]).
+fn well_formed(ranges: &[ProtectedRange]) -> bool {
+    let bounds: Vec<_> = ranges.iter().map(|r| (r.start, r.end, r.mask)).collect();
+    protected_ranges_well_formed(&bounds)
+}
+
+/// The ranges `target`'s settlement checks STOREs against, read from its code before the
+/// estimator replaces it. Empty for a consumer that opted out of the guard; the defaults for a
+/// target that doesn't report a well-formed list.
+fn protected_ranges<DB>(
+    cache_db: &mut CacheDB<DB>,
+    target: Address,
+    caller_address: Address,
+    sim_env: &SimEnvOpts,
+) -> Vec<ProtectedRange>
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+{
+    use revm::{ExecuteEvm, MainBuilder};
+
+    let data = Bytes::from(sdk::gasKillerProtectedRangesCall {}.abi_encode());
+    let reported = estimator_tx(target, caller_address, data, U256::ZERO, sim_env)
+        .ok()
+        .and_then(|tx| {
+            let mut evm = estimator_context(cache_db, sim_env).build_mainnet();
+            evm.transact(tx).ok()
+        })
+        .and_then(|outcome| match outcome.result {
+            ExecutionResult::Success { output, .. } => {
+                sdk::gasKillerProtectedRangesCall::abi_decode_returns(output.data()).ok()
+            }
+            _ => None,
+        })
+        .filter(|ranges| well_formed(ranges));
+    reported.unwrap_or_else(default_protected_ranges)
+}
+
+/// What the `STATICCALL_CHECK`s in `updates` cost to run past their account access, each read
+/// run from `reader` against `cache_db` without committing. A pricer that leaves the checks out
+/// (see [`unpinned_for_pricing`]) adds it, since settlement runs every read again. Run before the
+/// estimator replaces `reader`'s code, as a read of the contract itself must see its real code.
+fn static_reads_gas<DB>(
+    cache_db: &mut CacheDB<DB>,
+    reader: Address,
+    updates: &[StateUpdate],
+    sim_env: &SimEnvOpts,
+) -> u64
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+{
+    use revm::{ExecuteEvm, MainBuilder};
+
+    updates
+        .iter()
+        .filter_map(|update| match update {
+            StateUpdate::StaticCallCheck(check) => Some(check),
+            _ => None,
+        })
+        .map(|check| {
+            let intrinsic = BASE_TX_COST + calldata_gas(&check.data);
+            let outcome = estimator_tx(
+                check.target,
+                reader,
+                check.data.clone(),
+                U256::ZERO,
+                sim_env,
+            )
+            .and_then(|tx| {
+                // Sent from the consumer, which has code: EIP-3607 would refuse it.
+                let mut evm = estimator_context(cache_db, sim_env)
+                    .modify_cfg_chained(|cfg| cfg.disable_eip3607 = true)
+                    .build_mainnet();
+                evm.transact(tx)
+                    .map_err(|e| anyhow!("running the read: {e:?}"))
+            });
+            match outcome {
+                Ok(outcome) => outcome.result.gas_used().saturating_sub(intrinsic),
+                Err(e) => {
+                    tracing::warn!(
+                        target = %check.target,
+                        error = %e,
+                        "could not measure a dropped STATICCALL_CHECK's read; not charged"
+                    );
+                    0
+                }
+            }
+        })
+        .sum()
+}
+
+/// Build the calldata for `StateChangeHandlerGasEstimator`'s
+/// `runStateUpdatesCall(uint8[], bytes[], (uint256,uint256,bytes32)[])`, which applies
+/// `state_updates` checking every STORE against `ranges`, as the consumer's settlement does.
+pub fn build_gas_estimation_calldata(
+    state_updates: &[StateUpdate],
+    ranges: &[ProtectedRange],
+) -> Bytes {
+    let (types, args) = encode_state_updates_to_sol(state_updates);
+    sdk::runStateUpdatesCallCall {
+        types: types.iter().map(|t| *t as u8).collect(),
+        args,
+        ranges: ranges.to_vec(),
+    }
+    .abi_encode()
+    .into()
+}
+
+/// How a target injected by [`inject_estimator`] applies a program: against its protected
+/// ranges.
+#[derive(Clone, Debug)]
+struct Handler(Vec<ProtectedRange>);
+
+impl Handler {
+    /// The calldata applying `updates`, and how to adjust the gas running it measures:
+    ///
+    /// - less the gas of the bytes settlement doesn't send: the ranges, which a consumer builds
+    ///   in memory;
+    /// - plus, when `sim_env` doesn't verify observations, what the program left out costs: each
+    ///   check's cold account access, and the calldata of the pins and checks settlement sends.
+    ///   A check's read is measured separately (see [`static_reads_gas`]).
+    fn calldata(&self, program: &[StateUpdate], sim_env: &SimEnvOpts) -> (Bytes, GasAdjust) {
+        let (unpinned, mut plus);
+        let updates = if sim_env.verify_observations {
+            plus = 0;
+            program
+        } else {
+            (unpinned, plus) = unpinned_for_pricing(program);
+            plus += program_calldata_gas(program).saturating_sub(program_calldata_gas(&unpinned));
+            &unpinned
+        };
+        let data = build_gas_estimation_calldata(updates, &self.0);
+        let less = calldata_gas(&data).saturating_sub(program_calldata_gas(updates));
+        (data, GasAdjust { less, plus })
+    }
+}
+
+/// What to take off and add to a measured run: see [`Handler::calldata`].
+#[derive(Clone, Copy, Debug)]
+struct GasAdjust {
+    less: u64,
+    plus: u64,
+}
+
+impl GasAdjust {
+    fn apply(self, gas: u64) -> u64 {
+        gas.saturating_sub(self.less).saturating_add(self.plus)
+    }
+}
 
 static IMPL_SLOT: LazyLock<U256> = LazyLock::new(|| {
     U256::from_be_bytes(*alloy_primitives::keccak256("gas.estimator.implementation"))
         - U256::from(1)
 });
-
-/// Build the calldata for `runStateUpdatesCall(uint8[], bytes[])` from state updates.
-///
-/// This encodes the state updates into the calldata format expected by the
-/// StateChangeHandlerGasEstimator contract.
-pub fn build_gas_estimation_calldata(state_updates: &[StateUpdate]) -> Result<Bytes> {
-    let (types, args) = encode_state_updates_to_sol(state_updates);
-
-    let types_array = DynSolValue::Array(
-        types
-            .iter()
-            .map(|x| DynSolValue::Uint(U256::from(*x as u8), 8))
-            .collect(),
-    );
-
-    let args_array = DynSolValue::Array(
-        args.iter()
-            .map(|b| DynSolValue::Bytes(b.to_vec()))
-            .collect(),
-    );
-
-    // Function selector for runStateUpdatesCall(uint8[],bytes[])
-    let selector: [u8; 4] = [0x7a, 0x88, 0x8d, 0xbc];
-
-    let tuple = DynSolValue::Tuple(vec![types_array, args_array]);
-    let encoded_args = tuple.abi_encode_params();
-
-    let mut calldata = Vec::with_capacity(4 + encoded_args.len());
-    calldata.extend_from_slice(&selector);
-    calldata.extend_from_slice(&encoded_args);
-
-    Ok(Bytes::from(calldata))
-}
 
 /// Estimate gas for executing pre-built calldata against the StateChangeHandlerGasEstimator.
 ///
@@ -155,7 +331,8 @@ pub fn build_gas_estimation_calldata(state_updates: &[StateUpdate]) -> Result<By
 /// * `cache_db` - A CacheDB wrapping any database backend
 /// * `contract_address` - The address to inject the estimator contract at
 /// * `caller_address` - The address to use as the caller (also used as tx.origin)
-/// * `calldata` - The encoded calldata for `runStateUpdatesCall(uint8[], bytes[])`
+/// * `calldata` - The calldata for `runStateUpdatesCall`, ranges included (see
+///   [`build_gas_estimation_calldata`])
 /// * `sim_env` - Simulation environment fields (block and tx context)
 pub fn estimate_gas_raw<DB>(
     cache_db: &mut CacheDB<DB>,
@@ -199,6 +376,9 @@ fn call_value_total(state_updates: &[StateUpdate]) -> U256 {
 /// whatever the sender's balance. Only pricing is affected: a contract already holding enough is
 /// left untouched, so balance checks against it read what they read on chain. Runs before
 /// injection, which carries the balance over.
+///
+/// Not when the estimate verifies observations: it then runs on the state the trace ran on, which
+/// settlement sees too, and a raised balance would fail a pinned balance check of the contract.
 ///
 /// If the account can't be read, nothing is funded: writing over an account that was never read
 /// could lower its real balance and zero its nonce, and would hide the backend failure behind a
@@ -251,6 +431,9 @@ fn backup_address(contract_address: Address) -> Address {
 /// (keccak256("gas.estimator.implementation") - 1). Stashing the original code there lets external
 /// protocols (e.g. oracles) call back into `contract_address` during a state-update CALL and get
 /// valid responses. The slot is written directly, so no constructor runs.
+///
+/// Read the target's protected ranges first, with [`handler_for`]: the original code answers
+/// that call, and once injected it's the estimator's.
 fn inject_estimator<DB>(cache_db: &mut CacheDB<DB>, contract_address: Address) -> Result<()>
 where
     DB: revm::database_interface::DatabaseRef,
@@ -309,7 +492,23 @@ where
     let backup_addr_u256 = U256::from_be_slice(backup_addr.as_slice());
     cache_db
         .insert_account_storage(contract_address, *IMPL_SLOT, backup_addr_u256)
-        .map_err(|e| anyhow!("Failed to write IMPL_SLOT: {:?}", e))
+        .map_err(|e| anyhow!("Failed to write IMPL_SLOT: {:?}", e))?;
+    Ok(())
+}
+
+/// The handler applying a program to `target`, with the ranges its settlement checks. Call it
+/// before [`inject_estimator`] replaces the target's code.
+fn handler_for<DB>(
+    cache_db: &mut CacheDB<DB>,
+    target: Address,
+    caller_address: Address,
+    sim_env: &SimEnvOpts,
+) -> Handler
+where
+    DB: revm::database_interface::DatabaseRef,
+    <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
+{
+    Handler(protected_ranges(cache_db, target, caller_address, sim_env))
 }
 
 /// Credit the caller with `value` on top of its balance.
@@ -405,6 +604,39 @@ pub struct EstimateReverted {
 
 impl std::fmt::Display for EstimateReverted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let gas = self.gas_used;
+        if let Ok(write) = ProtectedSlotWrite::abi_decode(&self.output) {
+            return write!(
+                f,
+                "Gas estimation reverted (gas: {gas}): update {} writes protected slot {} \
+                 (ProtectedSlotWrite), so the program can never settle",
+                write.index, write.slot
+            );
+        }
+        if let Ok(e) = ObservationMismatch::abi_decode(&self.output) {
+            return write!(
+                f,
+                "Gas estimation reverted (gas: {gas}): update {} pinned {} but observes {} \
+                 (ObservationMismatch): what the trace saw has changed",
+                e.index, e.expected, e.actual
+            );
+        }
+        if let Ok(e) = InsufficientCallGas::abi_decode(&self.output) {
+            return write!(
+                f,
+                "Gas estimation reverted (gas: {gas}): update {} can't give its callee its \
+                 gasLimit of {} (InsufficientCallGas)",
+                e.index, e.gasLimit
+            );
+        }
+        if let Ok(e) = MalformedOp::abi_decode(&self.output) {
+            return write!(
+                f,
+                "Gas estimation reverted (gas: {gas}): update {} isn't in the handler's layout \
+                 (MalformedOp)",
+                e.index
+            );
+        }
         write!(
             f,
             "Gas estimation reverted (gas: {}): {}",
@@ -426,6 +658,26 @@ pub fn reverting_context(err: &anyhow::Error) -> Option<RevertingContext> {
         .chain()
         .find_map(|e| e.downcast_ref::<EstimateReverted>())?;
     RevertingContext::abi_decode(&reverted.output).ok()
+}
+
+/// The `ProtectedSlotWrite` an estimate failed with: a program changes a slot its consumer's
+/// settlement protects, so it reverts on every attempt.
+///
+/// Looks through `err`'s whole chain, as [`reverting_context`] does.
+pub fn protected_slot_write(err: &anyhow::Error) -> Option<ProtectedSlotWrite> {
+    let reverted = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<EstimateReverted>())?;
+    ProtectedSlotWrite::abi_decode(&reverted.output).ok()
+}
+
+/// The `ObservationMismatch` an estimate failed with: an op's pin no longer holds against the
+/// state the estimate ran on. Looks through `err`'s whole chain, as [`reverting_context`] does.
+pub fn observation_mismatch(err: &anyhow::Error) -> Option<ObservationMismatch> {
+    let reverted = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<EstimateReverted>())?;
+    ObservationMismatch::abi_decode(&reverted.output).ok()
 }
 
 /// The estimator run's gas, or why it failed.
@@ -512,7 +764,8 @@ where
 }
 
 /// Prepare `cache_db` for the transaction applying `state_updates` (fund the value calls, inject
-/// the estimator, top up the caller) and return that transaction.
+/// the estimator, top up the caller) and return that transaction, with how to adjust its
+/// result (see [`Handler::calldata`]).
 ///
 /// [`estimate_state_changes_gas`] and [`inspect_state_changes`] both start here, so a traced
 /// re-run always runs the transaction that failed.
@@ -522,7 +775,7 @@ fn prepare_state_changes<DB>(
     caller_address: Address,
     state_updates: &[StateUpdate],
     sim_env: &SimEnvOpts,
-) -> Result<TxEnv>
+) -> Result<(TxEnv, GasAdjust)>
 where
     DB: revm::database_interface::DatabaseRef,
     <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
@@ -534,17 +787,24 @@ where
         "estimate_state_changes_gas takes a flat program; price nested trees with \
          estimate_frame_tree_gas"
     );
-    let calldata = build_gas_estimation_calldata(state_updates)?;
-    fund_value_calls(cache_db, contract_address, call_value_total(state_updates));
+    let mut static_gas = 0;
+    if !sim_env.verify_observations {
+        fund_value_calls(cache_db, contract_address, call_value_total(state_updates));
+        static_gas = static_reads_gas(cache_db, contract_address, state_updates, sim_env);
+    }
+    let handler = handler_for(cache_db, contract_address, caller_address, sim_env);
     inject_estimator(cache_db, contract_address)?;
-    prepare_estimator_tx(
+    let (calldata, mut adjust) = handler.calldata(state_updates, sim_env);
+    adjust.plus += static_gas;
+    let tx = prepare_estimator_tx(
         cache_db,
         contract_address,
         caller_address,
         calldata,
         sim_env.value,
         sim_env,
-    )
+    )?;
+    Ok((tx, adjust))
 }
 
 /// Run the transaction [`estimate_state_changes_gas`] runs, under `inspector`, and return its
@@ -568,7 +828,7 @@ where
 {
     use revm::{InspectEvm, MainBuilder};
 
-    let tx = prepare_state_changes(
+    let (tx, _) = prepare_state_changes(
         cache_db,
         contract_address,
         caller_address,
@@ -608,14 +868,14 @@ where
     DB: revm::database_interface::DatabaseRef,
     <DB as revm::database_interface::DatabaseRef>::Error: core::fmt::Debug,
 {
-    let tx = prepare_state_changes(
+    let (tx, adjust) = prepare_state_changes(
         cache_db,
         contract_address,
         caller_address,
         state_updates,
         sim_env,
     )?;
-    execute_estimator(cache_db, tx, sim_env, false)
+    Ok(adjust.apply(execute_estimator(cache_db, tx, sim_env, false)?))
 }
 
 // ============================================================================
@@ -717,19 +977,33 @@ where
         return Err(anyhow!("a frame tree needs a root frame"));
     }
     // A contract can appear in several frames; fund it for every call it sends across them.
-    let mut call_values: HashMap<Address, U256> = HashMap::new();
-    for frame in frames {
-        let total = call_values.entry(frame.target).or_default();
-        *total = total.saturating_add(call_value_total(&frame.updates));
+    if !sim_env.verify_observations {
+        let mut call_values: HashMap<Address, U256> = HashMap::new();
+        for frame in frames {
+            let total = call_values.entry(frame.target).or_default();
+            *total = total.saturating_add(call_value_total(&frame.updates));
+        }
+        for (target, required) in call_values {
+            fund_value_calls(cache_db, target, required);
+        }
     }
-    for (target, required) in call_values {
-        fund_value_calls(cache_db, target, required);
-    }
+    // Before injection, so each read sees the code it read in the trace.
+    let static_gas: Vec<u64> = frames
+        .iter()
+        .map(|frame| {
+            if sim_env.verify_observations {
+                0
+            } else {
+                static_reads_gas(cache_db, frame.target, &frame.updates, sim_env)
+            }
+        })
+        .collect();
 
     // Once per contract: injecting again would stash the estimator itself as the original code.
-    let mut injected = HashSet::new();
+    let mut handlers = HashMap::new();
     for frame in frames {
-        if injected.insert(frame.target) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = handlers.entry(frame.target) {
+            entry.insert(handler_for(cache_db, frame.target, caller_address, sim_env));
             inject_estimator(cache_db, frame.target)?;
         }
     }
@@ -737,16 +1011,22 @@ where
     let mut frame_gas = vec![0; frames.len()];
     let mut tree = FrameTreeRun {
         frames,
+        handlers,
         caller_address,
         sim_env,
         exec,
     };
     tree.run(cache_db, 0, root_value, &mut frame_gas)?;
+    for (gas, reads) in frame_gas.iter_mut().zip(static_gas) {
+        *gas += reads;
+    }
     Ok(frame_gas)
 }
 
 struct FrameTreeRun<'a, X> {
     frames: &'a [FrameProgram],
+    /// Each frame contract's handler, from its injection.
+    handlers: HashMap<Address, Handler>,
     caller_address: Address,
     sim_env: &'a SimEnvOpts,
     /// Runs one prepared piece and commits its writes.
@@ -822,7 +1102,7 @@ impl<X> FrameTreeRun<'_, X> {
         X: FnMut(&mut CacheDB<DB>, TxEnv) -> Result<u64>,
     {
         let frame = &self.frames[index];
-        let calldata = build_gas_estimation_calldata(updates)?;
+        let (calldata, adjust) = self.handlers[&frame.target].calldata(updates, self.sim_env);
         let value = if piece_index == 0 { value } else { U256::ZERO };
         let gas = prepare_estimator_tx(
             cache_db,
@@ -833,6 +1113,7 @@ impl<X> FrameTreeRun<'_, X> {
             self.sim_env,
         )
         .and_then(|tx| (self.exec)(cache_db, tx))
+        .map(|gas| adjust.apply(gas))
         .map_err(|e| {
             e.context(format!(
                 "frame {index} ({}), piece {piece_index}",
@@ -973,6 +1254,7 @@ mod tests {
     use alloy_dyn_abi::DynSolValue;
     use alloy_primitives::address;
     use alloy_sol_types::{SolError, sol};
+    use gas_analyzer_core::sim_profile::{SDK_CONFIG_NAMESPACE, STATE_TRACKER_SLOT};
     use gas_analyzer_core::types::IStateUpdateTypes;
     use revm::DatabaseCommit;
     use revm::context::result::ExecutionResult;
@@ -1122,6 +1404,7 @@ mod tests {
             difficulty: U256::ZERO,
             spec: SpecId::OSAKA,
             value: U256::ZERO,
+            verify_observations: false,
         };
 
         let (mut cache_db, callee_address) = deploy_sim_env_test(caller, &sim_env);
@@ -1133,6 +1416,8 @@ mod tests {
             target: callee_address,
             value: U256::ZERO,
             callargs: test_selector,
+            resultHash: alloy_primitives::B256::ZERO,
+            gasLimit: alloy_primitives::U256::MAX,
         })];
 
         // Use any address for the estimator contract — it just needs to not
@@ -1170,6 +1455,7 @@ mod tests {
             difficulty: U256::ZERO,
             spec: SpecId::OSAKA,
             value: U256::ZERO,
+            verify_observations: false,
         };
 
         let (mut cache_db, callee_address) = deploy_sim_env_test(caller, &sim_env);
@@ -1179,6 +1465,8 @@ mod tests {
             target: callee_address,
             value: U256::ZERO,
             callargs: test_selector,
+            resultHash: alloy_primitives::B256::ZERO,
+            gasLimit: alloy_primitives::U256::MAX,
         })];
 
         let estimator_address = address!("0x000000000000000000000000000000000000E570");
@@ -1217,6 +1505,7 @@ mod tests {
             difficulty: U256::ZERO,
             spec: SpecId::OSAKA,
             value: U256::ZERO,
+            verify_observations: false,
         };
 
         let (mut cache_db, callee_address) = deploy_sim_env_test(caller, &sim_env);
@@ -1226,6 +1515,8 @@ mod tests {
             target: callee_address,
             value: U256::ZERO,
             callargs: test_selector,
+            resultHash: alloy_primitives::B256::ZERO,
+            gasLimit: alloy_primitives::U256::MAX,
         })];
 
         let estimator_address = address!("0x000000000000000000000000000000000000E570");
@@ -1264,6 +1555,7 @@ mod tests {
             difficulty: U256::ZERO,
             spec: SpecId::OSAKA,
             value: U256::ZERO,
+            verify_observations: false,
         };
 
         let (mut cache_db, callee_address) = deploy_sim_env_test(caller, &sim_env);
@@ -1273,6 +1565,8 @@ mod tests {
             target: callee_address,
             value: U256::ZERO,
             callargs: test_selector,
+            resultHash: alloy_primitives::B256::ZERO,
+            gasLimit: alloy_primitives::U256::MAX,
         })];
 
         let estimator_address = address!("0x000000000000000000000000000000000000E570");
@@ -1310,6 +1604,8 @@ mod tests {
             difficulty: U256::ZERO,
             spec,
             value: U256::ZERO,
+            // The estimator's own tests run on the state their programs were written for.
+            verify_observations: true,
         }
     }
 
@@ -1689,6 +1985,8 @@ mod tests {
             ("mixed", &mixed),
         ];
 
+        // Settlement also checks every STORE against the protected ranges, which the
+        // measurement includes: the target reports none, so it's priced with the defaults.
         for (name, build) in shapes {
             for n in [1usize, 2, 5, 25, 100, 400, 650] {
                 let updates: Vec<StateUpdate> = (0..n).map(build).collect();
@@ -1703,9 +2001,10 @@ mod tests {
 
                 assert!(
                     analytic >= measured,
-                    "{name} n={n}: analytic bound {analytic} is BELOW the measured cost \
-                     {measured} (short by {}). The gate would admit a payload that does not fit. \
-                     A term is missing from estimate_applied_payload_gas — see its doc comment.",
+                    "{name} n={n}: analytic bound {analytic} is BELOW the \
+                     measured cost {measured} (short by {}). The gate would admit a payload \
+                     that does not fit. A term is missing from estimate_applied_payload_gas \
+                     — see its doc comment.",
                     measured - analytic
                 );
             }
@@ -1759,6 +2058,8 @@ mod tests {
             target,
             value: U256::ZERO,
             callargs: Bytes::from_static(&[0x01]),
+            resultHash: alloy_primitives::B256::ZERO,
+            gasLimit: alloy_primitives::U256::MAX,
         })
     }
 
@@ -1767,6 +2068,8 @@ mod tests {
             target,
             value,
             callargs: Bytes::new(),
+            resultHash: alloy_primitives::B256::ZERO,
+            gasLimit: alloy_primitives::U256::MAX,
         })
     }
 
@@ -1779,11 +2082,15 @@ mod tests {
         let root = address!("0x00000000000000000000000000000000000a0000");
         let recipient = address!("0x00000000000000000000000000000000000c0000");
         let caller = address!("0x000000000000000000000000000000000000beef");
-        let sim_env = sim_env_with_spec(SpecId::CANCUN);
+        // Priced at a forked block, where observations aren't verified.
+        let sim_env = SimEnvOpts {
+            verify_observations: false,
+            ..sim_env_with_spec(SpecId::CANCUN)
+        };
         let updates = vec![value_call(recipient, U256::from(ONE_ETH))];
 
         let mut unfunded = CacheDB::new(EmptyDB::default());
-        let calldata = build_gas_estimation_calldata(&updates).unwrap();
+        let calldata = build_gas_estimation_calldata(&updates, &default_protected_ranges());
         assert!(
             estimate_gas_raw(&mut unfunded, root, caller, calldata, &sim_env).is_err(),
             "without funding the value call must fail, or this test proves nothing"
@@ -1802,7 +2109,11 @@ mod tests {
         let child = address!("0x00000000000000000000000000000000000b0000");
         let recipient = address!("0x00000000000000000000000000000000000c0000");
         let caller = address!("0x000000000000000000000000000000000000beef");
-        let sim_env = sim_env_with_spec(SpecId::CANCUN);
+        // Priced at a forked block, where observations aren't verified.
+        let sim_env = SimEnvOpts {
+            verify_observations: false,
+            ..sim_env_with_spec(SpecId::CANCUN)
+        };
         let frames = [
             frame(
                 root,
@@ -1825,6 +2136,52 @@ mod tests {
             estimate_frame_tree_gas(&mut cache_db, &frames, caller, U256::ZERO, &sim_env)
                 .expect("every frame's value calls are priced");
         assert!(frame_gas.iter().all(|&g| g > 0));
+    }
+
+    /// Verifying observations, the estimate runs on the traced state and funds nothing: ETH the
+    /// program's own CALL brings in covers its value call, and a pinned balance check of the
+    /// contract reads what the trace read rather than a topped-up balance.
+    #[test]
+    fn verified_estimates_fund_no_value_calls() {
+        use revm::database_interface::DatabaseRef;
+
+        let root = address!("0x00000000000000000000000000000000000a0000");
+        let payer = address!("0x00000000000000000000000000000000000d0000");
+        let recipient = address!("0x00000000000000000000000000000000000c0000");
+        let caller = address!("0x000000000000000000000000000000000000beef");
+        // Sends its caller 1 ETH: CALL(gas, CALLER, 1e18, 0, 0, 0, 0).
+        let mut payer_code = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x67];
+        payer_code.extend_from_slice(&ONE_ETH.to_be_bytes()[8..]);
+        payer_code.extend_from_slice(&[0x33, 0x5a, 0xf1, 0x00]);
+        let mut cache_db = CacheDB::new(EmptyDB::default());
+        with_code(&mut cache_db, payer, &payer_code);
+        cache_db.insert_account_info(
+            payer,
+            AccountInfo {
+                balance: U256::from(ONE_ETH),
+                ..cache_db.basic_ref(payer).unwrap().unwrap()
+            },
+        );
+        let updates = vec![
+            pinned_call(
+                payer,
+                B256::ZERO,
+                gas_analyzer_core::types::CALL_GAS_UNCAPPED,
+            ),
+            StateUpdate::BalanceCheck(IStateUpdateTypes::BalanceCheck {
+                account: root,
+                balance: U256::from(ONE_ETH),
+            }),
+            value_call(recipient, U256::from(ONE_ETH)),
+        ];
+        estimate_state_changes_gas(
+            &mut cache_db,
+            root,
+            caller,
+            &updates,
+            &sim_env_with_spec(SpecId::CANCUN),
+        )
+        .expect("the balance the trace saw holds");
     }
 
     /// Funding only tops up: a contract already holding enough keeps its real balance, so a
@@ -2037,5 +2394,402 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("more children than NESTED ops"));
+    }
+
+    // ------------------------------------------------------------------------
+    // Storage guard
+    // ------------------------------------------------------------------------
+
+    const GUARDED_ROOT: Address = address!("0x00000000000000000000000000000000000a0002");
+    const GUARDED_CALLER: Address = address!("0x000000000000000000000000000000000000beef");
+
+    fn guarded_env() -> SimEnvOpts {
+        sim_env_with_spec(SpecId::PRAGUE)
+    }
+
+    fn store(slot: B256, value: u64) -> StateUpdate {
+        StateUpdate::Store(IStateUpdateTypes::Store {
+            slot,
+            value: B256::from(U256::from(value)),
+        })
+    }
+
+    fn config_slot() -> B256 {
+        let mut slot = SDK_CONFIG_NAMESPACE;
+        slot.0[31] = 0x01;
+        slot
+    }
+
+    /// Runtime code that answers every call with `data`.
+    fn returning(data: &[u8]) -> Vec<u8> {
+        let len = u16::try_from(data.len()).unwrap().to_be_bytes();
+        // PUSH2 len, PUSH1 14, PUSH1 0, CODECOPY, PUSH2 len, PUSH1 0, RETURN, then `data` at 14.
+        let mut code = vec![
+            0x61, len[0], len[1], 0x60, 0x0e, 0x60, 0x00, 0x39, 0x61, len[0], len[1], 0x60, 0x00,
+            0xf3,
+        ];
+        code.extend_from_slice(data);
+        code
+    }
+
+    /// A target whose `gasKillerProtectedRanges()` (like any other call) returns `ranges`.
+    fn reporting(ranges: Vec<ProtectedRange>) -> CacheDB<EmptyDB> {
+        let mut cache_db = CacheDB::new(EmptyDB::default());
+        let data = sdk::gasKillerProtectedRangesCall::abi_encode_returns(&ranges);
+        with_code(&mut cache_db, GUARDED_ROOT, &returning(&data));
+        cache_db
+    }
+
+    fn single(slot: B256) -> ProtectedRange {
+        ProtectedRange {
+            start: slot.into(),
+            end: slot.into(),
+            mask: B256::repeat_byte(0xff),
+        }
+    }
+
+    fn estimate(cache_db: &mut CacheDB<EmptyDB>, updates: &[StateUpdate]) -> Result<u64> {
+        estimate_state_changes_gas(
+            cache_db,
+            GUARDED_ROOT,
+            GUARDED_CALLER,
+            updates,
+            &guarded_env(),
+        )
+    }
+
+    #[test]
+    fn calldata_matches_the_artifacts_entry_point() {
+        let json: serde_json::Value = serde_json::from_str(ESTIMATOR_ABI_JSON).unwrap();
+        let selector = json["methodIdentifiers"]
+            ["runStateUpdatesCall(uint8[],bytes[],(uint256,uint256,bytes32)[])"]
+            .as_str()
+            .expect("the v0.2.0 entry point is in the artifact");
+        assert_eq!(
+            hex::encode(sdk::runStateUpdatesCallCall::SELECTOR),
+            selector
+        );
+    }
+
+    #[test]
+    fn default_ranges_are_well_formed_and_protect_the_counter() {
+        let ranges = default_protected_ranges();
+        assert!(well_formed(&ranges));
+        assert!(ranges.contains(&single(STATE_TRACKER_SLOT)));
+        assert!(!well_formed(&[ranges[1].clone(), ranges[0].clone()]));
+
+        // The masks the SDK's validateRanges rejects.
+        let with_mask = |r: &ProtectedRange, mask| ProtectedRange { mask, ..r.clone() };
+        assert!(!well_formed(&[with_mask(&ranges[0], B256::ZERO)]));
+        assert!(
+            !well_formed(&[with_mask(&ranges[0], B256::with_last_byte(0xff))]),
+            "a partial mask over more than one slot"
+        );
+        assert!(
+            well_formed(&[with_mask(&ranges[1], B256::with_last_byte(0xff))]),
+            "a partial mask on a single slot"
+        );
+    }
+
+    /// A target that doesn't report ranges is priced with the defaults: the guard costs more than
+    /// an opted-out consumer's unchecked apply, and the ranges' own calldata is deducted.
+    #[test]
+    fn prices_a_store_with_the_guard() {
+        let updates = vec![store(B256::with_last_byte(1), 1)];
+        let unguarded = estimate(&mut reporting(vec![]), &updates).unwrap();
+        let guarded = estimate(&mut CacheDB::new(EmptyDB::default()), &updates).unwrap();
+        assert!(
+            guarded > unguarded && guarded - unguarded < 10_000,
+            "unguarded {unguarded}, guarded {guarded}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_write_to_the_sdk_config() {
+        let updates = vec![store(B256::with_last_byte(1), 1), store(config_slot(), 1)];
+        let err = estimate(&mut CacheDB::new(EmptyDB::default()), &updates).unwrap_err();
+        assert_eq!(
+            protected_slot_write(&err),
+            Some(ProtectedSlotWrite {
+                index: U256::from(1),
+                slot: config_slot(),
+            })
+        );
+        assert!(err.to_string().contains("ProtectedSlotWrite"), "{err}");
+    }
+
+    /// Settlement has bumped the counter before the program runs; the estimator hasn't, so the
+    /// program's copy moves it forward, which the guard allows. A rewind it rejects.
+    #[test]
+    fn counter_moves_forward_never_back() {
+        let at_five = || {
+            let mut cache_db = CacheDB::new(EmptyDB::default());
+            cache_db
+                .insert_account_storage(GUARDED_ROOT, STATE_TRACKER_SLOT.into(), U256::from(5))
+                .unwrap();
+            cache_db
+        };
+        assert!(estimate(&mut at_five(), &[store(STATE_TRACKER_SLOT, 6)]).is_ok());
+        assert!(estimate(&mut at_five(), &[store(STATE_TRACKER_SLOT, 5)]).is_ok());
+        let err = estimate(&mut at_five(), &[store(STATE_TRACKER_SLOT, 4)]).unwrap_err();
+        assert!(protected_slot_write(&err).is_some(), "{err}");
+    }
+
+    /// A target's own list replaces the defaults: its range is checked, the SDK config (which a
+    /// real consumer's list would include) is not.
+    #[test]
+    fn uses_the_ranges_a_target_reports() {
+        let guarded = B256::with_last_byte(7);
+        let err =
+            estimate(&mut reporting(vec![single(guarded)]), &[store(guarded, 1)]).unwrap_err();
+        assert!(protected_slot_write(&err).is_some(), "{err}");
+        assert!(
+            estimate(
+                &mut reporting(vec![single(guarded)]),
+                &[store(config_slot(), 1)]
+            )
+            .is_ok()
+        );
+    }
+
+    /// A consumer that opted out of the guard reports no ranges, and settles unchecked.
+    #[test]
+    fn runs_an_opted_out_consumer_unguarded() {
+        assert!(estimate(&mut reporting(vec![]), &[store(config_slot(), 1)]).is_ok());
+    }
+
+    /// A malformed list isn't a consumer's: the defaults apply, rather than a guard that fails open.
+    #[test]
+    fn ignores_a_malformed_list() {
+        let descending = vec![
+            single(B256::with_last_byte(9)),
+            single(B256::with_last_byte(8)),
+        ];
+        let err = estimate(&mut reporting(descending), &[store(config_slot(), 1)]).unwrap_err();
+        assert!(protected_slot_write(&err).is_some(), "{err}");
+    }
+
+    #[test]
+    fn frame_trees_are_guarded() {
+        let frames = vec![frame(GUARDED_ROOT, vec![store(config_slot(), 1)], vec![])];
+        let err = estimate_frame_tree_gas(
+            &mut CacheDB::new(EmptyDB::default()),
+            &frames,
+            GUARDED_CALLER,
+            U256::ZERO,
+            &guarded_env(),
+        )
+        .unwrap_err();
+        assert!(protected_slot_write(&err).is_some(), "{err:#}");
+
+        let frames = vec![frame(
+            GUARDED_ROOT,
+            vec![store(B256::with_last_byte(1), 1)],
+            vec![],
+        )];
+        let tree = estimate_frame_tree_gas(
+            &mut CacheDB::new(EmptyDB::default()),
+            &frames,
+            GUARDED_CALLER,
+            U256::ZERO,
+            &guarded_env(),
+        )
+        .unwrap();
+        let flat = estimate(
+            &mut CacheDB::new(EmptyDB::default()),
+            &[store(B256::with_last_byte(1), 1)],
+        )
+        .unwrap();
+        assert_eq!(tree, vec![flat]);
+    }
+
+    /// Prebuilt calldata carries its own ranges, so a write it protects fails raw too.
+    #[test]
+    fn estimate_gas_raw_runs_prebuilt_calldata() {
+        let raw = |updates: &[StateUpdate]| {
+            estimate_gas_raw(
+                &mut CacheDB::new(EmptyDB::default()),
+                GUARDED_ROOT,
+                GUARDED_CALLER,
+                build_gas_estimation_calldata(updates, &default_protected_ranges()),
+                &guarded_env(),
+            )
+        };
+        assert!(raw(&[store_slot0()]).unwrap() > 0);
+        assert!(raw(&[store(config_slot(), 1)]).is_err());
+    }
+
+    // ------------------------------------------------------------------------
+    // Program layouts and observations through the handler
+    // ------------------------------------------------------------------------
+
+    /// `keccak256(abi.encodePacked(true))`: a successful call that returned nothing.
+    fn empty_success_hash() -> B256 {
+        alloy_primitives::keccak256([1u8])
+    }
+
+    fn pinned_call(target: Address, result_hash: B256, gas_limit: U256) -> StateUpdate {
+        StateUpdate::Call(IStateUpdateTypes::Call {
+            target,
+            value: U256::ZERO,
+            callargs: Bytes::from_static(&[0x01]),
+            resultHash: result_hash,
+            gasLimit: gas_limit,
+        })
+    }
+
+    #[test]
+    fn settles_a_call_whose_result_matches_its_pin() {
+        let target = address!("0x00000000000000000000000000000000000c0002");
+        let updates = vec![pinned_call(target, empty_success_hash(), U256::MAX)];
+        estimate(&mut CacheDB::new(EmptyDB::default()), &updates)
+            .expect("the pinned result matches");
+    }
+
+    #[test]
+    fn rejects_a_call_whose_result_moved() {
+        let target = address!("0x00000000000000000000000000000000000c0002");
+        let updates = vec![pinned_call(target, B256::repeat_byte(0x42), U256::MAX)];
+        let err = estimate(&mut CacheDB::new(EmptyDB::default()), &updates).unwrap_err();
+        let mismatch = observation_mismatch(&err).expect("an ObservationMismatch");
+        assert_eq!(mismatch.index, U256::ZERO);
+        assert_eq!(mismatch.expected, B256::repeat_byte(0x42));
+        assert_eq!(mismatch.actual, empty_success_hash());
+        assert!(err.to_string().contains("ObservationMismatch"), "{err}");
+    }
+
+    #[test]
+    fn honors_a_call_gas_cap() {
+        let target = address!("0x00000000000000000000000000000000000c0002");
+        let capped = vec![pinned_call(target, B256::ZERO, U256::from(2_300))];
+        estimate(&mut CacheDB::new(EmptyDB::default()), &capped).expect("a 2,300 cap settles");
+    }
+
+    #[test]
+    fn checks_balances_and_code() {
+        let account = address!("0x00000000000000000000000000000000000c0003");
+        let mut cache_db = CacheDB::new(EmptyDB::default());
+        cache_db.insert_account_info(
+            account,
+            AccountInfo {
+                balance: U256::from(5),
+                ..Default::default()
+            },
+        );
+        let balance = |balance: u64| {
+            StateUpdate::BalanceCheck(IStateUpdateTypes::BalanceCheck {
+                account,
+                balance: U256::from(balance),
+            })
+        };
+        let codehash = StateUpdate::CodehashCheck(IStateUpdateTypes::CodehashCheck {
+            account,
+            codehash: B256::ZERO,
+        });
+        estimate(&mut cache_db.clone(), &[balance(5), codehash]).expect("observations hold");
+        assert!(
+            estimate(&mut cache_db, &[balance(6)]).is_err(),
+            "a moved balance fails"
+        );
+    }
+
+    /// Where observations can't be verified, the program is priced unpinned: a pin that no longer
+    /// holds doesn't fail the estimate, and each check left out is charged a cold account access
+    /// and the calldata settlement sends for it. A pin's calldata is charged too.
+    #[test]
+    fn pricing_without_verifying_leaves_pins_out_and_charges_the_checks() {
+        let account = address!("0x00000000000000000000000000000000000c0003");
+        let check = StateUpdate::BalanceCheck(IStateUpdateTypes::BalanceCheck {
+            account,
+            balance: U256::from(6),
+        });
+        let moved_call = pinned_call(
+            account,
+            B256::repeat_byte(0x42),
+            gas_analyzer_core::types::CALL_GAS_UNCAPPED,
+        );
+        let pricing = SimEnvOpts {
+            verify_observations: false,
+            ..guarded_env()
+        };
+        let price = |updates: &[StateUpdate]| {
+            estimate_state_changes_gas(
+                &mut CacheDB::new(EmptyDB::default()),
+                GUARDED_ROOT,
+                GUARDED_CALLER,
+                updates,
+                &pricing,
+            )
+        };
+        assert!(
+            estimate(
+                &mut CacheDB::new(EmptyDB::default()),
+                std::slice::from_ref(&check)
+            )
+            .is_err()
+        );
+        let bare = [store_slot0(), moved_call.clone()];
+        let with_check = [store_slot0(), moved_call.clone(), check];
+        assert_eq!(
+            price(&with_check).unwrap(),
+            price(&bare).unwrap()
+                + gas_analyzer_core::heuristic::COLD_ACCOUNT_ACCESS_COST
+                + program_calldata_gas(&with_check)
+                - program_calldata_gas(&bare)
+        );
+
+        let unpinned_call = pinned_call(
+            account,
+            B256::ZERO,
+            gas_analyzer_core::types::CALL_GAS_UNCAPPED,
+        );
+        assert_eq!(
+            price(std::slice::from_ref(&moved_call)).unwrap(),
+            price(std::slice::from_ref(&unpinned_call)).unwrap()
+                + program_calldata_gas(&[moved_call])
+                - program_calldata_gas(&[unpinned_call]),
+            "the pin's calldata"
+        );
+    }
+
+    /// A check left out of a priced program is still charged its read: settlement runs the
+    /// `STATICCALL` again.
+    #[test]
+    fn pricing_without_verifying_charges_each_static_reads_execution() {
+        let view = address!("0x00000000000000000000000000000000000c0004");
+        // Burns gas in a loop, then returns: i = 200; loop { i -= 1; if i == 0 break }.
+        let burner = [
+            0x60, 0xc8, 0x5b, 0x60, 0x01, 0x90, 0x03, 0x80, 0x60, 0x02, 0x57, 0x00,
+        ];
+        let read = |target| {
+            StateUpdate::StaticCallCheck(IStateUpdateTypes::StaticCallCheck {
+                target,
+                data: Bytes::new(),
+                resultHash: B256::ZERO,
+            })
+        };
+        let pricing = SimEnvOpts {
+            verify_observations: false,
+            ..guarded_env()
+        };
+        let price = |target| {
+            let mut cache_db = CacheDB::new(EmptyDB::default());
+            with_code(&mut cache_db, view, &burner);
+            // A consumer has code, and the read is sent from it.
+            with_code(&mut cache_db, GUARDED_ROOT, &[0x00]);
+            estimate_state_changes_gas(
+                &mut cache_db,
+                GUARDED_ROOT,
+                GUARDED_CALLER,
+                &[store_slot0(), read(target)],
+                &pricing,
+            )
+            .unwrap()
+        };
+        let empty = address!("0x00000000000000000000000000000000000c0005");
+        assert!(
+            price(view) > price(empty) + 200 * 10,
+            "the loop's ~200 iterations are charged"
+        );
     }
 }

@@ -30,7 +30,8 @@ use alloy_rpc_types::TransactionTrait;
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use gas_analyzer_core::types::{IStateUpdateTypes, StateUpdate};
 use gas_analyzer_estimator::{
-    SimEnvOpts, build_gas_estimation_calldata, estimate_gas_raw, replay_preceding_transactions,
+    SimEnvOpts, build_gas_estimation_calldata, default_protected_ranges, estimate_gas_raw,
+    replay_preceding_transactions,
 };
 use pprof::criterion::{Output, PProfProfiler};
 use revm::database::{CacheDB, EmptyDB};
@@ -92,6 +93,7 @@ fn sim_env() -> SimEnvOpts {
         difficulty: U256::ZERO,
         spec: SpecId::CANCUN,
         value: U256::ZERO,
+        verify_observations: false,
     }
 }
 
@@ -138,13 +140,19 @@ fn bench_gas_estimation(c: &mut Criterion) {
     ensure_heap_profiler();
 
     let state_updates = canned_state_updates();
-    let calldata = build_gas_estimation_calldata(&state_updates).unwrap();
+    let ranges = default_protected_ranges();
+    let calldata = build_gas_estimation_calldata(&state_updates, &ranges);
     let env = sim_env();
 
     let mut group = c.benchmark_group("gas_estimation");
 
     group.bench_function("build_calldata", |b| {
-        b.iter(|| black_box(build_gas_estimation_calldata(black_box(&state_updates)).unwrap()))
+        b.iter(|| {
+            black_box(build_gas_estimation_calldata(
+                black_box(&state_updates),
+                &ranges,
+            ))
+        })
     });
 
     group.bench_function("estimate_gas_raw", |b| {

@@ -199,6 +199,7 @@ mod tests {
             difficulty: U256::ZERO,
             spec: SpecId::PRAGUE,
             value: U256::ZERO,
+            verify_observations: false,
         }
     }
 
@@ -245,6 +246,8 @@ mod tests {
             target,
             value: U256::ZERO,
             callargs: Bytes::copy_from_slice(callargs),
+            resultHash: alloy::primitives::B256::ZERO,
+            gasLimit: alloy::primitives::U256::MAX,
         })
     }
 

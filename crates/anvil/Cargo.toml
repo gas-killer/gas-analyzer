@@ -10,6 +10,7 @@ alloy = { version = "1.0.37", features = ["sol-types", "contract", "rpc", "rpc-t
 alloy-dyn-abi = "1.0.37"
 alloy-provider = { version = "1.0.37", features = ["debug-api"] }
 alloy-rpc-types = { version = "1.0.37", features = ["trace"] }
+tracing = "0.1"
 anyhow = "1.0.98"
 chrono = { version = "0.4.41", features = ["clock", "serde"] }
 foundry-evm-traces = { git = "https://github.com/foundry-rs/foundry", package = "foundry-evm-traces", branch = "master" }

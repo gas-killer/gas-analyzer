@@ -85,49 +85,40 @@ impl SignatureType {
     }
 }
 
-/// Encode state updates to Solidity types (for contract calls).
+/// Encode state updates to Solidity types (for contract calls), in solidity-sdk v0.2.0's layouts.
 pub fn encode_state_updates_to_sol(
     state_updates: &[StateUpdate],
 ) -> (Vec<StateUpdateType>, Vec<Bytes>) {
-    let state_update_types: Vec<StateUpdateType> = state_updates
-        .iter()
-        .map(|state_update| match state_update {
-            StateUpdate::Store(_) => StateUpdateType::STORE,
-            StateUpdate::Call(_) => StateUpdateType::CALL,
-            StateUpdate::Log0(_) => StateUpdateType::LOG0,
-            StateUpdate::Log1(_) => StateUpdateType::LOG1,
-            StateUpdate::Log2(_) => StateUpdateType::LOG2,
-            StateUpdate::Log3(_) => StateUpdateType::LOG3,
-            StateUpdate::Log4(_) => StateUpdateType::LOG4,
-            StateUpdate::Create(_) => StateUpdateType::CREATE,
-            StateUpdate::Create2(_) => StateUpdateType::CREATE2,
-            StateUpdate::Nested(_) => StateUpdateType::NESTED,
-        })
-        .collect::<Vec<_>>();
-
-    // This is ugly but I can't bother doing it with traits
-    let datas: Vec<Bytes> = state_updates
+    state_updates
         .iter()
         .map(|state_update| {
-            Bytes::copy_from_slice(&match state_update {
-                StateUpdate::Store(x) => x.abi_encode_sequence(),
-                StateUpdate::Call(x) => x.abi_encode_sequence(),
-                StateUpdate::Log0(x) => x.abi_encode_sequence(),
-                StateUpdate::Log1(x) => x.abi_encode_sequence(),
-                StateUpdate::Log2(x) => x.abi_encode_sequence(),
-                StateUpdate::Log3(x) => x.abi_encode_sequence(),
-                StateUpdate::Log4(x) => x.abi_encode_sequence(),
-                StateUpdate::Create(x) => x.abi_encode_sequence(),
-                StateUpdate::Create2(x) => x.abi_encode_sequence(),
-                StateUpdate::Nested(x) => x.abi_encode_sequence(),
-            })
+            let (kind, data) = match state_update {
+                StateUpdate::Store(x) => (StateUpdateType::STORE, x.abi_encode_sequence()),
+                StateUpdate::Call(x) => (StateUpdateType::CALL, x.abi_encode_sequence()),
+                StateUpdate::Log0(x) => (StateUpdateType::LOG0, x.abi_encode_sequence()),
+                StateUpdate::Log1(x) => (StateUpdateType::LOG1, x.abi_encode_sequence()),
+                StateUpdate::Log2(x) => (StateUpdateType::LOG2, x.abi_encode_sequence()),
+                StateUpdate::Log3(x) => (StateUpdateType::LOG3, x.abi_encode_sequence()),
+                StateUpdate::Log4(x) => (StateUpdateType::LOG4, x.abi_encode_sequence()),
+                StateUpdate::Create(x) => (StateUpdateType::CREATE, x.abi_encode_sequence()),
+                StateUpdate::Create2(x) => (StateUpdateType::CREATE2, x.abi_encode_sequence()),
+                StateUpdate::Nested(x) => (StateUpdateType::NESTED, x.abi_encode_sequence()),
+                StateUpdate::StaticCallCheck(x) => {
+                    (StateUpdateType::STATICCALL_CHECK, x.abi_encode_sequence())
+                }
+                StateUpdate::BalanceCheck(x) => {
+                    (StateUpdateType::BALANCE_CHECK, x.abi_encode_sequence())
+                }
+                StateUpdate::CodehashCheck(x) => {
+                    (StateUpdateType::CODEHASH_CHECK, x.abi_encode_sequence())
+                }
+            };
+            (kind, Bytes::from(data))
         })
-        .collect::<Vec<_>>();
-
-    (state_update_types, datas)
+        .unzip()
 }
 
-/// Encode state updates to ABI format for transport.
+/// Encode state updates to ABI format for transport (see [`encode_state_updates_to_sol`]).
 pub fn encode_state_updates_to_abi(state_updates: &[StateUpdate]) -> Bytes {
     let (state_update_types, datas) = encode_state_updates_to_sol(state_updates);
 
@@ -203,7 +194,8 @@ pub fn encode_state_updates_to_abi(state_updates: &[StateUpdate]) -> Bytes {
 mod tests {
     use super::*;
     use crate::types::{IStateUpdateTypes, StateUpdate};
-    use alloy_primitives::B256;
+    use alloy_primitives::{Address, B256, U256};
+    use alloy_sol_types::SolType;
 
     /// A program with no operations still encodes to a full tuple: two offsets and two
     /// zero-length arrays. Nothing about the byte string says "empty" except its content, which
@@ -227,6 +219,80 @@ mod tests {
         let encoded = encode_state_updates_to_abi(&[store]);
         assert!(encoded.len() > 128);
         assert_ne!(encoded, encode_state_updates_to_abi(&[]));
+    }
+
+    fn pinned_call() -> StateUpdate {
+        StateUpdate::Call(IStateUpdateTypes::Call {
+            target: Address::repeat_byte(0xaa),
+            value: U256::from(7),
+            callargs: Bytes::from_static(&[1, 2, 3]),
+            resultHash: B256::repeat_byte(0x11),
+            gasLimit: U256::from(2_300),
+        })
+    }
+
+    fn pinned_create() -> StateUpdate {
+        StateUpdate::Create(IStateUpdateTypes::Create {
+            value: U256::ZERO,
+            initcode: Bytes::from_static(&[0x60, 0x00]),
+            expected: Address::repeat_byte(0xbb),
+        })
+    }
+
+    fn checks() -> Vec<StateUpdate> {
+        vec![
+            StateUpdate::StaticCallCheck(IStateUpdateTypes::StaticCallCheck {
+                target: Address::repeat_byte(0xcc),
+                data: Bytes::from_static(&[4]),
+                resultHash: B256::repeat_byte(0x22),
+            }),
+            StateUpdate::BalanceCheck(IStateUpdateTypes::BalanceCheck {
+                account: Address::repeat_byte(0xdd),
+                balance: U256::from(9),
+            }),
+            StateUpdate::CodehashCheck(IStateUpdateTypes::CodehashCheck {
+                account: Address::repeat_byte(0xee),
+                codehash: B256::repeat_byte(0x33),
+            }),
+        ]
+    }
+
+    /// The head word solidity-sdk v0.2.0's `_requireOffset` checks: the offset of the op's
+    /// dynamic field.
+    fn dynamic_offset(arg: &[u8], at: usize) -> U256 {
+        U256::from_be_slice(&arg[at..at + 32])
+    }
+
+    #[test]
+    fn layouts_match_the_sdks_canonical_offsets() {
+        let (types, args) = encode_state_updates_to_sol(&[pinned_call(), pinned_create()]);
+        assert_eq!(
+            types.iter().map(|t| *t as u8).collect::<Vec<_>>(),
+            [StateUpdateType::CALL as u8, StateUpdateType::CREATE as u8]
+        );
+        assert_eq!(dynamic_offset(&args[0], 0x40), U256::from(0xa0));
+        assert_eq!(dynamic_offset(&args[1], 0x20), U256::from(0x60));
+        let call = <IStateUpdateTypes::Call as SolType>::abi_decode_sequence(&args[0]).unwrap();
+        assert_eq!(call.resultHash, B256::repeat_byte(0x11));
+        assert_eq!(call.gasLimit, U256::from(2_300));
+    }
+
+    #[test]
+    fn check_ops_take_the_sdks_enum_values() {
+        let (types, args) = encode_state_updates_to_sol(&checks());
+        assert_eq!(
+            types.iter().map(|t| *t as u8).collect::<Vec<_>>(),
+            [10, 11, 12]
+        );
+        assert_eq!(
+            args[0].as_ref(),
+            (
+                Address::repeat_byte(0xcc),
+                Bytes::from_static(&[4]),
+                B256::repeat_byte(0x22)
+            )
+                .abi_encode_sequence()
+        );
     }
 
     #[test]

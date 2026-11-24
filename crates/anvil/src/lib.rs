@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 
+use alloy::eips::BlockId;
 use alloy::{
     contract,
     dyn_abi::DynSolValue,
@@ -51,11 +52,14 @@ fn impl_slot() -> U256 {
     )) - U256::from(1)
 }
 
+use gas_analyzer_core::heuristic::{
+    BASE_TX_COST, calldata_gas, program_calldata_gas, unpinned_for_pricing,
+};
 use gas_analyzer_core::{
     Opcode, RevertingContext, SignatureType, StateUpdate, TURETZKY_UPPER_GAS_LIMIT_SCHNORR,
     TraceExtract, compute_state_updates, encode_state_updates_to_abi, encode_state_updates_to_sol,
 };
-use gas_analyzer_rpc::get_tx_trace;
+use gas_analyzer_rpc::{get_tx_trace, resolve_code_hashes};
 
 // ============================================================================
 // Report Types
@@ -222,6 +226,58 @@ alloy::sol!(
     "../../abis/StateChangeHandlerGasEstimator.json"
 );
 
+alloy::sol! {
+    #[sol(rpc)]
+    interface IProtectedRanges {
+        struct Range {
+            uint256 start;
+            uint256 end;
+            bytes32 mask;
+        }
+
+        /// A consumer's protected ranges, as its settlement checks them.
+        function gasKillerProtectedRanges() external view returns (Range[] memory);
+    }
+}
+
+/// The ranges `target`'s settlement checks STOREs against: what it reports, or the defaults for a
+/// contract that doesn't report a well-formed list (one that isn't a consumer yet is priced as one
+/// would be, and a junk list can't make the guard fail open).
+async fn protected_ranges<P: Provider>(
+    provider: &P,
+    target: Address,
+) -> Vec<StorageGuard::ProtectedRange> {
+    let reported = IProtectedRanges::new(target, provider)
+        .gasKillerProtectedRanges()
+        .call()
+        .await
+        .ok()
+        .map(|ranges| {
+            ranges
+                .into_iter()
+                .map(|r| StorageGuard::ProtectedRange {
+                    start: r.start,
+                    end: r.end,
+                    mask: r.mask,
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|ranges| {
+            let bounds: Vec<_> = ranges.iter().map(|r| (r.start, r.end, r.mask)).collect();
+            gas_analyzer_core::sim_profile::protected_ranges_well_formed(&bounds)
+        });
+    reported.unwrap_or_else(|| {
+        gas_analyzer_core::sim_profile::default_protected_slots()
+            .into_iter()
+            .map(|(start, end)| StorageGuard::ProtectedRange {
+                start: start.into(),
+                end: end.into(),
+                mask: alloy::primitives::B256::repeat_byte(0xff),
+            })
+            .collect()
+    })
+}
+
 // Provider type alias
 type ConnectHTTPDefaultProvider = FillProvider<
     JoinFill<
@@ -294,6 +350,10 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
         let initial_block_number = self.provider.get_block_number().await?;
         let snapshot_id: U256 = self.provider.raw_request("evm_snapshot".into(), ()).await?;
         let original_code = self.provider.get_code_at(contract_address).await?;
+        // Read before the estimator replaces the code that answers it.
+        let ranges = protected_ranges(&self.provider, contract_address).await;
+        // Measured before then too: a read of the contract itself must run its real code.
+        let static_gas = self.static_reads_gas(contract_address, state_updates).await;
 
         // Stash the original bytecode at a synthetic backup address so the proxy's
         // fallback can DELEGATECALL to it when external protocols (oracles, AMMs)
@@ -318,12 +378,22 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
 
         let target_contract = StateChangeHandlerGasEstimator::new(contract_address, &self.provider);
 
-        let (types, args) = encode_state_updates_to_sol(state_updates);
+        // A fork's state needn't match what the observations saw: price the program unpinned,
+        // charging what it leaves out: each check's account access and read, and the calldata of
+        // the pins and checks settlement sends.
+        let (unpinned, check_gas) = unpinned_for_pricing(state_updates);
+        let left_out_calldata =
+            program_calldata_gas(state_updates).saturating_sub(program_calldata_gas(&unpinned));
+        let state_updates = unpinned;
+        let (types, args) = encode_state_updates_to_sol(&state_updates);
         let types = types.iter().map(|x| *x as u8).collect::<Vec<_>>();
-        let tx = target_contract
-            .runStateUpdatesCall(types, args)
-            .send()
-            .await;
+        let call = target_contract.runStateUpdatesCall(types, args, ranges);
+        // Settlement builds the ranges in memory rather than sending them: take off their calldata.
+        // At standard pricing only: when the calldata floor binds (Glamsterdam, a small program),
+        // the receipt charges the ranges at the floor rate and the estimate keeps the difference.
+        let ranges_calldata_gas =
+            calldata_gas(call.calldata()).saturating_sub(program_calldata_gas(&state_updates));
+        let tx = call.send().await;
         let tx = match tx {
             Ok(tx) => tx,
             Err(e) => return Err(Self::process_simulation_error(e).await),
@@ -347,7 +417,34 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
             initial_block_number, final_block_number,
             "block number should revert to initial state"
         );
-        Ok(receipt.gas_used)
+        Ok(receipt.gas_used - ranges_calldata_gas + check_gas + left_out_calldata + static_gas)
+    }
+
+    /// What the `STATICCALL_CHECK`s in `updates` cost to run past their account access, each read
+    /// estimated from `reader`. The node's estimate is the gas limit the read needs, a little above
+    /// what it uses. A read that can't be estimated is logged and not charged.
+    async fn static_reads_gas(&self, reader: Address, updates: &[StateUpdate]) -> u64 {
+        let mut gas = 0;
+        for update in updates {
+            let StateUpdate::StaticCallCheck(check) = update else {
+                continue;
+            };
+            let request = TransactionRequest::default()
+                .from(reader)
+                .to(check.target)
+                .input(check.data.clone().into());
+            match self.provider.estimate_gas(request).await {
+                Ok(estimate) => {
+                    gas += estimate.saturating_sub(BASE_TX_COST + calldata_gas(&check.data));
+                }
+                Err(e) => tracing::warn!(
+                    target = %check.target,
+                    error = %e,
+                    "could not estimate a dropped STATICCALL_CHECK's read; not charged"
+                ),
+            }
+        }
+        gas
     }
 
     async fn process_simulation_error(error: contract::Error) -> Error {
@@ -624,7 +721,7 @@ pub async fn gaskiller_reporter(
         state_updates,
         skipped_opcodes: skipped_opcodes_set,
         ..
-    } = compute_state_updates(trace, None)?;
+    } = compute_state_updates(trace, receipt.to)?;
     let skipped_opcodes = skipped_opcodes_set
         .into_iter()
         .collect::<Vec<_>>()
@@ -671,12 +768,20 @@ pub async fn call_to_encoded_state_updates_with_gas_estimate(
             TxKind::Create => None,
         })
         .ok_or_else(|| anyhow!("receipt does not have to address"))?;
-    let trace = get_trace_from_call(url, tx_request, block_height).await?;
+    let trace = get_trace_from_call(url.clone(), tx_request, block_height).await?;
     let TraceExtract {
-        state_updates,
+        mut state_updates,
         skipped_opcodes,
         ..
-    } = compute_state_updates(trace, None)?;
+    } = compute_state_updates(trace, Some(contract_address))?;
+    // The program pins a code size as its code's hash, read at the block the call was traced at.
+    let block = block_height.map_or(BlockId::latest(), BlockId::number);
+    resolve_code_hashes(
+        &ProviderBuilder::new().connect_http(url),
+        block,
+        &mut state_updates,
+    )
+    .await?;
     let gas_estimate = gk
         .estimate_state_changes_gas(contract_address, &state_updates)
         .await?;
@@ -702,6 +807,18 @@ impl<P: Provider + DebugApi> TxStateExtractor<P> {
         Self { provider }
     }
 
+    /// Pin each code size the program read as its code's hash, at the transaction's block.
+    async fn resolve_code_hashes(
+        &self,
+        receipt: &TransactionReceipt,
+        updates: &mut [StateUpdate],
+    ) -> Result<()> {
+        let block = receipt
+            .block_number
+            .map_or(BlockId::latest(), BlockId::number);
+        resolve_code_hashes(&self.provider, block, updates).await
+    }
+
     /// Extract state updates from a transaction hash
     pub async fn extract_state_updates(&self, tx_hash: FixedBytes<32>) -> Result<Vec<StateUpdate>> {
         let receipt = self
@@ -711,8 +828,9 @@ impl<P: Provider + DebugApi> TxStateExtractor<P> {
             .ok_or_else(|| anyhow!("could not get receipt for tx {}", tx_hash))?;
         let trace = get_tx_trace(&self.provider, tx_hash, receipt.status()).await?;
 
-        // Use existing compute_state_updates function
-        let state_updates = compute_state_updates(trace, None)?.state_updates;
+        let mut state_updates = compute_state_updates(trace, receipt.to)?.state_updates;
+        self.resolve_code_hashes(&receipt, &mut state_updates)
+            .await?;
 
         Ok(state_updates)
     }
@@ -739,7 +857,9 @@ impl<P: Provider + DebugApi> TxStateExtractor<P> {
         }
 
         let trace = get_tx_trace(&self.provider, tx_hash, receipt.status()).await?;
-        let state_updates = compute_state_updates(trace, None)?.state_updates;
+        let mut state_updates = compute_state_updates(trace, receipt.to)?.state_updates;
+        self.resolve_code_hashes(&receipt, &mut state_updates)
+            .await?;
 
         Ok(StateUpdateReport {
             tx_hash,
@@ -970,7 +1090,8 @@ mod tests {
         let gas_estimate = gk
             .estimate_state_changes_gas(SIMPLE_STORAGE_ADDRESS, &state_updates)
             .await?;
-        assert_eq!(gas_estimate, 48024);
+        // Floor-bound, like the access-control estimate below: the ranges' calldata is part of it.
+        assert_eq!(gas_estimate, 61080);
         Ok(())
     }
 
@@ -995,8 +1116,10 @@ mod tests {
         let gas_estimate = gk
             .estimate_state_changes_gas(ACCESS_CONTROL_MAIN_ADDRESS, &state_updates)
             .await?;
-        // Glamsterdam's calldata floor exceeds execution here, so this pins the floor, not the payload.
-        assert_eq!(gas_estimate, 39832);
+        // Glamsterdam's calldata floor exceeds execution here, so this pins the floor, not the
+        // payload; the floor includes the ranges argument, and the check adds its cold account
+        // access, its calldata and its read.
+        assert_eq!(gas_estimate, 60776);
         Ok(())
     }
 
@@ -1145,8 +1268,13 @@ mod tests {
             .await?
             .ok_or_else(|| anyhow!("no receipt for tx {}", tx_hash))?;
         let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
-        let state_updates = compute_state_updates(trace, None)?.state_updates;
+        let (checks, state_updates): (Vec<_>, Vec<_>) = compute_state_updates(trace, None)?
+            .state_updates
+            .into_iter()
+            .partition(StateUpdate::is_check);
 
+        // The code size Solidity checks before the CALL to A, pinned
+        assert_eq!(checks.len(), 1);
         assert_eq!(state_updates.len(), 4);
         let StateUpdate::Store(IStateUpdateTypes::Store { slot, value }) = &state_updates[0] else {
             bail!("Expected Store, got {:?}", state_updates[0]);
@@ -1164,6 +1292,7 @@ mod tests {
             target,
             value,
             callargs,
+            ..
         }) = &state_updates[1]
         else {
             bail!("Expected Call, got {:?}", state_updates[1]);

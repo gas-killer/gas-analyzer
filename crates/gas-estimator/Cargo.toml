@@ -18,6 +18,7 @@ revm = { version = "31.0.1", default-features = false, features = [
     "optional_block_gas_limit",
     "optional_no_base_fee",
     "optional_fee_charge",
+    "optional_eip3607",
 ] }
 
 [dev-dependencies]

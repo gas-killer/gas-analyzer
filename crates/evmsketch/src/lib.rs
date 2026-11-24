@@ -152,14 +152,14 @@ use gas_analyzer_core::{
     Opcode, PrestateEligibility, SignatureType, StateUpdate, build_state_updates_from_prestate,
     classify_prestate_eligibility, compute_state_updates, compute_state_updates_canonical,
     encode_state_updates_to_abi, estimate_gas_from_operations, extract_operation_counts_from_trace,
-    frame_failure, validate_unbounded_cost, validate_unbounded_tree_cost,
+    frame_failure, static_observation, validate_unbounded_cost, validate_unbounded_tree_cost,
 };
 use gas_analyzer_estimator::SimEnvOpts;
 pub use gas_analyzer_estimator::{PrecedingTx, reverting_context};
 use gas_analyzer_rpc::{
-    MuxedTraces, get_call_frame_from_call_with_profile,
+    MuxedTraces, get_call_frame_from_call_with_profile, get_observation_from_call_with_profile,
     get_prestate_diff_and_call_frame_with_profile, get_prestate_diff_from_call_with_profile,
-    get_trace_from_call_with_profile,
+    get_trace_from_call_with_profile, resolve_code_hashes,
 };
 
 // ============================================================================
@@ -604,6 +604,9 @@ impl DefaultEvmSketchExecutor {
     /// with the replay, as in [`Self::estimate_state_changes_gas_with_preceding`], so a payload
     /// whose updates spend or check the ETH that call brought in prices as it will land instead of
     /// reverting for want of it.
+    ///
+    /// State is read at the anchor block itself, the state `debug_traceCall` at that block ran on,
+    /// so the observations the program pins hold against it.
     pub async fn estimate_state_changes_gas_with_hints_timed(
         &self,
         contract_address: Address,
@@ -612,7 +615,11 @@ impl DefaultEvmSketchExecutor {
         storage_hints: &HashMap<Address, Vec<B256>>,
         value: U256,
     ) -> Result<(u64, EstimateTimings)> {
-        let state_block = self.anchor_block_number().saturating_sub(1);
+        // The state the signed path's trace ran on: `debug_traceCall` at the anchor runs after
+        // its block, so the program, its pins and this estimate all see the same world. (The
+        // historical-transaction estimators read the block before, so a mined transaction doesn't
+        // see its own writes.)
+        let state_block = self.anchor_block_number();
         let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
         let mut cache_db = CacheDB::new(simple_db);
 
@@ -622,8 +629,12 @@ impl DefaultEvmSketchExecutor {
             .context("storage slot prefetch failed")?;
         let prefetch = prefetch_started.elapsed();
 
-        let mut sim_env = self.sim_env();
-        sim_env.value = value;
+        // The state the trace ran on, so every pin the program carries has to hold.
+        let sim_env = SimEnvOpts {
+            value,
+            verify_observations: true,
+            ..self.sim_env()
+        };
         let execute_started = Instant::now();
         let gas = gas_analyzer_estimator::estimate_state_changes_gas(
             &mut cache_db,
@@ -651,7 +662,11 @@ impl DefaultEvmSketchExecutor {
         storage_hints: &HashMap<Address, Vec<B256>>,
         value: U256,
     ) -> Result<(Vec<u64>, EstimateTimings)> {
-        let state_block = self.anchor_block_number().saturating_sub(1);
+        // The state the signed path's trace ran on: `debug_traceCall` at the anchor runs after
+        // its block, so the program, its pins and this estimate all see the same world. (The
+        // historical-transaction estimators read the block before, so a mined transaction doesn't
+        // see its own writes.)
+        let state_block = self.anchor_block_number();
         let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
         let mut cache_db = CacheDB::new(simple_db);
 
@@ -661,8 +676,10 @@ impl DefaultEvmSketchExecutor {
             .context("storage slot prefetch failed")?;
         let prefetch = prefetch_started.elapsed();
 
+        // The state the trace ran on, so every pin the program carries has to hold.
         let sim_env = SimEnvOpts {
             value,
+            verify_observations: true,
             ..self.sim_env()
         };
         let execute_started = Instant::now();
@@ -689,6 +706,8 @@ impl DefaultEvmSketchExecutor {
     /// `basefee` comes from the header (0 for pre-EIP-1559 blocks).
     /// `spec` is the pre-computed `SpecId` stored at build time;
     /// `difficulty` carries the legacy PoW value (zero post-Merge).
+    /// `verify_observations` is off: only the signed-path estimators, which read the state the
+    /// trace ran on, turn it on.
     pub fn sim_env(&self) -> SimEnvOpts {
         let header = self.sketch.anchor.header();
         SimEnvOpts {
@@ -702,6 +721,7 @@ impl DefaultEvmSketchExecutor {
             difficulty: header.difficulty,
             spec: self.spec,
             value: U256::ZERO,
+            verify_observations: false,
         }
     }
 
@@ -1366,18 +1386,19 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
             block_id,
             contract_address,
             encoding,
-            profile
+            profile,
         ),
         cache.get_or_build_timed(rpc_url, block_number),
     )?;
     let Extracted {
-        state_updates,
+        mut state_updates,
         skipped_opcodes,
         call_gas_total,
         extraction,
         trace_fetch,
         parse,
     } = extracted;
+    resolve_code_hashes(&provider, block_id, &mut state_updates).await?;
     tracing::Span::current().record("state_update_count", state_updates.len());
 
     // The unbounded profile's whole bargain: compute may be unbounded, the payload that lands
@@ -1461,6 +1482,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
 /// (which the canonical extractor flags) is invisible there. That only affects reporting — transient
 /// storage is discarded at the end of the transaction and eligibility already rules out the external
 /// calls that could observe it, so it cannot change the extracted diff.
+#[allow(clippy::too_many_arguments)]
 async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
     provider: &P,
     mux: &MuxSupport,
@@ -1509,7 +1531,9 @@ async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
         // Re-entry detection is off (`None`): the simulation path never surfaces
         // the flag — only the historical-tx analyzers do.
         StructLogEncoder::Legacy => {
-            let extract = compute_state_updates(trace, None)?;
+            // The consumer as origin, which `SELFBALANCE`'s pin reads; it also turns on re-entry
+            // detection, whose flag this path doesn't surface.
+            let extract = compute_state_updates(trace, Some(consumer))?;
             (
                 extract.state_updates,
                 extract.skipped_opcodes,
@@ -1559,9 +1583,33 @@ async fn try_prestate_net<P: Provider + DebugApi>(
         return Err(anyhow::Error::new(EvmFailure::new(reason)));
     }
     match classify_prestate_eligibility(&frame, &diff, consumer) {
-        PrestateEligibility::Eligible => Ok(Some(build_state_updates_from_prestate(
-            consumer, &diff, &frame,
-        ))),
+        PrestateEligibility::Eligible => {
+            // The net form can't carry the checks a program pins its reads with, so a call that
+            // read anything outside the consumer goes to the struct-log encoder.
+            let observed = match static_observation(&frame) {
+                Some(reason) => Some(reason),
+                // A scan that fails says nothing either way: the struct-log encoder pins what
+                // the call read, so it takes the call instead of failing the encode.
+                None => match get_observation_from_call_with_profile(
+                    provider,
+                    tx_request.clone(),
+                    block,
+                    profile,
+                )
+                .await
+                {
+                    Ok(observed) => observed,
+                    Err(e) => Some(format!("the observation scan failed: {e:#}")),
+                },
+            };
+            if let Some(reason) = observed {
+                tracing::debug!(reason = %reason, "call observes outside the consumer; using struct-log encoder");
+                return Ok(None);
+            }
+            Ok(Some(build_state_updates_from_prestate(
+                consumer, &diff, &frame,
+            )))
+        }
         PrestateEligibility::Fallback(reason) => {
             tracing::debug!(reason = %reason, "call has no net form; using struct-log encoder");
             Ok(None)
@@ -1748,6 +1796,7 @@ pub struct EncodedFrameTree {
 /// prestate net form never applies to a call that makes a regular `CALL`. Under
 /// [`StateEncoding::PrestateNet`] a call the net form represents is returned as a single frame.
 #[tracing::instrument(name = "evmsketch.encode_frame_tree", skip_all, fields(block_number, encoding = ?encoding, profile = ?profile, frame_count = tracing::field::Empty))]
+#[allow(clippy::too_many_arguments)]
 pub async fn call_to_frame_tree_with_evmsketch(
     cache: &EvmSketchExecutorCache,
     rpc_url: impl AsRef<str>,
@@ -1835,9 +1884,12 @@ pub async fn call_to_frame_tree_with_evmsketch(
     trace_fetch += started.elapsed();
 
     let started = Instant::now();
-    let tree = compute_frame_tree_canonical(trace, root, &|a| nestable.contains(&a), cost)?;
+    let mut tree = compute_frame_tree_canonical(trace, root, &|a| nestable.contains(&a), cost)?;
     let parse = started.elapsed();
     tracing::Span::current().record("frame_count", tree.frames.len());
+    for frame in &mut tree.frames {
+        resolve_code_hashes(&provider, block, &mut frame.updates).await?;
+    }
 
     // The whole tree lands in one transaction, so the unbounded profile's payload budget covers
     // every frame together.
@@ -2576,6 +2628,8 @@ mod tests {
                 target: call_target,
                 value: U256::ZERO,
                 callargs: Bytes::new(),
+                resultHash: alloy::primitives::B256::ZERO,
+                gasLimit: alloy::primitives::U256::MAX,
             }),
             StateUpdate::Log0(IStateUpdateTypes::Log0 { data: Bytes::new() }),
         ];
@@ -3074,7 +3128,6 @@ mod tests {
                 U256::ZERO,
                 SEPOLIA_CHAIN_ID,
                 1_000,
-                gas_analyzer_core::SignedFormat::V0_1,
             )
             .expect("encodable tree");
             assert_eq!(encoded.leaves.len(), 4);
@@ -3214,6 +3267,8 @@ mod tests {
                 target: gate,
                 value: U256::ZERO,
                 callargs: Bytes::new(),
+                resultHash: alloy::primitives::B256::ZERO,
+                gasLimit: alloy::primitives::U256::MAX,
             })];
             let replay_at = |gas_price| {
                 gk.estimate_state_changes_gas_with_preceding(
@@ -3694,16 +3749,176 @@ mod tests {
         /// A consumer that takes ETH in and checks, at settlement, that it arrived — the shape of
         /// a deposit into a pool that must stay backed.
         ///
-        /// With no calldata: `SSTORE(0, CALLVALUE)`, then `CALL(self, value 0, data 0x01)`, reverting
-        /// if that call fails. With calldata (the self-call): revert unless
-        /// `SELFBALANCE >= SLOAD(0)`. The diff is `[Store(0, value), Call(self, 0, 0x01)]`, and the
-        /// call re-runs the balance check when the payload is applied, so it only lands when the
-        /// settlement carries the ETH.
+        /// With no calldata: `SSTORE(0, CALLVALUE)`, then `CALL(self, value 0, data 0x01000000)`,
+        /// reverting if that call fails. With calldata (the self-call): revert unless
+        /// `SELFBALANCE >= SLOAD(0)`. The diff is `[Store(0, value), Call(self, 0, 0x01000000)]`,
+        /// and the call re-runs the balance check when the payload is applied, so it only lands
+        /// when the settlement carries the ETH. The self-call carries a whole selector: settlement
+        /// refuses one with fewer than four bytes of calldata whatever the call policy.
         pub(super) fn backed_deposit_code() -> Bytes {
             hex_code(
-                "36 601f 57 34 6000 55 6001 6000 53 6000 6000 6001 6000 6000 30 5a f1 15 6029 57 00 \
+                "36 601f 57 34 6000 55 6001 6000 53 6000 6000 6004 6000 6000 30 5a f1 15 6029 57 00 \
                  5b 6000 54 47 10 6029 57 00 5b 6000 6000 fd",
             )
+        }
+
+        /// Returns one word, 0x2a.
+        fn returner_code() -> Bytes {
+            hex_code("602a 6000 52 6020 6000 f3")
+        }
+
+        /// Reverts with one word, 0x2a.
+        fn data_reverter_code() -> Bytes {
+            hex_code("602a 6000 52 6020 6000 fd")
+        }
+
+        /// A consumer that observes the world every way a v0.2.0 program pins, using some
+        /// observations and dropping others:
+        ///
+        /// - a CALL with all gas, its result dropped;
+        /// - a CALL capped at 2,300, its RETURNDATASIZE stored to slot 9;
+        /// - a caught revert with data, dropped (a caught failure is pinned anyway);
+        /// - a STATICCALL, its success stored to slot 6;
+        /// - BALANCE stored to slot 5, then the same BALANCE again to slot 8 (a repeat);
+        /// - EXTCODESIZE stored to slot 7, SELFBALANCE dropped, then SSTORE(4, 1).
+        fn observer_code(returner: Address, reverter: Address) -> Bytes {
+            let r = addr_hex(returner);
+            let v = addr_hex(reverter);
+            hex_code(&format!(
+                "6000 6000 6000 6000 6000 73{r} 5a f1 50 \
+                 6000 6000 6000 6000 6000 73{r} 6108fc f1 50 3d 6009 55 \
+                 6000 6000 6000 6000 6000 73{v} 5a f1 50 \
+                 6000 6000 6000 6000 73{r} 5a fa 6006 55 \
+                 73{r} 31 6005 55 \
+                 73{r} 31 6008 55 \
+                 73{r} 3b 6007 55 \
+                 47 50 \
+                 6001 6004 55 00"
+            ))
+        }
+
+        /// The observation tracer runs on the node the scan `opcode_observation` makes: a read at
+        /// target depth or in a library the consumer delegates to counts, and one inside a
+        /// contract it calls doesn't.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
+        async fn the_observation_tracer_finds_target_depth_reads() {
+            let anvil = spawn_as_sepolia().await;
+            let provider = anvil.provider();
+            let reader = address!("0x0000000000000000000000000000000000002101");
+            let library = address!("0x0000000000000000000000000000000000002102");
+            let delegator = address!("0x0000000000000000000000000000000000002103");
+            let caller = address!("0x0000000000000000000000000000000000002104");
+            // BALANCE(ADDRESS); POP; STOP
+            set_code(&provider, reader, hex_code("30 31 50 00")).await;
+            // SELFBALANCE; POP; STOP
+            set_code(&provider, library, hex_code("47 50 00")).await;
+            let lib = addr_hex(library);
+            set_code(
+                &provider,
+                delegator,
+                hex_code(&format!("6000 6000 6000 6000 73{lib} 5a f4 50 00")),
+            )
+            .await;
+            let r = addr_hex(reader);
+            set_code(
+                &provider,
+                caller,
+                hex_code(&format!("6000 6000 6000 6000 6000 73{r} 5a f1 50 00")),
+            )
+            .await;
+
+            for (to, expected) in [
+                (reader, Some("BALANCE")),
+                (delegator, Some("SELFBALANCE")),
+                (caller, None),
+            ] {
+                let found = get_observation_from_call_with_profile(
+                    &provider,
+                    call_request(to),
+                    BlockId::latest(),
+                    SimProfile::Chain,
+                )
+                .await
+                .expect("the tracer runs");
+                assert_eq!(
+                    found.as_deref().and_then(|r| r.split(' ').next()),
+                    expected,
+                    "{to}: {found:?}"
+                );
+            }
+        }
+
+        /// A real trace, encoded and priced by the settlement handler: every pin the walk
+        /// records (call results, a caught revert, the cap, the read checks, a resolved code hash)
+        /// holds when settlement re-checks it, under both struct-log encoders. Only what the
+        /// consumer used is pinned, and the repeated read is checked once.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
+        async fn test_pins_hold_against_the_handler() {
+            use alloy::sol_types::{SolType, sol_data};
+
+            let anvil = spawn_as_sepolia().await;
+            let provider = anvil.provider();
+            let consumer = address!("0x0000000000000000000000000000000000001010");
+            let returner = address!("0x0000000000000000000000000000000000001011");
+            let reverter = address!("0x0000000000000000000000000000000000001012");
+            set_code(&provider, returner, returner_code()).await;
+            set_code(&provider, reverter, data_reverter_code()).await;
+            set_code(&provider, consumer, observer_code(returner, reverter)).await;
+            let block = provider.get_block_number().await.expect("block number");
+            let cache = EvmSketchExecutorCache::new(4);
+
+            for encoding in [StateEncoding::Legacy, StateEncoding::Canonical] {
+                let encoded = call_to_encoded_state_updates_with_evmsketch_profiled(
+                    &cache,
+                    &anvil.url,
+                    call_request(consumer),
+                    block,
+                    encoding,
+                    SimProfile::Chain,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{encoding:?}: every pin must hold: {e:#}"));
+                assert!(!encoded.is_heuristic, "{encoding:?}: priced by execution");
+
+                type Program = (
+                    sol_data::Array<sol_data::Uint<8>>,
+                    sol_data::Array<sol_data::Bytes>,
+                );
+                type CallOp = (
+                    sol_data::Address,
+                    sol_data::Uint<256>,
+                    sol_data::Bytes,
+                    sol_data::FixedBytes<32>,
+                    sol_data::Uint<256>,
+                );
+                let (types, args) =
+                    Program::abi_decode_params(&encoded.storage_updates).expect("a program");
+                let count = |kind: u8| types.iter().filter(|t| **t == kind).count();
+                assert_eq!(count(1), 3, "{encoding:?}: three CALLs: {types:?}");
+                assert_eq!(count(10), 1, "{encoding:?}: the STATICCALL_CHECK");
+                assert_eq!(
+                    count(11),
+                    1,
+                    "{encoding:?}: one BALANCE_CHECK, no SELFBALANCE"
+                );
+                assert_eq!(count(12), 1, "{encoding:?}: EXTCODESIZE's CODEHASH_CHECK");
+                let pinned: Vec<bool> = types
+                    .iter()
+                    .zip(&args)
+                    .filter(|(kind, _)| **kind == 1)
+                    .map(|(_, op)| {
+                        let (_, _, _, hash, _) = CallOp::abi_decode_params(op).expect("a CALL op");
+                        !hash.is_zero()
+                    })
+                    .collect();
+                assert_eq!(
+                    pinned,
+                    [false, true, true],
+                    "{encoding:?}: the dropped result goes unpinned"
+                );
+            }
         }
 
         /// The gas estimate must replay the payload with the call's `msg.value`. A consumer that
@@ -4026,11 +4241,11 @@ mod tests {
             let trace = get_trace_from_call(provider, call_request(to), BlockId::latest())
                 .await
                 .expect("struct-log debug_traceCall failed");
-            let legacy = compute_state_updates(trace.clone(), None)
+            let legacy = gas_analyzer_core::compute_state_updates(trace.clone(), None)
                 .expect("compute_state_updates failed")
                 .state_updates;
-            let (canonical, _, _) =
-                compute_state_updates_canonical(trace, to).expect("canonical extraction failed");
+            let (canonical, _, _) = gas_analyzer_core::compute_state_updates_canonical(trace, to)
+                .expect("canonical extraction failed");
             (net, legacy, canonical)
         }
 
@@ -4220,6 +4435,9 @@ mod tests {
                         target: callee,
                         value: U256::ZERO,
                         callargs: Bytes::new(),
+                        // The caller drops the result, so the call only has to succeed.
+                        resultHash: alloy::primitives::B256::ZERO,
+                        gasLimit: alloy::primitives::U256::MAX,
                     }),
                     store_up(4, 1),
                 ],

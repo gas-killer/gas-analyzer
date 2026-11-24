@@ -6,11 +6,15 @@
 
 use std::collections::{HashMap, HashSet};
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types::trace::geth::{DefaultFrame, StructLog};
 use anyhow::{Result, bail};
 
-use crate::types::{IStateUpdateTypes, Opcode, StateUpdate};
+use crate::observe::{
+    Await, ExitData, PendingRead, dedupe_checks, is_precompile, stack_top, static_check,
+};
+use crate::taint::Usage;
+use crate::types::{CALL_GAS_UNCAPPED, IStateUpdateTypes, Opcode, StateUpdate};
 
 // ============================================================================
 // Memory Utilities
@@ -55,12 +59,63 @@ pub fn parse_trace_memory(memory: Vec<String>) -> Vec<u8> {
 // State Update Extraction
 // ============================================================================
 
-/// Opcodes whose memory [`append_state_update_from_struct_log`] reads; it must cover every
-/// `copy_memory` there, since the wasm crate's lean trace parser drops memory for every other opcode.
+/// The most a `CALL` opcode costs before its callee starts: a cold account (2,600), a value
+/// transfer (9,000) and a new account (25,000).
+const CALL_OPCODE_MAX_COST: u64 = 36_600;
+
+/// The EVM's cap on the gas a call passes on: all but one 64th of what is left (EIP-150).
+const fn all_but_one_64th(gas: u64) -> u64 {
+    gas - gas / 64
+}
+
+/// EIP-7825's per-transaction gas cap, which every settlement transaction is under.
+const EIP7825_TX_GAS_CAP: u64 = 1 << 24;
+
+/// The most gas a callee can get in any settlement transaction: EIP-7825's cap, less the
+/// transaction's base cost and solidity-sdk's 40,000 allowance for the `CALL` itself. Generous,
+/// since the program's earlier ops and the signature check spend gas too; a cap above it can
+/// never settle.
+pub const SETTLEMENT_CALL_GAS_BUDGET: u64 =
+    all_but_one_64th(EIP7825_TX_GAS_CAP - crate::heuristic::BASE_TX_COST - 40_000);
+
+/// solidity-sdk v0.2.0's `gasLimit` for a traced `CALL`, from its gas operand and the gas left
+/// when it ran (`gas_at_call`).
+///
+/// - A cap the call could actually impose, below what the EVM would pass on anyway, is kept as
+///   is. That covers `transfer` and `send`, whose operand is 0 with value (the EVM adds the
+///   2,300 stipend) and 2,300 without, and explicit `{gas: n}` caps.
+/// - An operand at or above that, as `call(gas(), ...)` passes, means "everything left", and so
+///   does a cap above [`SETTLEMENT_CALL_GAS_BUDGET`], which an over-limit trace can carry but no
+///   settlement can meet. Both become [`CALL_GAS_UNCAPPED`]: always settleable, though the settler
+///   then picks the callee's gas.
+///
+/// Sizing an uncapped call's need, so it is capped too, needs the callee simulated cold and warm.
+pub fn traced_call_gas_limit(operand: U256, gas_at_call: u64) -> U256 {
+    let passed_on = all_but_one_64th(gas_at_call.saturating_sub(CALL_OPCODE_MAX_COST));
+    match u64::try_from(operand) {
+        Ok(cap) if cap < passed_on && cap <= SETTLEMENT_CALL_GAS_BUDGET => U256::from(cap),
+        _ => CALL_GAS_UNCAPPED,
+    }
+}
+
+/// Opcodes whose memory the extractors read: [`append_state_update_from_struct_log`]'s ops, plus
+/// what the observation pins read ([`crate::observe`]: a `STATICCALL`'s calldata and the data a
+/// frame returns or reverts with). It must cover every memory read, since the wasm crate's lean
+/// trace parser drops memory for every other opcode.
 pub fn reads_memory(op: &str) -> bool {
     matches!(
         op,
-        "CREATE" | "CREATE2" | "CALL" | "LOG0" | "LOG1" | "LOG2" | "LOG3" | "LOG4"
+        "CREATE"
+            | "CREATE2"
+            | "CALL"
+            | "LOG0"
+            | "LOG1"
+            | "LOG2"
+            | "LOG3"
+            | "LOG4"
+            | "STATICCALL"
+            | "RETURN"
+            | "REVERT"
     )
 }
 
@@ -96,10 +151,10 @@ pub fn append_state_update_from_struct_log(
             let offset: usize = stack[1].try_into().expect("invalid CREATE offset");
             let length: usize = stack[2].try_into().expect("invalid CREATE length");
             let initcode = copy_memory(&memory, offset, length);
-            state_updates.push(StateUpdate::Create(IStateUpdateTypes::Create {
+            state_updates.push(StateUpdate::Create(IStateUpdateTypes::Create::unpinned(
                 value,
-                initcode: initcode.into(),
-            }));
+                initcode.into(),
+            )));
         }
         "CREATE2" => {
             // Stack: [value, offset, size, salt] (top = index 0 after reverse)
@@ -136,6 +191,8 @@ pub fn append_state_update_from_struct_log(
                 target: Address::from_word(stack[1].into()),
                 value: stack[2],
                 callargs: args.into(),
+                resultHash: B256::ZERO,
+                gasLimit: traced_call_gas_limit(stack[0], struct_log.gas),
             }));
         }
         "LOG0" => {
@@ -256,6 +313,9 @@ struct CallGas {
 /// `origin` is the address of the traced transaction's target contract (the
 /// code executing at depth 1). When supplied, calls from deeper frames back
 /// into it set [`TraceExtract::reentered`]; pass `None` to skip detection.
+///
+/// Alongside the writes it records what the consumer observed and the program's effects depend
+/// on: call results, `CREATE` addresses and read checks, in trace order.
 #[tracing::instrument(name = "gas.trace_parse", skip_all, fields(state_update_count = tracing::field::Empty))]
 pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Result<TraceExtract> {
     // Transaction-global cumulative counter; the final step holds the tx
@@ -283,10 +343,46 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
     let mut create_gas_total = 0u64;
     let mut sstore_gas_total = 0u64;
     let mut reentered = false;
+    // What each frame returned, the ops whose pins wait on the trace resuming after them (with
+    // the depth they ran at and whether they opened a frame), and a read whose result is on the
+    // next log's stack.
+    let mut exits = ExitData::default();
+    let mut awaiting: Vec<(u64, Await, bool)> = Vec::new();
+    let mut pending_read: Option<(u64, PendingRead)> = None;
+    // Which observations the program's effects depend on; the rest stay unpinned.
+    let usage = Usage::of(&trace.struct_logs);
 
-    for struct_log in trace.struct_logs {
+    for (step, struct_log) in trace.struct_logs.into_iter().enumerate() {
         let depth = struct_log.depth;
         let op = struct_log.op.as_ref().to_string();
+
+        exits.step(&struct_log)?;
+        if let Some((read_depth, read)) = pending_read.take()
+            && depth == read_depth
+            && let Some(check) = stack_top(&struct_log, 0).and_then(|result| read.check(result))
+        {
+            state_updates.push(check);
+        }
+        if let Some((await_depth, _, entered)) = awaiting.last_mut()
+            && depth == *await_depth + 1
+        {
+            *entered = true;
+        }
+        while let Some(&(await_depth, pin, entered)) = awaiting.last()
+            && depth <= await_depth
+        {
+            awaiting.pop();
+            if depth == await_depth
+                && let Some(top) = stack_top(&struct_log, 0)
+            {
+                let returndata = if entered {
+                    exits.take(depth + 1)
+                } else {
+                    Default::default()
+                };
+                pin.resolve(&mut state_updates, top, &returndata)?;
+            }
+        }
 
         if let Some((call_depth, idx)) = awaiting_entry.take()
             && depth == call_depth + 1
@@ -344,6 +440,40 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
             target_depth = depth;
         }
 
+        // Reads an emitting frame makes and its effects depend on, pinned where they happen.
+        if matches!(
+            op.as_str(),
+            "STATICCALL" | "BALANCE" | "SELFBALANCE" | "EXTCODEHASH" | "EXTCODESIZE"
+        ) && depth == target_depth
+            && call_stack.is_empty()
+            && struct_log.error.is_none()
+            && usage.used(step)
+        {
+            if op == "STATICCALL" {
+                if let Some(check) = static_check(&struct_log)? {
+                    state_updates.push(check);
+                    let index = state_updates.len() - 1;
+                    awaiting.push((depth, Await::Static { index }, false));
+                    // Settlement runs the read again: its gas counts like a CALL's, tracked the
+                    // same way until the trace returns from it.
+                    let call_index_1based = state_updates.len();
+                    call_stack.push((depth, call_index_1based));
+                    call_gas_tracking.insert(
+                        call_index_1based,
+                        CallGas {
+                            gas: struct_log.gas,
+                            gas_cost: struct_log.gas_cost,
+                            entry_gas: None,
+                        },
+                    );
+                    awaiting_entry = Some((depth, call_index_1based));
+                    target_depth = depth + 1;
+                }
+            } else if let Some(read) = PendingRead::of(&struct_log, origin) {
+                pending_read = Some((depth, read));
+            }
+        }
+
         if depth == target_depth {
             if op == "DELEGATECALL" || op == "CALLCODE" {
                 target_depth = depth + 1;
@@ -388,6 +518,27 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
                     if op == "CREATE" || op == "CREATE2" {
                         pending_create = Some((depth, gas_after_opcode));
                     }
+                    if op == "CREATE" && usage.used(step) {
+                        let index = state_updates.len() - 1;
+                        awaiting.push((depth, Await::Create { index }, false));
+                    }
+                    if op == "CALL"
+                        && let Some(StateUpdate::Call(call)) = state_updates.last()
+                        && !is_precompile(call.target)
+                    {
+                        let index = state_updates.len() - 1;
+                        let value_sent = !call.value.is_zero();
+                        let used = usage.used(step);
+                        awaiting.push((
+                            depth,
+                            Await::Call {
+                                index,
+                                value_sent,
+                                used,
+                            },
+                            false,
+                        ));
+                    }
                     if op == "CALL" {
                         let call_index_1based = state_updates.len();
                         call_stack.push((depth, call_index_1based));
@@ -424,6 +575,7 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
         );
     }
 
+    dedupe_checks(&mut state_updates);
     tracing::Span::current().record("state_update_count", state_updates.len());
     Ok(TraceExtract {
         state_updates,
@@ -557,6 +709,206 @@ mod tests {
             storage: None,
             refund_counter: None,
         }
+    }
+
+    // ── Observation pins (solidity-sdk v0.2.0) ──────────────────────────
+
+    const ORIGIN: Address = Address::new([0x77; 20]);
+    const CALLEE: Address = Address::new([0xcc; 20]);
+
+    /// A struct log at `depth` whose stack is `top_first`, top item first.
+    fn at(op: &str, depth: u64, top_first: &[U256]) -> StructLog {
+        let mut stack = top_first.to_vec();
+        stack.reverse();
+        let mut l = make_struct_log(op, stack, vec![]);
+        l.depth = depth;
+        l
+    }
+
+    fn call_to(depth: u64, callee: Address) -> StructLog {
+        at(
+            "CALL",
+            depth,
+            &[
+                U256::from(50_000u64),
+                addr_word(callee),
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+            ],
+        )
+    }
+
+    fn returning(op: &str, depth: u64, data: u8) -> StructLog {
+        let mut l = at(op, depth, &[U256::ZERO, U256::from(1u64)]);
+        l.memory = Some(vec![format!("{:02x}{}", data, "00".repeat(31))]);
+        l
+    }
+
+    fn journal(logs: Vec<StructLog>) -> Vec<StateUpdate> {
+        let trace = DefaultFrame {
+            gas: 0,
+            failed: false,
+            return_value: Default::default(),
+            struct_logs: logs,
+        };
+        compute_state_updates(trace, Some(ORIGIN))
+            .unwrap()
+            .state_updates
+    }
+
+    #[test]
+    fn journal_pins_a_calls_result() {
+        let updates = journal(vec![
+            call_to(1, CALLEE),
+            returning("RETURN", 2, 0x2a),
+            at("JUMPDEST", 1, &[U256::from(1u64)]),
+        ]);
+        let StateUpdate::Call(call) = &updates[0] else {
+            panic!("a CALL");
+        };
+        assert_eq!(call.resultHash, crate::observe::result_hash(true, &[0x2a]));
+    }
+
+    #[test]
+    fn journal_pins_a_caught_revert() {
+        let updates = journal(vec![
+            call_to(1, CALLEE),
+            returning("REVERT", 2, 0x01),
+            at("JUMPDEST", 1, &[U256::ZERO]),
+        ]);
+        let StateUpdate::Call(call) = &updates[0] else {
+            panic!("a CALL");
+        };
+        assert_eq!(call.resultHash, crate::observe::result_hash(false, &[0x01]));
+    }
+
+    #[test]
+    fn journal_checks_reads_in_trace_order() {
+        let updates = journal(vec![
+            at("SSTORE", 1, &[U256::from(1u64), U256::from(10u64)]),
+            at(
+                "STATICCALL",
+                1,
+                &[
+                    U256::from(50_000u64),
+                    addr_word(CALLEE),
+                    U256::ZERO,
+                    U256::ZERO,
+                    U256::ZERO,
+                    U256::ZERO,
+                ],
+            ),
+            returning("RETURN", 2, 0x07),
+            at("JUMPDEST", 1, &[U256::from(1u64)]),
+            at("SELFBALANCE", 1, &[]),
+            at("JUMPDEST", 1, &[U256::from(9u64)]),
+            at("SSTORE", 1, &[U256::from(2u64), U256::from(20u64)]),
+        ]);
+        assert_eq!(updates.len(), 4, "{updates:?}");
+        assert!(matches!(&updates[0], StateUpdate::Store(_)));
+        let StateUpdate::StaticCallCheck(check) = &updates[1] else {
+            panic!("a STATICCALL_CHECK, got {:?}", updates[1]);
+        };
+        assert_eq!(check.target, CALLEE);
+        assert_eq!(check.resultHash, crate::observe::result_hash(true, &[0x07]));
+        assert!(
+            matches!(&updates[2], StateUpdate::BalanceCheck(b) if b.account == ORIGIN && b.balance == U256::from(9u64))
+        );
+        assert!(matches!(&updates[3], StateUpdate::Store(_)));
+    }
+
+    #[test]
+    fn journal_pins_a_creates_address() {
+        let deployed = Address::repeat_byte(0xde);
+        let updates = journal(vec![
+            at("CREATE", 1, &[U256::ZERO, U256::ZERO, U256::ZERO]),
+            at("STOP", 2, &[]),
+            at("JUMPDEST", 1, &[addr_word(deployed)]),
+        ]);
+        let StateUpdate::Create(create) = &updates[0] else {
+            panic!("a CREATE");
+        };
+        assert_eq!(create.expected, deployed);
+    }
+
+    #[test]
+    fn journal_leaves_precompile_calls_unpinned() {
+        let updates = journal(vec![
+            call_to(1, Address::with_last_byte(4)),
+            at("JUMPDEST", 1, &[U256::from(1u64)]),
+        ]);
+        let StateUpdate::Call(call) = &updates[0] else {
+            panic!("a CALL");
+        };
+        assert_eq!(call.resultHash, B256::ZERO);
+    }
+
+    #[test]
+    fn call_gas_limit_keeps_caps_the_call_imposed() {
+        let gas = 1_000_000;
+        // `transfer` with value, `send` without, an explicit cap.
+        for cap in [0u64, 2_300, 50_000] {
+            assert_eq!(traced_call_gas_limit(U256::from(cap), gas), U256::from(cap));
+        }
+    }
+
+    #[test]
+    fn call_gas_limit_leaves_everything_left_uncapped() {
+        let gas = 1_000_000;
+        // `call(gas(), ...)` passes the gas left, which the EVM trims to 63/64.
+        assert_eq!(
+            traced_call_gas_limit(U256::from(gas), gas),
+            CALL_GAS_UNCAPPED
+        );
+        assert_eq!(
+            traced_call_gas_limit(U256::from(all_but_one_64th(gas)), gas),
+            CALL_GAS_UNCAPPED
+        );
+        assert_eq!(traced_call_gas_limit(U256::MAX, gas), CALL_GAS_UNCAPPED);
+    }
+
+    /// An over-limit trace can impose a cap no settlement transaction can meet.
+    #[test]
+    fn call_gas_limit_never_exceeds_the_settlement_budget() {
+        let gas = 1u64 << 30;
+        let over = SETTLEMENT_CALL_GAS_BUDGET + 1;
+        assert_eq!(
+            traced_call_gas_limit(U256::from(over), gas),
+            CALL_GAS_UNCAPPED
+        );
+        assert_eq!(
+            traced_call_gas_limit(U256::from(SETTLEMENT_CALL_GAS_BUDGET), gas),
+            U256::from(SETTLEMENT_CALL_GAS_BUDGET)
+        );
+    }
+
+    #[test]
+    fn call_decodes_its_gas_operand() {
+        // Stack bottom→top: retSize, retOffset, argsSize, argsOffset, value, address, gas.
+        let stack = vec![
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            U256::from(1u64),
+            U256::from(0xabcdu64),
+            U256::ZERO,
+        ];
+        let mut updates = Vec::new();
+        append_state_update_from_struct_log(&mut updates, make_struct_log("CALL", stack, vec![]))
+            .unwrap();
+        let StateUpdate::Call(call) = &updates[0] else {
+            panic!("expected Call, got {:?}", updates[0]);
+        };
+        assert_eq!(
+            call.gasLimit,
+            U256::ZERO,
+            "a transfer with value keeps its 0"
+        );
+        assert_eq!(call.resultHash, B256::ZERO);
     }
 
     #[test]
@@ -1089,6 +1441,47 @@ mod tests {
             log("JUMPDEST", 2, 900_000, &[], &[], None),
             log("STOP", 2, 870_000, &[], &[], None),
             resume(1, 1_000_000 - 902_600 + 870_000, true),
+        ];
+        for gas in call_and_callee_gas(logs) {
+            assert_eq!(gas, (32_600, 30_000));
+        }
+    }
+
+    /// Settlement runs a checked read again, so both walks count its gas like a `CALL`'s.
+    #[test]
+    fn a_checked_static_read_counts_like_a_call() {
+        let y = Address::new([0x44; 20]);
+        let mut read = log(
+            "STATICCALL",
+            1,
+            1_000_000,
+            &[
+                U256::from(900_000u64),
+                addr_word(y),
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+            ],
+            &[],
+            None,
+        );
+        read.gas_cost = 902_600;
+        let logs = vec![
+            read,
+            log("JUMPDEST", 2, 900_000, &[], &[], None),
+            log("STOP", 2, 870_000, &[], &[], None),
+            resume(1, 1_000_000 - 902_600 + 870_000, true),
+            // The read's result is stored, so the program depends on it.
+            log("PUSH1", 1, 960_000, &[U256::from(1u64)], &[], None),
+            log(
+                "SSTORE",
+                1,
+                959_000,
+                &[U256::from(7u64), U256::from(1u64)],
+                &[],
+                None,
+            ),
         ];
         for gas in call_and_callee_gas(logs) {
             assert_eq!(gas, (32_600, 30_000));

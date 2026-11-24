@@ -20,8 +20,11 @@ use sha2::{Digest, Sha256};
 
 pub use crate::encoding::encode_state_updates_to_abi as encoded_program;
 use crate::heuristic::BASE_TX_COST;
-use crate::signed_format::SignedFormat;
+use crate::observe::{
+    Await, ExitData, PendingRead, call_pin, dedupe_checks, is_precompile, stack_top, static_check,
+};
 use crate::sim_profile::STATE_TRACKER_SLOT;
+use crate::taint::Usage;
 use crate::trace::{append_state_update_from_struct_log, callee_gas};
 use crate::types::Opcode;
 pub use crate::types::{IStateUpdateTypes, StateUpdate};
@@ -66,25 +69,10 @@ fn sha256(data: &[u8]) -> B256 {
     B256::from_slice(&Sha256::digest(data))
 }
 
-/// The root frame's leaf for a solidity-sdk v0.1.0 consumer: the single-transition digest for the
-/// `msg.value` the tree settles with. A zero value keeps the four-field encoding, so it hashes
-/// exactly as before. A v0.2.0 consumer binds the chain id: see [`chain_bound_root_leaf`].
+/// The root frame's leaf: the single-transition digest for the `msg.value` the tree settles
+/// with, with the chain id after the transition index. A zero value keeps the five-field
+/// encoding, as solidity-sdk v0.2.0's `NestedFrames.rootLeaf` does.
 pub fn root_leaf(
-    transition_index: U256,
-    target: Address,
-    selector: FixedBytes<4>,
-    program: &Bytes,
-    value: U256,
-) -> B256 {
-    if value.is_zero() {
-        return sha256(&(transition_index, target, selector, program.clone()).abi_encode_params());
-    }
-    sha256(&(transition_index, target, selector, program.clone(), value).abi_encode_params())
-}
-
-/// The root frame's leaf for a solidity-sdk v0.2.0 consumer: [`root_leaf`] with the chain id
-/// after the transition index, as in the v0.2.0 single-transition digest.
-pub fn chain_bound_root_leaf(
     transition_index: U256,
     chain_id: u64,
     target: Address,
@@ -465,6 +453,8 @@ struct ProgramState {
     children: Vec<usize>,
     /// The `CALL` op this frame replaces, restored if the frame is pruned.
     fallback: Option<IStateUpdateTypes::Call>,
+    /// The caller uses what the `CALL` returned, so a restored `fallback` pins it.
+    fallback_used: bool,
     dropped: bool,
     native_gas: u64,
     /// Gas of the storage writes and logs the program reproduces.
@@ -509,6 +499,8 @@ struct WalkFrame {
     /// Programs with this id or above were opened inside this frame, and are dropped with
     /// it if it reverts.
     first_program: usize,
+    /// The op in the caller's output this frame's outcome pins.
+    pin: Option<Await>,
 }
 
 struct PendingFrame {
@@ -520,6 +512,8 @@ struct PendingFrame {
     emitted_create: bool,
     nested_start_gas: Option<u64>,
     call_gas_cost: u64,
+    /// The op in the caller's output the call's outcome pins.
+    pin: Option<Await>,
 }
 
 /// The canonical storage image of `target` visible right now: every open frame's journal
@@ -731,6 +725,7 @@ fn split_frame_tree(
         updates: None,
         children: Vec::new(),
         fallback: None,
+        fallback_used: false,
         dropped: false,
         native_gas: 0,
         effect_gas: 0,
@@ -757,12 +752,29 @@ fn split_frame_tree(
         emitted_create: false,
         nested_start_gas: None,
         first_program: 0,
+        pin: None,
     }];
     let mut pending: Option<PendingFrame> = None;
+    let mut exits = ExitData::default();
+    let mut pending_read: Option<(u64, PendingRead)> = None;
+    // Which observations each program's effects depend on; the rest stay unpinned.
+    let usage = Usage::of(&trace.struct_logs);
 
     for (log_index, struct_log) in trace.struct_logs.into_iter().enumerate() {
         let depth = struct_log.depth;
         let op = struct_log.op.as_ref().to_string();
+
+        exits.step(&struct_log)?;
+        if let Some((read_depth, read)) = pending_read.take()
+            && depth == read_depth
+            && let Some(check) = stack_top(&struct_log, 0).and_then(|result| read.check(result))
+        {
+            frames
+                .last_mut()
+                .expect("root frame must remain")
+                .out
+                .push(check);
+        }
 
         if let Some(p) = pending.take() {
             if depth == p.parent_depth + 1 {
@@ -786,6 +798,7 @@ fn split_frame_tree(
                     emitted_create: p.emitted_create,
                     nested_start_gas: p.nested_start_gas,
                     first_program,
+                    pin: p.pin,
                 });
             } else {
                 if p.nested_start_gas.is_some() {
@@ -795,7 +808,13 @@ fn split_frame_tree(
                     );
                 }
                 // No frame was entered (EOA / precompile / failed call): the call completed
-                // inline. Account its gas now if it was emitted.
+                // inline, returning nothing. Pin it, and account its gas if it was emitted.
+                if let Some(pin) = p.pin
+                    && let Some(top) = stack_top(&struct_log, 0)
+                {
+                    let caller = frames.last_mut().expect("root frame must remain");
+                    pin.resolve(&mut caller.out, top, &[])?;
+                }
                 if p.emitted_create {
                     let deployed = struct_log.stack.as_ref().and_then(|s| s.last());
                     if deployed.is_none_or(|address| address.is_zero()) {
@@ -843,6 +862,12 @@ fn split_frame_tree(
             if frame.emitted_create && !success {
                 bail!(failed_create(depth));
             }
+            if let Some(pin) = frame.pin {
+                let top = *stack.last().expect("checked above");
+                let returndata = exits.take(closing_depth);
+                let caller = frames.last_mut().expect("root frame must remain");
+                pin.resolve(&mut caller.out, top, &returndata)?;
+            }
             let parent_program = frames.last().and_then(|f| f.program);
             if !success {
                 for program in &mut programs[frame.first_program..] {
@@ -867,6 +892,15 @@ fn split_frame_tree(
 
             if let Some(start_gas) = nested_root {
                 let id = frame.program.expect("a nested frame emits");
+                // If pruning turns the frame back into a `CALL`, that `CALL` is pinned like any
+                // other.
+                let returndata = exits.take(closing_depth);
+                let fallback_used = programs[id].fallback_used;
+                if let Some(fallback) = programs[id].fallback.as_mut()
+                    && (fallback_used || !success)
+                {
+                    fallback.resultHash = call_pin(success, !fallback.value.is_zero(), &returndata);
+                }
                 if success {
                     let native = start_gas.saturating_sub(struct_log.gas);
                     programs[id].native_gas = native;
@@ -929,6 +963,14 @@ fn split_frame_tree(
         let cur_ctx = frames[idx].storage_ctx;
         let op_errored = struct_log.error.is_some();
 
+        if cur_emitting
+            && !op_errored
+            && usage.used(log_index)
+            && let Some(read) = PendingRead::of(&struct_log, cur_ctx)
+        {
+            pending_read = Some((depth, read));
+        }
+
         match op.as_str() {
             "SSTORE" => {
                 if let Some(ctx) = cur_ctx
@@ -974,6 +1016,7 @@ fn split_frame_tree(
                         emitted_create: false,
                         nested_start_gas: None,
                         call_gas_cost: 0,
+                        pin: None,
                     });
                 }
             }
@@ -986,15 +1029,32 @@ fn split_frame_tree(
                     let callee = stack
                         .get(stack.len().wrapping_sub(2))
                         .map(|v| Address::from_word((*v).into()));
+                    // A read an emitting frame makes and uses is pinned where it happens. Its
+                    // callee runs code, which can read the target, so the target's storage is
+                    // brought to the canonical image first, as at a `CALL`.
+                    let mut pin = None;
+                    if cur_emitting
+                        && usage.used(log_index)
+                        && let Some(check) = static_check(&struct_log)?
+                    {
+                        flush_slice(&mut frames, &programs);
+                        frames[idx].out.push(check);
+                        pin = Some(Await::Static {
+                            index: frames[idx].out.len() - 1,
+                        });
+                    }
+                    // Settlement runs a checked read again, so its gas counts like a `CALL`'s.
+                    let checked = pin.is_some();
                     pending = Some(PendingFrame {
                         parent_depth: depth,
                         storage_ctx: callee,
                         program: None,
                         emitted_view: BTreeMap::new(),
-                        emitted_call_gas: None,
+                        emitted_call_gas: checked.then_some(struct_log.gas),
                         emitted_create: false,
                         nested_start_gas: None,
-                        call_gas_cost: 0,
+                        call_gas_cost: if checked { struct_log.gas_cost } else { 0 },
+                        pin,
                     });
                 }
             }
@@ -1016,6 +1076,7 @@ fn split_frame_tree(
                     emitted_create: false,
                     nested_start_gas: None,
                     call_gas_cost: struct_log.gas_cost,
+                    pin: None,
                 };
                 if cur_emitting && !op_errored {
                     // Boundary: external code is about to observe the current target's
@@ -1040,6 +1101,7 @@ fn split_frame_tree(
                                 updates: None,
                                 children: Vec::new(),
                                 fallback: Some(call.clone()),
+                                fallback_used: usage.used(log_index),
                                 dropped: false,
                                 native_gas: 0,
                                 effect_gas: 0,
@@ -1062,6 +1124,15 @@ fn split_frame_tree(
                             next.nested_start_gas = Some(gas_after_opcode);
                         }
                         (_, Some(update)) => {
+                            if let StateUpdate::Call(call) = &update
+                                && !is_precompile(call.target)
+                            {
+                                next.pin = Some(Await::Call {
+                                    index: frames[idx].out.len(),
+                                    value_sent: !call.value.is_zero(),
+                                    used: usage.used(log_index),
+                                });
+                            }
                             frames[idx].out.push(update);
                             next.emitted_call_gas = Some(gas_after_opcode);
                         }
@@ -1084,6 +1155,12 @@ fn split_frame_tree(
                         unreachable!("CREATE/CREATE2 are never skipped opcodes");
                     }
                 }
+                // A `CREATE`'s address depends on the deployer's nonce, so it is pinned. Indexed
+                // after the flush, which can put the target's pending STOREs ahead of it.
+                let pin =
+                    (emitted && op == "CREATE" && usage.used(log_index)).then(|| Await::Create {
+                        index: frames[idx].out.len() - 1,
+                    });
                 if !op_errored {
                     pending = Some(PendingFrame {
                         parent_depth: depth,
@@ -1098,6 +1175,7 @@ fn split_frame_tree(
                         emitted_create: emitted,
                         nested_start_gas: None,
                         call_gas_cost: 0,
+                        pin,
                     });
                 }
             }
@@ -1124,6 +1202,9 @@ fn split_frame_tree(
     flush_slice(&mut frames, &programs);
     let root_frame = frames.pop().expect("root frame present");
     programs[0].updates = Some(root_frame.out);
+    for updates in programs.iter_mut().filter_map(|p| p.updates.as_mut()) {
+        dedupe_checks(updates);
+    }
     programs[0].direct_call_gas = root_frame.call_gas;
     programs[0].direct_callee_gas = root_frame.callee_gas;
     programs[0].direct_create_gas = root_frame.create_gas;
@@ -1330,15 +1411,13 @@ pub struct EncodedTree {
 /// program), build the tree, then build witnesses bottom-up (a witness carries its children's).
 ///
 /// `root_value` is the `msg.value` the tree settles with. The trace can't supply it, which is why
-/// the root frame's own `value` is always zero. `format` is the root consumer's: it decides whether
-/// the root leaf binds `chain_id`.
+/// the root frame's own `value` is always zero.
 pub fn encode_frame_tree(
     frames: &[FrameProgram],
     root_selector: FixedBytes<4>,
     root_value: U256,
     chain_id: u64,
     expiry_block: u64,
-    format: SignedFormat,
 ) -> Result<EncodedTree> {
     let n = frames.len();
     if n == 0 {
@@ -1370,19 +1449,14 @@ pub fn encode_frame_tree(
             .transition_index
             .ok_or_else(|| anyhow::anyhow!("frame {i} has no transition index"))?;
         frame_leaves[i] = if i == 0 {
-            match format {
-                SignedFormat::V0_1 => {
-                    root_leaf(index, frame.target, root_selector, &programs[0], root_value)
-                }
-                SignedFormat::V0_2 => chain_bound_root_leaf(
-                    index,
-                    chain_id,
-                    frame.target,
-                    root_selector,
-                    &programs[0],
-                    root_value,
-                ),
-            }
+            root_leaf(
+                index,
+                chain_id,
+                frame.target,
+                root_selector,
+                &programs[0],
+                root_value,
+            )
         } else {
             nested_leaf(
                 chain_id,
@@ -1439,6 +1513,7 @@ mod tests {
     use alloy_sol_types::SolType;
 
     use super::*;
+    use crate::observe::result_hash;
     use crate::trace::compute_state_updates_canonical;
 
     // ------------------------------------------------------------------------
@@ -1448,39 +1523,11 @@ mod tests {
     const A11CE: Address = address!("0x00000000000000000000000000000000000a11ce");
     const B0B: Address = address!("0x0000000000000000000000000000000000000b0b");
 
+    /// Against solidity-sdk v0.2.0's `NestedFrames.rootLeaf` at chain id 1.
     #[test]
     fn root_leaf_matches_solidity() {
-        assert_eq!(
-            root_leaf(
-                U256::from(7),
-                A11CE,
-                FixedBytes::from([0x12, 0x34, 0x56, 0x78]),
-                &bytes!("c0ffee"),
-                U256::ZERO
-            ),
-            b256!("0x18fece75dabcbe169342c5e311d4af162b89a28a80cb659d125f7fe70e191b2b")
-        );
-    }
-
-    #[test]
-    fn valued_root_leaf_matches_solidity() {
-        assert_eq!(
-            root_leaf(
-                U256::from(7),
-                A11CE,
-                FixedBytes::from([0x12, 0x34, 0x56, 0x78]),
-                &bytes!("c0ffee"),
-                U256::from(5)
-            ),
-            b256!("0x9e2758ecd6d0b8e5563e02127be8e49b5cb8bcbe907e0d44d24968d955d0d6eb")
-        );
-    }
-
-    /// Against solidity-sdk v0.2.0's `NestedFrames.rootLeaf` at chain id 1, with the inputs above.
-    #[test]
-    fn chain_bound_root_leaf_matches_solidity() {
         let leaf = |value| {
-            chain_bound_root_leaf(
+            root_leaf(
                 U256::from(7),
                 1,
                 A11CE,
@@ -1706,6 +1753,236 @@ mod tests {
         ]
     }
 
+    // ── Observation pins (solidity-sdk v0.2.0) ──────────────────────────
+
+    const DATA: u64 = 0x2a;
+
+    /// A callee's `RETURN` or `REVERT` of one word holding [`DATA`].
+    fn exit(op: &str, depth: u64) -> StructLog {
+        let mut l = log(op, depth, 900_000, &[U256::ZERO, U256::from(32)], 0);
+        l.memory = Some(vec![format!("{:064x}", DATA)]);
+        l
+    }
+
+    fn data_word() -> Vec<u8> {
+        B256::from(U256::from(DATA)).to_vec()
+    }
+
+    fn staticcall(depth: u64, callee: Address) -> StructLog {
+        let args = [
+            U256::from(100_000),
+            word(callee),
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+        ];
+        log("STATICCALL", depth, 1_000_000, &args, 0)
+    }
+
+    /// The log after a frameless read, with the read's result on its stack.
+    fn result(depth: u64, value: U256) -> StructLog {
+        log("JUMPDEST", depth, 900_000, &[value], 0)
+    }
+
+    fn only_call(updates: &[StateUpdate]) -> &IStateUpdateTypes::Call {
+        let calls: Vec<_> = updates
+            .iter()
+            .filter_map(|u| match u {
+                StateUpdate::Call(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "{updates:?}");
+        calls[0]
+    }
+
+    #[test]
+    fn a_call_pins_what_its_callee_returned() {
+        let tree = split(
+            vec![
+                call(1, 1_000_000, C),
+                exit("RETURN", 2),
+                resume(1, 900_000, true),
+            ],
+            &[],
+        );
+        let call = only_call(&tree.frames[0].updates);
+        assert_eq!(call.resultHash, result_hash(true, &data_word()));
+    }
+
+    #[test]
+    fn a_caught_revert_is_pinned_as_a_failure() {
+        let tree = split(
+            vec![
+                call(1, 1_000_000, C),
+                exit("REVERT", 2),
+                resume(1, 900_000, false),
+            ],
+            &[],
+        );
+        let call = only_call(&tree.frames[0].updates);
+        assert_eq!(call.resultHash, result_hash(false, &data_word()));
+    }
+
+    /// An exceptional halt returns no data, so the SDK can't tell it from its own failures.
+    #[test]
+    fn a_halted_call_stays_unpinned() {
+        let tree = split(
+            vec![
+                call(1, 1_000_000, C),
+                log("INVALID", 2, 900_000, &[], 0),
+                resume(1, 900_000, false),
+            ],
+            &[],
+        );
+        assert_eq!(only_call(&tree.frames[0].updates).resultHash, B256::ZERO);
+    }
+
+    /// A call into an account without code opens no frame and returns nothing.
+    #[test]
+    fn a_frameless_call_pins_an_empty_success() {
+        let tree = split(vec![call(1, 1_000_000, C), resume(1, 900_000, true)], &[]);
+        let call = only_call(&tree.frames[0].updates);
+        assert_eq!(call.resultHash, result_hash(true, &[]));
+    }
+
+    #[test]
+    fn a_read_is_checked_where_it_happened_after_the_target_is_brought_up_to_date() {
+        let tree = split(
+            vec![
+                sstore(1, slot(1), 10),
+                staticcall(1, C),
+                exit("RETURN", 2),
+                resume(1, 900_000, true),
+                sstore(1, slot(2), 20),
+            ],
+            &[],
+        );
+        let updates = &tree.frames[0].updates;
+        assert_eq!(updates.len(), 3, "{updates:?}");
+        assert!(matches!(&updates[0], StateUpdate::Store(s) if s.slot == slot(1)));
+        let StateUpdate::StaticCallCheck(check) = &updates[1] else {
+            panic!("a STATICCALL_CHECK, got {:?}", updates[1]);
+        };
+        assert_eq!(check.target, C);
+        assert_eq!(check.resultHash, result_hash(true, &data_word()));
+        assert!(matches!(&updates[2], StateUpdate::Store(s) if s.slot == slot(2)));
+    }
+
+    #[test]
+    fn reads_of_precompiles_are_not_checked() {
+        let ecrecover = Address::with_last_byte(1);
+        let tree = split(
+            vec![staticcall(1, ecrecover), resume(1, 900_000, true)],
+            &[],
+        );
+        assert!(tree.frames[0].updates.is_empty());
+    }
+
+    #[test]
+    fn balance_and_code_reads_are_checked() {
+        let tree = split(
+            vec![
+                log("BALANCE", 1, 1_000_000, &[word(C)], 0),
+                result(1, U256::from(77)),
+                log("SELFBALANCE", 1, 1_000_000, &[], 0),
+                result(1, U256::from(5)),
+                log("EXTCODEHASH", 1, 1_000_000, &[word(C)], 0),
+                result(1, U256::from(0xabc)),
+                log("EXTCODESIZE", 1, 1_000_000, &[word(B)], 0),
+                result(1, U256::ZERO),
+            ],
+            &[],
+        );
+        let updates = &tree.frames[0].updates;
+        assert!(
+            matches!(&updates[0], StateUpdate::BalanceCheck(b) if b.account == C && b.balance == U256::from(77))
+        );
+        assert!(
+            matches!(&updates[1], StateUpdate::BalanceCheck(b) if b.account == ROOT && b.balance == U256::from(5))
+        );
+        assert!(
+            matches!(&updates[2], StateUpdate::CodehashCheck(c) if c.account == C && c.codehash == B256::from(U256::from(0xabc)))
+        );
+        assert!(
+            matches!(&updates[3], StateUpdate::CodehashCheck(c) if c.account == B && c.codehash.is_zero())
+        );
+    }
+
+    /// Reads inside a callee that replays natively aren't the program's to pin.
+    #[test]
+    fn reads_inside_a_native_call_are_not_checked() {
+        let tree = split(
+            vec![
+                call(1, 1_000_000, C),
+                log("BALANCE", 2, 900_000, &[word(B)], 0),
+                result(2, U256::from(1)),
+                resume(1, 800_000, true),
+            ],
+            &[],
+        );
+        assert_eq!(kinds(&tree.frames[0].updates), ["CALL"]);
+    }
+
+    #[test]
+    fn a_create_pins_its_address() {
+        let deployed = Address::repeat_byte(0xde);
+        let tree = split(
+            vec![
+                log(
+                    "CREATE",
+                    1,
+                    1_000_000,
+                    &[U256::ZERO, U256::ZERO, U256::ZERO],
+                    0,
+                ),
+                stop(2, 900_000),
+                log("JUMPDEST", 1, 800_000, &[word(deployed)], 0),
+            ],
+            &[],
+        );
+        let StateUpdate::Create(create) = &tree.frames[0].updates[0] else {
+            panic!("a CREATE");
+        };
+        assert_eq!(create.expected, deployed);
+    }
+
+    /// A STORE flushed ahead of the `CREATE` doesn't take its pin.
+    #[test]
+    fn a_create_after_a_store_pins_its_address() {
+        let deployed = Address::repeat_byte(0xde);
+        let tree = split(
+            vec![
+                sstore(1, slot(1), 10),
+                log(
+                    "CREATE",
+                    1,
+                    1_000_000,
+                    &[U256::ZERO, U256::ZERO, U256::ZERO],
+                    0,
+                ),
+                stop(2, 900_000),
+                log("JUMPDEST", 1, 800_000, &[word(deployed)], 0),
+            ],
+            &[],
+        );
+        assert_eq!(kinds(&tree.frames[0].updates), ["STORE", "CREATE"]);
+        let StateUpdate::Create(create) = &tree.frames[0].updates[1] else {
+            panic!("a CREATE");
+        };
+        assert_eq!(create.expected, deployed);
+    }
+
+    /// A nested frame pruned back into a `CALL` restores a pinned one.
+    #[test]
+    fn a_pruned_frame_restores_a_pinned_call() {
+        let tree = split(root_calls(B, 0, 1_000_000, 995_000), &[B]);
+        assert_eq!(tree.frames.len(), 1);
+        let call = only_call(&tree.frames[0].updates);
+        assert_eq!(call.resultHash, result_hash(true, &[]));
+    }
+
     #[test]
     fn eligible_callee_becomes_its_own_frame() {
         let tree = split(root_calls(B, 0, 1_000_000, 100_000), &[B]);
@@ -1732,7 +2009,7 @@ mod tests {
     #[test]
     fn without_a_nestable_callee_the_root_program_is_the_canonical_program() {
         let logs = root_calls(B, 0, 1_000_000, 100_000);
-        let canonical = compute_state_updates_canonical(trace(logs.clone()), ROOT)
+        let canonical = crate::trace::compute_state_updates_canonical(trace(logs.clone()), ROOT)
             .unwrap()
             .0;
         let tree = split(logs, &[]);
@@ -2383,15 +2660,7 @@ mod tests {
             &[B, C],
         );
         let selector = FixedBytes::from([0xde, 0xad, 0xbe, 0xef]);
-        let encoded = encode_frame_tree(
-            &tree.frames,
-            selector,
-            U256::ZERO,
-            1,
-            1060,
-            SignedFormat::V0_1,
-        )
-        .unwrap();
+        let encoded = encode_frame_tree(&tree.frames, selector, U256::ZERO, 1, 1060).unwrap();
 
         assert_eq!(encoded.leaves.len(), 4);
         assert_eq!(encoded.leaves[0], expiry_leaf(1, ROOT, 1060));
@@ -2407,7 +2676,14 @@ mod tests {
         ));
         assert_eq!(
             encoded.frame_leaves[0],
-            root_leaf(U256::ZERO, ROOT, selector, &encoded.programs[0], U256::ZERO)
+            root_leaf(
+                U256::ZERO,
+                1,
+                ROOT,
+                selector,
+                &encoded.programs[0],
+                U256::ZERO
+            )
         );
 
         // The root's NESTED op names B's leaf; B's witness carries C's.
@@ -2446,21 +2722,12 @@ mod tests {
         let tree = split(root_calls(B, 0, 1_000_000, 100_000), &[B]);
         let selector = FixedBytes::from([0xde, 0xad, 0xbe, 0xef]);
         let value = U256::from(10).pow(U256::from(18));
-        let unvalued = encode_frame_tree(
-            &tree.frames,
-            selector,
-            U256::ZERO,
-            1,
-            1060,
-            SignedFormat::V0_1,
-        )
-        .unwrap();
-        let valued =
-            encode_frame_tree(&tree.frames, selector, value, 1, 1060, SignedFormat::V0_1).unwrap();
+        let unvalued = encode_frame_tree(&tree.frames, selector, U256::ZERO, 1, 1060).unwrap();
+        let valued = encode_frame_tree(&tree.frames, selector, value, 1, 1060).unwrap();
 
         assert_eq!(
             valued.frame_leaves[0],
-            root_leaf(U256::ZERO, ROOT, selector, &valued.programs[0], value)
+            root_leaf(U256::ZERO, 1, ROOT, selector, &valued.programs[0], value)
         );
         assert_ne!(valued.frame_leaves[0], unvalued.frame_leaves[0]);
         assert_ne!(valued.root, unvalued.root);
@@ -2469,43 +2736,25 @@ mod tests {
     }
 
     #[test]
-    fn a_v0_2_tree_binds_the_chain_id_in_the_root_leaf_only() {
+    fn the_root_leaf_binds_the_chain_id() {
         let tree = split(root_calls(B, 0, 1_000_000, 100_000), &[B]);
         let selector = FixedBytes::from([0xde, 0xad, 0xbe, 0xef]);
-        let encode = |chain_id, format| {
-            encode_frame_tree(&tree.frames, selector, U256::ZERO, chain_id, 1060, format).unwrap()
+        let encode = |chain_id| {
+            encode_frame_tree(&tree.frames, selector, U256::ZERO, chain_id, 1060).unwrap()
         };
-        let v1 = encode(1, SignedFormat::V0_1);
-        let v2 = encode(1, SignedFormat::V0_2);
-
+        let one = encode(1);
         assert_eq!(
-            v2.frame_leaves[0],
-            chain_bound_root_leaf(U256::ZERO, 1, ROOT, selector, &v2.programs[0], U256::ZERO)
+            one.frame_leaves[0],
+            root_leaf(U256::ZERO, 1, ROOT, selector, &one.programs[0], U256::ZERO)
         );
-        assert_ne!(v2.root, v1.root);
-        assert_eq!(v2.frame_leaves[1..], v1.frame_leaves[1..]);
-        assert_eq!(v2.programs, v1.programs);
-        assert!(verify(&v2.root_proof, v2.root, v2.frame_leaves[0]));
-        assert_ne!(
-            encode(2, SignedFormat::V0_2).frame_leaves[0],
-            v2.frame_leaves[0]
-        );
+        assert!(verify(&one.root_proof, one.root, one.frame_leaves[0]));
+        assert_ne!(encode(2).frame_leaves[0], one.frame_leaves[0]);
     }
 
     #[test]
     fn encoding_rejects_a_frame_without_an_index() {
         let mut tree = split(root_calls(B, 0, 1_000_000, 100_000), &[B]);
         tree.frames[1].transition_index = None;
-        assert!(
-            encode_frame_tree(
-                &tree.frames,
-                FixedBytes::ZERO,
-                U256::ZERO,
-                1,
-                1060,
-                SignedFormat::V0_1
-            )
-            .is_err()
-        );
+        assert!(encode_frame_tree(&tree.frames, FixedBytes::ZERO, U256::ZERO, 1, 1060,).is_err());
     }
 }

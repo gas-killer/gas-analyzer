@@ -38,7 +38,7 @@
 use std::collections::HashMap;
 
 use crate::trace::TraceExtract;
-use crate::types::StateUpdate;
+use crate::types::{IStateUpdateTypes, StateUpdate};
 
 /// Heuristic gas costs for different operations
 pub const BASE_TX_COST: u64 = 21_000;
@@ -50,6 +50,8 @@ pub const CALLDATA_NONZERO_BYTE_COST: u64 = 16;
 pub const LOG_BASE_COST: u64 = 375;
 pub const LOG_TOPIC_COST: u64 = 375;
 pub const LOG_DATA_COST_PER_BYTE: u64 = 8;
+/// EIP-2929 cold account access: what a read check pays to reach its account again.
+pub const COLD_ACCOUNT_ACCESS_COST: u64 = 2_600;
 
 /// Operations and gas data extracted from a trace
 #[derive(Debug, Default)]
@@ -73,6 +75,21 @@ pub fn calldata_gas(data: &[u8]) -> u64 {
             }
         })
         .sum()
+}
+
+/// The calldata gas of `updates` as `runStateUpdatesCall(uint8[], bytes[])` would carry them:
+/// the program, without the ranges argument settlement never sends. An estimator run sends the
+/// ranges too; what that adds is its [`calldata_gas`] less this.
+pub fn program_calldata_gas(updates: &[StateUpdate]) -> u64 {
+    use alloy_sol_types::{SolType, sol_data};
+    let (types, args) = crate::encoding::encode_state_updates_to_sol(updates);
+    let types: Vec<u8> = types.iter().map(|t| *t as u8).collect();
+    let params = <(
+        sol_data::Array<sol_data::Uint<8>>,
+        sol_data::Array<sol_data::Bytes>,
+    )>::abi_encode_params(&(types, args));
+    // A selector's four bytes, as nonzero as the estimator's.
+    4 * CALLDATA_NONZERO_BYTE_COST + calldata_gas(&params)
 }
 
 /// Net EIP-3529 refunds out of a gross (pre-refund) gas estimate.
@@ -138,10 +155,45 @@ pub fn estimate_gas_from_state_updates(extract: &TraceExtract) -> u64 {
             }
             // Covered by create_gas_total above.
             StateUpdate::Create(_) | StateUpdate::Create2(_) => 0,
+            // A STATICCALL_CHECK's read, access included, is in call_gas_total like a CALL's.
+            StateUpdate::StaticCallCheck(_) => 0,
+            // The access a check repeats.
+            StateUpdate::BalanceCheck(_) | StateUpdate::CodehashCheck(_) => {
+                COLD_ACCOUNT_ACCESS_COST
+            }
         };
     }
 
     apply_refund(gas, extract.refund_counter)
+}
+
+/// A program as a pricer runs it on state its observations may not hold against (a block before
+/// the trace, a synthetic state): every `CALL` and `CREATE` unpinned and every check left out.
+/// Returns it with the gas the checks would have cost, a cold account access each, as
+/// [`estimate_gas_from_state_updates`] prices them.
+///
+/// An unpinned caught revert must then succeed, as it had to before programs could pin.
+pub fn unpinned_for_pricing(updates: &[StateUpdate]) -> (Vec<StateUpdate>, u64) {
+    let mut checks = 0u64;
+    let program = updates
+        .iter()
+        .filter_map(|update| match update {
+            _ if update.is_check() => {
+                checks += 1;
+                None
+            }
+            StateUpdate::Call(call) => Some(StateUpdate::Call(IStateUpdateTypes::Call {
+                resultHash: alloy_primitives::B256::ZERO,
+                ..call.clone()
+            })),
+            StateUpdate::Create(create) => Some(StateUpdate::Create(IStateUpdateTypes::Create {
+                expected: alloy_primitives::Address::ZERO,
+                ..create.clone()
+            })),
+            other => Some(other.clone()),
+        })
+        .collect();
+    (program, checks * COLD_ACCOUNT_ACCESS_COST)
 }
 
 /// Estimate gas from trace operations using heuristic costs.
