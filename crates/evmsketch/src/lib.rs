@@ -1568,7 +1568,12 @@ struct Extracted {
 ///
 /// The node's own scan is a JavaScript tracer that runs on every step, which on a heavy call takes
 /// longer than a signing round. The replay needs only the call's touched state, which the node's
-/// native `prestateTracer` reports in one cheap request.
+/// native `prestateTracer` reports in one cheap request, and the environment the node gives the
+/// call, which a probe run through the same request path reads.
+///
+/// A replay that diverges costs those requests on top of the node's scan. They are bounded by the
+/// touched state, not the call's steps, so the fallback isn't started alongside the replay: that
+/// would put the per-step tracer on the node for every call, which is the load this avoids.
 async fn local_observation<P: Provider + DebugApi>(
     provider: &P,
     diff: &DiffMode,
@@ -1586,6 +1591,10 @@ async fn local_observation<P: Provider + DebugApi>(
         tracing::debug!(%block, "can't replay a call at a block tag; asking the node to scan it");
         return None;
     }
+    if let Some(reason) = local_scan::unreplayable_request(tx_request) {
+        tracing::debug!(%reason, "can't replay the call locally; asking the node to scan it");
+        return None;
+    }
     let fetched = tokio::try_join!(
         get_prestate_from_call_with_profile(provider, tx_request.clone(), block, profile),
         async {
@@ -1595,14 +1604,10 @@ async fn local_observation<P: Provider + DebugApi>(
                 .map_err(|e| anyhow!("fetching the block: {e}"))?
                 .ok_or_else(|| anyhow!("no block {block}"))
         },
-        async {
-            provider
-                .get_chain_id()
-                .await
-                .map_err(|e| anyhow!("fetching the chain id: {e}"))
-        },
+        // The values the node gives the call, which can differ from the block's header.
+        gas_analyzer_rpc::get_simulated_env_with_profile(provider, tx_request, block, profile),
     );
-    let (pre, block, chain_id) = match fetched {
+    let (pre, block, node_env) = match fetched {
         Ok(fetched) => fetched,
         Err(e) => {
             tracing::debug!(error = %e, "can't replay the call locally; asking the node to scan it");
@@ -1612,23 +1617,16 @@ async fn local_observation<P: Provider + DebugApi>(
     let header = &block.header.inner;
     // A chain the analyzer has no fork schedule for runs under revm's default. A fork that
     // changed what the call did would show up as a divergence.
-    let spec = chain_id_to_genesis_and_spec(chain_id)
+    let spec = chain_id_to_genesis_and_spec(node_env.chain_id)
         .map(|(_, hardforks)| alloy_evm::spec(&hardforks, header))
         .unwrap_or_default();
     let env = local_scan::ScanEnv {
-        chain_id,
         spec,
-        number: header.number,
-        timestamp: header.timestamp,
-        gas_limit: header.gas_limit,
-        coinbase: header.beneficiary,
-        prevrandao: header.mix_hash,
-        basefee: header.base_fee_per_gas.unwrap_or_default(),
-        difficulty: header.difficulty,
+        node: node_env,
     };
     let (diff, frame, tx) = (diff.clone(), frame.clone(), tx_request.clone());
     let scanned = tokio::task::spawn_blocking(move || {
-        local_scan::scan_observations(&pre, &frame, &diff, &tx, &env, profile)
+        local_scan::scan_observations(&pre, &frame, &diff, &tx, &env)
     })
     .await;
     match scanned {

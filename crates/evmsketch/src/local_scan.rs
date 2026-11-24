@@ -7,10 +7,11 @@
 //! replayed in revm instead, on the state the node's default-mode `prestateTracer` reports, under
 //! an inspector that makes the same scan at native speed.
 //!
-//! The replay is trusted only when it ran the call the node ran: its outcome, output, calls (in
-//! order, precompiles aside), logs and storage writes must all match the node's `callTracer`
-//! frame and prestate diff. Otherwise the scan is [`LocalScan::Diverged`], and the caller asks the
-//! node instead.
+//! The replay runs in the environment the node gave the call (its gas, and the block values as the
+//! node set them, read with a probe), and it is trusted only when it ran the call the node ran: its
+//! outcome, gas, output, calls (in order and with their values, precompiles aside), logs, storage
+//! writes, balances and nonces must all match the node's `callTracer` frame and prestate diff.
+//! Otherwise the scan is [`LocalScan::Diverged`], and the caller asks the node instead.
 
 use std::collections::BTreeMap;
 
@@ -18,8 +19,8 @@ use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::rpc::types::TransactionRequest;
 use alloy::rpc::types::trace::geth::{CallFrame, DiffMode, PreStateMode};
 use anyhow::{Result, anyhow};
-use gas_analyzer_core::SimProfile;
 use gas_analyzer_core::observe::is_precompile;
+use gas_analyzer_rpc::SimulatedEnv;
 use revm::bytecode::opcode;
 use revm::context::TxEnv;
 use revm::context::result::ExecutionResult;
@@ -27,26 +28,19 @@ use revm::context_interface::ContextTr;
 use revm::database::{CacheDB, EmptyDB};
 use revm::interpreter::interpreter_types::Jumps;
 use revm::interpreter::{
-    CallInputs, CallOutcome, CallScheme, CreateInputs, CreateOutcome, CreateScheme, Interpreter,
+    CallInputs, CallOutcome, CallScheme, CallValue, CreateInputs, CreateOutcome, CreateScheme,
+    Interpreter,
 };
 use revm::primitives::TxKind;
 use revm::primitives::hardfork::SpecId;
 use revm::state::{AccountInfo, Bytecode};
 use revm::{Context, InspectEvm, Inspector, MainBuilder, MainContext};
 
-/// The block a call is replayed in: the header fields a call can read, and the fork it runs
-/// under.
+/// The environment a call is replayed in: the values the node gave it, and the fork it runs under.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ScanEnv {
-    pub chain_id: u64,
     pub spec: SpecId,
-    pub number: u64,
-    pub timestamp: u64,
-    pub gas_limit: u64,
-    pub coinbase: Address,
-    pub prevrandao: B256,
-    pub basefee: u64,
-    pub difficulty: U256,
+    pub node: SimulatedEnv,
 }
 
 /// What an in-process scan found.
@@ -59,27 +53,34 @@ pub(crate) enum LocalScan {
     Diverged(String),
 }
 
-/// Replays the call `tx` (already shaped by `profile`'s gas) on `pre`, the state the node's
-/// default-mode `prestateTracer` reported for it, and scans its target-depth context. `frame` and
-/// `diff` are the node's `callTracer` frame and prestate diff for the same call, which the replay
-/// must reproduce to be trusted.
+/// Replays the call `tx` on `pre`, the state the node's default-mode `prestateTracer` reported for
+/// it, in `env`, and scans its target-depth context. `frame` and `diff` are the node's
+/// `callTracer` frame and prestate diff for the same call, which the replay must reproduce to be
+/// trusted.
 pub(crate) fn scan_observations(
     pre: &PreStateMode,
     frame: &CallFrame,
     diff: &DiffMode,
     tx: &TransactionRequest,
     env: &ScanEnv,
-    profile: SimProfile,
 ) -> Result<LocalScan> {
     if let Some(reason) = unreplayable_request(tx) {
         return Ok(LocalScan::Diverged(reason));
     }
-    Ok(judge(&replay(pre, tx, env, profile)?, frame, diff))
+    Ok(judge(&replay(pre, tx, env)?, frame, diff))
 }
 
 /// Why the replay can't reproduce `tx` as the node runs it, or `None`. It drops blobs, access
-/// lists and EIP-7702 authorizations, each of which changes what the node runs.
-fn unreplayable_request(tx: &TransactionRequest) -> Option<String> {
+/// lists and EIP-7702 authorizations, each of which changes what the node runs, and charges no
+/// fee, where a node charges one the request sets.
+pub(crate) fn unreplayable_request(tx: &TransactionRequest) -> Option<String> {
+    if tx.gas_price.is_some()
+        || tx.max_fee_per_gas.is_some()
+        || tx.max_priority_fee_per_gas.is_some()
+        || tx.max_fee_per_blob_gas.is_some()
+    {
+        return Some("the call sets a fee".into());
+    }
     if tx
         .blob_versioned_hashes
         .as_ref()
@@ -104,6 +105,8 @@ fn unreplayable_request(tx: &TransactionRequest) -> Option<String> {
 struct Replay {
     result: ExecutionResult,
     state: revm::state::EvmState,
+    /// Each account's balance and nonce before the call, from the node's prestate.
+    before: BTreeMap<Address, (U256, u64)>,
     inspector: ObservationInspector,
 }
 
@@ -121,13 +124,10 @@ fn judge(replay: &Replay, frame: &CallFrame, diff: &DiffMode) -> LocalScan {
     )
 }
 
-fn replay(
-    pre: &PreStateMode,
-    tx: &TransactionRequest,
-    env: &ScanEnv,
-    profile: SimProfile,
-) -> Result<Replay> {
+fn replay(pre: &PreStateMode, tx: &TransactionRequest, env: &ScanEnv) -> Result<Replay> {
+    let node = &env.node;
     let mut db = CacheDB::new(EmptyDB::default());
+    let mut before = BTreeMap::new();
     for (address, account) in &pre.0 {
         let code = account
             .code
@@ -142,6 +142,7 @@ fn replay(
                 .map_or(revm::primitives::KECCAK_EMPTY, Bytecode::hash_slow),
             code,
         };
+        before.insert(*address, (info.balance, info.nonce));
         db.insert_account_info(*address, info);
         for (slot, value) in &account.storage {
             db.insert_account_storage(*address, (*slot).into(), (*value).into())
@@ -152,47 +153,40 @@ fn replay(
     let Some(TxKind::Call(to)) = tx.to else {
         return Err(anyhow!("the call has no target"));
     };
-    let gas_limit = profile
-        .tx_gas_limit_override()
-        .or(tx.gas)
-        .unwrap_or(env.gas_limit);
     let tx_env = TxEnv::builder()
         .caller(tx.from.unwrap_or_default())
         .kind(TxKind::Call(to))
         .data(tx.input.input().cloned().unwrap_or_default())
         .value(tx.value.unwrap_or_default())
-        .gas_limit(gas_limit)
-        .gas_price(0)
-        .chain_id(Some(env.chain_id))
+        .gas_limit(node.tx_gas_limit)
+        .gas_price(node.gas_price)
+        .chain_id(Some(node.chain_id))
         .build()
         .map_err(|e| anyhow!("building the replay transaction: {e:?}"))?;
-    let block_gas_limit = profile
-        .block_gas_limit_override()
-        .unwrap_or(env.gas_limit)
-        .max(gas_limit);
-
     let context = Context::mainnet()
         .with_db(&mut db)
         .modify_cfg_chained(|cfg| {
-            cfg.chain_id = env.chain_id;
+            cfg.chain_id = node.chain_id;
             cfg.spec = env.spec;
             cfg.disable_nonce_check = true;
             cfg.disable_balance_check = true;
             cfg.disable_base_fee = true;
             cfg.disable_fee_charge = true;
+            // The node may run a call with more gas than its block allows.
             cfg.disable_block_gas_limit = true;
             // A call simulated from a contract's address, as the analyzer's are.
             cfg.disable_eip3607 = true;
             cfg.tx_gas_limit_cap = Some(u64::MAX);
         })
         .modify_block_chained(|block| {
-            block.number = U256::from(env.number);
-            block.timestamp = U256::from(env.timestamp);
-            block.gas_limit = block_gas_limit;
-            block.beneficiary = env.coinbase;
-            block.prevrandao = Some(env.prevrandao);
-            block.basefee = env.basefee;
-            block.difficulty = env.difficulty;
+            block.number = U256::from(node.number);
+            block.timestamp = U256::from(node.timestamp);
+            block.gas_limit = node.block_gas_limit;
+            block.beneficiary = node.coinbase;
+            // One opcode reads either, depending on the fork.
+            block.prevrandao = Some(node.prevrandao);
+            block.difficulty = node.prevrandao.into();
+            block.basefee = node.basefee;
         });
     let mut evm = context.build_mainnet_with_inspector(ObservationInspector::default());
     let outcome = evm
@@ -201,6 +195,7 @@ fn replay(
     Ok(Replay {
         result: outcome.result,
         state: outcome.state,
+        before,
         inspector: evm.inspector,
     })
 }
@@ -213,6 +208,7 @@ fn divergence(replay: &Replay, frame: &CallFrame, diff: &DiffMode) -> Option<Str
     let Replay {
         result,
         state,
+        before,
         inspector,
     } = replay;
     if let Some(op) = inspector.unreplayable {
@@ -274,7 +270,45 @@ fn divergence(replay: &Replay, frame: &CallFrame, diff: &DiffMode) -> Option<Str
     if storage_writes(diff) != replay_writes {
         return Some("the replay wrote different storage".into());
     }
+
+    let replay_accounts: BTreeMap<Address, (U256, u64)> = state
+        .iter()
+        .filter_map(|(address, account)| {
+            let was = before.get(address).copied().unwrap_or_default();
+            let is = if account.is_selfdestructed() {
+                (U256::ZERO, 0)
+            } else {
+                (account.info.balance, account.info.nonce)
+            };
+            (is != was).then_some((*address, is))
+        })
+        .collect();
+    if account_changes(diff) != replay_accounts {
+        return Some("the replay left different balances or nonces".into());
+    }
     None
+}
+
+/// The balances and nonces the node's run changed, from its prestate diff, as each account's
+/// balance and nonce after the call. `post` holds only the fields that changed, and an account in
+/// `pre` but missing from `post` was deleted.
+fn account_changes(diff: &DiffMode) -> BTreeMap<Address, (U256, u64)> {
+    let mut changes = BTreeMap::new();
+    for address in diff.pre.keys().chain(diff.post.keys()) {
+        let pre = diff.pre.get(address);
+        let was = (
+            pre.and_then(|a| a.balance).unwrap_or_default(),
+            pre.and_then(|a| a.nonce).unwrap_or_default(),
+        );
+        let is = match diff.post.get(address) {
+            Some(post) => (post.balance.unwrap_or(was.0), post.nonce.unwrap_or(was.1)),
+            None => (U256::ZERO, 0),
+        };
+        if is != was {
+            changes.insert(*address, is);
+        }
+    }
+    changes
 }
 
 /// The storage the node's run changed, from its prestate diff: every slot whose value before
@@ -311,6 +345,9 @@ struct SeenCall {
     /// The callee, or the code a `DELEGATECALL`/`CALLCODE` ran; `None` for a create.
     to: Option<Address>,
     input: Bytes,
+    /// The value a `CALL`, `CALLCODE` or create sends. `None` for a `DELEGATECALL` or
+    /// `STATICCALL`, which send none, and whose value field tracers fill in differently.
+    value: Option<U256>,
 }
 
 /// The calls under `frame`, in the order they were made, precompiles left out (tracers differ on
@@ -333,11 +370,13 @@ fn collect_calls(frame: &CallFrame, out: &mut Vec<SeenCall>) {
         };
         let creates = kind.starts_with("CREATE");
         let to = if creates { None } else { call.to };
+        let sends = matches!(kind, "CALL" | "CALLCODE") || creates;
         if !to.is_some_and(is_precompile) {
             out.push(SeenCall {
                 kind,
                 to,
                 input: call.input.clone(),
+                value: sends.then(|| call.value.unwrap_or_default()),
             });
         }
         collect_calls(call, out);
@@ -372,9 +411,9 @@ struct ObservationInspector {
     emitting: Vec<bool>,
     /// The first observation opcode the context ran.
     found: Option<&'static str>,
-    /// The first opcode, at any depth, whose value the replay can't be sure matches the node's:
-    /// `BLOCKHASH` (the replay has no block hashes), and the fee and blob values nodes set
-    /// differently for a simulated call.
+    /// The first opcode, at any depth, whose value the replay can't match to the node's:
+    /// `BLOCKHASH` (the replay has no block hashes) and the blob values, which the environment
+    /// probe doesn't read (a chain before Cancun has no opcode for them).
     unreplayable: Option<&'static str>,
     calls: Vec<SeenCall>,
 }
@@ -385,8 +424,6 @@ impl<CTX: ContextTr> Inspector<CTX> for ObservationInspector {
         if self.unreplayable.is_none() {
             self.unreplayable = match op {
                 opcode::BLOCKHASH => Some("BLOCKHASH"),
-                opcode::BASEFEE => Some("BASEFEE"),
-                opcode::GASPRICE => Some("GASPRICE"),
                 opcode::BLOBHASH => Some("BLOBHASH"),
                 opcode::BLOBBASEFEE => Some("BLOBBASEFEE"),
                 _ => None,
@@ -410,6 +447,10 @@ impl<CTX: ContextTr> Inspector<CTX> for ObservationInspector {
             self.emitting.push(true);
             return None;
         };
+        let value = match inputs.value {
+            CallValue::Transfer(value) => Some(value),
+            CallValue::Apparent(_) => None,
+        };
         let (kind, delegated) = match inputs.scheme {
             CallScheme::Call => ("CALL", false),
             CallScheme::StaticCall => ("STATICCALL", false),
@@ -426,6 +467,8 @@ impl<CTX: ContextTr> Inspector<CTX> for ObservationInspector {
                 kind,
                 to: Some(to),
                 input: inputs.input.bytes(context),
+                // A STATICCALL carries a zero transfer.
+                value: value.filter(|_| inputs.scheme != CallScheme::StaticCall),
             });
         }
         self.emitting.push(parent && delegated);
@@ -445,6 +488,7 @@ impl<CTX: ContextTr> Inspector<CTX> for ObservationInspector {
             kind,
             to: None,
             input: inputs.init_code.clone(),
+            value: Some(inputs.value),
         });
         self.emitting.push(false);
         None
@@ -471,15 +515,18 @@ mod tests {
 
     fn env() -> ScanEnv {
         ScanEnv {
-            chain_id: 11_155_111,
             spec: SpecId::PRAGUE,
-            number: 100,
-            timestamp: 1_000_000,
-            gas_limit: 30_000_000,
-            coinbase: Address::ZERO,
-            prevrandao: B256::ZERO,
-            basefee: 0,
-            difficulty: U256::ZERO,
+            node: SimulatedEnv {
+                tx_gas_limit: 1_000_000,
+                timestamp: 1_000_000,
+                number: 100,
+                coinbase: Address::ZERO,
+                prevrandao: B256::ZERO,
+                block_gas_limit: 30_000_000,
+                basefee: 7,
+                chain_id: 11_155_111,
+                gas_price: 0,
+            },
         }
     }
 
@@ -511,7 +558,7 @@ mod tests {
     }
 
     fn replayed(code: &str) -> Replay {
-        replay(&prestate(code), &tx(), &env(), SimProfile::Chain).expect("the replay runs")
+        replay(&prestate(code), &tx(), &env()).expect("the replay runs")
     }
 
     /// The node's frame for a run that matches the replay's gas.
@@ -522,10 +569,19 @@ mod tests {
         }
     }
 
-    /// Judges the replay of `code` against a node run with the same gas and `diff`.
+    /// `diff` with the caller's nonce bumped, as every call bumps it.
+    fn bumping_the_caller(diff: &DiffMode) -> DiffMode {
+        let mut diff = diff.clone();
+        diff.pre.entry(CALLER).or_default().nonce = Some(0);
+        diff.post.entry(CALLER).or_default().nonce = Some(1);
+        diff
+    }
+
+    /// Judges the replay of `code` against a node run with the same gas and `diff`, plus the
+    /// caller's nonce bump.
     fn scan(code: &str, diff: &DiffMode) -> LocalScan {
         let replay = replayed(code);
-        judge(&replay, &frame_like(&replay), diff)
+        judge(&replay, &frame_like(&replay), &bumping_the_caller(diff))
     }
 
     fn diverges(scan: LocalScan, why: &str) {
@@ -609,10 +665,94 @@ mod tests {
         diverges(scan("6001 40 50 00", &DiffMode::default()), "BLOCKHASH");
     }
 
+    /// A diff in which the consumer's slot 0 went from zero to `value`.
+    fn wrote_slot_zero(value: u64) -> DiffMode {
+        DiffMode {
+            pre: BTreeMap::from([(CONSUMER, AccountState::default())]),
+            post: BTreeMap::from([(
+                CONSUMER,
+                AccountState {
+                    storage: BTreeMap::from([(B256::ZERO, B256::from(U256::from(value)))]),
+                    ..Default::default()
+                },
+            )]),
+        }
+    }
+
     #[test]
-    fn a_basefee_read_is_a_divergence() {
-        // BASEFEE; POP; STOP. Nodes set it differently for a simulated call.
-        diverges(scan("48 50 00", &DiffMode::default()), "BASEFEE");
+    fn the_replay_reads_the_values_the_node_gave_the_call() {
+        // SSTORE(0, BASEFEE + GASLIMIT); STOP. The node's run stored its base fee (7) plus its
+        // block gas limit, so a replay that used the header's values would write another value.
+        let diff = wrote_slot_zero(7 + 30_000_000);
+        assert_eq!(
+            scan("48 45 01 6000 55 00", &diff),
+            LocalScan::Observed(None)
+        );
+    }
+
+    #[test]
+    fn the_replay_runs_with_the_gas_the_node_gave_the_call() {
+        // SSTORE(0, GAS); STOP. The 1M-gas call has 978,998 left when GAS runs (after the
+        // intrinsic 21,000 and GAS's own 2), whatever gas the request named.
+        let diff = wrote_slot_zero(1_000_000 - 21_002);
+        let replay = replay(
+            &prestate("5a 6000 55 00"),
+            &TransactionRequest { gas: None, ..tx() },
+            &env(),
+        )
+        .expect("the replay runs");
+        assert_eq!(
+            judge(&replay, &frame_like(&replay), &bumping_the_caller(&diff)),
+            LocalScan::Observed(None)
+        );
+    }
+
+    #[test]
+    fn a_call_sending_a_different_value_is_a_divergence() {
+        // CALL(gas, 0x3003, 0, 0, 0, 0, 0); POP; STOP, against a node run whose call sent 1 wei.
+        let replay = replayed(
+            "6000 6000 6000 6000 6000 73 0000000000000000000000000000000000003003 5a f1 50 00",
+        );
+        let mut node = frame_like(&replay);
+        node.calls.push(CallFrame {
+            typ: "CALL".into(),
+            from: CONSUMER,
+            to: Some(address!("0x0000000000000000000000000000000000003003")),
+            value: Some(U256::from(1)),
+            ..Default::default()
+        });
+        diverges(judge(&replay, &node, &DiffMode::default()), "calls");
+    }
+
+    #[test]
+    fn a_nonce_the_node_didnt_bump_is_a_divergence() {
+        let replay = replayed("6001 50 00");
+        diverges(
+            judge(&replay, &frame_like(&replay), &DiffMode::default()),
+            "nonces",
+        );
+    }
+
+    #[test]
+    fn a_balance_the_node_changed_differently_is_a_divergence() {
+        // PUSH1 1; POP; STOP, against a node run that moved a wei out of the caller.
+        let diff = DiffMode {
+            pre: BTreeMap::from([(
+                CALLER,
+                AccountState {
+                    balance: Some(U256::from(10)),
+                    ..Default::default()
+                },
+            )]),
+            post: BTreeMap::from([(
+                CALLER,
+                AccountState {
+                    balance: Some(U256::from(9)),
+                    ..Default::default()
+                },
+            )]),
+        };
+        diverges(scan("6001 50 00", &diff), "balances");
     }
 
     #[test]
@@ -626,21 +766,71 @@ mod tests {
     }
 
     #[test]
-    fn a_call_with_blobs_or_authorizations_is_not_replayed() {
-        let blobs = TransactionRequest {
-            blob_versioned_hashes: Some(vec![B256::repeat_byte(1)]),
-            ..tx()
-        };
-        let scanned = scan_observations(
-            &prestate("00"),
-            &frame(),
-            &DiffMode::default(),
-            &blobs,
-            &env(),
-            SimProfile::Chain,
-        )
-        .expect("the request is checked");
-        diverges(scanned, "blobs");
+    fn a_call_with_blobs_an_access_list_authorizations_or_a_fee_is_not_replayed() {
+        let requests = [
+            (
+                TransactionRequest {
+                    blob_versioned_hashes: Some(vec![B256::repeat_byte(1)]),
+                    ..tx()
+                },
+                "blobs",
+            ),
+            (
+                TransactionRequest {
+                    access_list: Some(alloy::eips::eip2930::AccessList(vec![
+                        alloy::eips::eip2930::AccessListItem {
+                            address: CONSUMER,
+                            storage_keys: vec![],
+                        },
+                    ])),
+                    ..tx()
+                },
+                "access list",
+            ),
+            (
+                TransactionRequest {
+                    authorization_list: Some(vec![
+                        alloy::eips::eip7702::SignedAuthorization::new_unchecked(
+                            alloy::eips::eip7702::Authorization {
+                                chain_id: U256::from(1),
+                                address: CONSUMER,
+                                nonce: 0,
+                            },
+                            0,
+                            U256::from(1),
+                            U256::from(1),
+                        ),
+                    ]),
+                    ..tx()
+                },
+                "authorizations",
+            ),
+            (
+                TransactionRequest {
+                    gas_price: Some(1),
+                    ..tx()
+                },
+                "fee",
+            ),
+            (
+                TransactionRequest {
+                    max_fee_per_gas: Some(1),
+                    ..tx()
+                },
+                "fee",
+            ),
+        ];
+        for (request, why) in requests {
+            let scanned = scan_observations(
+                &prestate("00"),
+                &frame(),
+                &DiffMode::default(),
+                &request,
+                &env(),
+            )
+            .expect("the request is checked");
+            diverges(scanned, why);
+        }
     }
 
     #[test]
