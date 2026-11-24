@@ -1117,8 +1117,9 @@ mod tests {
             .estimate_state_changes_gas(ACCESS_CONTROL_MAIN_ADDRESS, &state_updates)
             .await?;
         // Glamsterdam's calldata floor exceeds execution here, so this pins the floor, not the
-        // payload; the floor includes the ranges argument, and a cold account access for the check.
-        assert_eq!(gas_estimate, 59584);
+        // payload; the floor includes the ranges argument, and the check adds its cold account
+        // access, its calldata and its read.
+        assert_eq!(gas_estimate, 60776);
         Ok(())
     }
 
