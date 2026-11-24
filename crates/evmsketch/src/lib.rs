@@ -3074,6 +3074,7 @@ mod tests {
                 U256::ZERO,
                 SEPOLIA_CHAIN_ID,
                 1_000,
+                gas_analyzer_core::SignedFormat::V0_1,
             )
             .expect("encodable tree");
             assert_eq!(encoded.leaves.len(), 4);
