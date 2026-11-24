@@ -150,7 +150,7 @@ use gas_analyzer_core::nested::{
 use gas_analyzer_core::sim_profile::STATE_TRACKER_SLOT;
 use gas_analyzer_core::{
     Opcode, PrestateEligibility, SignatureType, StateUpdate, build_state_updates_from_prestate,
-    classify_prestate_eligibility, compute_state_updates, compute_state_updates_canonical,
+    classify_prestate_eligibility, compute_state_updates_canonical_for, compute_state_updates_for,
     encode_state_updates_to_abi, estimate_gas_from_operations, extract_operation_counts_from_trace,
     frame_failure, resolve_code_sizes, unresolved_code_sizes, v0_2_observation,
     validate_unbounded_cost, validate_unbounded_tree_cost,
@@ -1569,14 +1569,16 @@ async fn extract_state_updates_hybrid<P: Provider + DebugApi>(
         StructLogEncoder::Legacy => {
             // The consumer as origin, which `SELFBALANCE`'s pin reads; it also turns on re-entry
             // detection, whose flag this path doesn't surface.
-            let extract = compute_state_updates(trace, Some(consumer))?;
+            let extract = compute_state_updates_for(trace, Some(consumer), format)?;
             (
                 extract.state_updates,
                 extract.skipped_opcodes,
                 extract.call_gas_total,
             )
         }
-        StructLogEncoder::Canonical => compute_state_updates_canonical(trace, consumer)?,
+        StructLogEncoder::Canonical => {
+            compute_state_updates_canonical_for(trace, consumer, format)?
+        }
     };
     Ok(Extracted {
         state_updates,
@@ -1917,7 +1919,8 @@ pub async fn call_to_frame_tree_with_evmsketch(
     trace_fetch += started.elapsed();
 
     let started = Instant::now();
-    let mut tree = compute_frame_tree_canonical(trace, root, &|a| nestable.contains(&a), cost)?;
+    let mut tree =
+        compute_frame_tree_canonical(trace, root, &|a| nestable.contains(&a), cost, format)?;
     let parse = started.elapsed();
     tracing::Span::current().record("frame_count", tree.frames.len());
     if format == SignedFormat::V0_2 {
@@ -4240,11 +4243,11 @@ mod tests {
             let trace = get_trace_from_call(provider, call_request(to), BlockId::latest())
                 .await
                 .expect("struct-log debug_traceCall failed");
-            let legacy = compute_state_updates(trace.clone(), None)
+            let legacy = gas_analyzer_core::compute_state_updates(trace.clone(), None)
                 .expect("compute_state_updates failed")
                 .state_updates;
-            let (canonical, _, _) =
-                compute_state_updates_canonical(trace, to).expect("canonical extraction failed");
+            let (canonical, _, _) = gas_analyzer_core::compute_state_updates_canonical(trace, to)
+                .expect("canonical extraction failed");
             (net, legacy, canonical)
         }
 
@@ -4434,7 +4437,7 @@ mod tests {
                         target: callee,
                         value: U256::ZERO,
                         callargs: Bytes::new(),
-                        // The caller drops the result, so the call only has to succeed.
+                        // Extracted for v0.1.0, which carries no pins.
                         resultHash: alloy::primitives::B256::ZERO,
                         gasLimit: alloy::primitives::U256::MAX,
                     }),

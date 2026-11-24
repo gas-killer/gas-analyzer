@@ -597,8 +597,15 @@ pub fn compute_frame_tree_canonical(
     root: Address,
     is_nestable: &dyn Fn(Address) -> bool,
     cost: &NestingCostModel,
+    format: SignedFormat,
 ) -> Result<FrameTreeExtract> {
-    split_frame_tree(trace, root, Eligibility::Consumers(is_nestable), cost)
+    split_frame_tree(
+        trace,
+        root,
+        Eligibility::Consumers(is_nestable),
+        cost,
+        format,
+    )
 }
 
 /// [`compute_frame_tree_canonical`] for code that never integrated the SDK: what a historical
@@ -617,7 +624,14 @@ pub fn compute_frame_tree_hypothetical(
     owned: &BTreeSet<Address>,
     cost: &NestingCostModel,
 ) -> Result<FrameTreeExtract> {
-    split_frame_tree(trace, root, Eligibility::Hypothetical(owned), cost)
+    // A what-if split for sizing, not a program anyone signs: no observations.
+    split_frame_tree(
+        trace,
+        root,
+        Eligibility::Hypothetical(owned),
+        cost,
+        SignedFormat::V0_1,
+    )
 }
 
 /// A program without its `NESTED` ops, for pricers that cannot execute them.
@@ -727,6 +741,7 @@ fn split_frame_tree(
     root: Address,
     eligibility: Eligibility<'_>,
     cost: &NestingCostModel,
+    format: SignedFormat,
 ) -> Result<FrameTreeExtract> {
     let (candidates, root_index) = scan_candidates(&trace.struct_logs, root)?;
     let mut skipped_opcodes = HashSet::new();
@@ -774,13 +789,16 @@ fn split_frame_tree(
     let mut exits = ExitData::default();
     let mut pending_read: Option<(u64, PendingRead)> = None;
     // Which observations each program's effects depend on; the rest stay unpinned.
-    let usage = Usage::of(&trace.struct_logs);
+    let observing = format == SignedFormat::V0_2;
+    let usage = Usage::for_format(&trace.struct_logs, format);
 
     for (log_index, struct_log) in trace.struct_logs.into_iter().enumerate() {
         let depth = struct_log.depth;
         let op = struct_log.op.as_ref().to_string();
 
-        exits.step(&struct_log)?;
+        if observing {
+            exits.step(&struct_log)?;
+        }
         if let Some((read_depth, read)) = pending_read.take()
             && depth == read_depth
             && let Some(check) = stack_top(&struct_log, 0).and_then(|result| read.check(result))
@@ -913,6 +931,7 @@ fn split_frame_tree(
                 let returndata = exits.take(closing_depth);
                 let fallback_used = programs[id].fallback_used;
                 if let Some(fallback) = programs[id].fallback.as_mut()
+                    && observing
                     && (fallback_used || !success)
                 {
                     fallback.resultHash = call_pin(success, !fallback.value.is_zero(), &returndata);
@@ -1139,6 +1158,7 @@ fn split_frame_tree(
                         }
                         (_, Some(update)) => {
                             if let StateUpdate::Call(call) = &update
+                                && observing
                                 && !is_precompile(call.target)
                             {
                                 next.pin = Some(Await::Call {
@@ -1760,6 +1780,7 @@ mod tests {
             ROOT,
             &move |a| nestable.contains(&a),
             &NESTING_COST_MODEL_V1,
+            SignedFormat::V0_2,
         )
         .expect("frame tree")
     }
@@ -2035,9 +2056,13 @@ mod tests {
     #[test]
     fn without_a_nestable_callee_the_root_program_is_the_canonical_program() {
         let logs = root_calls(B, 0, 1_000_000, 100_000);
-        let canonical = compute_state_updates_canonical(trace(logs.clone()), ROOT)
-            .unwrap()
-            .0;
+        let canonical = crate::trace::compute_state_updates_canonical_for(
+            trace(logs.clone()),
+            ROOT,
+            SignedFormat::V0_2,
+        )
+        .unwrap()
+        .0;
         let tree = split(logs, &[]);
         assert_eq!(tree.frames.len(), 1);
         assert_eq!(
@@ -2171,9 +2196,15 @@ mod tests {
     }
 
     fn split_err(logs: Vec<StructLog>) -> String {
-        compute_frame_tree_canonical(trace(logs), ROOT, &|_| false, &NESTING_COST_MODEL_V1)
-            .expect_err("a failed emitted create cannot settle")
-            .to_string()
+        compute_frame_tree_canonical(
+            trace(logs),
+            ROOT,
+            &|_| false,
+            &NESTING_COST_MODEL_V1,
+            SignedFormat::V0_2,
+        )
+        .expect_err("a failed emitted create cannot settle")
+        .to_string()
     }
 
     #[test]

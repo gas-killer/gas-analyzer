@@ -8,8 +8,8 @@
 //!
 //! The struct-log walks ([`crate::compute_state_updates`] and
 //! [`crate::nested::compute_frame_tree_canonical`]) record each observation an emitting frame
-//! makes that the program's effects depend on (the `taint` module decides which), and drop repeated reads;
-//! this module holds what they share. A v0.1.0 encoding drops the pins again (see
+//! makes that the program's effects depend on (the `taint` module decides which), and drop
+//! repeated reads; this module holds what they share. A v0.1.0 encoding drops the pins again (see
 //! [`crate::encode_state_updates_to_sol`]).
 
 use std::collections::HashMap;
@@ -98,10 +98,15 @@ impl ExitData {
         }
         self.prev_depth = depth;
         if matches!(log.op.as_ref(), "RETURN" | "REVERT") && log.error.is_none() {
-            let offset = usize_of(stack_top(log, 0), "RETURN/REVERT offset")?;
             let len = usize_of(stack_top(log, 1), "RETURN/REVERT size")?;
-            self.by_depth
-                .insert(depth, memory_slice(log, offset, len).into());
+            // An empty return may name any offset, however large.
+            let data = if len == 0 {
+                Bytes::new()
+            } else {
+                let offset = usize_of(stack_top(log, 0), "RETURN/REVERT offset")?;
+                memory_slice(log, offset, len).into()
+            };
+            self.by_depth.insert(depth, data);
         }
         Ok(())
     }
