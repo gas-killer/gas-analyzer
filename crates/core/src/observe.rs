@@ -7,8 +7,9 @@
 //! reverts with `ObservationMismatch` if the world moved.
 //!
 //! The struct-log walks ([`crate::compute_state_updates`] and
-//! [`crate::nested::compute_frame_tree_canonical`]) record every observation an emitting frame
-//! makes; this module holds what they share. A v0.1.0 encoding drops the pins again (see
+//! [`crate::nested::compute_frame_tree_canonical`]) record each observation an emitting frame
+//! makes that the program's effects depend on (the `taint` module decides which), and drop repeated reads;
+//! this module holds what they share. A v0.1.0 encoding drops the pins again (see
 //! [`crate::encode_state_updates_to_sol`]).
 
 use std::collections::HashMap;
@@ -115,8 +116,13 @@ impl ExitData {
 /// An op whose pin is known only once the trace resumes after it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Await {
-    /// A `CALL` at this index of the output: pin its result.
-    Call { index: usize, value_sent: bool },
+    /// A `CALL` at this index of the output: pin its result if the program `used` it, or if
+    /// the call failed, which settlement otherwise reverts on.
+    Call {
+        index: usize,
+        value_sent: bool,
+        used: bool,
+    },
     /// A `CREATE` at this index: pin the address it deployed to.
     Create { index: usize },
     /// A `STATICCALL_CHECK` placeholder at this index: fill in its result hash.
@@ -130,8 +136,14 @@ impl Await {
     pub(crate) fn resolve(self, out: &mut [StateUpdate], resume_top: U256, returndata: &[u8]) {
         let success = !resume_top.is_zero();
         match self {
-            Self::Call { index, value_sent } => {
-                if let Some(StateUpdate::Call(call)) = out.get_mut(index) {
+            Self::Call {
+                index,
+                value_sent,
+                used,
+            } => {
+                if let Some(StateUpdate::Call(call)) = out.get_mut(index)
+                    && (used || !success)
+                {
                     call.resultHash = call_pin(success, value_sent, returndata);
                 }
             }
@@ -250,6 +262,57 @@ impl PendingRead {
             }
             Self::Codehash(_) | Self::CodeSize(_) => return None,
         })
+    }
+}
+
+/// Drop every check that repeats an earlier one with nothing between them that could change
+/// what it reads. A `STATICCALL`'s callee can read anything, so any op that changes state ends
+/// the run; a balance or code hash changes only through a call, a deployment or a nested frame.
+pub(crate) fn dedupe_checks(updates: &mut Vec<StateUpdate>) {
+    let mut reads: Vec<StateUpdate> = Vec::new();
+    let mut accounts: Vec<StateUpdate> = Vec::new();
+    updates.retain(|update| {
+        let seen = match update {
+            StateUpdate::StaticCallCheck(_) => &mut reads,
+            StateUpdate::BalanceCheck(_) | StateUpdate::CodehashCheck(_) => &mut accounts,
+            StateUpdate::Store(_)
+            | StateUpdate::Log0(_)
+            | StateUpdate::Log1(_)
+            | StateUpdate::Log2(_)
+            | StateUpdate::Log3(_)
+            | StateUpdate::Log4(_) => {
+                reads.clear();
+                return true;
+            }
+            StateUpdate::Call(_)
+            | StateUpdate::Create(_)
+            | StateUpdate::Create2(_)
+            | StateUpdate::Nested(_) => {
+                reads.clear();
+                accounts.clear();
+                return true;
+            }
+        };
+        if seen.iter().any(|earlier| same_check(earlier, update)) {
+            return false;
+        }
+        seen.push(update.clone());
+        true
+    });
+}
+
+fn same_check(a: &StateUpdate, b: &StateUpdate) -> bool {
+    match (a, b) {
+        (StateUpdate::StaticCallCheck(a), StateUpdate::StaticCallCheck(b)) => {
+            a.target == b.target && a.data == b.data && a.resultHash == b.resultHash
+        }
+        (StateUpdate::BalanceCheck(a), StateUpdate::BalanceCheck(b)) => {
+            a.account == b.account && a.balance == b.balance
+        }
+        (StateUpdate::CodehashCheck(a), StateUpdate::CodehashCheck(b)) => {
+            a.account == b.account && a.codehash == b.codehash
+        }
+        _ => false,
     }
 }
 

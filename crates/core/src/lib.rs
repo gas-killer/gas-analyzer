@@ -13,6 +13,7 @@ pub mod opcode_report;
 pub mod prestate;
 pub mod signed_format;
 pub mod sim_profile;
+mod taint;
 pub mod trace;
 pub mod types;
 

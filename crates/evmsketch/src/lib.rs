@@ -3821,19 +3821,26 @@ mod tests {
             hex_code("602a 6000 52 6020 6000 fd")
         }
 
-        /// A consumer that observes the world every way a v0.2.0 program pins: a CALL with all
-        /// gas, one capped at 2,300, a caught revert with data, a STATICCALL, then BALANCE (stored
-        /// to slot 5), EXTCODESIZE and SELFBALANCE, then SSTORE(4,1).
+        /// A consumer that observes the world every way a v0.2.0 program pins, using some
+        /// observations and dropping others:
+        ///
+        /// - a CALL with all gas, its result dropped;
+        /// - a CALL capped at 2,300, its RETURNDATASIZE stored to slot 9;
+        /// - a caught revert with data, dropped (a caught failure is pinned anyway);
+        /// - a STATICCALL, its success stored to slot 6;
+        /// - BALANCE stored to slot 5, then the same BALANCE again to slot 8 (a repeat);
+        /// - EXTCODESIZE stored to slot 7, SELFBALANCE dropped, then SSTORE(4, 1).
         fn observer_code(returner: Address, reverter: Address) -> Bytes {
             let r = addr_hex(returner);
             let v = addr_hex(reverter);
             hex_code(&format!(
                 "6000 6000 6000 6000 6000 73{r} 5a f1 50 \
-                 6000 6000 6000 6000 6000 73{r} 6108fc f1 50 \
+                 6000 6000 6000 6000 6000 73{r} 6108fc f1 50 3d 6009 55 \
                  6000 6000 6000 6000 6000 73{v} 5a f1 50 \
-                 6000 6000 6000 6000 73{r} 5a fa 50 \
+                 6000 6000 6000 6000 73{r} 5a fa 6006 55 \
                  73{r} 31 6005 55 \
-                 73{r} 3b 50 \
+                 73{r} 31 6008 55 \
+                 73{r} 3b 6007 55 \
                  47 50 \
                  6001 6004 55 00"
             ))
@@ -3841,7 +3848,8 @@ mod tests {
 
         /// A real trace, encoded for v0.2.0 and priced by the v0.2.0 handler: every pin the walk
         /// records (call results, a caught revert, the cap, the read checks, a resolved code hash)
-        /// holds when settlement re-checks it, under both struct-log encoders.
+        /// holds when settlement re-checks it, under both struct-log encoders. Only what the
+        /// consumer used is pinned, and the repeated read is checked once.
         #[tokio::test(flavor = "multi_thread")]
         #[ignore = "spawns a local anvil; requires foundry on PATH"]
         async fn test_v0_2_pins_hold_against_the_v0_2_handler() {
@@ -3876,13 +3884,38 @@ mod tests {
                     sol_data::Array<sol_data::Uint<8>>,
                     sol_data::Array<sol_data::Bytes>,
                 );
-                let (types, _) =
+                type CallOp = (
+                    sol_data::Address,
+                    sol_data::Uint<256>,
+                    sol_data::Bytes,
+                    sol_data::FixedBytes<32>,
+                    sol_data::Uint<256>,
+                );
+                let (types, args) =
                     Program::abi_decode_params(&encoded.storage_updates).expect("a program");
                 let count = |kind: u8| types.iter().filter(|t| **t == kind).count();
                 assert_eq!(count(1), 3, "{encoding:?}: three CALLs: {types:?}");
-                assert_eq!(count(10), 1, "{encoding:?}: one STATICCALL_CHECK");
-                assert_eq!(count(11), 2, "{encoding:?}: BALANCE and SELFBALANCE");
+                assert_eq!(count(10), 1, "{encoding:?}: the STATICCALL_CHECK");
+                assert_eq!(
+                    count(11),
+                    1,
+                    "{encoding:?}: one BALANCE_CHECK, no SELFBALANCE"
+                );
                 assert_eq!(count(12), 1, "{encoding:?}: EXTCODESIZE's CODEHASH_CHECK");
+                let pinned: Vec<bool> = types
+                    .iter()
+                    .zip(&args)
+                    .filter(|(kind, _)| **kind == 1)
+                    .map(|(_, op)| {
+                        let (_, _, _, hash, _) = CallOp::abi_decode_params(op).expect("a CALL op");
+                        !hash.is_zero()
+                    })
+                    .collect();
+                assert_eq!(
+                    pinned,
+                    [false, true, true],
+                    "{encoding:?}: the dropped result goes unpinned"
+                );
             }
         }
 
@@ -4401,8 +4434,8 @@ mod tests {
                         target: callee,
                         value: U256::ZERO,
                         callargs: Bytes::new(),
-                        // The callee returned nothing: a pinned empty success.
-                        resultHash: gas_analyzer_core::observe::result_hash(true, &[]),
+                        // The caller drops the result, so the call only has to succeed.
+                        resultHash: alloy::primitives::B256::ZERO,
                         gasLimit: alloy::primitives::U256::MAX,
                     }),
                     store_up(4, 1),

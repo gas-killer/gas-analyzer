@@ -21,10 +21,11 @@ use sha2::{Digest, Sha256};
 pub use crate::encoding::encode_state_updates_to_abi as encoded_program;
 use crate::heuristic::BASE_TX_COST;
 use crate::observe::{
-    Await, ExitData, PendingRead, call_pin, is_precompile, stack_top, static_check,
+    Await, ExitData, PendingRead, call_pin, dedupe_checks, is_precompile, stack_top, static_check,
 };
 use crate::signed_format::SignedFormat;
 use crate::sim_profile::STATE_TRACKER_SLOT;
+use crate::taint::Usage;
 use crate::trace::{append_state_update_from_struct_log, callee_gas};
 use crate::types::Opcode;
 pub use crate::types::{IStateUpdateTypes, StateUpdate};
@@ -468,6 +469,8 @@ struct ProgramState {
     children: Vec<usize>,
     /// The `CALL` op this frame replaces, restored if the frame is pruned.
     fallback: Option<IStateUpdateTypes::Call>,
+    /// The caller uses what the `CALL` returned, so a restored `fallback` pins it.
+    fallback_used: bool,
     dropped: bool,
     native_gas: u64,
     /// Gas of the storage writes and logs the program reproduces.
@@ -738,6 +741,7 @@ fn split_frame_tree(
         updates: None,
         children: Vec::new(),
         fallback: None,
+        fallback_used: false,
         dropped: false,
         native_gas: 0,
         effect_gas: 0,
@@ -769,6 +773,8 @@ fn split_frame_tree(
     let mut pending: Option<PendingFrame> = None;
     let mut exits = ExitData::default();
     let mut pending_read: Option<(u64, PendingRead)> = None;
+    // Which observations each program's effects depend on; the rest stay unpinned.
+    let usage = Usage::of(&trace.struct_logs);
 
     for (log_index, struct_log) in trace.struct_logs.into_iter().enumerate() {
         let depth = struct_log.depth;
@@ -905,7 +911,10 @@ fn split_frame_tree(
                 // If pruning turns the frame back into a `CALL`, that `CALL` is pinned like any
                 // other.
                 let returndata = exits.take(closing_depth);
-                if let Some(fallback) = programs[id].fallback.as_mut() {
+                let fallback_used = programs[id].fallback_used;
+                if let Some(fallback) = programs[id].fallback.as_mut()
+                    && (fallback_used || !success)
+                {
                     fallback.resultHash = call_pin(success, !fallback.value.is_zero(), &returndata);
                 }
                 if success {
@@ -972,6 +981,7 @@ fn split_frame_tree(
 
         if cur_emitting
             && !op_errored
+            && usage.used(log_index)
             && let Some(read) = PendingRead::of(&struct_log, cur_ctx)
         {
             pending_read = Some((depth, read));
@@ -1035,11 +1045,14 @@ fn split_frame_tree(
                     let callee = stack
                         .get(stack.len().wrapping_sub(2))
                         .map(|v| Address::from_word((*v).into()));
-                    // A read an emitting frame makes is pinned where it happens. Its callee runs
-                    // code, which can read the target, so the target's storage is brought to the
-                    // canonical image first, as at a `CALL`.
+                    // A read an emitting frame makes and uses is pinned where it happens. Its
+                    // callee runs code, which can read the target, so the target's storage is
+                    // brought to the canonical image first, as at a `CALL`.
                     let mut pin = None;
-                    if cur_emitting && let Some(check) = static_check(&struct_log)? {
+                    if cur_emitting
+                        && usage.used(log_index)
+                        && let Some(check) = static_check(&struct_log)?
+                    {
                         flush_slice(&mut frames, &programs);
                         frames[idx].out.push(check);
                         pin = Some(Await::Static {
@@ -1102,6 +1115,7 @@ fn split_frame_tree(
                                 updates: None,
                                 children: Vec::new(),
                                 fallback: Some(call.clone()),
+                                fallback_used: usage.used(log_index),
                                 dropped: false,
                                 native_gas: 0,
                                 effect_gas: 0,
@@ -1130,6 +1144,7 @@ fn split_frame_tree(
                                 next.pin = Some(Await::Call {
                                     index: frames[idx].out.len(),
                                     value_sent: !call.value.is_zero(),
+                                    used: usage.used(log_index),
                                 });
                             }
                             frames[idx].out.push(update);
@@ -1146,9 +1161,10 @@ fn split_frame_tree(
                 let emitted = cur_emitting && !op_errored;
                 let gas_at_opcode = struct_log.gas;
                 // A `CREATE`'s address depends on the deployer's nonce, so it is pinned.
-                let pin = (emitted && op == "CREATE").then(|| Await::Create {
-                    index: frames[idx].out.len(),
-                });
+                let pin =
+                    (emitted && op == "CREATE" && usage.used(log_index)).then(|| Await::Create {
+                        index: frames[idx].out.len(),
+                    });
                 if emitted {
                     // Initcode can call back into the target: boundary here too.
                     flush_slice(&mut frames, &programs);
@@ -1199,6 +1215,9 @@ fn split_frame_tree(
     flush_slice(&mut frames, &programs);
     let root_frame = frames.pop().expect("root frame present");
     programs[0].updates = Some(root_frame.out);
+    for updates in programs.iter_mut().filter_map(|p| p.updates.as_mut()) {
+        dedupe_checks(updates);
+    }
     programs[0].direct_call_gas = root_frame.call_gas;
     programs[0].direct_callee_gas = root_frame.callee_gas;
     programs[0].direct_create_gas = root_frame.create_gas;

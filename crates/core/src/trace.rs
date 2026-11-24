@@ -10,7 +10,10 @@ use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types::trace::geth::{DefaultFrame, StructLog};
 use anyhow::{Result, bail};
 
-use crate::observe::{Await, ExitData, PendingRead, is_precompile, stack_top, static_check};
+use crate::observe::{
+    Await, ExitData, PendingRead, dedupe_checks, is_precompile, stack_top, static_check,
+};
+use crate::taint::Usage;
 use crate::types::{CALL_GAS_UNCAPPED, IStateUpdateTypes, Opcode, StateUpdate};
 
 // ============================================================================
@@ -343,8 +346,10 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
     let mut exits = ExitData::default();
     let mut awaiting: Vec<(u64, Await, bool)> = Vec::new();
     let mut pending_read: Option<(u64, PendingRead)> = None;
+    // Which observations the program's effects depend on; the rest stay unpinned.
+    let usage = Usage::of(&trace.struct_logs);
 
-    for struct_log in trace.struct_logs {
+    for (step, struct_log) in trace.struct_logs.into_iter().enumerate() {
         let depth = struct_log.depth;
         let op = struct_log.op.as_ref().to_string();
 
@@ -432,8 +437,12 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
             target_depth = depth;
         }
 
-        // Reads an emitting frame makes, pinned where they happen.
-        if depth == target_depth && call_stack.is_empty() && struct_log.error.is_none() {
+        // Reads an emitting frame makes and its effects depend on, pinned where they happen.
+        if depth == target_depth
+            && call_stack.is_empty()
+            && struct_log.error.is_none()
+            && usage.used(step)
+        {
             if op == "STATICCALL" {
                 if let Some(check) = static_check(&struct_log)? {
                     state_updates.push(check);
@@ -489,7 +498,7 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
                     if op == "CREATE" || op == "CREATE2" {
                         pending_create = Some((depth, gas_after_opcode));
                     }
-                    if op == "CREATE" {
+                    if op == "CREATE" && usage.used(step) {
                         let index = state_updates.len() - 1;
                         awaiting.push((depth, Await::Create { index }, false));
                     }
@@ -499,7 +508,16 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
                     {
                         let index = state_updates.len() - 1;
                         let value_sent = !call.value.is_zero();
-                        awaiting.push((depth, Await::Call { index, value_sent }, false));
+                        let used = usage.used(step);
+                        awaiting.push((
+                            depth,
+                            Await::Call {
+                                index,
+                                value_sent,
+                                used,
+                            },
+                            false,
+                        ));
                     }
                     if op == "CALL" {
                         let call_index_1based = state_updates.len();
@@ -537,6 +555,7 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
         );
     }
 
+    dedupe_checks(&mut state_updates);
     tracing::Span::current().record("state_update_count", state_updates.len());
     Ok(TraceExtract {
         state_updates,
