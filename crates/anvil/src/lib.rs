@@ -375,6 +375,8 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
         let types = types.iter().map(|x| *x as u8).collect::<Vec<_>>();
         let call = target_contract.runStateUpdatesCall(types, args, ranges);
         // Settlement builds the ranges in memory rather than sending them: take off their calldata.
+        // At standard pricing only: when the calldata floor binds (Glamsterdam, a small program),
+        // the receipt charges the ranges at the floor rate and the estimate keeps the difference.
         let ranges_calldata_gas =
             calldata_gas(call.calldata()).saturating_sub(program_calldata_gas(&state_updates));
         let tx = call.send().await;
@@ -1024,7 +1026,8 @@ mod tests {
         let gas_estimate = gk
             .estimate_state_changes_gas(SIMPLE_STORAGE_ADDRESS, &state_updates)
             .await?;
-        assert_eq!(gas_estimate, 48024);
+        // Floor-bound, like the access-control estimate below: the ranges' calldata is part of it.
+        assert_eq!(gas_estimate, 61080);
         Ok(())
     }
 
@@ -1049,8 +1052,9 @@ mod tests {
         let gas_estimate = gk
             .estimate_state_changes_gas(ACCESS_CONTROL_MAIN_ADDRESS, &state_updates)
             .await?;
-        // Glamsterdam's calldata floor exceeds execution here, so this pins the floor, not the payload.
-        assert_eq!(gas_estimate, 39832);
+        // Glamsterdam's calldata floor exceeds execution here, so this pins the floor, not the
+        // payload; the floor includes the ranges argument, and a cold account access for the check.
+        assert_eq!(gas_estimate, 59584);
         Ok(())
     }
 
