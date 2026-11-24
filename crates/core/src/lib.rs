@@ -40,7 +40,8 @@ pub use sim_profile::{
     estimate_applied_payload_gas, validate_unbounded_cost, validate_unbounded_tree_cost,
 };
 pub use trace::{
-    EvmFailure, TraceExtract, compute_state_updates, compute_state_updates_canonical, copy_memory,
+    EvmFailure, TraceExtract, compute_state_updates, compute_state_updates_canonical,
+    compute_state_updates_canonical_for, compute_state_updates_for, copy_memory,
     ensure_call_succeeded, parse_trace_memory,
 };
 pub use types::{

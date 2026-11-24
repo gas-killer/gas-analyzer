@@ -97,10 +97,15 @@ impl ExitData {
         }
         self.prev_depth = depth;
         if matches!(log.op.as_ref(), "RETURN" | "REVERT") && log.error.is_none() {
-            let offset = usize_of(stack_top(log, 0), "RETURN/REVERT offset")?;
             let len = usize_of(stack_top(log, 1), "RETURN/REVERT size")?;
-            self.by_depth
-                .insert(depth, memory_slice(log, offset, len).into());
+            // An empty return may name any offset, however large.
+            let data = if len == 0 {
+                Bytes::new()
+            } else {
+                let offset = usize_of(stack_top(log, 0), "RETURN/REVERT offset")?;
+                memory_slice(log, offset, len).into()
+            };
+            self.by_depth.insert(depth, data);
         }
         Ok(())
     }

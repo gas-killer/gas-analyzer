@@ -594,8 +594,15 @@ pub fn compute_frame_tree_canonical(
     root: Address,
     is_nestable: &dyn Fn(Address) -> bool,
     cost: &NestingCostModel,
+    format: SignedFormat,
 ) -> Result<FrameTreeExtract> {
-    split_frame_tree(trace, root, Eligibility::Consumers(is_nestable), cost)
+    split_frame_tree(
+        trace,
+        root,
+        Eligibility::Consumers(is_nestable),
+        cost,
+        format,
+    )
 }
 
 /// [`compute_frame_tree_canonical`] for code that never integrated the SDK: what a historical
@@ -614,7 +621,14 @@ pub fn compute_frame_tree_hypothetical(
     owned: &BTreeSet<Address>,
     cost: &NestingCostModel,
 ) -> Result<FrameTreeExtract> {
-    split_frame_tree(trace, root, Eligibility::Hypothetical(owned), cost)
+    // A what-if split for sizing, not a program anyone signs: no observations.
+    split_frame_tree(
+        trace,
+        root,
+        Eligibility::Hypothetical(owned),
+        cost,
+        SignedFormat::V0_1,
+    )
 }
 
 /// A program without its `NESTED` ops, for pricers that cannot execute them.
@@ -724,6 +738,7 @@ fn split_frame_tree(
     root: Address,
     eligibility: Eligibility<'_>,
     cost: &NestingCostModel,
+    format: SignedFormat,
 ) -> Result<FrameTreeExtract> {
     let (candidates, root_index) = scan_candidates(&trace.struct_logs, root)?;
     let mut skipped_opcodes = HashSet::new();
@@ -769,12 +784,16 @@ fn split_frame_tree(
     let mut pending: Option<PendingFrame> = None;
     let mut exits = ExitData::default();
     let mut pending_read: Option<(u64, PendingRead)> = None;
+    // A v0.1.0 program can't carry a pin, so its walk records no observation.
+    let observing = format == SignedFormat::V0_2;
 
     for (log_index, struct_log) in trace.struct_logs.into_iter().enumerate() {
         let depth = struct_log.depth;
         let op = struct_log.op.as_ref().to_string();
 
-        exits.step(&struct_log)?;
+        if observing {
+            exits.step(&struct_log)?;
+        }
         if let Some((read_depth, read)) = pending_read.take()
             && depth == read_depth
             && let Some(check) = stack_top(&struct_log, 0).and_then(|result| read.check(result))
@@ -905,7 +924,9 @@ fn split_frame_tree(
                 // If pruning turns the frame back into a `CALL`, that `CALL` is pinned like any
                 // other.
                 let returndata = exits.take(closing_depth);
-                if let Some(fallback) = programs[id].fallback.as_mut() {
+                if let Some(fallback) = programs[id].fallback.as_mut()
+                    && observing
+                {
                     fallback.resultHash = call_pin(success, !fallback.value.is_zero(), &returndata);
                 }
                 if success {
@@ -971,6 +992,7 @@ fn split_frame_tree(
         let op_errored = struct_log.error.is_some();
 
         if cur_emitting
+            && observing
             && !op_errored
             && let Some(read) = PendingRead::of(&struct_log, cur_ctx)
         {
@@ -1039,7 +1061,10 @@ fn split_frame_tree(
                     // code, which can read the target, so the target's storage is brought to the
                     // canonical image first, as at a `CALL`.
                     let mut pin = None;
-                    if cur_emitting && let Some(check) = static_check(&struct_log)? {
+                    if cur_emitting
+                        && observing
+                        && let Some(check) = static_check(&struct_log)?
+                    {
                         flush_slice(&mut frames, &programs);
                         frames[idx].out.push(check);
                         pin = Some(Await::Static {
@@ -1125,6 +1150,7 @@ fn split_frame_tree(
                         }
                         (_, Some(update)) => {
                             if let StateUpdate::Call(call) = &update
+                                && observing
                                 && !is_precompile(call.target)
                             {
                                 next.pin = Some(Await::Call {
@@ -1146,7 +1172,7 @@ fn split_frame_tree(
                 let emitted = cur_emitting && !op_errored;
                 let gas_at_opcode = struct_log.gas;
                 // A `CREATE`'s address depends on the deployer's nonce, so it is pinned.
-                let pin = (emitted && op == "CREATE").then(|| Await::Create {
+                let pin = (emitted && observing && op == "CREATE").then(|| Await::Create {
                     index: frames[idx].out.len(),
                 });
                 if emitted {
@@ -1741,6 +1767,7 @@ mod tests {
             ROOT,
             &move |a| nestable.contains(&a),
             &NESTING_COST_MODEL_V1,
+            SignedFormat::V0_2,
         )
         .expect("frame tree")
     }
@@ -2016,9 +2043,13 @@ mod tests {
     #[test]
     fn without_a_nestable_callee_the_root_program_is_the_canonical_program() {
         let logs = root_calls(B, 0, 1_000_000, 100_000);
-        let canonical = compute_state_updates_canonical(trace(logs.clone()), ROOT)
-            .unwrap()
-            .0;
+        let canonical = crate::trace::compute_state_updates_canonical_for(
+            trace(logs.clone()),
+            ROOT,
+            SignedFormat::V0_2,
+        )
+        .unwrap()
+        .0;
         let tree = split(logs, &[]);
         assert_eq!(tree.frames.len(), 1);
         assert_eq!(
@@ -2152,9 +2183,15 @@ mod tests {
     }
 
     fn split_err(logs: Vec<StructLog>) -> String {
-        compute_frame_tree_canonical(trace(logs), ROOT, &|_| false, &NESTING_COST_MODEL_V1)
-            .expect_err("a failed emitted create cannot settle")
-            .to_string()
+        compute_frame_tree_canonical(
+            trace(logs),
+            ROOT,
+            &|_| false,
+            &NESTING_COST_MODEL_V1,
+            SignedFormat::V0_2,
+        )
+        .expect_err("a failed emitted create cannot settle")
+        .to_string()
     }
 
     #[test]
