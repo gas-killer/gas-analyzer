@@ -6,11 +6,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types::trace::geth::{DefaultFrame, StructLog};
 use anyhow::{Result, bail};
 
-use crate::types::{IStateUpdateTypes, Opcode, StateUpdate};
+use crate::types::{CALL_GAS_UNCAPPED, IStateUpdateTypes, Opcode, StateUpdate};
 
 // ============================================================================
 // Memory Utilities
@@ -55,6 +55,45 @@ pub fn parse_trace_memory(memory: Vec<String>) -> Vec<u8> {
 // State Update Extraction
 // ============================================================================
 
+/// The most a `CALL` opcode costs before its callee starts: a cold account (2,600), a value
+/// transfer (9,000) and a new account (25,000).
+const CALL_OPCODE_MAX_COST: u64 = 36_600;
+
+/// The EVM's cap on the gas a call passes on: all but one 64th of what is left (EIP-150).
+const fn all_but_one_64th(gas: u64) -> u64 {
+    gas - gas / 64
+}
+
+/// EIP-7825's per-transaction gas cap, which every settlement transaction is under.
+const EIP7825_TX_GAS_CAP: u64 = 1 << 24;
+
+/// The most gas a callee can get in any settlement transaction: EIP-7825's cap, less the
+/// transaction's base cost and solidity-sdk's 40,000 allowance for the `CALL` itself. Generous,
+/// since the program's earlier ops and the signature check spend gas too; a cap above it can
+/// never settle.
+pub const SETTLEMENT_CALL_GAS_BUDGET: u64 =
+    all_but_one_64th(EIP7825_TX_GAS_CAP - crate::heuristic::BASE_TX_COST - 40_000);
+
+/// solidity-sdk v0.2.0's `gasLimit` for a traced `CALL`, from its gas operand and the gas left
+/// when it ran (`gas_at_call`).
+///
+/// - A cap the call could actually impose, below what the EVM would pass on anyway, is kept as
+///   is. That covers `transfer` and `send`, whose operand is 0 with value (the EVM adds the
+///   2,300 stipend) and 2,300 without, and explicit `{gas: n}` caps.
+/// - An operand at or above that, as `call(gas(), ...)` passes, means "everything left", and so
+///   does a cap above [`SETTLEMENT_CALL_GAS_BUDGET`], which an over-limit trace can carry but no
+///   settlement can meet. Both become [`CALL_GAS_UNCAPPED`]: always settleable, though the settler
+///   then picks the callee's gas.
+///
+/// Sizing an uncapped call's need, so it is capped too, needs the callee simulated cold and warm.
+pub fn traced_call_gas_limit(operand: U256, gas_at_call: u64) -> U256 {
+    let passed_on = all_but_one_64th(gas_at_call.saturating_sub(CALL_OPCODE_MAX_COST));
+    match u64::try_from(operand) {
+        Ok(cap) if cap < passed_on && cap <= SETTLEMENT_CALL_GAS_BUDGET => U256::from(cap),
+        _ => CALL_GAS_UNCAPPED,
+    }
+}
+
 /// Opcodes whose memory [`append_state_update_from_struct_log`] reads; it must cover every
 /// `copy_memory` there, since the wasm crate's lean trace parser drops memory for every other opcode.
 pub fn reads_memory(op: &str) -> bool {
@@ -96,10 +135,10 @@ pub fn append_state_update_from_struct_log(
             let offset: usize = stack[1].try_into().expect("invalid CREATE offset");
             let length: usize = stack[2].try_into().expect("invalid CREATE length");
             let initcode = copy_memory(&memory, offset, length);
-            state_updates.push(StateUpdate::Create(IStateUpdateTypes::Create {
+            state_updates.push(StateUpdate::Create(IStateUpdateTypes::Create::unpinned(
                 value,
-                initcode: initcode.into(),
-            }));
+                initcode.into(),
+            )));
         }
         "CREATE2" => {
             // Stack: [value, offset, size, salt] (top = index 0 after reverse)
@@ -136,6 +175,8 @@ pub fn append_state_update_from_struct_log(
                 target: Address::from_word(stack[1].into()),
                 value: stack[2],
                 callargs: args.into(),
+                resultHash: B256::ZERO,
+                gasLimit: traced_call_gas_limit(stack[0], struct_log.gas),
             }));
         }
         "LOG0" => {
@@ -557,6 +598,71 @@ mod tests {
             storage: None,
             refund_counter: None,
         }
+    }
+
+    #[test]
+    fn call_gas_limit_keeps_caps_the_call_imposed() {
+        let gas = 1_000_000;
+        // `transfer` with value, `send` without, an explicit cap.
+        for cap in [0u64, 2_300, 50_000] {
+            assert_eq!(traced_call_gas_limit(U256::from(cap), gas), U256::from(cap));
+        }
+    }
+
+    #[test]
+    fn call_gas_limit_leaves_everything_left_uncapped() {
+        let gas = 1_000_000;
+        // `call(gas(), ...)` passes the gas left, which the EVM trims to 63/64.
+        assert_eq!(
+            traced_call_gas_limit(U256::from(gas), gas),
+            CALL_GAS_UNCAPPED
+        );
+        assert_eq!(
+            traced_call_gas_limit(U256::from(all_but_one_64th(gas)), gas),
+            CALL_GAS_UNCAPPED
+        );
+        assert_eq!(traced_call_gas_limit(U256::MAX, gas), CALL_GAS_UNCAPPED);
+    }
+
+    /// An over-limit trace can impose a cap no settlement transaction can meet.
+    #[test]
+    fn call_gas_limit_never_exceeds_the_settlement_budget() {
+        let gas = 1u64 << 30;
+        let over = SETTLEMENT_CALL_GAS_BUDGET + 1;
+        assert_eq!(
+            traced_call_gas_limit(U256::from(over), gas),
+            CALL_GAS_UNCAPPED
+        );
+        assert_eq!(
+            traced_call_gas_limit(U256::from(SETTLEMENT_CALL_GAS_BUDGET), gas),
+            U256::from(SETTLEMENT_CALL_GAS_BUDGET)
+        );
+    }
+
+    #[test]
+    fn call_decodes_its_gas_operand() {
+        // Stack bottom→top: retSize, retOffset, argsSize, argsOffset, value, address, gas.
+        let stack = vec![
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            U256::from(1u64),
+            U256::from(0xabcdu64),
+            U256::ZERO,
+        ];
+        let mut updates = Vec::new();
+        append_state_update_from_struct_log(&mut updates, make_struct_log("CALL", stack, vec![]))
+            .unwrap();
+        let StateUpdate::Call(call) = &updates[0] else {
+            panic!("expected Call, got {:?}", updates[0]);
+        };
+        assert_eq!(
+            call.gasLimit,
+            U256::ZERO,
+            "a transfer with value keeps its 0"
+        );
+        assert_eq!(call.resultHash, B256::ZERO);
     }
 
     #[test]

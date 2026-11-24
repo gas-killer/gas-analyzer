@@ -154,8 +154,8 @@ use gas_analyzer_core::{
     encode_state_updates_to_abi, estimate_gas_from_operations, extract_operation_counts_from_trace,
     frame_failure, validate_unbounded_cost, validate_unbounded_tree_cost,
 };
-use gas_analyzer_estimator::SimEnvOpts;
 pub use gas_analyzer_estimator::{PrecedingTx, reverting_context};
+use gas_analyzer_estimator::{SignedFormat, SimEnvOpts};
 use gas_analyzer_rpc::{
     MuxedTraces, get_call_frame_from_call_with_profile,
     get_prestate_diff_and_call_frame_with_profile, get_prestate_diff_from_call_with_profile,
@@ -581,6 +581,7 @@ impl DefaultEvmSketchExecutor {
         state_updates: &[gas_analyzer_core::StateUpdate],
         storage_hints: &HashMap<Address, Vec<B256>>,
         value: U256,
+        format: SignedFormat,
     ) -> Result<u64> {
         self.estimate_state_changes_gas_with_hints_timed(
             contract_address,
@@ -588,6 +589,7 @@ impl DefaultEvmSketchExecutor {
             state_updates,
             storage_hints,
             value,
+            format,
         )
         .await
         .map(|(gas, _)| gas)
@@ -604,6 +606,8 @@ impl DefaultEvmSketchExecutor {
     /// with the replay, as in [`Self::estimate_state_changes_gas_with_preceding`], so a payload
     /// whose updates spend or check the ETH that call brought in prices as it will land instead of
     /// reverting for want of it.
+    ///
+    /// `format` is the consumer's signed format, which picks the estimator it is priced with.
     pub async fn estimate_state_changes_gas_with_hints_timed(
         &self,
         contract_address: Address,
@@ -611,6 +615,7 @@ impl DefaultEvmSketchExecutor {
         state_updates: &[gas_analyzer_core::StateUpdate],
         storage_hints: &HashMap<Address, Vec<B256>>,
         value: U256,
+        format: SignedFormat,
     ) -> Result<(u64, EstimateTimings)> {
         let state_block = self.anchor_block_number().saturating_sub(1);
         let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
@@ -622,8 +627,11 @@ impl DefaultEvmSketchExecutor {
             .context("storage slot prefetch failed")?;
         let prefetch = prefetch_started.elapsed();
 
-        let mut sim_env = self.sim_env();
-        sim_env.value = value;
+        let sim_env = SimEnvOpts {
+            value,
+            format,
+            ..self.sim_env()
+        };
         let execute_started = Instant::now();
         let gas = gas_analyzer_estimator::estimate_state_changes_gas(
             &mut cache_db,
@@ -643,13 +651,15 @@ impl DefaultEvmSketchExecutor {
 
     /// Like [`Self::estimate_state_changes_gas_with_hints_timed`] for a nested tree: the frames
     /// run in execution order on one state (see [`gas_analyzer_estimator::estimate_frame_tree_gas`]),
-    /// returning each frame's gas in frame order. `value` is the root call's `msg.value`.
+    /// returning each frame's gas in frame order. `value` is the root call's `msg.value`, and
+    /// `format` the signed format the tree's consumers settle.
     pub async fn estimate_frame_tree_gas_with_hints_timed(
         &self,
         frames: &[FrameProgram],
         caller_address: Address,
         storage_hints: &HashMap<Address, Vec<B256>>,
         value: U256,
+        format: SignedFormat,
     ) -> Result<(Vec<u64>, EstimateTimings)> {
         let state_block = self.anchor_block_number().saturating_sub(1);
         let simple_db = SimpleRpcDb::new(self.sketch.provider.clone(), state_block);
@@ -662,7 +672,7 @@ impl DefaultEvmSketchExecutor {
         let prefetch = prefetch_started.elapsed();
 
         let sim_env = SimEnvOpts {
-            format: gas_analyzer_estimator::SignedFormat::V0_1,
+            format,
             value,
             ..self.sim_env()
         };
@@ -683,7 +693,8 @@ impl DefaultEvmSketchExecutor {
         ))
     }
 
-    /// Build a `SimEnv` from the anchored block header.
+    /// Build a `SimEnv` from the anchored block header, for a v0.1.0 consumer: the signed-path
+    /// estimators take the consumer's format and override it.
     ///
     /// `gas_price` defaults to 0 since it is a transaction-level field;
     /// callers with access to the original transaction can override it.
@@ -1272,7 +1283,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch(
 /// Simulates the call via `debug_traceCall` at the given block under the real chain environment,
 /// extracts state updates under the chosen [`StateEncoding`], encodes them to ABI, and estimates gas.
 /// Convenience wrapper over [`call_to_encoded_state_updates_with_evmsketch_profiled`] for the
-/// [`SimProfile::Chain`] case.
+/// [`SimProfile::Chain`] case and a v0.1.0 consumer.
 pub async fn call_to_encoded_state_updates_with_evmsketch_mode(
     cache: &EvmSketchExecutorCache,
     rpc_url: impl AsRef<str>,
@@ -1287,6 +1298,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_mode(
         block_number,
         encoding,
         SimProfile::Chain,
+        SignedFormat::V0_1,
     )
     .await
 }
@@ -1295,7 +1307,9 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_mode(
 /// explicit [`StateEncoding`] and [`SimProfile`].
 ///
 /// The encoding selects the *signed representation* of the payload; the profile selects the *EVM
-/// environment the tracked function is simulated under*. They are independent axes.
+/// environment the tracked function is simulated under*. They are independent axes. `format` is
+/// the consumer's solidity-sdk format (its `IGasKillerSDK` interface ID), which decides the
+/// payload's op layouts and the estimator it is priced with.
 ///
 /// The executor build step (~50–70 ms, 1× `eth_getBlockByNumber`; plus `eth_chainId` on the first
 /// miss per URL) is skipped on cache hits. The HTTP connection pool for `rpc_url` is managed by
@@ -1324,6 +1338,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
     block_number: u64,
     encoding: StateEncoding,
     profile: SimProfile,
+    format: SignedFormat,
 ) -> Result<EncodedStateUpdates> {
     let rpc_url = rpc_url.as_ref();
     let provider = cache.get_or_create_trace_provider(rpc_url)?;
@@ -1410,7 +1425,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
         );
     }
 
-    let storage_updates = encode_state_updates_to_abi(&state_updates);
+    let storage_updates = encode_state_updates_to_abi(&state_updates, format);
 
     // Merge access-list hints with slots derived from state_updates.
     // Store slots all land at contract_address (one eth_getProof call for all of them).
@@ -1427,6 +1442,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
             &state_updates,
             &all_hints,
             tx_value,
+            format,
         )
         .await?;
 
@@ -1751,6 +1767,7 @@ pub struct EncodedFrameTree {
 /// prestate net form never applies to a call that makes a regular `CALL`. Under
 /// [`StateEncoding::PrestateNet`] a call the net form represents is returned as a single frame.
 #[tracing::instrument(name = "evmsketch.encode_frame_tree", skip_all, fields(block_number, encoding = ?encoding, profile = ?profile, frame_count = tracing::field::Empty))]
+#[allow(clippy::too_many_arguments)]
 pub async fn call_to_frame_tree_with_evmsketch(
     cache: &EvmSketchExecutorCache,
     rpc_url: impl AsRef<str>,
@@ -1758,6 +1775,7 @@ pub async fn call_to_frame_tree_with_evmsketch(
     block_number: u64,
     encoding: StateEncoding,
     profile: SimProfile,
+    format: SignedFormat,
     cost: &NestingCostModel,
 ) -> Result<EncodedFrameTree> {
     if encoding == StateEncoding::Legacy {
@@ -1796,6 +1814,7 @@ pub async fn call_to_frame_tree_with_evmsketch(
                     &updates,
                     &hints,
                     tx_value,
+                    format,
                 )
                 .await?;
             let frame = FrameProgram {
@@ -1872,7 +1891,13 @@ pub async fn call_to_frame_tree_with_evmsketch(
         }
     }
     let (frame_gas, estimate) = executor
-        .estimate_frame_tree_gas_with_hints_timed(&tree.frames, caller_address, &hints, tx_value)
+        .estimate_frame_tree_gas_with_hints_timed(
+            &tree.frames,
+            caller_address,
+            &hints,
+            tx_value,
+            format,
+        )
         .await?;
     let gas_estimate = frame_tree_total(&frame_gas, cost);
     let (prefetch, revm_estimate) = (estimate.prefetch, estimate.execute);
@@ -2579,6 +2604,8 @@ mod tests {
                 target: call_target,
                 value: U256::ZERO,
                 callargs: Bytes::new(),
+                resultHash: alloy::primitives::B256::ZERO,
+                gasLimit: alloy::primitives::U256::MAX,
             }),
             StateUpdate::Log0(IStateUpdateTypes::Log0 { data: Bytes::new() }),
         ];
@@ -3036,6 +3063,7 @@ mod tests {
                 block,
                 StateEncoding::Canonical,
                 SimProfile::Chain,
+                SignedFormat::V0_1,
                 cost,
             )
             .await
@@ -3217,6 +3245,8 @@ mod tests {
                 target: gate,
                 value: U256::ZERO,
                 callargs: Bytes::new(),
+                resultHash: alloy::primitives::B256::ZERO,
+                gasLimit: alloy::primitives::U256::MAX,
             })];
             let replay_at = |gas_price| {
                 gk.estimate_state_changes_gas_with_preceding(
@@ -3630,8 +3660,8 @@ mod tests {
         /// since the encoded bytes are what ships to `verifyAndUpdate`.
         fn assert_updates_eq(actual: &[StateUpdate], expected: &[StateUpdate], ctx: &str) {
             assert_eq!(
-                encode_state_updates_to_abi(actual),
-                encode_state_updates_to_abi(expected),
+                encode_state_updates_to_abi(actual, SignedFormat::V0_2),
+                encode_state_updates_to_abi(expected, SignedFormat::V0_2),
                 "{ctx}:\n  actual:   {actual:?}\n  expected: {expected:?}"
             );
         }
@@ -3689,6 +3719,7 @@ mod tests {
                 block_number,
                 encoding,
                 SimProfile::Chain,
+                SignedFormat::V0_1,
             )
             .await
             .expect("encode failed")
@@ -3732,6 +3763,7 @@ mod tests {
                 block,
                 StateEncoding::Legacy,
                 SimProfile::Chain,
+                SignedFormat::V0_1,
             )
             .await
             .expect(
@@ -3931,6 +3963,7 @@ mod tests {
                     block,
                     encoding,
                     SimProfile::Chain,
+                    SignedFormat::V0_1,
                 )
                 .await
                 .expect_err("a reverted call has no program");
@@ -3945,6 +3978,7 @@ mod tests {
                     block,
                     encoding,
                     SimProfile::Chain,
+                    SignedFormat::V0_1,
                     &gas_analyzer_core::nested::NESTING_COST_MODEL_V1,
                 )
                 .await
@@ -4223,6 +4257,8 @@ mod tests {
                         target: callee,
                         value: U256::ZERO,
                         callargs: Bytes::new(),
+                        resultHash: alloy::primitives::B256::ZERO,
+                        gasLimit: alloy::primitives::U256::MAX,
                     }),
                     store_up(4, 1),
                 ],
@@ -5198,7 +5234,7 @@ mod tests {
             )
             .await
             .unwrap_or_else(|e| panic!("{}: {e:#}", shape.name))
-            .map(|updates| encode_state_updates_to_abi(&updates))
+            .map(|updates| encode_state_updates_to_abi(&updates, SignedFormat::V0_2))
         }
 
         #[tokio::test(flavor = "multi_thread")]

@@ -15,7 +15,9 @@ use gas_analyzer_core::{
     build_state_updates_from_prestate, classify_prestate_eligibility, compute_state_updates,
     encode_state_updates_to_abi, estimate_gas_from_state_updates,
 };
-use gas_analyzer_estimator::{SimEnvOpts, estimate_frame_tree_gas, estimate_state_changes_gas};
+use gas_analyzer_estimator::{
+    SignedFormat, SimEnvOpts, estimate_frame_tree_gas, estimate_state_changes_gas,
+};
 use revm::database::{CacheDB, EmptyDB};
 use revm::primitives::KECCAK_EMPTY;
 use revm::primitives::hardfork::SpecId;
@@ -659,7 +661,7 @@ fn analyze_extract(
 ) -> Result<AnalyzeTraceResult, String> {
     let state_updates: &[StateUpdate] = &extract.state_updates;
 
-    let encoded = encode_state_updates_to_abi(state_updates);
+    let encoded = encode_state_updates_to_abi(state_updates, SignedFormat::V0_1);
 
     let addr: Address = estimator_address
         .parse()
@@ -978,7 +980,7 @@ pub fn encode_trace_inner(trace_json: &str) -> Result<EncodeTraceResult, String>
         ..
     } = parse_and_compute(trace_json, None)?.0;
 
-    let encoded = encode_state_updates_to_abi(&state_updates);
+    let encoded = encode_state_updates_to_abi(&state_updates, SignedFormat::V0_1);
     let mut skipped = skipped_opcodes.into_iter().collect::<Vec<_>>();
     skipped.sort();
 
@@ -2477,6 +2479,8 @@ mod tests {
             target: recipient,
             value: U256::from(1),
             callargs: Default::default(),
+            resultHash: alloy_primitives::B256::ZERO,
+            gasLimit: alloy_primitives::U256::MAX,
         });
         let accounts = |pre: serde_json::Value| {
             let diff = serde_json::json!({ "pre": { recipient.to_string(): pre }, "post": {} });

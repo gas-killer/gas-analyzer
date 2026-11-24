@@ -1193,8 +1193,12 @@ fn prune_unprofitable(programs: &mut [ProgramState], cost: &NestingCostModel) {
         if programs[id].dropped {
             continue;
         }
-        let program_bytes =
-            encoded_program(programs[id].updates.as_deref().unwrap_or_default()).len();
+        // Sized in the v0.2.0 layout, a superset of v0.1.0's.
+        let program_bytes = encoded_program(
+            programs[id].updates.as_deref().unwrap_or_default(),
+            SignedFormat::V0_2,
+        )
+        .len();
         let children_bytes: usize = programs[id]
             .children
             .iter()
@@ -1365,7 +1369,7 @@ pub fn encode_frame_tree(
         if children.next().is_some() {
             bail!("frame {i} has more children than NESTED ops");
         }
-        programs[i] = encoded_program(&updates);
+        programs[i] = encoded_program(&updates, format);
         let index = frame
             .transition_index
             .ok_or_else(|| anyhow::anyhow!("frame {i} has no transition index"))?;
@@ -1738,8 +1742,8 @@ mod tests {
         let tree = split(logs, &[]);
         assert_eq!(tree.frames.len(), 1);
         assert_eq!(
-            encoded_program(&tree.frames[0].updates),
-            encoded_program(&canonical)
+            encoded_program(&tree.frames[0].updates, SignedFormat::V0_2),
+            encoded_program(&canonical, SignedFormat::V0_2)
         );
         assert_eq!(kinds(&canonical), ["STORE", "STORE", "CALL"]);
         assert_eq!(tree.call_gas_total, 900_000);
@@ -2290,8 +2294,8 @@ mod tests {
         let tree = what_if(logs, &[]);
         assert_eq!(tree.frames.len(), 1);
         assert_eq!(
-            encoded_program(&tree.frames[0].updates),
-            encoded_program(&canonical)
+            encoded_program(&tree.frames[0].updates, SignedFormat::V0_2),
+            encoded_program(&canonical, SignedFormat::V0_2)
         );
     }
 
@@ -2358,7 +2362,7 @@ mod tests {
         let enc = |t: &FrameTreeExtract| -> Vec<Bytes> {
             t.frames
                 .iter()
-                .map(|f| encoded_program(&f.updates))
+                .map(|f| encoded_program(&f.updates, SignedFormat::V0_2))
                 .collect()
         };
         assert_eq!(enc(&a), enc(&b));

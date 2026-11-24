@@ -43,6 +43,8 @@
 //! commitment) simulate fine under `Unbounded` even though they could never
 //! land in a real transaction. Only the *signed payload* must fit on-chain.
 
+use crate::heuristic::COLD_ACCOUNT_ACCESS_COST;
+use crate::signed_format::SignedFormat;
 use crate::types::StateUpdate;
 use alloy_primitives::{B256, b256};
 
@@ -365,6 +367,11 @@ pub fn estimate_applied_payload_gas(
             // Charged through `external_call_gas`, which a create's analytic cost would
             // understate: it leaves out the initcode's execution and the code deposit.
             StateUpdate::Create(_) | StateUpdate::Create2(_) => 0,
+            // The cold access a check repeats. A STATICCALL_CHECK's callee is charged through
+            // `external_call_gas`, as a `CALL`'s is.
+            StateUpdate::StaticCallCheck(_)
+            | StateUpdate::BalanceCheck(_)
+            | StateUpdate::CodehashCheck(_) => COLD_ACCOUNT_ACCESS_COST,
         });
     }
 
@@ -372,7 +379,8 @@ pub fn estimate_applied_payload_gas(
     // approximation: that keeps dense and sparse slot values honest, covers a log's data bytes,
     // and stays correct if the encoding changes. The payload is what a `verifyAndUpdate`
     // transaction carries, bar the selector and attestation, which ride inside `signature_floor`.
-    let payload = crate::encoding::encode_state_updates_to_abi(updates);
+    // Sized in the v0.2.0 layout, a superset of v0.1.0's: the gate doesn't know which one lands.
+    let payload = crate::encoding::encode_state_updates_to_abi(updates, SignedFormat::V0_2);
     gas = gas.saturating_add(
         (payload.len() as u64).saturating_mul(UNBOUNDED_APPLY_GAS_PER_PAYLOAD_BYTE),
     );
@@ -460,6 +468,10 @@ fn validate(
             StateUpdate::Create(_) | StateUpdate::Create2(_) => {
                 return Err(UnboundedCostViolation::CreateNotAllowed { index });
             }
+            // Reads, which change nothing; counted with the calls that reach other contracts.
+            StateUpdate::StaticCallCheck(_)
+            | StateUpdate::BalanceCheck(_)
+            | StateUpdate::CodehashCheck(_) => cost.calls += 1,
         }
     }
     cost.applied_gas_upper_bound =
@@ -488,11 +500,11 @@ mod tests {
     }
 
     fn call() -> StateUpdate {
-        StateUpdate::Call(IStateUpdateTypes::Call {
-            target: Address::ZERO,
-            value: U256::ZERO,
-            callargs: Bytes::new(),
-        })
+        StateUpdate::Call(IStateUpdateTypes::Call::unpinned(
+            Address::ZERO,
+            U256::ZERO,
+            Bytes::new(),
+        ))
     }
 
     fn log1() -> StateUpdate {
@@ -503,10 +515,10 @@ mod tests {
     }
 
     fn create() -> StateUpdate {
-        StateUpdate::Create(IStateUpdateTypes::Create {
-            value: U256::ZERO,
-            initcode: Bytes::new(),
-        })
+        StateUpdate::Create(IStateUpdateTypes::Create::unpinned(
+            U256::ZERO,
+            Bytes::new(),
+        ))
     }
 
     /// Budget with no signature floor and no call gas, so tests price only the payload ops.

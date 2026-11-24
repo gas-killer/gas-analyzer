@@ -122,6 +122,21 @@ fn print_report(report: &StateUpdateReport) {
                 println!("  Target: {:?}", n.target);
                 println!("  Child leaf: {:?}", n.childLeaf);
             }
+            StateUpdate::StaticCallCheck(c) => {
+                println!("  Type: STATICCALL_CHECK");
+                println!("  Target: {:?}", c.target);
+                println!("  Result hash: {:?}", c.resultHash);
+            }
+            StateUpdate::BalanceCheck(c) => {
+                println!("  Type: BALANCE_CHECK");
+                println!("  Account: {:?}", c.account);
+                println!("  Balance: {}", c.balance);
+            }
+            StateUpdate::CodehashCheck(c) => {
+                println!("  Type: CODEHASH_CHECK");
+                println!("  Account: {:?}", c.account);
+                println!("  Code hash: {:?}", c.codehash);
+            }
         }
     }
 }

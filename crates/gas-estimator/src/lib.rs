@@ -215,7 +215,7 @@ pub fn build_gas_estimation_calldata_v0_2(
     state_updates: &[StateUpdate],
     ranges: &[ProtectedRange],
 ) -> Bytes {
-    let (types, args) = encode_state_updates_to_sol(state_updates);
+    let (types, args) = encode_state_updates_to_sol(state_updates, SignedFormat::V0_2);
     v0_2::runStateUpdatesCallCall {
         types: types.iter().map(|t| *t as u8).collect(),
         args,
@@ -260,7 +260,7 @@ static IMPL_SLOT: LazyLock<U256> = LazyLock::new(|| {
 /// This encodes the state updates into the calldata format expected by the
 /// StateChangeHandlerGasEstimator contract.
 pub fn build_gas_estimation_calldata(state_updates: &[StateUpdate]) -> Result<Bytes> {
-    let (types, args) = encode_state_updates_to_sol(state_updates);
+    let (types, args) = encode_state_updates_to_sol(state_updates, SignedFormat::V0_1);
 
     let types_array = DynSolValue::Array(
         types
@@ -1331,6 +1331,8 @@ mod tests {
             target: callee_address,
             value: U256::ZERO,
             callargs: test_selector,
+            resultHash: alloy_primitives::B256::ZERO,
+            gasLimit: alloy_primitives::U256::MAX,
         })];
 
         // Use any address for the estimator contract — it just needs to not
@@ -1378,6 +1380,8 @@ mod tests {
             target: callee_address,
             value: U256::ZERO,
             callargs: test_selector,
+            resultHash: alloy_primitives::B256::ZERO,
+            gasLimit: alloy_primitives::U256::MAX,
         })];
 
         let estimator_address = address!("0x000000000000000000000000000000000000E570");
@@ -1427,6 +1431,8 @@ mod tests {
             target: callee_address,
             value: U256::ZERO,
             callargs: test_selector,
+            resultHash: alloy_primitives::B256::ZERO,
+            gasLimit: alloy_primitives::U256::MAX,
         })];
 
         let estimator_address = address!("0x000000000000000000000000000000000000E570");
@@ -1476,6 +1482,8 @@ mod tests {
             target: callee_address,
             value: U256::ZERO,
             callargs: test_selector,
+            resultHash: alloy_primitives::B256::ZERO,
+            gasLimit: alloy_primitives::U256::MAX,
         })];
 
         let estimator_address = address!("0x000000000000000000000000000000000000E570");
@@ -1975,6 +1983,8 @@ mod tests {
             target,
             value: U256::ZERO,
             callargs: Bytes::from_static(&[0x01]),
+            resultHash: alloy_primitives::B256::ZERO,
+            gasLimit: alloy_primitives::U256::MAX,
         })
     }
 
@@ -1983,6 +1993,8 @@ mod tests {
             target,
             value,
             callargs: Bytes::new(),
+            resultHash: alloy_primitives::B256::ZERO,
+            gasLimit: alloy_primitives::U256::MAX,
         })
     }
 
@@ -2475,5 +2487,103 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("v0.1.0 calldata"), "{err}");
+    }
+
+    // ------------------------------------------------------------------------
+    // v0.2.0 program layouts through the v0.2.0 handler
+    // ------------------------------------------------------------------------
+
+    /// `keccak256(abi.encodePacked(true))`: a successful call that returned nothing.
+    fn empty_success_hash() -> B256 {
+        alloy_primitives::keccak256([1u8])
+    }
+
+    fn pinned_call(target: Address, result_hash: B256, gas_limit: U256) -> StateUpdate {
+        StateUpdate::Call(IStateUpdateTypes::Call {
+            target,
+            value: U256::ZERO,
+            callargs: Bytes::from_static(&[0x01]),
+            resultHash: result_hash,
+            gasLimit: gas_limit,
+        })
+    }
+
+    #[test]
+    fn v0_2_settles_a_call_whose_result_matches_its_pin() {
+        let target = address!("0x00000000000000000000000000000000000c0002");
+        let updates = vec![pinned_call(target, empty_success_hash(), U256::MAX)];
+        estimate(&mut CacheDB::new(EmptyDB::default()), &updates)
+            .expect("the pinned result matches");
+    }
+
+    #[test]
+    fn v0_2_rejects_a_call_whose_result_moved() {
+        let target = address!("0x00000000000000000000000000000000000c0002");
+        let updates = vec![pinned_call(target, B256::repeat_byte(0x42), U256::MAX)];
+        let err = estimate(&mut CacheDB::new(EmptyDB::default()), &updates).unwrap_err();
+        let reverted = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<EstimateReverted>())
+            .expect("an estimator revert");
+        let selector = alloy_primitives::keccak256("ObservationMismatch(uint256,bytes32,bytes32)");
+        assert_eq!(reverted.output[..4], selector[..4]);
+    }
+
+    #[test]
+    fn v0_2_honors_a_call_gas_cap() {
+        let target = address!("0x00000000000000000000000000000000000c0002");
+        let capped = vec![pinned_call(target, B256::ZERO, U256::from(2_300))];
+        estimate(&mut CacheDB::new(EmptyDB::default()), &capped).expect("a 2,300 cap settles");
+    }
+
+    #[test]
+    fn v0_2_checks_balances_and_code() {
+        let account = address!("0x00000000000000000000000000000000000c0003");
+        let mut cache_db = CacheDB::new(EmptyDB::default());
+        cache_db.insert_account_info(
+            account,
+            AccountInfo {
+                balance: U256::from(5),
+                ..Default::default()
+            },
+        );
+        let balance = |balance: u64| {
+            StateUpdate::BalanceCheck(IStateUpdateTypes::BalanceCheck {
+                account,
+                balance: U256::from(balance),
+            })
+        };
+        let codehash = StateUpdate::CodehashCheck(IStateUpdateTypes::CodehashCheck {
+            account,
+            codehash: B256::ZERO,
+        });
+        estimate(&mut cache_db.clone(), &[balance(5), codehash]).expect("observations hold");
+        assert!(
+            estimate(&mut cache_db, &[balance(6)]).is_err(),
+            "a moved balance fails"
+        );
+    }
+
+    /// A v0.1.0 estimate of the same program ignores the pins, which v0.1.0 can't carry.
+    #[test]
+    fn v0_1_ignores_v0_2_pins() {
+        let target = address!("0x00000000000000000000000000000000000c0002");
+        let mut updates = vec![pinned_call(
+            target,
+            B256::repeat_byte(0x42),
+            U256::from(2_300),
+        )];
+        updates.push(StateUpdate::BalanceCheck(IStateUpdateTypes::BalanceCheck {
+            account: target,
+            balance: U256::from(1),
+        }));
+        estimate_state_changes_gas(
+            &mut CacheDB::new(EmptyDB::default()),
+            ROOT_V0_2,
+            CALLER_V0_2,
+            &updates,
+            &sim_env_with_spec(SpecId::PRAGUE),
+        )
+        .expect("v0.1.0 has no pins to fail");
     }
 }

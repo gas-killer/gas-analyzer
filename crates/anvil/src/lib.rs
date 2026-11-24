@@ -52,8 +52,9 @@ fn impl_slot() -> U256 {
 }
 
 use gas_analyzer_core::{
-    Opcode, RevertingContext, SignatureType, StateUpdate, TURETZKY_UPPER_GAS_LIMIT_SCHNORR,
-    TraceExtract, compute_state_updates, encode_state_updates_to_abi, encode_state_updates_to_sol,
+    Opcode, RevertingContext, SignatureType, SignedFormat, StateUpdate,
+    TURETZKY_UPPER_GAS_LIMIT_SCHNORR, TraceExtract, compute_state_updates,
+    encode_state_updates_to_abi, encode_state_updates_to_sol,
 };
 use gas_analyzer_rpc::get_tx_trace;
 
@@ -318,7 +319,7 @@ impl GasKiller<ConnectHTTPDefaultProvider> {
 
         let target_contract = StateChangeHandlerGasEstimator::new(contract_address, &self.provider);
 
-        let (types, args) = encode_state_updates_to_sol(state_updates);
+        let (types, args) = encode_state_updates_to_sol(state_updates, SignedFormat::V0_1);
         let types = types.iter().map(|x| *x as u8).collect::<Vec<_>>();
         let tx = target_contract
             .runStateUpdatesCall(types, args)
@@ -681,7 +682,7 @@ pub async fn call_to_encoded_state_updates_with_gas_estimate(
         .estimate_state_changes_gas(contract_address, &state_updates)
         .await?;
     Ok((
-        encode_state_updates_to_abi(&state_updates),
+        encode_state_updates_to_abi(&state_updates, SignedFormat::V0_1),
         gas_estimate,
         skipped_opcodes,
     ))
@@ -859,13 +860,13 @@ mod tests {
             }),
         ];
 
-        let encoded = encode_state_updates_to_abi(&state_updates);
+        let encoded = encode_state_updates_to_abi(&state_updates, SignedFormat::V0_1);
         let (types, data) = decode_state_updates_tuple(&encoded)?;
         assert_eq!(
             types,
             vec![U256::from(0u8), U256::from(2u8), U256::from(3u8),]
         );
-        let (_, expected_data) = encode_state_updates_to_sol(&state_updates);
+        let (_, expected_data) = encode_state_updates_to_sol(&state_updates, SignedFormat::V0_1);
         assert_eq!(data.len(), expected_data.len());
         for (i, (decoded, expected)) in data.iter().zip(expected_data.iter()).enumerate() {
             assert_eq!(
@@ -893,7 +894,7 @@ mod tests {
             }),
         ];
 
-        let encoded = encode_state_updates_to_abi(&state_updates);
+        let encoded = encode_state_updates_to_abi(&state_updates, SignedFormat::V0_1);
 
         let (types, data) = decode_state_updates_tuple(&encoded)?;
         assert_eq!(types.len(), 3, "Should have 3 state updates");
@@ -903,7 +904,7 @@ mod tests {
         assert_eq!(types[2], U256::from(StateUpdateType::LOG1 as u8));
 
         // Verify decoded data matches the original ABI-encoded state updates
-        let (_, expected_data) = encode_state_updates_to_sol(&state_updates);
+        let (_, expected_data) = encode_state_updates_to_sol(&state_updates, SignedFormat::V0_1);
         for (i, (decoded, expected)) in data.iter().zip(expected_data.iter()).enumerate() {
             assert_eq!(
                 decoded, expected,
@@ -1164,6 +1165,7 @@ mod tests {
             target,
             value,
             callargs,
+            ..
         }) = &state_updates[1]
         else {
             bail!("Expected Call, got {:?}", state_updates[1]);

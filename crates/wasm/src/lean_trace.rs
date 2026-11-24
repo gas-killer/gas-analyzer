@@ -117,7 +117,7 @@ impl<'de> Visitor<'de> for LeanStructLogVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gas_analyzer_core::{compute_state_updates, encode_state_updates_to_abi};
+    use gas_analyzer_core::{SignedFormat, compute_state_updates, encode_state_updates_to_abi};
 
     fn parse_lean_frame(json: &[u8]) -> serde_json::Result<DefaultFrame> {
         serde_json::from_slice::<LeanFrame>(json).map(Into::into)
@@ -222,8 +222,8 @@ mod tests {
         let full = compute_state_updates(serde_json::from_slice(&json).unwrap(), None).unwrap();
         assert_eq!(lean.state_updates.len(), 3);
         assert_eq!(
-            encode_state_updates_to_abi(&lean.state_updates),
-            encode_state_updates_to_abi(&full.state_updates)
+            encode_state_updates_to_abi(&lean.state_updates, SignedFormat::V0_2),
+            encode_state_updates_to_abi(&full.state_updates, SignedFormat::V0_2)
         );
         assert_eq!(lean.skipped_opcodes, full.skipped_opcodes);
     }
@@ -242,8 +242,8 @@ mod tests {
         let lean = compute_state_updates(parse_lean_frame(&json).unwrap(), None).unwrap();
         let full = compute_state_updates(serde_json::from_slice(&json).unwrap(), None).unwrap();
         assert_eq!(
-            encode_state_updates_to_abi(&lean.state_updates),
-            encode_state_updates_to_abi(&full.state_updates)
+            encode_state_updates_to_abi(&lean.state_updates, SignedFormat::V0_2),
+            encode_state_updates_to_abi(&full.state_updates, SignedFormat::V0_2)
         );
         assert_eq!(lean.skipped_opcodes, full.skipped_opcodes);
         assert_eq!(lean.call_gas_total, full.call_gas_total);

@@ -37,6 +37,7 @@
 
 use std::collections::HashMap;
 
+use crate::signed_format::SignedFormat;
 use crate::trace::TraceExtract;
 use crate::types::StateUpdate;
 
@@ -50,6 +51,8 @@ pub const CALLDATA_NONZERO_BYTE_COST: u64 = 16;
 pub const LOG_BASE_COST: u64 = 375;
 pub const LOG_TOPIC_COST: u64 = 375;
 pub const LOG_DATA_COST_PER_BYTE: u64 = 8;
+/// EIP-2929 cold account access: what a read check pays to reach its account again.
+pub const COLD_ACCOUNT_ACCESS_COST: u64 = 2_600;
 
 /// Operations and gas data extracted from a trace
 #[derive(Debug, Default)]
@@ -98,9 +101,11 @@ pub fn estimate_gas_from_state_updates(extract: &TraceExtract) -> u64 {
     let mut gas = BASE_TX_COST;
 
     // The replay ships the state updates to the estimator as ABI-encoded
-    // calldata — real gas the on-chain GasKiller call pays.
+    // calldata — real gas the on-chain GasKiller call pays. Priced in the v0.2.0 layout, a
+    // superset of v0.1.0's, so neither format is underestimated.
     gas += calldata_gas(&crate::encoding::encode_state_updates_to_abi(
         &extract.state_updates,
+        SignedFormat::V0_2,
     ));
 
     // Add actual gas used by external calls (cannot be optimized)
@@ -138,6 +143,10 @@ pub fn estimate_gas_from_state_updates(extract: &TraceExtract) -> u64 {
             }
             // Covered by create_gas_total above.
             StateUpdate::Create(_) | StateUpdate::Create2(_) => 0,
+            // The access a check repeats; a STATICCALL_CHECK's callee runs on top.
+            StateUpdate::StaticCallCheck(_)
+            | StateUpdate::BalanceCheck(_)
+            | StateUpdate::CodehashCheck(_) => COLD_ACCOUNT_ACCESS_COST,
         };
     }
 
@@ -344,7 +353,10 @@ mod refund_tests {
     /// Calldata cost of shipping an empty state-update set to the estimator
     /// (the ABI framing alone is nonzero).
     fn empty_calldata() -> u64 {
-        calldata_gas(&crate::encoding::encode_state_updates_to_abi(&[]))
+        calldata_gas(&crate::encoding::encode_state_updates_to_abi(
+            &[],
+            SignedFormat::V0_2,
+        ))
     }
 
     #[test]
@@ -402,6 +414,7 @@ mod refund_tests {
         };
         let calldata = calldata_gas(&crate::encoding::encode_state_updates_to_abi(
             &e.state_updates,
+            SignedFormat::V0_2,
         ));
         assert_eq!(
             estimate_gas_from_state_updates(&e),
