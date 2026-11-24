@@ -133,6 +133,7 @@ fn warn_if_unsupported_hardfork(chain_id: u64, hardforks: &EthereumChainHardfork
     }
 }
 
+mod local_scan;
 pub mod revert_trace;
 pub mod simple_rpc_db;
 use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
@@ -159,7 +160,7 @@ pub use gas_analyzer_estimator::{PrecedingTx, reverting_context};
 use gas_analyzer_rpc::{
     MuxedTraces, get_call_frame_from_call_with_profile, get_observation_from_call_with_profile,
     get_prestate_diff_and_call_frame_with_profile, get_prestate_diff_from_call_with_profile,
-    get_trace_from_call_with_profile, resolve_code_hashes,
+    get_prestate_from_call_with_profile, get_trace_from_call_with_profile, resolve_code_hashes,
 };
 
 // ============================================================================
@@ -1562,6 +1563,82 @@ struct Extracted {
     parse: Duration,
 }
 
+/// The observation scan run in-process (see [`local_scan`]): `Some` with its answer when a revm
+/// replay of the call reproduced the node's run, `None` when the node has to be asked instead.
+///
+/// The node's own scan is a JavaScript tracer that runs on every step, which on a heavy call takes
+/// longer than a signing round. The replay needs only the call's touched state, which the node's
+/// native `prestateTracer` reports in one cheap request.
+async fn local_observation<P: Provider + DebugApi>(
+    provider: &P,
+    diff: &DiffMode,
+    frame: &CallFrame,
+    tx_request: &TransactionRequest,
+    block: BlockId,
+    profile: SimProfile,
+) -> Option<Option<String>> {
+    let fetched = tokio::try_join!(
+        get_prestate_from_call_with_profile(provider, tx_request.clone(), block, profile),
+        async {
+            provider
+                .get_block(block)
+                .await
+                .map_err(|e| anyhow!("fetching the block: {e}"))?
+                .ok_or_else(|| anyhow!("no block {block}"))
+        },
+        async {
+            provider
+                .get_chain_id()
+                .await
+                .map_err(|e| anyhow!("fetching the chain id: {e}"))
+        },
+    );
+    let (pre, block, chain_id) = match fetched {
+        Ok(fetched) => fetched,
+        Err(e) => {
+            tracing::debug!(error = %e, "can't replay the call locally; asking the node to scan it");
+            return None;
+        }
+    };
+    let header = &block.header.inner;
+    // A chain the analyzer has no fork schedule for runs under revm's default. A fork that
+    // changed what the call did would show up as a divergence.
+    let spec = chain_id_to_genesis_and_spec(chain_id)
+        .map(|(_, hardforks)| alloy_evm::spec(&hardforks, header))
+        .unwrap_or_default();
+    let env = local_scan::ScanEnv {
+        chain_id,
+        spec,
+        number: header.number,
+        timestamp: header.timestamp,
+        gas_limit: header.gas_limit,
+        coinbase: header.beneficiary,
+        prevrandao: header.mix_hash,
+        basefee: header.base_fee_per_gas.unwrap_or_default(),
+        difficulty: header.difficulty,
+    };
+    let (diff, frame, tx) = (diff.clone(), frame.clone(), tx_request.clone());
+    let scanned = tokio::task::spawn_blocking(move || {
+        local_scan::scan_observations(&pre, &frame, &diff, &tx, &env, profile)
+    })
+    .await;
+    match scanned {
+        Ok(Ok(local_scan::LocalScan::Observed(observed))) => Some(observed),
+        Ok(Ok(local_scan::LocalScan::Diverged(reason))) => {
+            tracing::info!(%reason, "the local replay diverged from the node's run; asking the node to scan it");
+            None
+        }
+        Ok(Err(e)) => {
+            tracing::info!(error = %e, "the local replay failed; asking the node to scan it");
+            None
+        }
+        Err(e) => {
+            tracing::info!(error = %e, "the local replay panicked; asking the node to scan it");
+            None
+        }
+    }
+}
+
 /// Build the prestate net form: `Ok(Some(updates))` when the call admits it, `Ok(None)` when the net
 /// form cannot represent the call and the struct-log extractor must produce the program, `Err` when
 /// the tracers are unavailable or fail, or an [`EvmFailure`] when the call itself failed. Never
@@ -1588,19 +1665,26 @@ async fn try_prestate_net<P: Provider + DebugApi>(
             // read anything outside the consumer goes to the struct-log encoder.
             let observed = match static_observation(&frame) {
                 Some(reason) => Some(reason),
-                // A scan that fails says nothing either way: the struct-log encoder pins what
-                // the call read, so it takes the call instead of failing the encode.
-                None => match get_observation_from_call_with_profile(
-                    provider,
-                    tx_request.clone(),
-                    block,
-                    profile,
-                )
-                .await
-                {
-                    Ok(observed) => observed,
-                    Err(e) => Some(format!("the observation scan failed: {e:#}")),
-                },
+                None => {
+                    match local_observation(provider, &diff, &frame, tx_request, block, profile)
+                        .await
+                    {
+                        Some(observed) => observed,
+                        // A scan that fails says nothing either way: the struct-log encoder pins
+                        // what the call read, so it takes the call instead of failing the encode.
+                        None => match get_observation_from_call_with_profile(
+                            provider,
+                            tx_request.clone(),
+                            block,
+                            profile,
+                        )
+                        .await
+                        {
+                            Ok(observed) => observed,
+                            Err(e) => Some(format!("the observation scan failed: {e:#}")),
+                        },
+                    }
+                }
             };
             if let Some(reason) = observed {
                 tracing::debug!(reason = %reason, "call observes outside the consumer; using struct-log encoder");
@@ -3845,6 +3929,89 @@ mod tests {
                     found.as_deref().and_then(|r| r.split(' ').next()),
                     expected,
                     "{to}: {found:?}"
+                );
+            }
+        }
+
+        /// The in-process scan answers as the node's tracer does on real traces: a read at
+        /// target depth or in a delegated library counts, one inside a called contract doesn't,
+        /// and a call that writes storage and logs replays without diverging.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
+        async fn the_local_scan_agrees_with_the_node() {
+            let anvil = spawn_as_sepolia().await;
+            let provider = anvil.provider();
+            let reader = address!("0x0000000000000000000000000000000000002201");
+            let library = address!("0x0000000000000000000000000000000000002202");
+            let delegator = address!("0x0000000000000000000000000000000000002203");
+            let caller = address!("0x0000000000000000000000000000000000002204");
+            let writer = address!("0x0000000000000000000000000000000000002205");
+            // BALANCE(ADDRESS); POP; STOP
+            set_code(&provider, reader, hex_code("30 31 50 00")).await;
+            // SELFBALANCE; POP; STOP
+            set_code(&provider, library, hex_code("47 50 00")).await;
+            let lib = addr_hex(library);
+            set_code(
+                &provider,
+                delegator,
+                hex_code(&format!("6000 6000 6000 6000 73{lib} 5a f4 50 00")),
+            )
+            .await;
+            let r = addr_hex(reader);
+            set_code(
+                &provider,
+                caller,
+                hex_code(&format!("6000 6000 6000 6000 6000 73{r} 5a f1 50 00")),
+            )
+            .await;
+            // SSTORE(1, 42); LOG1(0, 0, topic 7); STOP
+            set_code(
+                &provider,
+                writer,
+                hex_code("602a 6001 55 6007 6000 6000 a1 00"),
+            )
+            .await;
+            let block = BlockId::latest();
+
+            for (to, expected) in [
+                (reader, Some("BALANCE")),
+                (delegator, Some("SELFBALANCE")),
+                (caller, None),
+                (writer, None),
+            ] {
+                let request = call_request(to);
+                let (diff, frame) = tokio::try_join!(
+                    get_prestate_diff_from_call_with_profile(
+                        &provider,
+                        request.clone(),
+                        block,
+                        SimProfile::Chain
+                    ),
+                    get_call_frame_from_call_with_profile(
+                        &provider,
+                        request.clone(),
+                        block,
+                        SimProfile::Chain
+                    ),
+                )
+                .expect("the native tracers run");
+                let local =
+                    local_observation(&provider, &diff, &frame, &request, block, SimProfile::Chain)
+                        .await
+                        .expect("the replay matches the node's run");
+                let node = get_observation_from_call_with_profile(
+                    &provider,
+                    request,
+                    block,
+                    SimProfile::Chain,
+                )
+                .await
+                .expect("the tracer runs");
+                assert_eq!(local, node, "{to}");
+                assert_eq!(
+                    local.as_deref().and_then(|r| r.split(' ').next()),
+                    expected,
+                    "{to}: {local:?}"
                 );
             }
         }

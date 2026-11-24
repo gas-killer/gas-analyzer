@@ -10,7 +10,7 @@ use alloy::rpc::types::trace::geth::mux::{MuxConfig, MuxFrame};
 use alloy::rpc::types::trace::geth::{
     CallConfig, CallFrame, DefaultFrame, DiffMode, GethDebugBuiltInTracerType, GethDebugTracerType,
     GethDebugTracingCallOptions, GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace,
-    PreStateConfig, PreStateFrame,
+    PreStateConfig, PreStateFrame, PreStateMode,
 };
 use alloy::transports::TransportError;
 use alloy_eips::BlockId;
@@ -256,6 +256,41 @@ where
     {
         GethTrace::PreStateTracer(PreStateFrame::Diff(diff)) => Ok(diff),
         other => Err(anyhow!("expected prestate diff frame, got {other:?}")),
+    }
+}
+
+/// Simulate a call and return the `prestateTracer` frame in its default mode: every account the
+/// call touched, with its balance, nonce and code, and every storage slot it read or wrote, all as
+/// they were before the call.
+///
+/// Like the diff, its cost is `O(touched state)` rather than `O(execution steps)`. It is the state
+/// a local replay of the call needs, so the call can be scanned in-process instead of by a tracer
+/// that runs on every step on the node.
+pub async fn get_prestate_from_call_with_profile<P, Req>(
+    provider: &P,
+    tx_request: Req,
+    block: BlockId,
+    profile: SimProfile,
+) -> Result<PreStateMode>
+where
+    P: Provider + DebugApi,
+    Req: Into<alloy::rpc::types::eth::TransactionRequest>,
+{
+    let mut tx_request = tx_request.into();
+    let mut options = GethDebugTracingCallOptions {
+        tracing_options: GethDebugTracingOptions::prestate_tracer(PreStateConfig::default()),
+        ..Default::default()
+    };
+    apply_sim_profile(&mut tx_request, &mut options, profile);
+    match provider
+        .debug_trace_call(tx_request, block, options)
+        .await
+        .map_err(|e| anyhow!("prestate debug_trace_call failed: {}", e))?
+    {
+        GethTrace::PreStateTracer(PreStateFrame::Default(state)) => Ok(state),
+        other => Err(anyhow!(
+            "expected a default-mode prestate frame, got {other:?}"
+        )),
     }
 }
 
