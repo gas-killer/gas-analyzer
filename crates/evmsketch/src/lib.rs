@@ -203,7 +203,8 @@ pub struct EvmSketchExecutorCache {
     /// `RootProvider` is `Clone` (Arc-backed), so callers share one HTTP
     /// connection pool rather than creating a new one per invocation.
     trace_providers: Mutex<HashMap<String, RootProvider<Ethereum>>>,
-    /// What each trace endpoint has shown about `muxTracer`, by RPC URL.
+    /// What each trace endpoint has shown about `muxTracer` and the local replay's environment
+    /// probe, by RPC URL.
     mux_support: Mutex<HashMap<String, Arc<MuxSupport>>>,
 }
 
@@ -1576,6 +1577,7 @@ struct Extracted {
 /// would put the per-step tracer on the node for every call, which is the load this avoids.
 async fn local_observation<P: Provider + DebugApi>(
     provider: &P,
+    support: &MuxSupport,
     diff: &DiffMode,
     frame: &CallFrame,
     tx_request: &TransactionRequest,
@@ -1595,30 +1597,46 @@ async fn local_observation<P: Provider + DebugApi>(
         tracing::debug!(%reason, "can't replay the call locally; asking the node to scan it");
         return None;
     }
-    let fetched = tokio::try_join!(
+    if support.replay_is_paused() {
+        tracing::debug!(
+            "the endpoint keeps failing the environment probe; asking the node to scan"
+        );
+        return None;
+    }
+    let (pre, node_env) = tokio::join!(
         get_prestate_from_call_with_profile(provider, tx_request.clone(), block, profile),
-        async {
-            provider
-                .get_block(block)
-                .await
-                .map_err(|e| anyhow!("fetching the block: {e}"))?
-                .ok_or_else(|| anyhow!("no block {block}"))
-        },
         // The values the node gives the call, which can differ from the block's header.
         gas_analyzer_rpc::get_simulated_env_with_profile(provider, tx_request, block, profile),
     );
-    let (pre, block, node_env) = match fetched {
-        Ok(fetched) => fetched,
+    let node_env = match node_env {
+        Ok(node_env) => {
+            support.probe_answered();
+            node_env
+        }
+        Err(e) => {
+            let paused = support.probe_failed();
+            tracing::info!(error = %e, paused, "the environment probe failed; asking the node to scan it");
+            return None;
+        }
+    };
+    let pre = match pre {
+        Ok(pre) => pre,
         Err(e) => {
             tracing::debug!(error = %e, "can't replay the call locally; asking the node to scan it");
             return None;
         }
     };
-    let header = &block.header.inner;
-    // A chain the analyzer has no fork schedule for runs under revm's default. A fork that
-    // changed what the call did would show up as a divergence.
+    // The fork the node ran the call under, from the block it ran it in. A chain the analyzer has
+    // no fork schedule for runs under revm's default; a fork that changed what the call did would
+    // show up as a divergence.
     let spec = chain_id_to_genesis_and_spec(node_env.chain_id)
-        .map(|(_, hardforks)| alloy_evm::spec(&hardforks, header))
+        .map(|(_, hardforks)| {
+            alloy_evm::spec_by_timestamp_and_block_number(
+                &hardforks,
+                node_env.timestamp,
+                node_env.number,
+            )
+        })
         .unwrap_or_default();
     let env = local_scan::ScanEnv {
         spec,
@@ -1673,8 +1691,10 @@ async fn try_prestate_net<P: Provider + DebugApi>(
             let observed = match static_observation(&frame) {
                 Some(reason) => Some(reason),
                 None => {
-                    match local_observation(provider, &diff, &frame, tx_request, block, profile)
-                        .await
+                    match local_observation(
+                        provider, mux, &diff, &frame, tx_request, block, profile,
+                    )
+                    .await
                     {
                         Some(observed) => observed,
                         // A scan that fails says nothing either way: the struct-log encoder pins
@@ -1717,11 +1737,23 @@ const MUX_PAUSE: Duration = Duration::from_secs(60 * 60);
 /// burst of call-specific failures such as tracer timeouts on heavy calls does not pause it.
 const MUX_REJECTIONS_BEFORE_PAUSE: u32 = 3;
 
+/// How long an endpoint that keeps failing the environment probe goes without a local replay.
+/// Shorter than the mux pause: while it lasts, heavy calls fall back to the node's per-step scan.
+const REPLAY_PAUSE: Duration = Duration::from_secs(10 * 60);
+
+/// Failed environment probes in a row, with no answer in between, after which the local replay is
+/// paused. A few, so a transient RPC error doesn't pause it.
+const REPLAY_PROBE_FAILURES_BEFORE_PAUSE: u32 = 3;
+
 /// What a trace endpoint has shown about `muxTracer`, shared by every request to it.
 ///
 /// An endpoint that says it lacks `muxTracer`, answers it in an unusable shape, or keeps rejecting
 /// it is paused: requests go straight to the separate tracers until the pause ends. Pausing only
 /// ever costs speed, never correctness, since both paths return the same frames.
+///
+/// It also records whether the endpoint answers the local replay's environment probe. One that
+/// keeps failing it has the replay paused the same way, so heavy calls stop paying the replay's
+/// requests before the node's own scan, which gives the same answer.
 #[derive(Debug)]
 pub(crate) struct MuxSupport {
     pause: Duration,
@@ -1729,6 +1761,11 @@ pub(crate) struct MuxSupport {
     /// Milliseconds after `epoch` until which `muxTracer` is not requested.
     paused_until_ms: AtomicU64,
     rejections: AtomicU32,
+    /// Milliseconds after `epoch` until which the local replay isn't tried, because the endpoint
+    /// kept failing its environment probe (no state overrides on `debug_traceCall`, or a chain
+    /// whose EVM lacks the probe's opcodes).
+    replay_paused_until_ms: AtomicU64,
+    probe_failures: AtomicU32,
 }
 
 impl Default for MuxSupport {
@@ -1744,6 +1781,8 @@ impl MuxSupport {
             epoch: Instant::now(),
             paused_until_ms: AtomicU64::new(0),
             rejections: AtomicU32::new(0),
+            replay_paused_until_ms: AtomicU64::new(0),
+            probe_failures: AtomicU32::new(0),
         }
     }
 
@@ -1766,6 +1805,30 @@ impl MuxSupport {
     /// The endpoint served the request, whatever became of the call.
     fn answered(&self) {
         self.rejections.store(0, Ordering::Relaxed);
+    }
+
+    fn replay_is_paused(&self) -> bool {
+        self.now_ms() < self.replay_paused_until_ms.load(Ordering::Relaxed)
+    }
+
+    /// The endpoint answered the environment probe.
+    fn probe_answered(&self) {
+        self.probe_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Records a failed environment probe, pausing the local replay when it is one too many.
+    /// Returns whether it did. Pausing costs only speed: the node's own scan gives the same answer.
+    fn probe_failed(&self) -> bool {
+        let pause = self.probe_failures.fetch_add(1, Ordering::Relaxed) + 1
+            >= REPLAY_PROBE_FAILURES_BEFORE_PAUSE;
+        if pause {
+            let until = self
+                .now_ms()
+                .saturating_add(u64::try_from(REPLAY_PAUSE.as_millis()).unwrap_or(u64::MAX));
+            self.replay_paused_until_ms.store(until, Ordering::Relaxed);
+            self.probe_failures.store(0, Ordering::Relaxed);
+        }
+        pause
     }
 
     /// Records a rejection, pausing `muxTracer` when it is one too many. Returns whether it did.
@@ -3003,6 +3066,27 @@ mod tests {
         assert!(asserter.pop_response().is_none());
     }
 
+    /// The local replay is paused after a few failed environment probes in a row, and an answer
+    /// in between starts the count again.
+    #[test]
+    fn test_repeated_probe_failures_pause_the_replay() {
+        let support = MuxSupport::default();
+        for _ in 1..REPLAY_PROBE_FAILURES_BEFORE_PAUSE {
+            assert!(!support.probe_failed());
+        }
+        support.probe_answered();
+        for _ in 1..REPLAY_PROBE_FAILURES_BEFORE_PAUSE {
+            assert!(!support.probe_failed());
+        }
+        assert!(!support.replay_is_paused());
+        assert!(
+            support.probe_failed(),
+            "one failure too many pauses the replay"
+        );
+        assert!(support.replay_is_paused());
+        assert!(!support.is_paused(), "the mux is paused separately");
+    }
+
     /// End-to-end coverage of the extraction dispatcher and the `rpc` tracer helpers against a
     /// real node, rather than synthetic tracer output.
     ///
@@ -4003,10 +4087,17 @@ mod tests {
                     ),
                 )
                 .expect("the native tracers run");
-                let local =
-                    local_observation(&provider, &diff, &frame, &request, block, SimProfile::Chain)
-                        .await
-                        .expect("the replay matches the node's run");
+                let local = local_observation(
+                    &provider,
+                    &MuxSupport::default(),
+                    &diff,
+                    &frame,
+                    &request,
+                    block,
+                    SimProfile::Chain,
+                )
+                .await
+                .expect("the replay matches the node's run");
                 let node = get_observation_from_call_with_profile(
                     &provider,
                     request,

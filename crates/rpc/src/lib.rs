@@ -384,7 +384,25 @@ where
     if let Some(error) = frame.error {
         bail!("the environment probe failed: {error}");
     }
-    parse_simulated_env(frame.output.as_ref().map_or(&[][..], |o| o.as_ref()))
+    let env = parse_simulated_env(frame.output.as_ref().map_or(&[][..], |o| o.as_ref()))?;
+    check_probe_gas(&env, frame.gas)?;
+    Ok(env)
+}
+
+/// Checks the gas limit the probe worked out from `GAS` against the one its root frame reports,
+/// `frame_gas`. Clients report either the call's full gas limit there or what was left after the
+/// intrinsic 21,000. Anything else means the node charged gas before the call ran that the
+/// standard intrinsic cost doesn't account for (an L1 data fee, say), which a replay can't
+/// reproduce.
+fn check_probe_gas(env: &SimulatedEnv, frame_gas: U256) -> Result<()> {
+    let limit = U256::from(env.tx_gas_limit);
+    if frame_gas == limit || frame_gas + U256::from(21_000) == limit {
+        return Ok(());
+    }
+    bail!(
+        "the node charged gas before the probe ran: its frame reports {frame_gas} gas, but the \
+         probe had {limit} less the intrinsic cost"
+    )
 }
 
 fn parse_simulated_env(output: &[u8]) -> Result<SimulatedEnv> {
@@ -808,6 +826,27 @@ mod tests {
                 gas_price: 3,
             }
         );
+    }
+
+    #[test]
+    fn the_probe_gas_must_match_its_frame() {
+        let env = SimulatedEnv {
+            tx_gas_limit: 1_000_000,
+            timestamp: 0,
+            number: 0,
+            coinbase: Address::ZERO,
+            prevrandao: B256::ZERO,
+            block_gas_limit: 0,
+            basefee: 0,
+            chain_id: 1,
+            gas_price: 0,
+        };
+        // The full limit, or what was left after the intrinsic cost.
+        assert!(check_probe_gas(&env, U256::from(1_000_000)).is_ok());
+        assert!(check_probe_gas(&env, U256::from(979_000)).is_ok());
+        // Gas charged up front that the intrinsic cost doesn't explain.
+        assert!(check_probe_gas(&env, U256::from(1_200_000)).is_err());
+        assert!(check_probe_gas(&env, U256::from(990_000)).is_err());
     }
 
     #[test]

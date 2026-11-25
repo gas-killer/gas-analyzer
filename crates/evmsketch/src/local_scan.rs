@@ -57,6 +57,8 @@ pub(crate) enum LocalScan {
 /// it, in `env`, and scans its target-depth context. `frame` and `diff` are the node's
 /// `callTracer` frame and prestate diff for the same call, which the replay must reproduce to be
 /// trusted.
+///
+/// The caller checks [`unreplayable_request`] first, before fetching anything for the replay.
 pub(crate) fn scan_observations(
     pre: &PreStateMode,
     frame: &CallFrame,
@@ -64,15 +66,20 @@ pub(crate) fn scan_observations(
     tx: &TransactionRequest,
     env: &ScanEnv,
 ) -> Result<LocalScan> {
-    if let Some(reason) = unreplayable_request(tx) {
-        return Ok(LocalScan::Diverged(reason));
+    // The replay runs at a zero gas price: the revm here charges the caller and pays the coinbase
+    // whatever its fee settings, so a nonzero price would move balances the node may not have.
+    if env.node.gas_price != 0 {
+        return Ok(LocalScan::Diverged(format!(
+            "the node gave the call a gas price of {}",
+            env.node.gas_price
+        )));
     }
     Ok(judge(&replay(pre, tx, env)?, frame, diff))
 }
 
 /// Why the replay can't reproduce `tx` as the node runs it, or `None`. It drops blobs, access
-/// lists and EIP-7702 authorizations, each of which changes what the node runs, and charges no
-/// fee, where a node charges one the request sets.
+/// lists and EIP-7702 authorizations, each of which changes what the node runs, and runs at a
+/// zero gas price, where a node charges the fee a request sets.
 pub(crate) fn unreplayable_request(tx: &TransactionRequest) -> Option<String> {
     if tx.gas_price.is_some()
         || tx.max_fee_per_gas.is_some()
@@ -159,7 +166,7 @@ fn replay(pre: &PreStateMode, tx: &TransactionRequest, env: &ScanEnv) -> Result<
         .data(tx.input.input().cloned().unwrap_or_default())
         .value(tx.value.unwrap_or_default())
         .gas_limit(node.tx_gas_limit)
-        .gas_price(node.gas_price)
+        .gas_price(0)
         .chain_id(Some(node.chain_id))
         .build()
         .map_err(|e| anyhow!("building the replay transaction: {e:?}"))?;
@@ -821,16 +828,20 @@ mod tests {
             ),
         ];
         for (request, why) in requests {
-            let scanned = scan_observations(
-                &prestate("00"),
-                &frame(),
-                &DiffMode::default(),
-                &request,
-                &env(),
-            )
-            .expect("the request is checked");
-            diverges(scanned, why);
+            let reason = unreplayable_request(&request).expect("the request isn't replayed");
+            assert!(reason.contains(why), "{reason}");
         }
+        assert_eq!(unreplayable_request(&tx()), None);
+    }
+
+    #[test]
+    fn a_call_the_node_priced_is_not_replayed() {
+        let mut env = env();
+        env.node.gas_price = 1;
+        let scanned =
+            scan_observations(&prestate("00"), &frame(), &DiffMode::default(), &tx(), &env)
+                .expect("the price is checked");
+        diverges(scanned, "gas price");
     }
 
     #[test]
