@@ -60,7 +60,7 @@ use gas_analyzer_core::{
     TraceExtract, compute_state_updates, encode_state_updates_to_abi, encode_state_updates_to_sol,
     unpin_stateless_reads,
 };
-use gas_analyzer_rpc::{get_tx_trace, resolve_code_hashes};
+use gas_analyzer_rpc::{get_tx_trace, resolve_code_hashes, sets_code};
 
 // ============================================================================
 // Report Types
@@ -780,10 +780,7 @@ pub async fn call_to_encoded_state_updates_with_gas_estimate(
         Some(height) => height,
         None => upstream.get_block_number().await?,
     };
-    let authorizes = tx_request
-        .authorization_list
-        .as_ref()
-        .is_some_and(|list| !list.is_empty());
+    let authorizes = sets_code(&tx_request);
     let trace = get_trace_from_call(url, tx_request, Some(block_height)).await?;
     let TraceExtract {
         mut state_updates,

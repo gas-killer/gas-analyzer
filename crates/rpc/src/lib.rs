@@ -748,13 +748,26 @@ pub async fn get_preceding_transactions<P: Provider>(
     Ok(preceding)
 }
 
+/// Whether `tx` carries EIP-7702 authorizations. They change accounts' code before the call
+/// runs, so the code at the block the call is traced on isn't the code that ran: a caller pinning
+/// stateless reads by code calls [`gas_analyzer_core::observe::unpin_stateless_reads`] instead.
+pub fn sets_code(tx: &alloy::rpc::types::TransactionRequest) -> bool {
+    tx.authorization_list
+        .as_ref()
+        .is_some_and(|list| !list.is_empty())
+}
+
 /// Fill in the code hash of every account whose code a program pins but the trace doesn't show,
 /// fetching the code at `block` (see [`gas_analyzer_core::observe::resolve_code_sizes`]):
 ///
 /// - an account read by `EXTCODESIZE`, whose code is checked against the size the trace saw;
 /// - an account whose code a stateless `STATICCALL` ran, so the read is pinned by code hash
-///   rather than run again at settlement. A read whose code can't be fetched falls back to its
-///   `STATICCALL_CHECK`.
+///   rather than run again at settlement. A read that ran an account with no code at `block`
+///   falls back to its `STATICCALL_CHECK`.
+///
+/// The accounts are fetched concurrently, and any fetch that fails fails the call: falling back
+/// on an RPC error would make the program depend on the node's luck, not just on the trace, and
+/// operators signing the same call would disagree.
 ///
 /// `block` must be the state the trace ran on (for a call traced at a block, that block), or a
 /// stateless read could be pinned to code other than what ran. A caller that can't promise that
@@ -765,28 +778,18 @@ pub async fn resolve_code_hashes<P: Provider>(
     block: BlockId,
     updates: &mut Vec<StateUpdate>,
 ) -> Result<()> {
-    let sized: std::collections::HashSet<Address> =
-        gas_analyzer_core::observe::unresolved_code_sizes(updates)
-            .into_iter()
-            .map(|(account, _)| account)
-            .collect();
-    let mut code = std::collections::HashMap::new();
-    for account in gas_analyzer_core::observe::unresolved_code_accounts(updates) {
-        match provider.get_code_at(account).block_id(block).await {
-            Ok(bytes) => {
-                code.insert(account, bytes);
-            }
-            Err(e) if sized.contains(&account) => {
-                bail!("fetching the code of {account}, read by EXTCODESIZE: {e}")
-            }
-            // Only stateless reads need it: they fall back to running the read.
-            Err(e) => tracing::warn!(
-                %account,
-                error = %e,
-                "could not fetch code a stateless read ran; checking the read by running it"
-            ),
-        }
-    }
+    let accounts = gas_analyzer_core::observe::unresolved_code_accounts(updates);
+    let code = futures::future::try_join_all(accounts.into_iter().map(|account| async move {
+        provider
+            .get_code_at(account)
+            .block_id(block)
+            .await
+            .map(|bytes| (account, bytes))
+            .map_err(|e| anyhow!("fetching the code of {account} at {block}: {e}"))
+    }))
+    .await?
+    .into_iter()
+    .collect();
     gas_analyzer_core::observe::resolve_code_sizes(updates, &code)
 }
 

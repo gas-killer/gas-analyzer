@@ -148,6 +148,7 @@ pub use gas_analyzer_core::nested::frame_tree_total;
 use gas_analyzer_core::nested::{
     FrameProgram, NestingCostModel, compute_frame_tree_canonical, without_nested_ops,
 };
+use gas_analyzer_core::observe::unpin_stateless_reads;
 use gas_analyzer_core::sim_profile::STATE_TRACKER_SLOT;
 use gas_analyzer_core::{
     Opcode, PrestateEligibility, SignatureType, StateUpdate, build_state_updates_from_prestate,
@@ -161,6 +162,7 @@ use gas_analyzer_rpc::{
     MuxedTraces, get_call_frame_from_call_with_profile, get_observation_from_call_with_profile,
     get_prestate_diff_and_call_frame_with_profile, get_prestate_diff_from_call_with_profile,
     get_prestate_from_call_with_profile, get_trace_from_call_with_profile, resolve_code_hashes,
+    sets_code,
 };
 
 // ============================================================================
@@ -1360,6 +1362,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
     // extraction, and a payload whose updates spend or check that ETH reverts if it is replayed
     // without it.
     let tx_value = tx_request.value.unwrap_or_default();
+    let sets_code = sets_code(&tx_request);
 
     // Collect storage hints from the EIP-2930 access list before tx_request
     // is consumed by get_trace_from_call. Address-only entries (no storage keys)
@@ -1400,6 +1403,11 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
         trace_fetch,
         parse,
     } = extracted;
+    // EIP-7702 authorizations change code before the call runs, so the block's code isn't what
+    // ran: check stateless reads by running them.
+    if sets_code {
+        unpin_stateless_reads(&mut state_updates)?;
+    }
     resolve_code_hashes(&provider, block_id, &mut state_updates).await?;
     tracing::Span::current().record("state_update_count", state_updates.len());
 
@@ -1996,6 +2004,7 @@ pub async fn call_to_frame_tree_with_evmsketch(
         .ok_or_else(|| anyhow!("Transaction must have a 'to' address"))?;
     let caller_address = tx_request.from.unwrap_or_default();
     let tx_value = tx_request.value.unwrap_or_default();
+    let sets_code = sets_code(&tx_request);
     let block = BlockId::Number(BlockNumberOrTag::Number(block_number));
 
     let mut trace_fetch = Duration::ZERO;
@@ -2062,6 +2071,10 @@ pub async fn call_to_frame_tree_with_evmsketch(
     let parse = started.elapsed();
     tracing::Span::current().record("frame_count", tree.frames.len());
     for frame in &mut tree.frames {
+        // As for a flat program: authorizations change code before the call runs.
+        if sets_code {
+            unpin_stateless_reads(&mut frame.updates)?;
+        }
         resolve_code_hashes(&provider, block, &mut frame.updates).await?;
     }
 

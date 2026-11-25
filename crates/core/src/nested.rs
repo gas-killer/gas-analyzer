@@ -597,13 +597,21 @@ pub fn compute_frame_tree_canonical(
 /// outside it runs inside that contract's native `CALL`, as it would in a real settlement.
 /// Frames carry their counter's index where the trace shows one, and zero otherwise; the split
 /// is for pricing, not for signing.
+///
+/// A historical transaction ran after others in its block, so no caller can fetch the code it
+/// ran: every stateless read is checked by running it again (see
+/// [`crate::observe::unpin_stateless_reads`]).
 pub fn compute_frame_tree_hypothetical(
     trace: DefaultFrame,
     root: Address,
     owned: &BTreeSet<Address>,
     cost: &NestingCostModel,
 ) -> Result<FrameTreeExtract> {
-    split_frame_tree(trace, root, Eligibility::Hypothetical(owned), cost)
+    let mut tree = split_frame_tree(trace, root, Eligibility::Hypothetical(owned), cost)?;
+    for frame in &mut tree.frames {
+        crate::observe::unpin_stateless_reads(&mut frame.updates)?;
+    }
+    Ok(tree)
 }
 
 /// A program without its `NESTED` ops, for pricers that cannot execute them.
@@ -1925,6 +1933,35 @@ mod tests {
                     if c.account == C && c.codehash == keccak256([0xfeu8])
             ),
             "{updates:?}"
+        );
+    }
+
+    /// A historical transaction's code can't be fetched as it ran, so a hypothetical tree
+    /// checks a stateless read by running it, with no code markers left over for pricing.
+    #[test]
+    fn a_hypothetical_tree_checks_stateless_reads_by_running_them() {
+        let tree = compute_frame_tree_hypothetical(
+            trace(vec![
+                sstore(1, slot(1), 10),
+                staticcall(1, C),
+                log("CALLDATALOAD", 2, 950_000, &[U256::ZERO], 0),
+                exit("RETURN", 2),
+                resume(1, 900_000, true),
+                sstore(1, slot(2), 20),
+            ]),
+            ROOT,
+            &BTreeSet::new(),
+            &NESTING_COST_MODEL_V1,
+        )
+        .expect("frame tree");
+        assert!(
+            matches!(
+                tree.frames[0].updates.as_slice(),
+                [StateUpdate::Store(_), StateUpdate::StaticCallCheck(read), StateUpdate::Store(_)]
+                    if read.target == C
+            ),
+            "{:?}",
+            tree.frames[0].updates
         );
     }
 

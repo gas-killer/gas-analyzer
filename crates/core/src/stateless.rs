@@ -7,9 +7,9 @@
 //! whose code ran (see `observe::code_check`).
 //!
 //! A frame is stateless when every op it runs is on [`pure`]'s list, and every call it makes is
-//! either into a precompile, or a `STATICCALL` or `DELEGATECALL` into code that is itself
-//! stateless, and succeeded. Everything else, from an `SLOAD` or `TIMESTAMP` to an op this module
-//! doesn't know, leaves the read checked by running it again.
+//! either into a precompile every chain has (0x01 to 0x0a), or a `STATICCALL` or `DELEGATECALL`
+//! into code that is itself stateless, and succeeded. Everything else, from an `SLOAD` or
+//! `TIMESTAMP` to an op this module doesn't know, leaves the read checked by running it again.
 //!
 //! Code deployed in the trace itself can't be pinned by its hash: the code a caller fetches
 //! from the state the trace ran on isn't there yet. A read that ran such code is left checked.
@@ -148,7 +148,13 @@ fn follow(logs: &[StructLog]) -> HashMap<usize, Vec<Address>> {
         };
         if let Some(at) = inside {
             outcomes.push((depth, at));
-            if !is_precompile(target) {
+            if is_precompile(target) {
+                if !always_active(target) {
+                    // On a chain or fork without it, the address is an empty account and the
+                    // call "succeeds" with nothing: its result is the fork's, not the code's.
+                    open[at].stateless = false;
+                }
+            } else {
                 match op {
                     "DELEGATECALL" => {
                         // The code runs in the caller's context; it's the code address's code.
@@ -179,6 +185,14 @@ fn follow(logs: &[StructLog]) -> HashMap<usize, Vec<Address>> {
     out
 }
 
+/// Whether `precompile` is one every EVM chain this runs on has had since Cancun: `ECRECOVER`
+/// (0x01) through the point evaluation precompile (0x0a). Later ones (the BLS12-381 precompiles,
+/// `P256VERIFY`) came with later forks, and some chains still lack them.
+fn always_active(precompile: Address) -> bool {
+    let bytes = precompile.0.0;
+    bytes[..19].iter().all(|&b| b == 0) && (1..=0x0a).contains(&bytes[19])
+}
+
 fn is_call(op: &str) -> bool {
     matches!(op, "STATICCALL" | "CALL" | "DELEGATECALL" | "CALLCODE")
 }
@@ -187,11 +201,13 @@ fn is_call(op: &str) -> bool {
 /// code, and its call's context, which the caller fixes), so its result is the same at
 /// settlement as in the trace.
 ///
-/// `GAS` counts, though a callee could branch on it: snarkjs verifiers pass `gas()` to the
-/// pairing precompile, and pinning such a read by its code loses nothing. A `STATICCALL_CHECK`
-/// runs the read again with whatever gas settlement has left, not the gas the trace gave it, so
-/// a result that depends on gas was never pinned to the trace's either. A transition is defined
-/// by the trace at its reference block, gas included.
+/// `GAS` counts, as a deliberate trade-off: snarkjs verifiers pass `gas()` to the pairing
+/// precompile, and without it no such verifier could be pinned by its code. The cost is that a
+/// read whose result does depend on its gas (a callee branching on `gasleft()`) is settled on
+/// the result the trace saw. A `STATICCALL_CHECK` would have run it again with settlement's gas
+/// and reverted on a different result; pinned by code, the trace's result stands. A transition
+/// is defined by the trace at its reference block, gas included, so that result is the one the
+/// operators signed.
 ///
 /// Not listed, and so stateful: storage and transient storage (`SLOAD`, `TLOAD`), other
 /// accounts (`BALANCE`, `SELFBALANCE`, `EXTCODESIZE`, `EXTCODEHASH`, `EXTCODECOPY`), the block and
@@ -428,6 +444,26 @@ mod tests {
             StatelessReads::of_used(&logs, &Usage::only(&[1])).code_of(1),
             Some(&[A][..])
         );
+    }
+
+    /// A precompile a chain may not have yet answers by fork, not by code: the read stays checked.
+    #[test]
+    fn later_precompiles_are_stateful() {
+        const P256VERIFY: Address =
+            Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
+        const BLS12_G1ADD: Address = Address::new([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0b,
+        ]);
+        for precompile in [P256VERIFY, BLS12_G1ADD] {
+            let logs = [
+                call("STATICCALL", 1, A),
+                call("STATICCALL", 2, precompile),
+                resume(2, true),
+                log("RETURN", 2, &[]),
+                resume(1, true),
+            ];
+            assert_eq!(verdict(&logs), None, "{precompile}");
+        }
     }
 
     /// The callee's own revert is its result, which the walks pin like a success.
