@@ -148,6 +148,7 @@ pub use gas_analyzer_core::nested::frame_tree_total;
 use gas_analyzer_core::nested::{
     FrameProgram, NestingCostModel, compute_frame_tree_canonical, without_nested_ops,
 };
+use gas_analyzer_core::observe::unpin_stateless_reads;
 use gas_analyzer_core::sim_profile::STATE_TRACKER_SLOT;
 use gas_analyzer_core::{
     Opcode, PrestateEligibility, SignatureType, StateUpdate, build_state_updates_from_prestate,
@@ -161,6 +162,7 @@ use gas_analyzer_rpc::{
     MuxedTraces, get_call_frame_from_call_with_profile, get_observation_from_call_with_profile,
     get_prestate_diff_and_call_frame_with_profile, get_prestate_diff_from_call_with_profile,
     get_prestate_from_call_with_profile, get_trace_from_call_with_profile, resolve_code_hashes,
+    sets_code,
 };
 
 // ============================================================================
@@ -1360,6 +1362,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
     // extraction, and a payload whose updates spend or check that ETH reverts if it is replayed
     // without it.
     let tx_value = tx_request.value.unwrap_or_default();
+    let sets_code = sets_code(&tx_request);
 
     // Collect storage hints from the EIP-2930 access list before tx_request
     // is consumed by get_trace_from_call. Address-only entries (no storage keys)
@@ -1395,12 +1398,19 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
     let Extracted {
         mut state_updates,
         skipped_opcodes,
-        call_gas_total,
+        mut call_gas_total,
         extraction,
         trace_fetch,
         parse,
     } = extracted;
-    resolve_code_hashes(&provider, block_id, &mut state_updates).await?;
+    // EIP-7702 authorizations change code before the call runs, so the block's code isn't what
+    // ran: check stateless reads by running them.
+    if sets_code {
+        unpin_stateless_reads(&mut state_updates)?;
+    }
+    // A read pinned by its code is never run at settlement: its gas leaves the call gas.
+    let pinned_gas = resolve_code_hashes(&provider, block_id, &mut state_updates).await?;
+    call_gas_total = call_gas_total.saturating_sub(pinned_gas);
     tracing::Span::current().record("state_update_count", state_updates.len());
 
     // The unbounded profile's whole bargain: compute may be unbounded, the payload that lands
@@ -1996,6 +2006,7 @@ pub async fn call_to_frame_tree_with_evmsketch(
         .ok_or_else(|| anyhow!("Transaction must have a 'to' address"))?;
     let caller_address = tx_request.from.unwrap_or_default();
     let tx_value = tx_request.value.unwrap_or_default();
+    let sets_code = sets_code(&tx_request);
     let block = BlockId::Number(BlockNumberOrTag::Number(block_number));
 
     let mut trace_fetch = Duration::ZERO;
@@ -2062,7 +2073,13 @@ pub async fn call_to_frame_tree_with_evmsketch(
     let parse = started.elapsed();
     tracing::Span::current().record("frame_count", tree.frames.len());
     for frame in &mut tree.frames {
-        resolve_code_hashes(&provider, block, &mut frame.updates).await?;
+        // As for a flat program: authorizations change code before the call runs.
+        if sets_code {
+            unpin_stateless_reads(&mut frame.updates)?;
+        }
+        // A read pinned by its code is never run at settlement: its gas leaves the call gas.
+        let pinned_gas = resolve_code_hashes(&provider, block, &mut frame.updates).await?;
+        tree.call_gas_total = tree.call_gas_total.saturating_sub(pinned_gas);
     }
 
     // The whole tree lands in one transaction, so the unbounded profile's payload budget covers
@@ -3973,7 +3990,9 @@ mod tests {
         /// - a CALL with all gas, its result dropped;
         /// - a CALL capped at 2,300, its RETURNDATASIZE stored to slot 9;
         /// - a caught revert with data, dropped (a caught failure is pinned anyway);
-        /// - a STATICCALL, its success stored to slot 6;
+        /// - a STATICCALL of the returner, its success stored to slot 6: the returner reads no
+        ///   state, so the read is pinned by its code hash rather than run again (the same hash
+        ///   `EXTCODESIZE` pins below, checked once);
         /// - BALANCE stored to slot 5, then the same BALANCE again to slot 8 (a repeat);
         /// - EXTCODESIZE stored to slot 7, SELFBALANCE dropped, then SSTORE(4, 1).
         fn observer_code(returner: Address, reverter: Address) -> Bytes {
@@ -4183,13 +4202,22 @@ mod tests {
                     Program::abi_decode_params(&encoded.storage_updates).expect("a program");
                 let count = |kind: u8| types.iter().filter(|t| **t == kind).count();
                 assert_eq!(count(1), 3, "{encoding:?}: three CALLs: {types:?}");
-                assert_eq!(count(10), 1, "{encoding:?}: the STATICCALL_CHECK");
+                assert_eq!(
+                    count(10),
+                    0,
+                    "{encoding:?}: no STATICCALL_CHECK of stateless code"
+                );
                 assert_eq!(
                     count(11),
                     1,
                     "{encoding:?}: one BALANCE_CHECK, no SELFBALANCE"
                 );
-                assert_eq!(count(12), 1, "{encoding:?}: EXTCODESIZE's CODEHASH_CHECK");
+                assert_eq!(
+                    count(12),
+                    1,
+                    "{encoding:?}: the stateless read and EXTCODESIZE pin the returner's code \
+                     hash, once"
+                );
                 let pinned: Vec<bool> = types
                     .iter()
                     .zip(&args)

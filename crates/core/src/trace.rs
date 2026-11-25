@@ -11,8 +11,10 @@ use alloy_rpc_types::trace::geth::{DefaultFrame, StructLog};
 use anyhow::{Result, bail};
 
 use crate::observe::{
-    Await, ExitData, PendingRead, dedupe_checks, is_precompile, stack_top, static_check,
+    Await, ExitData, PendingRead, charge_stateless_read, code_check, dedupe_checks, is_precompile,
+    stack_top, static_check,
 };
+use crate::stateless::StatelessReads;
 use crate::taint::Usage;
 use crate::types::{CALL_GAS_UNCAPPED, IStateUpdateTypes, Opcode, StateUpdate};
 
@@ -260,14 +262,17 @@ pub fn append_state_update_from_struct_log(
 /// handling DELEGATECALL and CALLCODE depth tracking correctly.
 ///
 /// Everything extracted from a struct-log trace in a single pass.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct TraceExtract {
     pub state_updates: Vec<StateUpdate>,
     pub skipped_opcodes: HashSet<Opcode>,
     /// Total gas consumed by the extracted depth-1 CALLs (gross, pre-refund).
     pub call_gas_total: u64,
     /// The part of `call_gas_total` spent inside the callees, without the `CALL` opcodes' own
-    /// cost: what a simulation that runs those `CALL`s into code-less accounts misses.
+    /// cost: what a simulation that runs those `CALL`s into code-less accounts misses. As walked:
+    /// a caller that pins stateless reads by code takes their gas off `call_gas_total` only (see
+    /// `observe::resolve_code_sizes`), so this keeps it. Only pricers that check every read by
+    /// running it use this.
     pub callee_gas_total: u64,
     /// Total gas consumed by the extracted CREATE/CREATE2s (gross, pre-refund): the opcode, its
     /// initcode's execution and the code deposit.
@@ -349,8 +354,10 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
     let mut exits = ExitData::default();
     let mut awaiting: Vec<(u64, Await, bool)> = Vec::new();
     let mut pending_read: Option<(u64, PendingRead)> = None;
-    // Which observations the program's effects depend on; the rest stay unpinned.
+    // Which observations the program's effects depend on; the rest stay unpinned. Of the reads
+    // that are, those whose callee ran stateless code are pinned by that code.
     let usage = Usage::of(&trace.struct_logs);
+    let stateless = StatelessReads::of_used(&trace.struct_logs, &usage);
 
     for (step, struct_log) in trace.struct_logs.into_iter().enumerate() {
         let depth = struct_log.depth;
@@ -429,6 +436,7 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
                     if let Some(call) = call_gas_tracking.remove(&idx) {
                         let gas_used = call.gas.saturating_sub(struct_log.gas);
                         total_call_gas += gas_used;
+                        charge_stateless_read(&mut state_updates, idx - 1, gas_used);
                         callee_gas_total += callee_gas(gas_used, call.gas_cost, call.entry_gas);
                     }
                     call_stack.pop();
@@ -453,10 +461,18 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
                 if let Some(check) = static_check(&struct_log)? {
                     state_updates.push(check);
                     let index = state_updates.len() - 1;
-                    awaiting.push((depth, Await::Static { index }, false));
-                    // Settlement runs the read again: its gas counts like a CALL's, tracked the
-                    // same way until the trace returns from it.
                     let call_index_1based = state_updates.len();
+                    // A read of stateless code may be pinned by that code instead: its markers
+                    // follow the check until a caller resolves one or the other.
+                    let code = stateless.code_of(step);
+                    if let Some(accounts) = code {
+                        state_updates.extend(accounts.iter().map(|&account| code_check(account)));
+                    }
+                    let stateless = code.is_some();
+                    awaiting.push((depth, Await::Static { index, stateless }, false));
+                    // Settlement runs the read again: its gas counts like a CALL's, tracked the
+                    // same way until the trace returns from it. Counted for a stateless read too,
+                    // which may fall back to that.
                     call_stack.push((depth, call_index_1based));
                     call_gas_tracking.insert(
                         call_index_1based,
@@ -693,6 +709,8 @@ mod tests {
     use alloy_primitives::{B256, U256};
 
     use super::*;
+    use crate::encoding::encode_state_updates_to_abi;
+    use crate::observe::{resolve_code_sizes, unresolved_code_accounts};
 
     fn make_struct_log(op: &str, stack: Vec<U256>, memory_words: Vec<&str>) -> StructLog {
         StructLog {
@@ -801,6 +819,8 @@ mod tests {
                     U256::ZERO,
                 ],
             ),
+            // The callee reads storage, so settlement must run the read again.
+            at("SLOAD", 2, &[U256::ZERO]),
             returning("RETURN", 2, 0x07),
             at("JUMPDEST", 1, &[U256::from(1u64)]),
             at("SELFBALANCE", 1, &[]),
@@ -818,6 +838,297 @@ mod tests {
             matches!(&updates[2], StateUpdate::BalanceCheck(b) if b.account == ORIGIN && b.balance == U256::from(9u64))
         );
         assert!(matches!(&updates[3], StateUpdate::Store(_)));
+    }
+
+    fn staticcall_to(depth: u64, callee: Address) -> StructLog {
+        at(
+            "STATICCALL",
+            depth,
+            &[
+                U256::from(50_000u64),
+                addr_word(callee),
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
+            ],
+        )
+    }
+
+    /// The root writes slot 1, reads `callee` and branches on what it returned (so the program
+    /// depends on the read), then writes slot 2. The read is struct log 1.
+    fn branching_on_a_read(callee_logs: Vec<StructLog>) -> Vec<StructLog> {
+        let mut logs = vec![
+            at("SSTORE", 1, &[U256::from(1u64), U256::from(10u64)]),
+            staticcall_to(1, CALLEE),
+        ];
+        logs.extend(callee_logs);
+        logs.extend([
+            at("ISZERO", 1, &[U256::from(1u64)]),
+            at("JUMPI", 1, &[U256::from(9u64), U256::ZERO]),
+            at("SSTORE", 1, &[U256::from(2u64), U256::from(20u64)]),
+        ]);
+        logs
+    }
+
+    fn describe(updates: &[StateUpdate]) -> Vec<String> {
+        updates
+            .iter()
+            .map(|u| match u {
+                StateUpdate::StaticCallCheck(c) => format!("STATICCALL {}", c.target),
+                StateUpdate::CodehashCheck(c) => format!("CODEHASH {} {}", c.account, c.codehash),
+                StateUpdate::Store(s) => format!("STORE {}", s.slot),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    fn trace_of(logs: Vec<StructLog>) -> DefaultFrame {
+        DefaultFrame {
+            gas: 0,
+            failed: false,
+            return_value: Default::default(),
+            struct_logs: logs,
+        }
+    }
+
+    /// Both walks' programs, which must agree op for op: as walked, and as a caller resolves
+    /// them with `code` (or, given none, as one that can't fetch code falls back).
+    fn both_programs(
+        logs: Vec<StructLog>,
+        code: Option<&HashMap<Address, alloy_primitives::Bytes>>,
+    ) -> Vec<String> {
+        let legacy = journal(logs.clone());
+        let tree = crate::nested::compute_frame_tree_canonical(
+            trace_of(logs),
+            ORIGIN,
+            &|_| false,
+            &crate::nested::NESTING_COST_MODEL_V1,
+        )
+        .expect("frame tree");
+        let tree = tree.frames[0].updates.clone();
+        assert_eq!(describe(&tree), describe(&legacy), "the walks differ");
+        let mut program = legacy;
+        match code {
+            Some(code) => {
+                resolve_code_sizes(&mut program, code).unwrap();
+            }
+            None => crate::observe::unpin_stateless_reads(&mut program).unwrap(),
+        }
+        let mut tree = tree;
+        match code {
+            Some(code) => {
+                resolve_code_sizes(&mut tree, code).unwrap();
+            }
+            None => crate::observe::unpin_stateless_reads(&mut tree).unwrap(),
+        }
+        assert_eq!(
+            encode_state_updates_to_abi(&tree),
+            encode_state_updates_to_abi(&program),
+            "the walks encode differently"
+        );
+        describe(&program)
+    }
+
+    const INNER: Address = Address::new([0xdd; 20]);
+    const SHA256: Address =
+        Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    const CALLEE_CODE: &[u8] = &[0x60, 0x01];
+    const INNER_CODE: &[u8] = &[0x60, 0x02];
+
+    fn code() -> HashMap<Address, alloy_primitives::Bytes> {
+        HashMap::from([
+            (CALLEE, alloy_primitives::Bytes::from_static(CALLEE_CODE)),
+            (INNER, alloy_primitives::Bytes::from_static(INNER_CODE)),
+        ])
+    }
+
+    fn stores_around(middle: &[String]) -> Vec<String> {
+        let mut out = vec![format!("STORE {}", B256::from(U256::from(1)))];
+        out.extend_from_slice(middle);
+        out.push(format!("STORE {}", B256::from(U256::from(2))));
+        out
+    }
+
+    fn code_pin(account: Address, code: &[u8]) -> String {
+        format!("CODEHASH {account} {}", alloy_primitives::keccak256(code))
+    }
+
+    /// A verifier that only hashes, calls a precompile and returns: pinned by its code, where
+    /// the read happened, in both walks; checked by running it for a caller without code.
+    #[test]
+    fn a_stateless_read_is_pinned_by_its_code() {
+        let logs = branching_on_a_read(vec![
+            at("CALLDATALOAD", 2, &[U256::ZERO]),
+            at(
+                "MULMOD",
+                2,
+                &[U256::from(3u64), U256::from(2u64), U256::from(7u64)],
+            ),
+            staticcall_to(2, SHA256),
+            at("ISZERO", 2, &[U256::from(1u64)]),
+            returning("RETURN", 2, 0x01),
+        ]);
+        assert_eq!(
+            unresolved_code_accounts(&journal(logs.clone())),
+            [CALLEE],
+            "its code hash waits for the code"
+        );
+        assert_eq!(
+            both_programs(logs.clone(), Some(&code())),
+            stores_around(&[code_pin(CALLEE, CALLEE_CODE)])
+        );
+        assert_eq!(
+            both_programs(logs, None),
+            stores_around(&[format!("STATICCALL {CALLEE}")])
+        );
+    }
+
+    /// The read's gas is in the program's call gas, as settlement running it again; pinning it by
+    /// its code hands that gas back.
+    #[test]
+    fn pinning_a_read_by_its_code_returns_its_gas() {
+        let mut logs = branching_on_a_read(vec![
+            at("CALLDATALOAD", 2, &[U256::ZERO]),
+            returning("RETURN", 2, 0x01),
+        ]);
+        let call = logs
+            .iter()
+            .position(|l| l.op.as_ref() == "STATICCALL")
+            .expect("the read");
+        for (i, log) in logs.iter_mut().enumerate() {
+            log.gas = if i <= call { 100_000 } else { 70_000 };
+        }
+
+        let extract = compute_state_updates(trace_of(logs.clone()), Some(ORIGIN)).unwrap();
+        assert_eq!(extract.call_gas_total, 30_000);
+        let mut flat = extract.state_updates;
+        assert_eq!(resolve_code_sizes(&mut flat, &code()).unwrap(), 30_000);
+
+        let tree = crate::nested::compute_frame_tree_canonical(
+            trace_of(logs.clone()),
+            ORIGIN,
+            &|_| false,
+            &crate::nested::NESTING_COST_MODEL_V1,
+        )
+        .expect("frame tree");
+        assert_eq!(tree.call_gas_total, 30_000);
+        let mut root = tree.frames[0].updates.clone();
+        assert_eq!(resolve_code_sizes(&mut root, &code()).unwrap(), 30_000);
+        assert_eq!(
+            encode_state_updates_to_abi(&flat),
+            encode_state_updates_to_abi(&root),
+            "both walks resolve to the same program"
+        );
+
+        // Falling back keeps the read, and its gas.
+        let mut checked = compute_state_updates(trace_of(logs), Some(ORIGIN))
+            .unwrap()
+            .state_updates;
+        crate::observe::unpin_stateless_reads(&mut checked).unwrap();
+        assert_eq!(resolve_code_sizes(&mut checked, &code()).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_read_of_storage_is_checked_by_running_it() {
+        let logs = branching_on_a_read(vec![
+            at("SLOAD", 2, &[U256::ZERO]),
+            returning("RETURN", 2, 0x01),
+        ]);
+        assert_eq!(
+            both_programs(logs, Some(&code())),
+            stores_around(&[format!("STATICCALL {CALLEE}")])
+        );
+    }
+
+    /// A stateless callee that reads another stateless contract pins both contracts' code.
+    #[test]
+    fn nested_stateless_code_is_pinned_too() {
+        let logs = branching_on_a_read(vec![
+            staticcall_to(2, INNER),
+            at("ADD", 3, &[U256::from(1u64), U256::from(2u64)]),
+            returning("RETURN", 3, 0x05),
+            at("ISZERO", 2, &[U256::from(1u64)]),
+            returning("RETURN", 2, 0x01),
+        ]);
+        assert_eq!(
+            both_programs(logs.clone(), Some(&code())),
+            stores_around(&[code_pin(CALLEE, CALLEE_CODE), code_pin(INNER, INNER_CODE)])
+        );
+        // Without the inner contract's code, the whole read falls back.
+        let only_callee =
+            HashMap::from([(CALLEE, alloy_primitives::Bytes::from_static(CALLEE_CODE))]);
+        assert_eq!(
+            both_programs(logs, Some(&only_callee)),
+            stores_around(&[format!("STATICCALL {CALLEE}")])
+        );
+    }
+
+    #[test]
+    fn a_nested_storage_read_keeps_the_whole_read_checked() {
+        let logs = branching_on_a_read(vec![
+            staticcall_to(2, INNER),
+            at("SLOAD", 3, &[U256::ZERO]),
+            returning("RETURN", 3, 0x05),
+            at("ISZERO", 2, &[U256::from(1u64)]),
+            returning("RETURN", 2, 0x01),
+        ]);
+        assert_eq!(
+            both_programs(logs, Some(&code())),
+            stores_around(&[format!("STATICCALL {CALLEE}")])
+        );
+    }
+
+    /// Code the trace deployed isn't at the state it started on, so a read of it is checked by
+    /// running it, even with its code at hand.
+    #[test]
+    fn a_read_of_code_deployed_in_the_trace_is_checked_by_running_it() {
+        let mut logs = vec![
+            at("CREATE", 1, &[U256::ZERO, U256::ZERO, U256::ZERO]),
+            at("STOP", 2, &[]),
+            at("JUMPDEST", 1, &[addr_word(CALLEE)]),
+        ];
+        logs.extend(branching_on_a_read(vec![returning("RETURN", 2, 0x01)]));
+        assert!(StatelessReads::of(&logs).code_of(4).is_none());
+        let program = describe(&journal(logs));
+        assert!(
+            program.contains(&format!("STATICCALL {CALLEE}"))
+                && !program.iter().any(|op| op.starts_with("CODEHASH")),
+            "{program:?}"
+        );
+    }
+
+    /// A stateless read that failed without data reverted with nothing itself (`follow` rules
+    /// out the EVM's own failures), which its code pins; settlement would reject the failure if
+    /// it ran the read again, so a caller without code can't fall back.
+    #[test]
+    fn a_stateless_read_that_failed_without_data_is_pinned_by_its_code() {
+        let mut logs = branching_on_a_read(vec![at("REVERT", 2, &[U256::ZERO, U256::ZERO])]);
+        logs[3] = at("ISZERO", 1, &[U256::ZERO]);
+        assert!(
+            StatelessReads::of(&logs).code_of(1).is_some(),
+            "the callee is stateless"
+        );
+        assert_eq!(
+            both_programs(logs.clone(), Some(&code())),
+            stores_around(&[code_pin(CALLEE, CALLEE_CODE)])
+        );
+        let err = crate::observe::unpin_stateless_reads(&mut journal(logs)).unwrap_err();
+        assert!(
+            err.to_string().contains("without pinning its code"),
+            "{err}"
+        );
+    }
+
+    /// A stateful callee's empty failure is still rejected by the walk.
+    #[test]
+    fn a_stateful_read_that_failed_without_data_is_rejected() {
+        let mut logs = branching_on_a_read(vec![
+            at("SLOAD", 2, &[U256::ZERO]),
+            at("REVERT", 2, &[U256::ZERO, U256::ZERO]),
+        ]);
+        logs[4] = at("ISZERO", 1, &[U256::ZERO]);
+        assert!(compute_state_updates(trace_of(logs), Some(ORIGIN)).is_err());
     }
 
     #[test]
@@ -1470,6 +1781,8 @@ mod tests {
         let logs = vec![
             read,
             log("JUMPDEST", 2, 900_000, &[], &[], None),
+            // A storage read: the callee isn't stateless, so settlement runs it again.
+            log("SLOAD", 2, 890_000, &[U256::ZERO], &[], None),
             log("STOP", 2, 870_000, &[], &[], None),
             resume(1, 1_000_000 - 902_600 + 870_000, true),
             // The read's result is stored, so the program depends on it.
@@ -1483,7 +1796,15 @@ mod tests {
                 None,
             ),
         ];
-        for gas in call_and_callee_gas(logs) {
+        for gas in call_and_callee_gas(logs.clone()) {
+            assert_eq!(gas, (32_600, 30_000));
+        }
+
+        // Without the storage read the callee is stateless, but the read may still fall back
+        // to being run (a caller without its code), so its gas is counted the same.
+        let mut stateless = logs;
+        stateless.remove(2);
+        for gas in call_and_callee_gas(stateless) {
             assert_eq!(gas, (32_600, 30_000));
         }
     }

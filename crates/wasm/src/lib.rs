@@ -60,6 +60,8 @@ pub struct AnalyzeTraceResult {
     pub signature_verification_gas: u64,
     /// Accounts whose code size the program read but whose code hash this crate can't fetch:
     /// their checks are left out of `encoded_updates`, which pins less than settlement could.
+    /// (A stateless `STATICCALL`, which could be pinned by its code's hash, keeps its
+    /// `STATICCALL_CHECK` here instead.)
     pub unpinned_code_reads: Vec<String>,
 }
 
@@ -661,10 +663,18 @@ fn analyze_extract(
     with_code: &BTreeSet<Address>,
     replay: Option<(&Replay, Address)>,
 ) -> Result<AnalyzeTraceResult, String> {
-    let state_updates: &[StateUpdate] = &extract.state_updates;
+    // Priced as encoded: each stateless read checked by running it, without its code markers.
+    // (Size checks still waiting for code stay in, as the pricer leaves checks out anyway.)
+    let mut priced = extract.state_updates.clone();
+    gas_analyzer_core::observe::unpin_stateless_reads(&mut priced)
+        .map_err(|e| format!("Failed to compute state updates: {e}"))?;
+    let state_updates: &[StateUpdate] = &priced;
 
     let mut program = state_updates.to_vec();
-    let unpinned_code_reads = addresses(drop_unresolved_code_sizes(&mut program));
+    let unpinned_code_reads = addresses(
+        drop_unresolved_code_sizes(&mut program)
+            .map_err(|e| format!("Failed to compute state updates: {e}"))?,
+    );
     let encoded = encode_state_updates_to_abi(&program);
 
     let addr: Address = estimator_address
@@ -695,7 +705,13 @@ fn analyze_extract(
             match estimate_state_changes_gas(&mut cache_db, addr, caller, state_updates, &sim_env) {
                 // The callees have no code here, so the simulation charges only the `CALL`s.
                 Ok(gas) => (gas.saturating_add(extract.callee_gas_total), false, false),
-                Err(_) => (estimate_gas_from_state_updates(extract), true, false),
+                Err(_) => {
+                    let priced = TraceExtract {
+                        state_updates: state_updates.to_vec(),
+                        ..extract.clone()
+                    };
+                    (estimate_gas_from_state_updates(&priced), true, false)
+                }
             }
         }
     };
@@ -962,7 +978,11 @@ pub fn estimate_gas_heuristic_inner(
     trace_json: &str,
     origin_address: Option<&str>,
 ) -> Result<EstimateGasResult, String> {
-    let (extract, _) = parse_and_compute(trace_json, parse_origin(origin_address)?)?;
+    let (mut extract, _) = parse_and_compute(trace_json, parse_origin(origin_address)?)?;
+    // No code to pin by here: every stateless read is checked by running it, as the program
+    // this estimates would.
+    gas_analyzer_core::observe::unpin_stateless_reads(&mut extract.state_updates)
+        .map_err(|e| format!("Failed to compute state updates: {e}"))?;
 
     let gas = estimate_gas_from_state_updates(&extract);
 
@@ -986,7 +1006,10 @@ pub fn encode_trace_inner(trace_json: &str) -> Result<EncodeTraceResult, String>
     } = parse_and_compute(trace_json, None)?.0;
 
     let mut state_updates = state_updates;
-    let unpinned_code_reads = addresses(drop_unresolved_code_sizes(&mut state_updates));
+    let unpinned_code_reads = addresses(
+        drop_unresolved_code_sizes(&mut state_updates)
+            .map_err(|e| format!("Failed to compute state updates: {e}"))?,
+    );
     let encoded = encode_state_updates_to_abi(&state_updates);
     let mut skipped = skipped_opcodes.into_iter().collect::<Vec<_>>();
     skipped.sort();

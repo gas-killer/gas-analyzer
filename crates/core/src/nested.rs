@@ -21,9 +21,11 @@ use sha2::{Digest, Sha256};
 pub use crate::encoding::encode_state_updates_to_abi as encoded_program;
 use crate::heuristic::BASE_TX_COST;
 use crate::observe::{
-    Await, ExitData, PendingRead, call_pin, dedupe_checks, is_precompile, stack_top, static_check,
+    Await, ExitData, PendingRead, call_pin, charge_stateless_read, code_check, dedupe_checks,
+    is_precompile, stack_top, static_check,
 };
 use crate::sim_profile::STATE_TRACKER_SLOT;
+use crate::stateless::StatelessReads;
 use crate::taint::Usage;
 use crate::trace::{append_state_update_from_struct_log, callee_gas};
 use crate::types::Opcode;
@@ -225,7 +227,10 @@ pub struct FrameTreeExtract {
     /// Gas of every `CALL` op that replays natively, across all frames.
     pub call_gas_total: u64,
     /// The part of `call_gas_total` spent inside the callees, without the `CALL` opcodes' own
-    /// cost: what a simulation that runs those `CALL`s into code-less accounts misses.
+    /// cost: what a simulation that runs those `CALL`s into code-less accounts misses. As walked:
+    /// a caller that pins stateless reads by code takes their gas off `call_gas_total` only (see
+    /// `observe::resolve_code_sizes`), so this keeps it. Only pricers that check every read by
+    /// running it use this.
     pub callee_gas_total: u64,
     /// Gas of every `CREATE`/`CREATE2` op the kept programs replay, initcode execution and code
     /// deposit included. Kept apart from `call_gas_total`, as in [`TraceExtract`], so creates are
@@ -595,13 +600,21 @@ pub fn compute_frame_tree_canonical(
 /// outside it runs inside that contract's native `CALL`, as it would in a real settlement.
 /// Frames carry their counter's index where the trace shows one, and zero otherwise; the split
 /// is for pricing, not for signing.
+///
+/// A historical transaction ran after others in its block, so no caller can fetch the code it
+/// ran: every stateless read is checked by running it again (see
+/// [`crate::observe::unpin_stateless_reads`]).
 pub fn compute_frame_tree_hypothetical(
     trace: DefaultFrame,
     root: Address,
     owned: &BTreeSet<Address>,
     cost: &NestingCostModel,
 ) -> Result<FrameTreeExtract> {
-    split_frame_tree(trace, root, Eligibility::Hypothetical(owned), cost)
+    let mut tree = split_frame_tree(trace, root, Eligibility::Hypothetical(owned), cost)?;
+    for frame in &mut tree.frames {
+        crate::observe::unpin_stateless_reads(&mut frame.updates)?;
+    }
+    Ok(tree)
 }
 
 /// A program without its `NESTED` ops, for pricers that cannot execute them.
@@ -757,8 +770,10 @@ fn split_frame_tree(
     let mut pending: Option<PendingFrame> = None;
     let mut exits = ExitData::default();
     let mut pending_read: Option<(u64, PendingRead)> = None;
-    // Which observations each program's effects depend on; the rest stay unpinned.
+    // Which observations each program's effects depend on; the rest stay unpinned. Of the reads
+    // that are, those whose callee ran stateless code are pinned by that code.
     let usage = Usage::of(&trace.struct_logs);
+    let stateless = StatelessReads::of_used(&trace.struct_logs, &usage);
 
     for (log_index, struct_log) in trace.struct_logs.into_iter().enumerate() {
         let depth = struct_log.depth;
@@ -862,6 +877,13 @@ fn split_frame_tree(
             if frame.emitted_create && !success {
                 bail!(failed_create(depth));
             }
+            let read = match frame.pin {
+                Some(Await::Static {
+                    index,
+                    stateless: true,
+                }) => Some(index),
+                _ => None,
+            };
             if let Some(pin) = frame.pin {
                 let top = *stack.last().expect("checked above");
                 let returndata = exits.take(closing_depth);
@@ -884,6 +906,9 @@ fn split_frame_tree(
                     caller.call_gas += gas;
                     caller.callee_gas +=
                         callee_gas(gas, frame.call_gas_cost, Some(frame.entry_gas));
+                    if let Some(index) = read {
+                        charge_stateless_read(&mut caller.out, index, gas);
+                    }
                 }
                 if let Some(parent) = parent_program {
                     programs[parent].child_call_gas += gas;
@@ -1039,11 +1064,22 @@ fn split_frame_tree(
                     {
                         flush_slice(&mut frames, &programs);
                         frames[idx].out.push(check);
+                        let index = frames[idx].out.len() - 1;
+                        // A read of stateless code may be pinned by that code instead: its
+                        // markers follow the check until a caller resolves one or the other.
+                        let code = stateless.code_of(log_index);
+                        if let Some(accounts) = code {
+                            frames[idx]
+                                .out
+                                .extend(accounts.iter().map(|&account| code_check(account)));
+                        }
                         pin = Some(Await::Static {
-                            index: frames[idx].out.len() - 1,
+                            index,
+                            stateless: code.is_some(),
                         });
                     }
-                    // Settlement runs a checked read again, so its gas counts like a `CALL`'s.
+                    // Settlement runs a checked read again, so its gas counts like a `CALL`'s;
+                    // a stateless read's too, which may fall back to that.
                     let checked = pin.is_some();
                     pending = Some(PendingFrame {
                         parent_depth: depth,
@@ -1274,8 +1310,17 @@ fn prune_unprofitable(programs: &mut [ProgramState], cost: &NestingCostModel) {
         if programs[id].dropped {
             continue;
         }
-        let program_bytes =
-            encoded_program(programs[id].updates.as_deref().unwrap_or_default()).len();
+        // Sized as the program settles with each stateless read checked by running it: its
+        // code markers stand in for the check, never beside it.
+        let program: Vec<StateUpdate> = programs[id]
+            .updates
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|update| !crate::observe::is_code_marker(update))
+            .cloned()
+            .collect();
+        let program_bytes = encoded_program(&program).len();
         let children_bytes: usize = programs[id]
             .children
             .iter()
@@ -1853,6 +1898,8 @@ mod tests {
             vec![
                 sstore(1, slot(1), 10),
                 staticcall(1, C),
+                // The callee reads storage, which can be the target's.
+                log("SLOAD", 2, 950_000, &[U256::ZERO], 0),
                 exit("RETURN", 2),
                 resume(1, 900_000, true),
                 sstore(1, slot(2), 20),
@@ -1868,6 +1915,76 @@ mod tests {
         assert_eq!(check.target, C);
         assert_eq!(check.resultHash, result_hash(true, &data_word()));
         assert!(matches!(&updates[2], StateUpdate::Store(s) if s.slot == slot(2)));
+    }
+
+    /// A callee that reads no state may be pinned by its code, where its check would be.
+    #[test]
+    fn a_stateless_read_is_pinned_by_its_code_where_it_happened() {
+        let tree = split(
+            vec![
+                sstore(1, slot(1), 10),
+                staticcall(1, C),
+                log("CALLDATALOAD", 2, 950_000, &[U256::ZERO], 0),
+                exit("RETURN", 2),
+                resume(1, 900_000, true),
+                sstore(1, slot(2), 20),
+            ],
+            &[],
+        );
+        // Where its check would be, after the target is brought up to date: the store, the
+        // check, the marker of C's code, the store.
+        let mut updates = tree.frames[0].updates.clone();
+        assert!(
+            matches!(
+                updates.as_slice(),
+                [
+                    StateUpdate::Store(a),
+                    StateUpdate::StaticCallCheck(read),
+                    StateUpdate::CodehashCheck(code),
+                    StateUpdate::Store(b),
+                ] if a.slot == slot(1) && read.target == C && code.account == C && b.slot == slot(2)
+            ),
+            "{updates:?}"
+        );
+        let code = std::collections::HashMap::from([(C, Bytes::from_static(&[0xfe]))]);
+        crate::observe::resolve_code_sizes(&mut updates, &code).unwrap();
+        assert!(
+            matches!(
+                updates.as_slice(),
+                [StateUpdate::Store(_), StateUpdate::CodehashCheck(c), StateUpdate::Store(_)]
+                    if c.account == C && c.codehash == keccak256([0xfeu8])
+            ),
+            "{updates:?}"
+        );
+    }
+
+    /// A historical transaction's code can't be fetched as it ran, so a hypothetical tree
+    /// checks a stateless read by running it, with no code markers left over for pricing.
+    #[test]
+    fn a_hypothetical_tree_checks_stateless_reads_by_running_them() {
+        let tree = compute_frame_tree_hypothetical(
+            trace(vec![
+                sstore(1, slot(1), 10),
+                staticcall(1, C),
+                log("CALLDATALOAD", 2, 950_000, &[U256::ZERO], 0),
+                exit("RETURN", 2),
+                resume(1, 900_000, true),
+                sstore(1, slot(2), 20),
+            ]),
+            ROOT,
+            &BTreeSet::new(),
+            &NESTING_COST_MODEL_V1,
+        )
+        .expect("frame tree");
+        assert!(
+            matches!(
+                tree.frames[0].updates.as_slice(),
+                [StateUpdate::Store(_), StateUpdate::StaticCallCheck(read), StateUpdate::Store(_)]
+                    if read.target == C
+            ),
+            "{:?}",
+            tree.frames[0].updates
+        );
     }
 
     #[test]

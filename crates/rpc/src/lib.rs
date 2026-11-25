@@ -662,7 +662,11 @@ pub async fn compute_state_updates_from_tx<P: Provider + DebugApi>(
     let trace = get_tx_trace(provider, tx_hash, status).await?;
     let struct_logs_len = trace.struct_logs.len();
     if struct_logs_len > 0 {
-        return compute_state_updates(trace, origin);
+        let mut extract = compute_state_updates(trace, origin)?;
+        // A mined transaction ran after the ones before it in its block, a state no block tag
+        // names: its stateless reads are checked by running them, not pinned by code.
+        gas_analyzer_core::observe::unpin_stateless_reads(&mut extract.state_updates)?;
+        return Ok(extract);
     }
 
     bail!(
@@ -744,23 +748,56 @@ pub async fn get_preceding_transactions<P: Provider>(
     Ok(preceding)
 }
 
-/// Fill in the code hash of every account whose `EXTCODESIZE` a program pins: the trace
-/// shows the size, so the code is fetched at the traced `block` and checked against it (see
+/// Whether `tx` carries EIP-7702 authorizations. They change accounts' code before the call
+/// runs, so the code at the block the call is traced on isn't the code that ran: a caller pinning
+/// stateless reads by code calls [`gas_analyzer_core::observe::unpin_stateless_reads`] instead.
+pub fn sets_code(tx: &alloy::rpc::types::TransactionRequest) -> bool {
+    tx.authorization_list
+        .as_ref()
+        .is_some_and(|list| !list.is_empty())
+}
+
+/// Fill in the code hash of every account whose code a program pins but the trace doesn't show,
+/// fetching the code at `block` (see [`gas_analyzer_core::observe::resolve_code_sizes`]):
+///
+/// - an account read by `EXTCODESIZE`, whose code is checked against the size the trace saw;
+/// - an account whose code a stateless `STATICCALL` ran, so the read is pinned by code hash
+///   rather than run again at settlement. A read that ran an account with no code at `block`
+///   falls back to its `STATICCALL_CHECK`.
+///
+/// The accounts are fetched a few at a time, and any fetch that fails fails the call: falling
+/// back on an RPC error would make the program depend on the node's luck, not just on the trace,
+/// and operators signing the same call would disagree.
+///
+/// Returns the gas the reads pinned by code cost in the trace, which the program's call gas
+/// counted as settlement running them again (see
 /// [`gas_analyzer_core::observe::resolve_code_sizes`]).
+///
+/// `block` must be the state the trace ran on (for a call traced at a block, that block), or a
+/// stateless read could be pinned to code other than what ran. A caller that can't promise that
+/// (a mined transaction runs after the transactions before it in its block) calls
+/// [`gas_analyzer_core::observe::unpin_stateless_reads`] first.
 pub async fn resolve_code_hashes<P: Provider>(
     provider: &P,
     block: BlockId,
-    updates: &mut [StateUpdate],
-) -> Result<()> {
-    let mut code = std::collections::HashMap::new();
-    for (account, _) in gas_analyzer_core::observe::unresolved_code_sizes(updates) {
-        let bytes = provider
-            .get_code_at(account)
-            .block_id(block)
-            .await
-            .map_err(|e| anyhow!("fetching the code of {account}, read by EXTCODESIZE: {e}"))?;
-        code.insert(account, bytes);
-    }
+    updates: &mut Vec<StateUpdate>,
+) -> Result<u64> {
+    use futures::{StreamExt, TryStreamExt};
+    /// Enough to overlap round trips without tripping a node's rate limit.
+    const CONCURRENT_FETCHES: usize = 8;
+    let accounts = gas_analyzer_core::observe::unresolved_code_accounts(updates);
+    let code = futures::stream::iter(accounts)
+        .map(|account| async move {
+            provider
+                .get_code_at(account)
+                .block_id(block)
+                .await
+                .map(|bytes| (account, bytes))
+                .map_err(|e| anyhow!("fetching the code of {account} at {block}: {e}"))
+        })
+        .buffer_unordered(CONCURRENT_FETCHES)
+        .try_collect()
+        .await?;
     gas_analyzer_core::observe::resolve_code_sizes(updates, &code)
 }
 
