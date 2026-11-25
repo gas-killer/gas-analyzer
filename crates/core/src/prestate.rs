@@ -128,8 +128,9 @@ fn scan_target_depth(frame: &CallFrame) -> Option<String> {
 /// made none (a read of a precompile pins nothing).
 ///
 /// `frame` is the call's `callTracer` frame. The reads the call frame can't show (`BALANCE`,
-/// `SELFBALANCE`, `EXTCODEHASH`, `EXTCODESIZE`) are found with [`OBSERVATION_TRACER`], or, where
-/// an endpoint won't run it, [`opcode_observation`].
+/// `SELFBALANCE`, `EXTCODEHASH`, `EXTCODESIZE`) are found by replaying the call in revm, which
+/// evmsketch does first, or else with [`OBSERVATION_TRACER`], or, where an endpoint won't run it,
+/// [`opcode_observation`].
 pub fn static_observation(frame: &CallFrame) -> Option<String> {
     static_read_at_target_depth(frame)
         .map(|to| format!("STATICCALL to {to} at target depth (needs a STATICCALL_CHECK)"))

@@ -133,6 +133,7 @@ fn warn_if_unsupported_hardfork(chain_id: u64, hardforks: &EthereumChainHardfork
     }
 }
 
+mod local_scan;
 pub mod revert_trace;
 pub mod simple_rpc_db;
 use simple_rpc_db::{SimpleRpcDb, prefetch_slots_into_cache};
@@ -159,7 +160,7 @@ pub use gas_analyzer_estimator::{PrecedingTx, reverting_context};
 use gas_analyzer_rpc::{
     MuxedTraces, get_call_frame_from_call_with_profile, get_observation_from_call_with_profile,
     get_prestate_diff_and_call_frame_with_profile, get_prestate_diff_from_call_with_profile,
-    get_trace_from_call_with_profile, resolve_code_hashes,
+    get_prestate_from_call_with_profile, get_trace_from_call_with_profile, resolve_code_hashes,
 };
 
 // ============================================================================
@@ -202,7 +203,8 @@ pub struct EvmSketchExecutorCache {
     /// `RootProvider` is `Clone` (Arc-backed), so callers share one HTTP
     /// connection pool rather than creating a new one per invocation.
     trace_providers: Mutex<HashMap<String, RootProvider<Ethereum>>>,
-    /// What each trace endpoint has shown about `muxTracer`, by RPC URL.
+    /// What each trace endpoint has shown about `muxTracer` and the local replay's environment
+    /// probe, by RPC URL.
     mux_support: Mutex<HashMap<String, Arc<MuxSupport>>>,
 }
 
@@ -1562,6 +1564,126 @@ struct Extracted {
     parse: Duration,
 }
 
+/// The observation scan run in-process (see [`local_scan`]): `Some` with its answer when a revm
+/// replay of the call reproduced the node's run, `None` when the node has to be asked instead.
+///
+/// The node's own scan is a JavaScript tracer that runs on every step, which on a heavy call takes
+/// longer than a signing round. The replay needs only the call's touched state, which the node's
+/// native `prestateTracer` reports in one cheap request, and the environment the node gives the
+/// call, which a probe run through the same request path reads.
+///
+/// A replay that diverges costs those requests on top of the node's scan. They are bounded by the
+/// touched state, not the call's steps, so the fallback isn't started alongside the replay: that
+/// would put the per-step tracer on the node for every call, which is the load this avoids.
+async fn local_observation<P: Provider + DebugApi>(
+    provider: &P,
+    support: &MuxSupport,
+    diff: &DiffMode,
+    frame: &CallFrame,
+    tx_request: &TransactionRequest,
+    block: BlockId,
+    profile: SimProfile,
+) -> Option<Option<String>> {
+    // A tag such as `latest` can move between requests, pairing the traces with another block's
+    // header, so only a fixed block is replayed. The signed path always names one.
+    if !matches!(
+        block,
+        BlockId::Hash(_) | BlockId::Number(BlockNumberOrTag::Number(_))
+    ) {
+        tracing::debug!(%block, "can't replay a call at a block tag; asking the node to scan it");
+        return None;
+    }
+    if let Some(reason) = local_scan::unreplayable_request(tx_request) {
+        tracing::debug!(%reason, "can't replay the call locally; asking the node to scan it");
+        return None;
+    }
+    if support.replay_is_paused() {
+        tracing::debug!(
+            "the endpoint keeps failing the environment probe; asking the node to scan"
+        );
+        return None;
+    }
+    // The probe fails fast where the endpoint can't serve it, and the prestate is the larger
+    // request, so a failed probe drops the prestate request rather than waiting for it.
+    let fetched = tokio::try_join!(
+        async {
+            get_prestate_from_call_with_profile(provider, tx_request.clone(), block, profile)
+                .await
+                .map_err(ReplayFetch::Prestate)
+        },
+        async {
+            // The values the node gives the call, which can differ from the block's header.
+            let node_env = gas_analyzer_rpc::get_simulated_env_with_profile(
+                provider, tx_request, block, profile,
+            )
+            .await
+            .map_err(ReplayFetch::Probe)?;
+            match local_scan::unreplayable_env(&node_env) {
+                Some(reason) => Err(ReplayFetch::Probe(anyhow!(reason))),
+                None => Ok(node_env),
+            }
+        },
+    );
+    let (pre, node_env) = match fetched {
+        Ok(fetched) => {
+            support.probe_answered();
+            fetched
+        }
+        Err(ReplayFetch::Probe(e)) => {
+            let paused = support.probe_failed();
+            tracing::info!(error = %e, paused, "the endpoint can't serve the local replay; asking the node to scan it");
+            return None;
+        }
+        Err(ReplayFetch::Prestate(e)) => {
+            tracing::debug!(error = %e, "can't replay the call locally; asking the node to scan it");
+            return None;
+        }
+    };
+    // The fork the node ran the call under, from the block it ran it in. A chain the analyzer has
+    // no fork schedule for runs under revm's default; a fork that changed what the call did would
+    // show up as a divergence.
+    let spec = chain_id_to_genesis_and_spec(node_env.chain_id)
+        .map(|(_, hardforks)| {
+            alloy_evm::spec_by_timestamp_and_block_number(
+                &hardforks,
+                node_env.timestamp,
+                node_env.number,
+            )
+        })
+        .unwrap_or_default();
+    let env = local_scan::ScanEnv {
+        spec,
+        node: node_env,
+    };
+    let (diff, frame, tx) = (diff.clone(), frame.clone(), tx_request.clone());
+    let scanned = tokio::task::spawn_blocking(move || {
+        local_scan::scan_observations(&pre, &frame, &diff, &tx, &env)
+    })
+    .await;
+    match scanned {
+        Ok(Ok(local_scan::LocalScan::Observed(observed))) => Some(observed),
+        Ok(Ok(local_scan::LocalScan::Diverged(reason))) => {
+            tracing::info!(%reason, "the local replay diverged from the node's run; asking the node to scan it");
+            None
+        }
+        Ok(Err(e)) => {
+            tracing::info!(error = %e, "the local replay failed; asking the node to scan it");
+            None
+        }
+        Err(e) => {
+            tracing::info!(error = %e, "the local replay panicked; asking the node to scan it");
+            None
+        }
+    }
+}
+
+/// Which of the local replay's requests failed: a probe failure says the endpoint can't serve the
+/// replay, a prestate failure may be about the call.
+enum ReplayFetch {
+    Probe(anyhow::Error),
+    Prestate(anyhow::Error),
+}
+
 /// Build the prestate net form: `Ok(Some(updates))` when the call admits it, `Ok(None)` when the net
 /// form cannot represent the call and the struct-log extractor must produce the program, `Err` when
 /// the tracers are unavailable or fail, or an [`EvmFailure`] when the call itself failed. Never
@@ -1588,19 +1710,28 @@ async fn try_prestate_net<P: Provider + DebugApi>(
             // read anything outside the consumer goes to the struct-log encoder.
             let observed = match static_observation(&frame) {
                 Some(reason) => Some(reason),
-                // A scan that fails says nothing either way: the struct-log encoder pins what
-                // the call read, so it takes the call instead of failing the encode.
-                None => match get_observation_from_call_with_profile(
-                    provider,
-                    tx_request.clone(),
-                    block,
-                    profile,
-                )
-                .await
-                {
-                    Ok(observed) => observed,
-                    Err(e) => Some(format!("the observation scan failed: {e:#}")),
-                },
+                None => {
+                    match local_observation(
+                        provider, mux, &diff, &frame, tx_request, block, profile,
+                    )
+                    .await
+                    {
+                        Some(observed) => observed,
+                        // A scan that fails says nothing either way: the struct-log encoder pins
+                        // what the call read, so it takes the call instead of failing the encode.
+                        None => match get_observation_from_call_with_profile(
+                            provider,
+                            tx_request.clone(),
+                            block,
+                            profile,
+                        )
+                        .await
+                        {
+                            Ok(observed) => observed,
+                            Err(e) => Some(format!("the observation scan failed: {e:#}")),
+                        },
+                    }
+                }
             };
             if let Some(reason) = observed {
                 tracing::debug!(reason = %reason, "call observes outside the consumer; using struct-log encoder");
@@ -1626,11 +1757,23 @@ const MUX_PAUSE: Duration = Duration::from_secs(60 * 60);
 /// burst of call-specific failures such as tracer timeouts on heavy calls does not pause it.
 const MUX_REJECTIONS_BEFORE_PAUSE: u32 = 3;
 
+/// How long an endpoint that keeps failing the environment probe goes without a local replay.
+/// Shorter than the mux pause: while it lasts, heavy calls fall back to the node's per-step scan.
+const REPLAY_PAUSE: Duration = Duration::from_secs(10 * 60);
+
+/// Failed environment probes in a row, with no answer in between, after which the local replay is
+/// paused. A few, so a transient RPC error doesn't pause it.
+const REPLAY_PROBE_FAILURES_BEFORE_PAUSE: u32 = 3;
+
 /// What a trace endpoint has shown about `muxTracer`, shared by every request to it.
 ///
 /// An endpoint that says it lacks `muxTracer`, answers it in an unusable shape, or keeps rejecting
 /// it is paused: requests go straight to the separate tracers until the pause ends. Pausing only
 /// ever costs speed, never correctness, since both paths return the same frames.
+///
+/// It also records whether the endpoint answers the local replay's environment probe. One that
+/// keeps failing it has the replay paused the same way, so heavy calls stop paying the replay's
+/// requests before the node's own scan, which gives the same answer.
 #[derive(Debug)]
 pub(crate) struct MuxSupport {
     pause: Duration,
@@ -1638,6 +1781,11 @@ pub(crate) struct MuxSupport {
     /// Milliseconds after `epoch` until which `muxTracer` is not requested.
     paused_until_ms: AtomicU64,
     rejections: AtomicU32,
+    /// Milliseconds after `epoch` until which the local replay isn't tried, because the endpoint
+    /// kept failing its environment probe (no state overrides on `debug_traceCall`, or a chain
+    /// whose EVM lacks the probe's opcodes).
+    replay_paused_until_ms: AtomicU64,
+    probe_failures: AtomicU32,
 }
 
 impl Default for MuxSupport {
@@ -1653,6 +1801,8 @@ impl MuxSupport {
             epoch: Instant::now(),
             paused_until_ms: AtomicU64::new(0),
             rejections: AtomicU32::new(0),
+            replay_paused_until_ms: AtomicU64::new(0),
+            probe_failures: AtomicU32::new(0),
         }
     }
 
@@ -1675,6 +1825,30 @@ impl MuxSupport {
     /// The endpoint served the request, whatever became of the call.
     fn answered(&self) {
         self.rejections.store(0, Ordering::Relaxed);
+    }
+
+    fn replay_is_paused(&self) -> bool {
+        self.now_ms() < self.replay_paused_until_ms.load(Ordering::Relaxed)
+    }
+
+    /// The endpoint answered the environment probe.
+    fn probe_answered(&self) {
+        self.probe_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Records a failed environment probe, pausing the local replay when it is one too many.
+    /// Returns whether it did. Pausing costs only speed: the node's own scan gives the same answer.
+    fn probe_failed(&self) -> bool {
+        let pause = self.probe_failures.fetch_add(1, Ordering::Relaxed) + 1
+            >= REPLAY_PROBE_FAILURES_BEFORE_PAUSE;
+        if pause {
+            let until = self
+                .now_ms()
+                .saturating_add(u64::try_from(REPLAY_PAUSE.as_millis()).unwrap_or(u64::MAX));
+            self.replay_paused_until_ms.store(until, Ordering::Relaxed);
+            self.probe_failures.store(0, Ordering::Relaxed);
+        }
+        pause
     }
 
     /// Records a rejection, pausing `muxTracer` when it is one too many. Returns whether it did.
@@ -2912,6 +3086,27 @@ mod tests {
         assert!(asserter.pop_response().is_none());
     }
 
+    /// The local replay is paused after a few failed environment probes in a row, and an answer
+    /// in between starts the count again.
+    #[test]
+    fn test_repeated_probe_failures_pause_the_replay() {
+        let support = MuxSupport::default();
+        for _ in 1..REPLAY_PROBE_FAILURES_BEFORE_PAUSE {
+            assert!(!support.probe_failed());
+        }
+        support.probe_answered();
+        for _ in 1..REPLAY_PROBE_FAILURES_BEFORE_PAUSE {
+            assert!(!support.probe_failed());
+        }
+        assert!(!support.replay_is_paused());
+        assert!(
+            support.probe_failed(),
+            "one failure too many pauses the replay"
+        );
+        assert!(support.replay_is_paused());
+        assert!(!support.is_paused(), "the mux is paused separately");
+    }
+
     /// End-to-end coverage of the extraction dispatcher and the `rpc` tracer helpers against a
     /// real node, rather than synthetic tracer output.
     ///
@@ -3845,6 +4040,97 @@ mod tests {
                     found.as_deref().and_then(|r| r.split(' ').next()),
                     expected,
                     "{to}: {found:?}"
+                );
+            }
+        }
+
+        /// The in-process scan answers as the node's tracer does on real traces: a read at
+        /// target depth or in a delegated library counts, one inside a called contract doesn't,
+        /// and a call that writes storage and logs replays without diverging.
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "spawns a local anvil; requires foundry on PATH"]
+        async fn the_local_scan_agrees_with_the_node() {
+            let anvil = spawn_as_sepolia().await;
+            let provider = anvil.provider();
+            let reader = address!("0x0000000000000000000000000000000000002201");
+            let library = address!("0x0000000000000000000000000000000000002202");
+            let delegator = address!("0x0000000000000000000000000000000000002203");
+            let caller = address!("0x0000000000000000000000000000000000002204");
+            let writer = address!("0x0000000000000000000000000000000000002205");
+            // BALANCE(ADDRESS); POP; STOP
+            set_code(&provider, reader, hex_code("30 31 50 00")).await;
+            // SELFBALANCE; POP; STOP
+            set_code(&provider, library, hex_code("47 50 00")).await;
+            let lib = addr_hex(library);
+            set_code(
+                &provider,
+                delegator,
+                hex_code(&format!("6000 6000 6000 6000 73{lib} 5a f4 50 00")),
+            )
+            .await;
+            let r = addr_hex(reader);
+            set_code(
+                &provider,
+                caller,
+                hex_code(&format!("6000 6000 6000 6000 6000 73{r} 5a f1 50 00")),
+            )
+            .await;
+            // SSTORE(1, 42); LOG1(0, 0, topic 7); STOP
+            set_code(
+                &provider,
+                writer,
+                hex_code("602a 6001 55 6007 6000 6000 a1 00"),
+            )
+            .await;
+            // A fixed block: the local scan doesn't replay at a tag.
+            let block = BlockId::number(provider.get_block_number().await.expect("block number"));
+
+            for (to, expected) in [
+                (reader, Some("BALANCE")),
+                (delegator, Some("SELFBALANCE")),
+                (caller, None),
+                (writer, None),
+            ] {
+                let request = call_request(to);
+                let (diff, frame) = tokio::try_join!(
+                    get_prestate_diff_from_call_with_profile(
+                        &provider,
+                        request.clone(),
+                        block,
+                        SimProfile::Chain
+                    ),
+                    get_call_frame_from_call_with_profile(
+                        &provider,
+                        request.clone(),
+                        block,
+                        SimProfile::Chain
+                    ),
+                )
+                .expect("the native tracers run");
+                let local = local_observation(
+                    &provider,
+                    &MuxSupport::default(),
+                    &diff,
+                    &frame,
+                    &request,
+                    block,
+                    SimProfile::Chain,
+                )
+                .await
+                .expect("the replay matches the node's run");
+                let node = get_observation_from_call_with_profile(
+                    &provider,
+                    request,
+                    block,
+                    SimProfile::Chain,
+                )
+                .await
+                .expect("the tracer runs");
+                assert_eq!(local, node, "{to}");
+                assert_eq!(
+                    local.as_deref().and_then(|r| r.split(' ').next()),
+                    expected,
+                    "{to}: {local:?}"
                 );
             }
         }

@@ -4,13 +4,13 @@
 //! (alloy-provider, DebugApi). These are separated from the core crate
 //! because they are not WASM-compatible.
 
-use alloy::primitives::{Address, FixedBytes};
+use alloy::primitives::{Address, B256, FixedBytes, U256};
 use alloy::rpc::types::BlockOverrides;
 use alloy::rpc::types::trace::geth::mux::{MuxConfig, MuxFrame};
 use alloy::rpc::types::trace::geth::{
     CallConfig, CallFrame, DefaultFrame, DiffMode, GethDebugBuiltInTracerType, GethDebugTracerType,
     GethDebugTracingCallOptions, GethDebugTracingOptions, GethDefaultTracingOptions, GethTrace,
-    PreStateConfig, PreStateFrame,
+    PreStateConfig, PreStateFrame, PreStateMode,
 };
 use alloy::transports::TransportError;
 use alloy_eips::BlockId;
@@ -257,6 +257,176 @@ where
         GethTrace::PreStateTracer(PreStateFrame::Diff(diff)) => Ok(diff),
         other => Err(anyhow!("expected prestate diff frame, got {other:?}")),
     }
+}
+
+/// Simulate a call and return the `prestateTracer` frame in its default mode: every account the
+/// call touched, with its balance, nonce and code, and every storage slot it read or wrote, all as
+/// they were before the call.
+///
+/// Like the diff, its cost is `O(touched state)` rather than `O(execution steps)`. It is the state
+/// a local replay of the call needs, so the call can be scanned in-process instead of by a tracer
+/// that runs on every step on the node.
+pub async fn get_prestate_from_call_with_profile<P, Req>(
+    provider: &P,
+    tx_request: Req,
+    block: BlockId,
+    profile: SimProfile,
+) -> Result<PreStateMode>
+where
+    P: Provider + DebugApi,
+    Req: Into<alloy::rpc::types::eth::TransactionRequest>,
+{
+    let mut tx_request = tx_request.into();
+    let mut options = GethDebugTracingCallOptions {
+        tracing_options: GethDebugTracingOptions::prestate_tracer(PreStateConfig::default()),
+        ..Default::default()
+    };
+    apply_sim_profile(&mut tx_request, &mut options, profile);
+    match provider
+        .debug_trace_call(tx_request, block, options)
+        .await
+        .map_err(|e| anyhow!("prestate debug_trace_call failed: {}", e))?
+    {
+        GethTrace::PreStateTracer(PreStateFrame::Default(state)) => Ok(state),
+        other => Err(anyhow!(
+            "expected a default-mode prestate frame, got {other:?}"
+        )),
+    }
+}
+
+/// The environment a node gives a simulated call: the values a call can read about its block and
+/// its own gas, as the node sets them rather than as the block's header records them. Nodes differ
+/// here (the base fee and gas price of a call with no fee, the gas of a call that names none), so a
+/// local replay reads them from the node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimulatedEnv {
+    /// The call's gas limit.
+    pub tx_gas_limit: u64,
+    pub timestamp: u64,
+    pub number: u64,
+    pub coinbase: Address,
+    /// `PREVRANDAO`, or `DIFFICULTY` before the merge.
+    pub prevrandao: B256,
+    pub block_gas_limit: u64,
+    pub basefee: u64,
+    pub chain_id: u64,
+    pub gas_price: u128,
+}
+
+/// Where the environment probe's code is placed for the call. Nothing is deployed there; the code
+/// arrives as a state override.
+const ENV_PROBE_ADDRESS: Address = Address::new([
+    0x9a, 0x5a, 0x11, 0x7e, 0xe5, 0x0e, 0x4b, 0x1f, 0x77, 0xc0, 0x1e, 0x5e, 0xab, 0x4e, 0x0b, 0xe3,
+    0x00, 0x00, 0xe0, 0x01,
+]);
+
+/// Stores `GAS`, `TIMESTAMP`, `NUMBER`, `COINBASE`, `PREVRANDAO`, `GASLIMIT`, `BASEFEE`,
+/// `CHAINID` and `GASPRICE` in nine words and returns them. `GAS` runs first, so the call's gas
+/// limit is what it returns plus the intrinsic 21,000 and its own 2.
+const ENV_PROBE_CODE: [u8; 43] = [
+    0x5a, 0x60, 0x00, 0x52, // GAS
+    0x42, 0x60, 0x20, 0x52, // TIMESTAMP
+    0x43, 0x60, 0x40, 0x52, // NUMBER
+    0x41, 0x60, 0x60, 0x52, // COINBASE
+    0x44, 0x60, 0x80, 0x52, // PREVRANDAO
+    0x45, 0x60, 0xa0, 0x52, // GASLIMIT
+    0x48, 0x60, 0xc0, 0x52, // BASEFEE
+    0x46, 0x60, 0xe0, 0x52, // CHAINID
+    0x3a, 0x61, 0x01, 0x00, 0x52, // GASPRICE
+    0x61, 0x01, 0x20, 0x60, 0x00, 0xf3, // RETURN(0, 0x120)
+];
+
+/// The probe's intrinsic gas (a call with no data, value or access list) plus `GAS`'s own cost.
+const ENV_PROBE_GAS_BEFORE_READ: u64 = 21_000 + 2;
+
+/// Reads the [`SimulatedEnv`] the node gives `tx_request` at `block` under `profile`, by running a
+/// probe in its place through the same `debug_traceCall` path: same sender, same gas field, same
+/// profile overrides, but no data, value or fee, and the probe's code at a fixed address.
+pub async fn get_simulated_env_with_profile<P>(
+    provider: &P,
+    tx_request: &alloy::rpc::types::eth::TransactionRequest,
+    block: BlockId,
+    profile: SimProfile,
+) -> Result<SimulatedEnv>
+where
+    P: Provider + DebugApi,
+{
+    let mut probe = alloy::rpc::types::eth::TransactionRequest {
+        from: tx_request.from,
+        to: Some(ENV_PROBE_ADDRESS.into()),
+        gas: tx_request.gas,
+        ..Default::default()
+    };
+    let mut options = GethDebugTracingCallOptions {
+        tracing_options: GethDebugTracingOptions::call_tracer(CallConfig::default()),
+        state_overrides: Some(
+            [(
+                ENV_PROBE_ADDRESS,
+                alloy::rpc::types::state::AccountOverride {
+                    code: Some(ENV_PROBE_CODE.to_vec().into()),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+        ),
+        ..Default::default()
+    };
+    apply_sim_profile(&mut probe, &mut options, profile);
+    let frame = match provider
+        .debug_trace_call(probe, block, options)
+        .await
+        .map_err(|e| anyhow!("environment probe debug_trace_call failed: {}", e))?
+    {
+        GethTrace::CallTracer(frame) => frame,
+        other => bail!("expected the probe's call frame, got {other:?}"),
+    };
+    if let Some(error) = frame.error {
+        bail!("the environment probe failed: {error}");
+    }
+    let env = parse_simulated_env(frame.output.as_ref().map_or(&[][..], |o| o.as_ref()))?;
+    check_probe_gas(&env, frame.gas)?;
+    Ok(env)
+}
+
+/// Checks the gas limit the probe worked out from `GAS` against the one its root frame reports,
+/// `frame_gas`. Clients report either the call's full gas limit there or what was left after the
+/// intrinsic 21,000. Anything else means the node charged gas before the call ran that the
+/// standard intrinsic cost doesn't account for (an L1 data fee, say), which a replay can't
+/// reproduce.
+fn check_probe_gas(env: &SimulatedEnv, frame_gas: U256) -> Result<()> {
+    let limit = U256::from(env.tx_gas_limit);
+    if frame_gas == limit || frame_gas + U256::from(21_000) == limit {
+        return Ok(());
+    }
+    bail!(
+        "the node charged gas before the probe ran: its frame reports {frame_gas} gas, but the \
+         probe had {limit} less the intrinsic cost"
+    )
+}
+
+fn parse_simulated_env(output: &[u8]) -> Result<SimulatedEnv> {
+    if output.len() != 9 * 32 {
+        bail!("the environment probe returned {} bytes", output.len());
+    }
+    let word = |i: usize| U256::from_be_slice(&output[i * 32..(i + 1) * 32]);
+    let small = |i: usize, name: &str| -> Result<u64> {
+        u64::try_from(word(i)).map_err(|_| anyhow!("the node's {name} doesn't fit in 64 bits"))
+    };
+    Ok(SimulatedEnv {
+        tx_gas_limit: small(0, "remaining gas")?
+            .checked_add(ENV_PROBE_GAS_BEFORE_READ)
+            .ok_or_else(|| anyhow!("the call's gas limit overflows"))?,
+        timestamp: small(1, "timestamp")?,
+        number: small(2, "block number")?,
+        coinbase: Address::from_slice(&output[3 * 32 + 12..4 * 32]),
+        prevrandao: B256::from_slice(&output[4 * 32..5 * 32]),
+        block_gas_limit: small(5, "block gas limit")?,
+        basefee: small(6, "base fee")?,
+        chain_id: small(7, "chain id")?,
+        gas_price: u128::try_from(word(8))
+            .map_err(|_| anyhow!("the node's gas price doesn't fit in 128 bits"))?,
+    })
 }
 
 /// Simulate a call and return the `callTracer` frame (with logs): the call tree + emitted events.
@@ -596,6 +766,94 @@ pub async fn resolve_code_hashes<P: Provider>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_environment_probe_reads_what_the_evm_gives_the_call() {
+        use revm::context::TxEnv;
+        use revm::context::result::{ExecutionResult, Output};
+        use revm::database::{CacheDB, EmptyDB};
+        use revm::primitives::TxKind;
+        use revm::state::{AccountInfo, Bytecode};
+        use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
+
+        let coinbase = Address::repeat_byte(0xcb);
+        let prevrandao = B256::repeat_byte(0x52);
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            ENV_PROBE_ADDRESS,
+            AccountInfo::default().with_code(Bytecode::new_raw(ENV_PROBE_CODE.to_vec().into())),
+        );
+        let mut evm = Context::mainnet()
+            .with_db(&mut db)
+            .modify_cfg_chained(|cfg| {
+                cfg.chain_id = 31_337;
+                cfg.disable_balance_check = true;
+                cfg.disable_base_fee = true;
+            })
+            .modify_block_chained(|block| {
+                block.number = U256::from(12);
+                block.timestamp = U256::from(34);
+                block.gas_limit = 45_000_000;
+                block.beneficiary = coinbase;
+                block.prevrandao = Some(prevrandao);
+                block.basefee = 9;
+            })
+            .build_mainnet();
+        let tx = TxEnv::builder()
+            .kind(TxKind::Call(ENV_PROBE_ADDRESS))
+            .gas_limit(1_000_000)
+            .gas_price(3)
+            .chain_id(Some(31_337))
+            .build()
+            .unwrap();
+        let ExecutionResult::Success {
+            output: Output::Call(output),
+            ..
+        } = evm.transact(tx).unwrap().result
+        else {
+            panic!("the probe runs");
+        };
+        assert_eq!(
+            parse_simulated_env(&output).unwrap(),
+            SimulatedEnv {
+                tx_gas_limit: 1_000_000,
+                timestamp: 34,
+                number: 12,
+                coinbase,
+                prevrandao,
+                block_gas_limit: 45_000_000,
+                basefee: 9,
+                chain_id: 31_337,
+                gas_price: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn the_probe_gas_must_match_its_frame() {
+        let env = SimulatedEnv {
+            tx_gas_limit: 1_000_000,
+            timestamp: 0,
+            number: 0,
+            coinbase: Address::ZERO,
+            prevrandao: B256::ZERO,
+            block_gas_limit: 0,
+            basefee: 0,
+            chain_id: 1,
+            gas_price: 0,
+        };
+        // The full limit, or what was left after the intrinsic cost.
+        assert!(check_probe_gas(&env, U256::from(1_000_000)).is_ok());
+        assert!(check_probe_gas(&env, U256::from(979_000)).is_ok());
+        // Gas charged up front that the intrinsic cost doesn't explain.
+        assert!(check_probe_gas(&env, U256::from(1_200_000)).is_err());
+        assert!(check_probe_gas(&env, U256::from(990_000)).is_err());
+    }
+
+    #[test]
+    fn a_probe_answer_of_the_wrong_length_is_an_error() {
+        assert!(parse_simulated_env(&[0; 8 * 32]).is_err());
+    }
+
     use super::*;
 
     const CALL_FRAME: &str = r#"{
