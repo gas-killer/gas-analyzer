@@ -58,6 +58,7 @@ use gas_analyzer_core::heuristic::{
 use gas_analyzer_core::{
     Opcode, RevertingContext, SignatureType, StateUpdate, TURETZKY_UPPER_GAS_LIMIT_SCHNORR,
     TraceExtract, compute_state_updates, encode_state_updates_to_abi, encode_state_updates_to_sol,
+    unpin_stateless_reads,
 };
 use gas_analyzer_rpc::{get_tx_trace, resolve_code_hashes};
 
@@ -718,10 +719,13 @@ pub async fn gaskiller_reporter(
 ) -> Result<ReportDetails> {
     let trace = get_tx_trace(&provider, tx_hash, receipt.status()).await?;
     let TraceExtract {
-        state_updates,
+        mut state_updates,
         skipped_opcodes: skipped_opcodes_set,
         ..
     } = compute_state_updates(trace, receipt.to)?;
+    // A mined transaction's stateless reads are checked by running them (see
+    // `TxStateExtractor::resolve_code_hashes`).
+    unpin_stateless_reads(&mut state_updates)?;
     let skipped_opcodes = skipped_opcodes_set
         .into_iter()
         .collect::<Vec<_>>()
@@ -768,20 +772,32 @@ pub async fn call_to_encoded_state_updates_with_gas_estimate(
             TxKind::Create => None,
         })
         .ok_or_else(|| anyhow!("receipt does not have to address"))?;
-    let trace = get_trace_from_call(url.clone(), tx_request, block_height).await?;
+    // The call runs as the first transaction on a fork of `block_height`, so the code it ran is
+    // the code at that block. Pin "latest" to a number first, so the fork and the code fetch
+    // can't see different blocks.
+    let upstream = ProviderBuilder::new().connect_http(url.clone());
+    let block_height = match block_height {
+        Some(height) => height,
+        None => upstream.get_block_number().await?,
+    };
+    let authorizes = tx_request
+        .authorization_list
+        .as_ref()
+        .is_some_and(|list| !list.is_empty());
+    let trace = get_trace_from_call(url, tx_request, Some(block_height)).await?;
     let TraceExtract {
         mut state_updates,
         skipped_opcodes,
         ..
     } = compute_state_updates(trace, Some(contract_address))?;
-    // The program pins a code size as its code's hash, read at the block the call was traced at.
-    let block = block_height.map_or(BlockId::latest(), BlockId::number);
-    resolve_code_hashes(
-        &ProviderBuilder::new().connect_http(url),
-        block,
-        &mut state_updates,
-    )
-    .await?;
+    // EIP-7702 authorizations change code before the call runs, so the block's code isn't what
+    // ran: check stateless reads by running them.
+    if authorizes {
+        unpin_stateless_reads(&mut state_updates)?;
+    }
+    // The program pins a code size, or the code a stateless read ran, as the code's hash, read
+    // at the block the call ran on.
+    resolve_code_hashes(&upstream, BlockId::number(block_height), &mut state_updates).await?;
     let gas_estimate = gk
         .estimate_state_changes_gas(contract_address, &state_updates)
         .await?;
@@ -808,11 +824,17 @@ impl<P: Provider + DebugApi> TxStateExtractor<P> {
     }
 
     /// Pin each code size the program read as its code's hash, at the transaction's block.
+    ///
+    /// A mined transaction ran after the ones before it in its block, a state no block tag
+    /// names: code at the block's end can differ from what ran (an EIP-7702 re-delegation later
+    /// in the block, say). So its stateless reads are checked by running them, not pinned by
+    /// code.
     async fn resolve_code_hashes(
         &self,
         receipt: &TransactionReceipt,
-        updates: &mut [StateUpdate],
+        updates: &mut Vec<StateUpdate>,
     ) -> Result<()> {
+        unpin_stateless_reads(updates)?;
         let block = receipt
             .block_number
             .map_or(BlockId::latest(), BlockId::number);

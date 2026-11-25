@@ -3974,7 +3974,8 @@ mod tests {
         /// - a CALL capped at 2,300, its RETURNDATASIZE stored to slot 9;
         /// - a caught revert with data, dropped (a caught failure is pinned anyway);
         /// - a STATICCALL of the returner, its success stored to slot 6: the returner reads no
-        ///   state, so the read is pinned by its code hash rather than run again;
+        ///   state, so the read is pinned by its code hash rather than run again (the same hash
+        ///   `EXTCODESIZE` pins below, checked once);
         /// - BALANCE stored to slot 5, then the same BALANCE again to slot 8 (a repeat);
         /// - EXTCODESIZE stored to slot 7, SELFBALANCE dropped, then SSTORE(4, 1).
         fn observer_code(returner: Address, reverter: Address) -> Bytes {
@@ -4196,8 +4197,9 @@ mod tests {
                 );
                 assert_eq!(
                     count(12),
-                    2,
-                    "{encoding:?}: the stateless read's and EXTCODESIZE's CODEHASH_CHECKs"
+                    1,
+                    "{encoding:?}: the stateless read and EXTCODESIZE pin the returner's code \
+                     hash, once"
                 );
                 let pinned: Vec<bool> = types
                     .iter()

@@ -11,10 +11,13 @@
 //! stateless, and succeeded. Everything else, from an `SLOAD` or `TIMESTAMP` to an op this module
 //! doesn't know, leaves the read checked by running it again.
 //!
+//! Code deployed in the trace itself can't be pinned by its hash: the code a caller fetches
+//! from the state the trace ran on isn't there yet. A read that ran such code is left checked.
+//!
 //! Like `taint`'s, the verdict is keyed by the `STATICCALL`'s struct-log index, which the walks
 //! also count, and depends only on the trace, so every operator reaches the same one.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use alloy_primitives::Address;
 use alloy_rpc_types::trace::geth::StructLog;
@@ -64,9 +67,26 @@ fn follow(logs: &[StructLog]) -> HashMap<usize, Vec<Address>> {
     let mut outcomes: Vec<(u64, usize)> = Vec::new();
     // A call that must open a frame for its read to stay stateless: (its depth, the read).
     let mut expect_frame: Option<(u64, usize)> = None;
+    // Every account the trace deploys code to, and the depths of the `CREATE`s and `CREATE2`s
+    // whose resume log (carrying the address) is still to come.
+    let mut created: HashSet<Address> = HashSet::new();
+    let mut creating: Vec<u64> = Vec::new();
 
     for (step, log) in logs.iter().enumerate() {
         let depth = log.depth;
+        while let Some(&create_depth) = creating.last()
+            && create_depth >= depth
+        {
+            creating.pop();
+            if create_depth == depth
+                && let Some(address) = stack_top(log, 0).filter(|a| !a.is_zero())
+            {
+                created.insert(Address::from_word(address.into()));
+            }
+        }
+        if matches!(log.op.as_ref(), "CREATE" | "CREATE2") && log.error.is_none() {
+            creating.push(depth);
+        }
         if let Some((call_depth, at)) = expect_frame.take()
             && depth != call_depth + 1
         {
@@ -141,6 +161,9 @@ fn follow(logs: &[StructLog]) -> HashMap<usize, Vec<Address>> {
         }
     }
     // Reads still open when the trace ends can't be followed to their outcome: none qualify.
+    // Nor can a read whose code was deployed by the trace (before it, since its code ran) be
+    // pinned by code fetched from the state the trace started on.
+    out.retain(|_, accounts| !accounts.iter().any(|a| created.contains(a)));
     out
 }
 
@@ -150,7 +173,13 @@ fn is_call(op: &str) -> bool {
 
 /// Whether `op` reads nothing but its own frame (stack, memory, calldata, return data, its
 /// code, and its call's context, which the caller fixes), so its result is the same at
-/// settlement as in the trace. `GAS` counts: a read's gas is part of how the trace ran it.
+/// settlement as in the trace.
+///
+/// `GAS` counts, though a callee could branch on it: snarkjs verifiers pass `gas()` to the
+/// pairing precompile, and pinning such a read by its code loses nothing. A `STATICCALL_CHECK`
+/// runs the read again with whatever gas settlement has left, not the gas the trace gave it, so
+/// a result that depends on gas was never pinned to the trace's either. A transition is defined
+/// by the trace at its reference block, gas included.
 ///
 /// Not listed, and so stateful: storage and transient storage (`SLOAD`, `TLOAD`), other
 /// accounts (`BALANCE`, `SELFBALANCE`, `EXTCODESIZE`, `EXTCODEHASH`, `EXTCODECOPY`), the block and

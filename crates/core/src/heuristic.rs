@@ -157,6 +157,9 @@ pub fn estimate_gas_from_state_updates(extract: &TraceExtract) -> u64 {
             StateUpdate::Create(_) | StateUpdate::Create2(_) => 0,
             // A STATICCALL_CHECK's read, access included, is in call_gas_total like a CALL's.
             StateUpdate::StaticCallCheck(_) => 0,
+            // A stateless read's code marker: the read is priced as its STATICCALL_CHECK, which
+            // it may still fall back to (see `observe::code_check`).
+            update if crate::observe::is_code_marker(update) => 0,
             // The access a check repeats.
             StateUpdate::BalanceCheck(_) | StateUpdate::CodehashCheck(_) => {
                 COLD_ACCOUNT_ACCESS_COST
@@ -173,11 +176,15 @@ pub fn estimate_gas_from_state_updates(extract: &TraceExtract) -> u64 {
 /// [`estimate_gas_from_state_updates`] prices them.
 ///
 /// An unpinned caught revert must then succeed, as it had to before programs could pin.
+///
+/// A stateless read whose code markers are still unresolved is priced as its `STATICCALL_CHECK`,
+/// which it may fall back to: its markers cost nothing.
 pub fn unpinned_for_pricing(updates: &[StateUpdate]) -> (Vec<StateUpdate>, u64) {
     let mut checks = 0u64;
     let program = updates
         .iter()
         .filter_map(|update| match update {
+            _ if crate::observe::is_code_marker(update) => None,
             _ if update.is_check() => {
                 checks += 1;
                 None

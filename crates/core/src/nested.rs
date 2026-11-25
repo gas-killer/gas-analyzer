@@ -1036,27 +1036,30 @@ fn split_frame_tree(
                     // A read an emitting frame makes and uses is pinned where it happens. Its
                     // callee runs code, which can read the target, so the target's storage is
                     // brought to the canonical image first, as at a `CALL`.
-                    // A read of stateless code is pinned by that code instead: it reads no
-                    // storage, so the target needn't be brought up to date for it.
                     let mut pin = None;
-                    if cur_emitting && usage.used(log_index) {
-                        if let Some(accounts) = stateless.code_of(log_index) {
+                    if cur_emitting
+                        && usage.used(log_index)
+                        && let Some(check) = static_check(&struct_log)?
+                    {
+                        flush_slice(&mut frames, &programs);
+                        frames[idx].out.push(check);
+                        let index = frames[idx].out.len() - 1;
+                        // A read of stateless code may be pinned by that code instead: its
+                        // markers follow the check until a caller resolves one or the other.
+                        let code = stateless.code_of(log_index);
+                        if let Some(accounts) = code {
                             frames[idx]
                                 .out
                                 .extend(accounts.iter().map(|&account| code_check(account)));
-                            pin = Some(Await::Stateless {
-                                target: accounts[0],
-                            });
-                        } else if let Some(check) = static_check(&struct_log)? {
-                            flush_slice(&mut frames, &programs);
-                            frames[idx].out.push(check);
-                            pin = Some(Await::Static {
-                                index: frames[idx].out.len() - 1,
-                            });
                         }
+                        pin = Some(Await::Static {
+                            index,
+                            stateless: code.is_some(),
+                        });
                     }
-                    // Settlement runs a checked read again, so its gas counts like a `CALL`'s.
-                    let checked = matches!(pin, Some(Await::Static { .. }));
+                    // Settlement runs a checked read again, so its gas counts like a `CALL`'s;
+                    // a stateless read's too, which may fall back to that.
+                    let checked = pin.is_some();
                     pending = Some(PendingFrame {
                         parent_depth: depth,
                         storage_ctx: callee,
@@ -1884,8 +1887,7 @@ mod tests {
         assert!(matches!(&updates[2], StateUpdate::Store(s) if s.slot == slot(2)));
     }
 
-    /// A callee that reads no state is pinned by its code. It can't see the target's storage,
-    /// so the target isn't brought up to date for it.
+    /// A callee that reads no state may be pinned by its code, where its check would be.
     #[test]
     fn a_stateless_read_is_pinned_by_its_code_where_it_happened() {
         let tree = split(
@@ -1899,24 +1901,31 @@ mod tests {
             ],
             &[],
         );
-        let updates = &tree.frames[0].updates;
-        let checks: Vec<_> = updates.iter().filter(|u| u.is_check()).collect();
+        // Where its check would be, after the target is brought up to date: the store, the
+        // check, the marker of C's code, the store.
+        let mut updates = tree.frames[0].updates.clone();
         assert!(
-            matches!(checks.as_slice(), [StateUpdate::CodehashCheck(c)] if c.account == C),
+            matches!(
+                updates.as_slice(),
+                [
+                    StateUpdate::Store(a),
+                    StateUpdate::StaticCallCheck(read),
+                    StateUpdate::CodehashCheck(code),
+                    StateUpdate::Store(b),
+                ] if a.slot == slot(1) && read.target == C && code.account == C && b.slot == slot(2)
+            ),
             "{updates:?}"
         );
+        let code = std::collections::HashMap::from([(C, Bytes::from_static(&[0xfe]))]);
+        crate::observe::resolve_code_sizes(&mut updates, &code).unwrap();
         assert!(
-            matches!(&updates[0], StateUpdate::CodehashCheck(_)),
+            matches!(
+                updates.as_slice(),
+                [StateUpdate::Store(_), StateUpdate::CodehashCheck(c), StateUpdate::Store(_)]
+                    if c.account == C && c.codehash == keccak256([0xfeu8])
+            ),
             "{updates:?}"
         );
-        assert_eq!(
-            stores(updates),
-            [
-                (slot(1), B256::from(U256::from(10))),
-                (slot(2), B256::from(U256::from(20)))
-            ]
-        );
-        assert_eq!(tree.call_gas_total, 0, "settlement doesn't run the read");
     }
 
     #[test]

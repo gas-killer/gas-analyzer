@@ -58,9 +58,10 @@ pub struct AnalyzeTraceResult {
     pub replay_error: Option<String>,
     /// See [`SIGNATURE_VERIFICATION_GAS`]; not included in `gas_estimate`.
     pub signature_verification_gas: u64,
-    /// Accounts whose code the program pins (read by `EXTCODESIZE`, or run by a stateless
-    /// `STATICCALL`) but whose code hash this crate can't fetch: their checks are left out of
-    /// `encoded_updates`, which pins less than settlement could.
+    /// Accounts whose code size the program read but whose code hash this crate can't fetch:
+    /// their checks are left out of `encoded_updates`, which pins less than settlement could.
+    /// (A stateless `STATICCALL`, which could be pinned by its code's hash, keeps its
+    /// `STATICCALL_CHECK` here instead.)
     pub unpinned_code_reads: Vec<String>,
 }
 
@@ -665,7 +666,10 @@ fn analyze_extract(
     let state_updates: &[StateUpdate] = &extract.state_updates;
 
     let mut program = state_updates.to_vec();
-    let unpinned_code_reads = addresses(drop_unresolved_code_sizes(&mut program));
+    let unpinned_code_reads = addresses(
+        drop_unresolved_code_sizes(&mut program)
+            .map_err(|e| format!("Failed to compute state updates: {e}"))?,
+    );
     let encoded = encode_state_updates_to_abi(&program);
 
     let addr: Address = estimator_address
@@ -987,7 +991,10 @@ pub fn encode_trace_inner(trace_json: &str) -> Result<EncodeTraceResult, String>
     } = parse_and_compute(trace_json, None)?.0;
 
     let mut state_updates = state_updates;
-    let unpinned_code_reads = addresses(drop_unresolved_code_sizes(&mut state_updates));
+    let unpinned_code_reads = addresses(
+        drop_unresolved_code_sizes(&mut state_updates)
+            .map_err(|e| format!("Failed to compute state updates: {e}"))?,
+    );
     let encoded = encode_state_updates_to_abi(&state_updates);
     let mut skipped = skipped_opcodes.into_iter().collect::<Vec<_>>();
     skipped.sort();

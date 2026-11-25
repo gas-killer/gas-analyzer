@@ -1041,7 +1041,8 @@ pub(crate) mod tests {
             }
         }
 
-        /// The same stateless read, branched on: pinned by its callee's code, not run again.
+        /// The same stateless read, branched on: its check, with its callee's code marked to pin
+        /// it instead once a caller fetches the code.
         #[test]
         fn a_used_stateless_staticcall_is_pinned_by_its_code() {
             let mut steps = call6_steps(1, "STATICCALL");
@@ -1056,9 +1057,10 @@ pub(crate) mod tests {
                 assert!(
                     matches!(
                         updates.as_slice(),
-                        [StateUpdate::CodehashCheck(c)] if c.account == callee
+                        [StateUpdate::StaticCallCheck(read), StateUpdate::CodehashCheck(c)]
+                            if read.target == callee && c.account == callee
                     ),
-                    "{updates:?}"
+                    "the check, and the marker of the code that may pin it instead: {updates:?}"
                 );
             }
         }

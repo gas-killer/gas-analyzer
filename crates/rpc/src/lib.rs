@@ -662,7 +662,11 @@ pub async fn compute_state_updates_from_tx<P: Provider + DebugApi>(
     let trace = get_tx_trace(provider, tx_hash, status).await?;
     let struct_logs_len = trace.struct_logs.len();
     if struct_logs_len > 0 {
-        return compute_state_updates(trace, origin);
+        let mut extract = compute_state_updates(trace, origin)?;
+        // A mined transaction ran after the ones before it in its block, a state no block tag
+        // names: its stateless reads are checked by running them, not pinned by code.
+        gas_analyzer_core::observe::unpin_stateless_reads(&mut extract.state_updates)?;
+        return Ok(extract);
     }
 
     bail!(
@@ -744,23 +748,44 @@ pub async fn get_preceding_transactions<P: Provider>(
     Ok(preceding)
 }
 
-/// Fill in the code hash of every account whose code a program pins but the trace doesn't show:
-/// one read by `EXTCODESIZE` (the trace shows the size, which the code is checked against), or
-/// one whose code a stateless `STATICCALL` ran. The code is fetched at the traced `block` (see
-/// [`gas_analyzer_core::observe::resolve_code_sizes`]).
+/// Fill in the code hash of every account whose code a program pins but the trace doesn't show,
+/// fetching the code at `block` (see [`gas_analyzer_core::observe::resolve_code_sizes`]):
+///
+/// - an account read by `EXTCODESIZE`, whose code is checked against the size the trace saw;
+/// - an account whose code a stateless `STATICCALL` ran, so the read is pinned by code hash
+///   rather than run again at settlement. A read whose code can't be fetched falls back to its
+///   `STATICCALL_CHECK`.
+///
+/// `block` must be the state the trace ran on (for a call traced at a block, that block), or a
+/// stateless read could be pinned to code other than what ran. A caller that can't promise that
+/// (a mined transaction runs after the transactions before it in its block) calls
+/// [`gas_analyzer_core::observe::unpin_stateless_reads`] first.
 pub async fn resolve_code_hashes<P: Provider>(
     provider: &P,
     block: BlockId,
-    updates: &mut [StateUpdate],
+    updates: &mut Vec<StateUpdate>,
 ) -> Result<()> {
+    let sized: std::collections::HashSet<Address> =
+        gas_analyzer_core::observe::unresolved_code_sizes(updates)
+            .into_iter()
+            .map(|(account, _)| account)
+            .collect();
     let mut code = std::collections::HashMap::new();
     for account in gas_analyzer_core::observe::unresolved_code_accounts(updates) {
-        let bytes = provider
-            .get_code_at(account)
-            .block_id(block)
-            .await
-            .map_err(|e| anyhow!("fetching the code of {account}, which the program pins: {e}"))?;
-        code.insert(account, bytes);
+        match provider.get_code_at(account).block_id(block).await {
+            Ok(bytes) => {
+                code.insert(account, bytes);
+            }
+            Err(e) if sized.contains(&account) => {
+                bail!("fetching the code of {account}, read by EXTCODESIZE: {e}")
+            }
+            // Only stateless reads need it: they fall back to running the read.
+            Err(e) => tracing::warn!(
+                %account,
+                error = %e,
+                "could not fetch code a stateless read ran; checking the read by running it"
+            ),
+        }
     }
     gas_analyzer_core::observe::resolve_code_sizes(updates, &code)
 }
