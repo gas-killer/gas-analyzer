@@ -744,8 +744,9 @@ pub async fn get_preceding_transactions<P: Provider>(
     Ok(preceding)
 }
 
-/// Fill in the code hash of every account whose `EXTCODESIZE` a program pins: the trace
-/// shows the size, so the code is fetched at the traced `block` and checked against it (see
+/// Fill in the code hash of every account whose code a program pins but the trace doesn't show:
+/// one read by `EXTCODESIZE` (the trace shows the size, which the code is checked against), or
+/// one whose code a stateless `STATICCALL` ran. The code is fetched at the traced `block` (see
 /// [`gas_analyzer_core::observe::resolve_code_sizes`]).
 pub async fn resolve_code_hashes<P: Provider>(
     provider: &P,
@@ -753,12 +754,12 @@ pub async fn resolve_code_hashes<P: Provider>(
     updates: &mut [StateUpdate],
 ) -> Result<()> {
     let mut code = std::collections::HashMap::new();
-    for (account, _) in gas_analyzer_core::observe::unresolved_code_sizes(updates) {
+    for account in gas_analyzer_core::observe::unresolved_code_accounts(updates) {
         let bytes = provider
             .get_code_at(account)
             .block_id(block)
             .await
-            .map_err(|e| anyhow!("fetching the code of {account}, read by EXTCODESIZE: {e}"))?;
+            .map_err(|e| anyhow!("fetching the code of {account}, which the program pins: {e}"))?;
         code.insert(account, bytes);
     }
     gas_analyzer_core::observe::resolve_code_sizes(updates, &code)

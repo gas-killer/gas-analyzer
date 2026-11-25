@@ -9,7 +9,11 @@
 //! The struct-log walks ([`crate::compute_state_updates`] and
 //! [`crate::nested::compute_frame_tree_canonical`]) record each observation an emitting frame
 //! makes that the program's effects depend on (the `taint` module decides which), and drop
-//! repeated reads; this module holds what they share. A pricer running on state the pins may not
+//! repeated reads; this module holds what they share.
+//!
+//! A `STATICCALL` whose callee ran stateless code (see the `stateless` module) is pinned by the code
+//! it ran instead: a `CODEHASH_CHECK` of each account whose code ran, so settlement checks code
+//! hashes rather than running the read again. A pricer running on state the pins may not
 //! hold against leaves them out (see [`crate::heuristic::unpinned_for_pricing`]).
 
 use std::collections::HashMap;
@@ -132,6 +136,9 @@ pub(crate) enum Await {
     Create { index: usize },
     /// A `STATICCALL_CHECK` placeholder at this index: fill in its result hash.
     Static { index: usize },
+    /// A `STATICCALL` to `target` pinned by the code it ran (see the `stateless` module): nothing
+    /// to fill in, but it must not have failed without data.
+    Stateless { target: Address },
 }
 
 impl Await {
@@ -176,6 +183,16 @@ impl Await {
                         );
                     }
                     check.resultHash = result_hash(success, returndata);
+                }
+            }
+            // Such a failure can be the EVM's own (out of gas, the call depth), which depends on
+            // more than the code and its input, so pinning the code doesn't pin it.
+            Self::Stateless { target } => {
+                if !success && returndata.is_empty() {
+                    bail!(
+                        "the program depends on a STATICCALL to {target} that failed without \
+                         data, which pinning its code can't check"
+                    );
                 }
             }
         }
@@ -223,6 +240,10 @@ pub(crate) fn static_check(log: &StructLog) -> Result<Option<StateUpdate>> {
 /// it: the trace shows the code's size, not its hash. The low 8 bytes hold the size.
 const CODE_SIZE_MARKER: [u8; 24] = *b"gaskiller.extcodesize\0\0\0";
 
+/// The marker a `CODEHASH_CHECK` pinning code a stateless `STATICCALL` ran carries until
+/// [`resolve_code_sizes`] replaces it: the trace shows neither the code nor its size.
+const CODE_MARKER: [u8; 32] = *b"gaskiller.statelesscode\0\0\0\0\0\0\0\0\0";
+
 fn code_size_marker(size: u64) -> B256 {
     let mut word = [0u8; 32];
     word[..24].copy_from_slice(&CODE_SIZE_MARKER);
@@ -233,6 +254,20 @@ fn code_size_marker(size: u64) -> B256 {
 fn marked_size(codehash: B256) -> Option<u64> {
     (codehash[..24] == CODE_SIZE_MARKER)
         .then(|| u64::from_be_bytes(codehash[24..].try_into().expect("8 bytes")))
+}
+
+/// Whether `codehash` is still a marker waiting for the account's code.
+fn is_marker(codehash: B256) -> bool {
+    codehash == B256::from(CODE_MARKER) || marked_size(codehash).is_some()
+}
+
+/// A `CODEHASH_CHECK` pinning `account`'s code, which a stateless `STATICCALL` ran (see the
+/// `stateless` module); its hash is filled in by [`resolve_code_sizes`].
+pub(crate) fn code_check(account: Address) -> StateUpdate {
+    StateUpdate::CodehashCheck(IStateUpdateTypes::CodehashCheck {
+        account,
+        codehash: B256::from(CODE_MARKER),
+    })
 }
 
 /// A read with no frame of its own, whose result is on top of the next log's stack.
@@ -337,21 +372,20 @@ fn same_check(a: &StateUpdate, b: &StateUpdate) -> bool {
     }
 }
 
-/// `updates` without the code-size checks still waiting for a code hash, for a caller that can't
-/// fetch code: a program carrying one could never settle. Returns the accounts left unpinned.
+/// `updates` without the code checks still waiting for a code hash (from `EXTCODESIZE` reads
+/// and stateless `STATICCALL`s), for a caller that can't fetch code: a program carrying one could
+/// never settle. Returns the accounts left unpinned.
 pub fn drop_unresolved_code_sizes(updates: &mut Vec<StateUpdate>) -> Vec<Address> {
-    let unresolved = unresolved_code_sizes(updates)
-        .into_iter()
-        .map(|(account, _)| account)
-        .collect();
-    updates.retain(|update| {
-        !matches!(update, StateUpdate::CodehashCheck(check) if marked_size(check.codehash).is_some())
-    });
+    let unresolved = unresolved_code_accounts(updates);
+    updates.retain(
+        |update| !matches!(update, StateUpdate::CodehashCheck(check) if is_marker(check.codehash)),
+    );
     unresolved
 }
 
 /// The accounts whose code hash `updates` still need, each with the code size the trace saw:
-/// the `EXTCODESIZE` reads of nonzero size.
+/// the `EXTCODESIZE` reads of nonzero size. See [`unresolved_code_accounts`] for every account
+/// whose code must be fetched.
 pub fn unresolved_code_sizes(updates: &[StateUpdate]) -> Vec<(Address, u64)> {
     let mut out: Vec<(Address, u64)> = updates
         .iter()
@@ -367,10 +401,27 @@ pub fn unresolved_code_sizes(updates: &[StateUpdate]) -> Vec<(Address, u64)> {
     out
 }
 
-/// Replace every `EXTCODESIZE` marker in `updates` with the account's code hash, from `code`:
-/// each account's code at the traced block. Fails if an account's code is missing or isn't the
-/// size the trace saw (code deployed earlier in the same transaction, say), since the program
-/// would then pin the wrong code.
+/// Every account whose code [`resolve_code_sizes`] needs, sorted: those read by `EXTCODESIZE`
+/// with a nonzero size, and those whose code a stateless `STATICCALL` ran.
+pub fn unresolved_code_accounts(updates: &[StateUpdate]) -> Vec<Address> {
+    let mut out: Vec<Address> = updates
+        .iter()
+        .filter_map(|update| match update {
+            StateUpdate::CodehashCheck(check) if is_marker(check.codehash) => Some(check.account),
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Replace every code marker in `updates` with the account's code hash, from `code`: each
+/// account's code at the traced block, for every account [`unresolved_code_accounts`] names.
+///
+/// Fails if an account's code is missing, or for an `EXTCODESIZE` read isn't the size the trace
+/// saw (code deployed earlier in the same transaction, say), or for a stateless `STATICCALL` is
+/// empty (the code that ran isn't there), since the program would then pin the wrong code.
 pub fn resolve_code_sizes(
     updates: &mut [StateUpdate],
     code: &HashMap<Address, Bytes>,
@@ -379,6 +430,21 @@ pub fn resolve_code_sizes(
         let StateUpdate::CodehashCheck(check) = update else {
             continue;
         };
+        if check.codehash == B256::from(CODE_MARKER) {
+            match code.get(&check.account) {
+                Some(bytes) if !bytes.is_empty() => check.codehash = keccak256(bytes),
+                Some(_) => bail!(
+                    "{} has no code at the traced block, but a STATICCALL the program pins by \
+                     its code ran code there",
+                    check.account
+                ),
+                None => bail!(
+                    "no code fetched for {}, run by a STATICCALL pinned by its code",
+                    check.account
+                ),
+            }
+            continue;
+        }
         let Some(size) = marked_size(check.codehash) else {
             continue;
         };
@@ -552,6 +618,82 @@ mod tests {
         };
         assert_eq!(check.codehash, keccak256([1u8, 2, 3]));
         assert!(unresolved_code_sizes(&updates).is_empty());
+    }
+
+    #[test]
+    fn code_markers_resolve_to_the_code_hash_and_drop_with_the_size_markers() {
+        let verifier = Address::repeat_byte(5);
+        let sized = Address::repeat_byte(3);
+        let updates = vec![
+            code_check(verifier),
+            PendingRead::CodeSize(sized).check(U256::from(2)).unwrap(),
+        ];
+        assert_eq!(unresolved_code_accounts(&updates), vec![sized, verifier]);
+        assert_eq!(unresolved_code_sizes(&updates), vec![(sized, 2)]);
+
+        let mut dropped = updates.clone();
+        assert_eq!(
+            drop_unresolved_code_sizes(&mut dropped),
+            vec![sized, verifier]
+        );
+        assert!(dropped.is_empty());
+
+        let sized_code = (sized, Bytes::from_static(&[1, 2]));
+        let missing = HashMap::from([sized_code.clone()]);
+        assert!(resolve_code_sizes(&mut updates.clone(), &missing).is_err());
+        let empty = HashMap::from([sized_code.clone(), (verifier, Bytes::new())]);
+        assert!(
+            resolve_code_sizes(&mut updates.clone(), &empty).is_err(),
+            "the code that ran isn't there"
+        );
+
+        let code = HashMap::from([sized_code, (verifier, Bytes::from_static(&[0xfe]))]);
+        let mut resolved = updates;
+        resolve_code_sizes(&mut resolved, &code).unwrap();
+        let StateUpdate::CodehashCheck(check) = &resolved[0] else {
+            panic!("a codehash check");
+        };
+        assert_eq!(check.codehash, keccak256([0xfeu8]));
+        assert!(unresolved_code_accounts(&resolved).is_empty());
+    }
+
+    /// A stateless read made twice pins its code once, unless a call between could change it.
+    #[test]
+    fn repeated_code_pins_dedupe_per_account() {
+        let store = StateUpdate::Store(IStateUpdateTypes::Store {
+            slot: B256::ZERO,
+            value: B256::ZERO,
+        });
+        let call = StateUpdate::Call(IStateUpdateTypes::Call {
+            target: Address::repeat_byte(9),
+            value: U256::ZERO,
+            callargs: Bytes::new(),
+            resultHash: B256::ZERO,
+            gasLimit: U256::MAX,
+        });
+        let a = Address::repeat_byte(5);
+        let b = Address::repeat_byte(6);
+        let mut updates = vec![
+            code_check(a),
+            code_check(b),
+            store.clone(),
+            code_check(a),
+            call,
+            code_check(a),
+        ];
+        dedupe_checks(&mut updates);
+        let pinned: Vec<Address> = updates
+            .iter()
+            .filter_map(|u| match u {
+                StateUpdate::CodehashCheck(c) => Some(c.account),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pinned, vec![a, b, a]);
+
+        let (priced, gas) = crate::heuristic::unpinned_for_pricing(&updates);
+        assert!(priced.iter().all(|u| !u.is_check()), "left out for pricing");
+        assert_eq!(gas, 3 * crate::heuristic::COLD_ACCOUNT_ACCESS_COST);
     }
 
     #[test]

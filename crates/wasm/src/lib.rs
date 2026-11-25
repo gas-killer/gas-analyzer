@@ -58,8 +58,9 @@ pub struct AnalyzeTraceResult {
     pub replay_error: Option<String>,
     /// See [`SIGNATURE_VERIFICATION_GAS`]; not included in `gas_estimate`.
     pub signature_verification_gas: u64,
-    /// Accounts whose code size the program read but whose code hash this crate can't fetch:
-    /// their checks are left out of `encoded_updates`, which pins less than settlement could.
+    /// Accounts whose code the program pins (read by `EXTCODESIZE`, or run by a stateless
+    /// `STATICCALL`) but whose code hash this crate can't fetch: their checks are left out of
+    /// `encoded_updates`, which pins less than settlement could.
     pub unpinned_code_reads: Vec<String>,
 }
 

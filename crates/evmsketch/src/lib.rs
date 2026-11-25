@@ -3973,7 +3973,8 @@ mod tests {
         /// - a CALL with all gas, its result dropped;
         /// - a CALL capped at 2,300, its RETURNDATASIZE stored to slot 9;
         /// - a caught revert with data, dropped (a caught failure is pinned anyway);
-        /// - a STATICCALL, its success stored to slot 6;
+        /// - a STATICCALL of the returner, its success stored to slot 6: the returner reads no
+        ///   state, so the read is pinned by its code hash rather than run again;
         /// - BALANCE stored to slot 5, then the same BALANCE again to slot 8 (a repeat);
         /// - EXTCODESIZE stored to slot 7, SELFBALANCE dropped, then SSTORE(4, 1).
         fn observer_code(returner: Address, reverter: Address) -> Bytes {
@@ -4183,13 +4184,21 @@ mod tests {
                     Program::abi_decode_params(&encoded.storage_updates).expect("a program");
                 let count = |kind: u8| types.iter().filter(|t| **t == kind).count();
                 assert_eq!(count(1), 3, "{encoding:?}: three CALLs: {types:?}");
-                assert_eq!(count(10), 1, "{encoding:?}: the STATICCALL_CHECK");
+                assert_eq!(
+                    count(10),
+                    0,
+                    "{encoding:?}: no STATICCALL_CHECK of stateless code"
+                );
                 assert_eq!(
                     count(11),
                     1,
                     "{encoding:?}: one BALANCE_CHECK, no SELFBALANCE"
                 );
-                assert_eq!(count(12), 1, "{encoding:?}: EXTCODESIZE's CODEHASH_CHECK");
+                assert_eq!(
+                    count(12),
+                    2,
+                    "{encoding:?}: the stateless read's and EXTCODESIZE's CODEHASH_CHECKs"
+                );
                 let pinned: Vec<bool> = types
                     .iter()
                     .zip(&args)

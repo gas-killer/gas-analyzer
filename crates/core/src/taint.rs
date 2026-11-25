@@ -1029,6 +1029,8 @@ pub(crate) mod tests {
             }
         }
 
+        /// The callee only writes memory and returns, which is stateless: unused, it pins
+        /// nothing, not even its code.
         #[test]
         fn a_staticcall_whose_result_is_dropped_is_not_checked() {
             let mut steps = call6_steps(1, "STATICCALL");
@@ -1036,6 +1038,28 @@ pub(crate) mod tests {
             steps.extend([(1, "POP", &[1][..]), (1, "STOP", &[])]);
             for updates in both(&steps) {
                 assert_eq!(checks(&updates), 0, "{updates:?}");
+            }
+        }
+
+        /// The same stateless read, branched on: pinned by its callee's code, not run again.
+        #[test]
+        fn a_used_stateless_staticcall_is_pinned_by_its_code() {
+            let mut steps = call6_steps(1, "STATICCALL");
+            steps.extend(returning(2));
+            steps.extend([
+                (1, "PUSH1", &[1][..]),
+                (1, "JUMPI", &[9, 1]),
+                (1, "STOP", &[]),
+            ]);
+            let callee = Address::left_padding_from(&[0x12, 0x34]);
+            for updates in both(&steps) {
+                assert!(
+                    matches!(
+                        updates.as_slice(),
+                        [StateUpdate::CodehashCheck(c)] if c.account == callee
+                    ),
+                    "{updates:?}"
+                );
             }
         }
     }

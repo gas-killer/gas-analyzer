@@ -21,9 +21,11 @@ use sha2::{Digest, Sha256};
 pub use crate::encoding::encode_state_updates_to_abi as encoded_program;
 use crate::heuristic::BASE_TX_COST;
 use crate::observe::{
-    Await, ExitData, PendingRead, call_pin, dedupe_checks, is_precompile, stack_top, static_check,
+    Await, ExitData, PendingRead, call_pin, code_check, dedupe_checks, is_precompile, stack_top,
+    static_check,
 };
 use crate::sim_profile::STATE_TRACKER_SLOT;
+use crate::stateless::StatelessReads;
 use crate::taint::Usage;
 use crate::trace::{append_state_update_from_struct_log, callee_gas};
 use crate::types::Opcode;
@@ -757,8 +759,10 @@ fn split_frame_tree(
     let mut pending: Option<PendingFrame> = None;
     let mut exits = ExitData::default();
     let mut pending_read: Option<(u64, PendingRead)> = None;
-    // Which observations each program's effects depend on; the rest stay unpinned.
+    // Which observations each program's effects depend on; the rest stay unpinned. Of the reads
+    // that are, those whose callee ran stateless code are pinned by that code.
     let usage = Usage::of(&trace.struct_logs);
+    let stateless = StatelessReads::of(&trace.struct_logs);
 
     for (log_index, struct_log) in trace.struct_logs.into_iter().enumerate() {
         let depth = struct_log.depth;
@@ -1032,19 +1036,27 @@ fn split_frame_tree(
                     // A read an emitting frame makes and uses is pinned where it happens. Its
                     // callee runs code, which can read the target, so the target's storage is
                     // brought to the canonical image first, as at a `CALL`.
+                    // A read of stateless code is pinned by that code instead: it reads no
+                    // storage, so the target needn't be brought up to date for it.
                     let mut pin = None;
-                    if cur_emitting
-                        && usage.used(log_index)
-                        && let Some(check) = static_check(&struct_log)?
-                    {
-                        flush_slice(&mut frames, &programs);
-                        frames[idx].out.push(check);
-                        pin = Some(Await::Static {
-                            index: frames[idx].out.len() - 1,
-                        });
+                    if cur_emitting && usage.used(log_index) {
+                        if let Some(accounts) = stateless.code_of(log_index) {
+                            frames[idx]
+                                .out
+                                .extend(accounts.iter().map(|&account| code_check(account)));
+                            pin = Some(Await::Stateless {
+                                target: accounts[0],
+                            });
+                        } else if let Some(check) = static_check(&struct_log)? {
+                            flush_slice(&mut frames, &programs);
+                            frames[idx].out.push(check);
+                            pin = Some(Await::Static {
+                                index: frames[idx].out.len() - 1,
+                            });
+                        }
                     }
                     // Settlement runs a checked read again, so its gas counts like a `CALL`'s.
-                    let checked = pin.is_some();
+                    let checked = matches!(pin, Some(Await::Static { .. }));
                     pending = Some(PendingFrame {
                         parent_depth: depth,
                         storage_ctx: callee,
@@ -1853,6 +1865,8 @@ mod tests {
             vec![
                 sstore(1, slot(1), 10),
                 staticcall(1, C),
+                // The callee reads storage, which can be the target's.
+                log("SLOAD", 2, 950_000, &[U256::ZERO], 0),
                 exit("RETURN", 2),
                 resume(1, 900_000, true),
                 sstore(1, slot(2), 20),
@@ -1868,6 +1882,41 @@ mod tests {
         assert_eq!(check.target, C);
         assert_eq!(check.resultHash, result_hash(true, &data_word()));
         assert!(matches!(&updates[2], StateUpdate::Store(s) if s.slot == slot(2)));
+    }
+
+    /// A callee that reads no state is pinned by its code. It can't see the target's storage,
+    /// so the target isn't brought up to date for it.
+    #[test]
+    fn a_stateless_read_is_pinned_by_its_code_where_it_happened() {
+        let tree = split(
+            vec![
+                sstore(1, slot(1), 10),
+                staticcall(1, C),
+                log("CALLDATALOAD", 2, 950_000, &[U256::ZERO], 0),
+                exit("RETURN", 2),
+                resume(1, 900_000, true),
+                sstore(1, slot(2), 20),
+            ],
+            &[],
+        );
+        let updates = &tree.frames[0].updates;
+        let checks: Vec<_> = updates.iter().filter(|u| u.is_check()).collect();
+        assert!(
+            matches!(checks.as_slice(), [StateUpdate::CodehashCheck(c)] if c.account == C),
+            "{updates:?}"
+        );
+        assert!(
+            matches!(&updates[0], StateUpdate::CodehashCheck(_)),
+            "{updates:?}"
+        );
+        assert_eq!(
+            stores(updates),
+            [
+                (slot(1), B256::from(U256::from(10))),
+                (slot(2), B256::from(U256::from(20)))
+            ]
+        );
+        assert_eq!(tree.call_gas_total, 0, "settlement doesn't run the read");
     }
 
     #[test]
