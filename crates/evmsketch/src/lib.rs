@@ -1603,25 +1603,38 @@ async fn local_observation<P: Provider + DebugApi>(
         );
         return None;
     }
-    let (pre, node_env) = tokio::join!(
-        get_prestate_from_call_with_profile(provider, tx_request.clone(), block, profile),
-        // The values the node gives the call, which can differ from the block's header.
-        gas_analyzer_rpc::get_simulated_env_with_profile(provider, tx_request, block, profile),
+    // The probe fails fast where the endpoint can't serve it, and the prestate is the larger
+    // request, so a failed probe drops the prestate request rather than waiting for it.
+    let fetched = tokio::try_join!(
+        async {
+            get_prestate_from_call_with_profile(provider, tx_request.clone(), block, profile)
+                .await
+                .map_err(ReplayFetch::Prestate)
+        },
+        async {
+            // The values the node gives the call, which can differ from the block's header.
+            let node_env = gas_analyzer_rpc::get_simulated_env_with_profile(
+                provider, tx_request, block, profile,
+            )
+            .await
+            .map_err(ReplayFetch::Probe)?;
+            match local_scan::unreplayable_env(&node_env) {
+                Some(reason) => Err(ReplayFetch::Probe(anyhow!(reason))),
+                None => Ok(node_env),
+            }
+        },
     );
-    let node_env = match node_env {
-        Ok(node_env) => {
+    let (pre, node_env) = match fetched {
+        Ok(fetched) => {
             support.probe_answered();
-            node_env
+            fetched
         }
-        Err(e) => {
+        Err(ReplayFetch::Probe(e)) => {
             let paused = support.probe_failed();
-            tracing::info!(error = %e, paused, "the environment probe failed; asking the node to scan it");
+            tracing::info!(error = %e, paused, "the endpoint can't serve the local replay; asking the node to scan it");
             return None;
         }
-    };
-    let pre = match pre {
-        Ok(pre) => pre,
-        Err(e) => {
+        Err(ReplayFetch::Prestate(e)) => {
             tracing::debug!(error = %e, "can't replay the call locally; asking the node to scan it");
             return None;
         }
@@ -1662,6 +1675,13 @@ async fn local_observation<P: Provider + DebugApi>(
             None
         }
     }
+}
+
+/// Which of the local replay's requests failed: a probe failure says the endpoint can't serve the
+/// replay, a prestate failure may be about the call.
+enum ReplayFetch {
+    Probe(anyhow::Error),
+    Prestate(anyhow::Error),
 }
 
 /// Build the prestate net form: `Ok(Some(updates))` when the call admits it, `Ok(None)` when the net

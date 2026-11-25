@@ -58,7 +58,12 @@ pub(crate) enum LocalScan {
 /// `callTracer` frame and prestate diff for the same call, which the replay must reproduce to be
 /// trusted.
 ///
-/// The caller checks [`unreplayable_request`] first, before fetching anything for the replay.
+/// The caller checks [`unreplayable_request`] before fetching anything for the replay, and
+/// [`unreplayable_env`] once the node's environment is known.
+///
+/// The replay is cut off once it has run more steps than the node's run could have (see
+/// [`step_limit`]), so a replay that leaves the node's path can't run on to the call's whole gas
+/// limit, which under the unbounded profile is far more than a signing round allows.
 pub(crate) fn scan_observations(
     pre: &PreStateMode,
     frame: &CallFrame,
@@ -66,21 +71,40 @@ pub(crate) fn scan_observations(
     tx: &TransactionRequest,
     env: &ScanEnv,
 ) -> Result<LocalScan> {
-    // The replay runs at a zero gas price: the revm here charges the caller and pays the coinbase
-    // whatever its fee settings, so a nonzero price would move balances the node may not have.
-    if env.node.gas_price != 0 {
-        return Ok(LocalScan::Diverged(format!(
-            "the node gave the call a gas price of {}",
-            env.node.gas_price
-        )));
-    }
-    Ok(judge(&replay(pre, tx, env)?, frame, diff))
+    Ok(judge(
+        &replay(pre, tx, env, step_limit(frame.gas_used))?,
+        frame,
+        diff,
+    ))
+}
+
+/// The most steps a run that used `gas_used` gas can take, with room to spare. Every opcode costs
+/// at least 1 gas except the ones that end a frame, which run once per frame, and every frame past
+/// the first costs at least 100 gas to open. Refunds take back at most a fifth of the gas, so the
+/// gas the run spent is at most 5/4 of `gas_used`. Twice `gas_used`, plus a margin, covers all of
+/// that.
+fn step_limit(gas_used: U256) -> u64 {
+    u64::try_from(gas_used)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(2)
+        .saturating_add(1_024)
+}
+
+/// Why the replay can't run in the environment the node gave the call, or `None`. The replay
+/// runs at a zero gas price: the revm here charges the caller and pays the coinbase whatever its
+/// fee settings, so a nonzero price would move balances the node may not have. That price is the
+/// node's choice for every call, so it says the endpoint can't be replayed, not just this call.
+pub(crate) fn unreplayable_env(node: &SimulatedEnv) -> Option<String> {
+    (node.gas_price != 0).then(|| format!("the node gives calls a gas price of {}", node.gas_price))
 }
 
 /// Why the replay can't reproduce `tx` as the node runs it, or `None`. It drops blobs, access
 /// lists and EIP-7702 authorizations, each of which changes what the node runs, and runs at a
 /// zero gas price, where a node charges the fee a request sets.
 pub(crate) fn unreplayable_request(tx: &TransactionRequest) -> Option<String> {
+    if !matches!(tx.to, Some(TxKind::Call(_))) {
+        return Some("the call has no target".into());
+    }
     if tx.gas_price.is_some()
         || tx.max_fee_per_gas.is_some()
         || tx.max_priority_fee_per_gas.is_some()
@@ -131,7 +155,12 @@ fn judge(replay: &Replay, frame: &CallFrame, diff: &DiffMode) -> LocalScan {
     )
 }
 
-fn replay(pre: &PreStateMode, tx: &TransactionRequest, env: &ScanEnv) -> Result<Replay> {
+fn replay(
+    pre: &PreStateMode,
+    tx: &TransactionRequest,
+    env: &ScanEnv,
+    step_limit: u64,
+) -> Result<Replay> {
     let node = &env.node;
     let mut db = CacheDB::new(EmptyDB::default());
     let mut before = BTreeMap::new();
@@ -195,10 +224,17 @@ fn replay(pre: &PreStateMode, tx: &TransactionRequest, env: &ScanEnv) -> Result<
             block.difficulty = node.prevrandao.into();
             block.basefee = node.basefee;
         });
-    let mut evm = context.build_mainnet_with_inspector(ObservationInspector::default());
-    let outcome = evm
-        .inspect_tx(tx_env)
-        .map_err(|e| anyhow!("replaying the call: {e:?}"))?;
+    let mut evm = context.build_mainnet_with_inspector(ObservationInspector {
+        step_limit,
+        ..Default::default()
+    });
+    let outcome = evm.inspect_tx(tx_env);
+    if evm.inspector.overran {
+        return Err(anyhow!(
+            "the replay ran past {step_limit} steps, more than the node's run could have taken"
+        ));
+    }
+    let outcome = outcome.map_err(|e| anyhow!("replaying the call: {e:?}"))?;
     Ok(Replay {
         result: outcome.result,
         state: outcome.state,
@@ -423,10 +459,23 @@ struct ObservationInspector {
     /// probe doesn't read (a chain before Cancun has no opcode for them).
     unreplayable: Option<&'static str>,
     calls: Vec<SeenCall>,
+    /// The steps after which the replay is cut off, and how many it has run.
+    step_limit: u64,
+    steps: u64,
+    /// Whether the replay was cut off.
+    overran: bool,
 }
 
 impl<CTX: ContextTr> Inspector<CTX> for ObservationInspector {
     fn step(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
+        self.steps += 1;
+        if self.steps > self.step_limit {
+            // Out of gas, the halt revm unwinds normally: every frame still open halts the same
+            // way on its next step, so the run ends at once.
+            self.overran = true;
+            interp.halt_oog();
+            return;
+        }
         let op = interp.bytecode.opcode();
         if self.unreplayable.is_none() {
             self.unreplayable = match op {
@@ -565,7 +614,7 @@ mod tests {
     }
 
     fn replayed(code: &str) -> Replay {
-        replay(&prestate(code), &tx(), &env()).expect("the replay runs")
+        replay(&prestate(code), &tx(), &env(), u64::MAX).expect("the replay runs")
     }
 
     /// The node's frame for a run that matches the replay's gas.
@@ -706,6 +755,7 @@ mod tests {
             &prestate("5a 6000 55 00"),
             &TransactionRequest { gas: None, ..tx() },
             &env(),
+            u64::MAX,
         )
         .expect("the replay runs");
         assert_eq!(
@@ -835,13 +885,41 @@ mod tests {
     }
 
     #[test]
-    fn a_call_the_node_priced_is_not_replayed() {
+    fn a_node_that_prices_calls_is_not_replayed() {
         let mut env = env();
+        assert_eq!(unreplayable_env(&env.node), None);
         env.node.gas_price = 1;
-        let scanned =
-            scan_observations(&prestate("00"), &frame(), &DiffMode::default(), &tx(), &env)
-                .expect("the price is checked");
-        diverges(scanned, "gas price");
+        let reason = unreplayable_env(&env.node).expect("the price is refused");
+        assert!(reason.contains("gas price"), "{reason}");
+    }
+
+    #[test]
+    fn a_replay_that_runs_past_the_nodes_run_is_cut_off() {
+        // JUMPDEST; PUSH1 0; JUMP: a loop that would run until the call's 1M gas ran out, against
+        // a node run that used 1,000.
+        let node = CallFrame {
+            gas_used: U256::from(1_000),
+            ..frame()
+        };
+        let error = scan_observations(
+            &prestate("5b 6000 56"),
+            &node,
+            &DiffMode::default(),
+            &tx(),
+            &env(),
+        )
+        .expect_err("the replay is cut off");
+        assert!(error.to_string().contains("3024 steps"), "{error:#}");
+    }
+
+    #[test]
+    fn a_create_is_not_replayed() {
+        let create = TransactionRequest {
+            to: Some(TxKind::Create),
+            ..tx()
+        };
+        let reason = unreplayable_request(&create).expect("a create isn't replayed");
+        assert!(reason.contains("no target"), "{reason}");
     }
 
     #[test]
