@@ -50,6 +50,24 @@ impl Usage {
         self.0.as_ref().is_none_or(|used| used.contains(&step))
     }
 
+    /// Whether any observation that reaches an effect is a `STATICCALL`: only the used steps are
+    /// looked at, unless the tracker gave up and every step counts.
+    pub(crate) fn any_used_staticcall(&self, logs: &[StructLog]) -> bool {
+        let is_static = |log: &StructLog| log.op.as_ref() == "STATICCALL";
+        match &self.0 {
+            Some(used) => used
+                .iter()
+                .any(|&step| logs.get(step).is_some_and(is_static)),
+            None => logs.iter().any(is_static),
+        }
+    }
+
+    /// Usage in which only the observations at `steps` reach an effect.
+    #[cfg(test)]
+    pub(crate) fn only(steps: &[usize]) -> Self {
+        Self(Some(steps.iter().copied().collect()))
+    }
+
     /// Whether the tracker followed the trace at all.
     #[cfg(test)]
     pub(crate) fn followed(&self) -> bool {

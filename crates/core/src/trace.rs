@@ -353,7 +353,7 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
     // Which observations the program's effects depend on; the rest stay unpinned. Of the reads
     // that are, those whose callee ran stateless code are pinned by that code.
     let usage = Usage::of(&trace.struct_logs);
-    let stateless = StatelessReads::of(&trace.struct_logs);
+    let stateless = StatelessReads::of_used(&trace.struct_logs, &usage);
 
     for (step, struct_log) in trace.struct_logs.into_iter().enumerate() {
         let depth = struct_log.depth;

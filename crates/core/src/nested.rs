@@ -762,7 +762,7 @@ fn split_frame_tree(
     // Which observations each program's effects depend on; the rest stay unpinned. Of the reads
     // that are, those whose callee ran stateless code are pinned by that code.
     let usage = Usage::of(&trace.struct_logs);
-    let stateless = StatelessReads::of(&trace.struct_logs);
+    let stateless = StatelessReads::of_used(&trace.struct_logs, &usage);
 
     for (log_index, struct_log) in trace.struct_logs.into_iter().enumerate() {
         let depth = struct_log.depth;

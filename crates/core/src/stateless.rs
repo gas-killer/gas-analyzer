@@ -23,6 +23,7 @@ use alloy_primitives::Address;
 use alloy_rpc_types::trace::geth::StructLog;
 
 use crate::observe::{is_precompile, stack_top};
+use crate::taint::Usage;
 
 /// The stateless `STATICCALL`s of a trace, by struct-log index, each with the accounts whose
 /// code ran under it: the target first, then each account a nested call ran code from, in trace
@@ -33,6 +34,17 @@ pub(crate) struct StatelessReads(HashMap<usize, Vec<Address>>);
 impl StatelessReads {
     pub(crate) fn of(logs: &[StructLog]) -> Self {
         Self(follow(logs))
+    }
+
+    /// [`Self::of`], for a trace whose observations `usage` tracked. Only a `STATICCALL` the
+    /// program depends on is ever looked up, so a trace without one skips the walk: most traces
+    /// make no such read, and the walk costs a pass over every step.
+    pub(crate) fn of_used(logs: &[StructLog], usage: &Usage) -> Self {
+        if usage.any_used_staticcall(logs) {
+            Self::of(logs)
+        } else {
+            Self::default()
+        }
     }
 
     /// The accounts to pin by code hash if the `STATICCALL` at struct-log `step` ran stateless
@@ -390,6 +402,32 @@ mod tests {
 
         let unfinished = [call("STATICCALL", 1, A), log("ADD", 2, &[])];
         assert_eq!(verdict(&unfinished), None);
+    }
+
+    /// The walk runs only for a trace with a `STATICCALL` the program depends on.
+    #[test]
+    fn only_a_used_read_is_followed() {
+        let logs = [
+            log("PUSH1", 1, &[]),
+            call("STATICCALL", 1, A),
+            log("ADD", 2, &[]),
+            log("RETURN", 2, &[]),
+            resume(1, true),
+        ];
+        assert!(
+            StatelessReads::of_used(&logs, &Usage::only(&[]))
+                .code_of(1)
+                .is_none()
+        );
+        assert!(
+            StatelessReads::of_used(&logs, &Usage::only(&[0]))
+                .code_of(1)
+                .is_none()
+        );
+        assert_eq!(
+            StatelessReads::of_used(&logs, &Usage::only(&[1])).code_of(1),
+            Some(&[A][..])
+        );
     }
 
     /// The callee's own revert is its result, which the walks pin like a success.
