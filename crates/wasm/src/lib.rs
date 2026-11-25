@@ -705,7 +705,13 @@ fn analyze_extract(
             match estimate_state_changes_gas(&mut cache_db, addr, caller, state_updates, &sim_env) {
                 // The callees have no code here, so the simulation charges only the `CALL`s.
                 Ok(gas) => (gas.saturating_add(extract.callee_gas_total), false, false),
-                Err(_) => (estimate_gas_from_state_updates(extract), true, false),
+                Err(_) => {
+                    let priced = TraceExtract {
+                        state_updates: state_updates.to_vec(),
+                        ..extract.clone()
+                    };
+                    (estimate_gas_from_state_updates(&priced), true, false)
+                }
             }
         }
     };

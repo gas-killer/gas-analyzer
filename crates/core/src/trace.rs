@@ -262,7 +262,7 @@ pub fn append_state_update_from_struct_log(
 /// handling DELEGATECALL and CALLCODE depth tracking correctly.
 ///
 /// Everything extracted from a struct-log trace in a single pass.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct TraceExtract {
     pub state_updates: Vec<StateUpdate>,
     pub skipped_opcodes: HashSet<Opcode>,

@@ -137,10 +137,13 @@ fn follow(logs: &[StructLog]) -> HashMap<usize, Vec<Address>> {
 
         let op = log.op.as_ref();
         let inside = open.len().checked_sub(1);
-        // Clients differ on whether a `REVERT` step carries an error (reth's tracer sets one,
-        // geth's doesn't), and every operator must reach the same verdict: a revert is the
-        // callee's own result, which the call's success flag already records.
-        let failed = log.error.is_some() && op != "REVERT";
+        // A tracer may mark the `REVERT` step itself with a revert error, and every operator
+        // must reach the same verdict: a revert is the callee's own result, which the call's
+        // success flag already records. Any other error there (out of gas expanding memory, a
+        // stack underflow) is the EVM's, which depends on more than code and input.
+        let failed = log.error.as_deref().is_some_and(|error| {
+            !(op == "REVERT" && error.to_ascii_lowercase().contains("revert"))
+        });
         if let Some(at) = inside
             && (failed || !(pure(op) || is_call(op)))
         {
@@ -477,14 +480,18 @@ mod tests {
         }
     }
 
-    /// A tracer that marks the `REVERT` step with an error (as reth's does) gets the same verdict
-    /// as one that doesn't.
+    /// A tracer that marks the `REVERT` step with a revert error gets the same verdict as one
+    /// that doesn't; running out of gas on that step is still the EVM's failure.
     #[test]
     fn a_revert_marked_as_an_error_is_still_stateless() {
         let mut revert = log("REVERT", 2, &[U256::ZERO, U256::from(32)]);
         revert.error = Some("Reverted".into());
-        let logs = [call("STATICCALL", 1, A), revert, resume(1, false)];
+        let logs = [call("STATICCALL", 1, A), revert.clone(), resume(1, false)];
         assert_eq!(verdict(&logs), Some(vec![A]));
+
+        revert.error = Some("out of gas".into());
+        let logs = [call("STATICCALL", 1, A), revert, resume(1, false)];
+        assert_eq!(verdict(&logs), None);
     }
 
     /// The callee's own revert is its result, which the walks pin like a success.

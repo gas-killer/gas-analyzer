@@ -347,7 +347,10 @@ fn stateless_reads(updates: &[StateUpdate]) -> Vec<(usize, std::ops::Range<usize
 /// keep the `STATICCALL_CHECK`s. For a caller that can't fetch code as of the state the trace
 /// ran on. Fails for a read that failed without data, which only its code could pin.
 pub fn unpin_stateless_reads(updates: &mut Vec<StateUpdate>) -> Result<()> {
-    unpin_reads_where(updates, |_| true)
+    unpin_reads_where(updates, |_| true)?;
+    // A read kept beside its stateless twin is now that twin's repeat.
+    dedupe_checks(updates);
+    Ok(())
 }
 
 /// Drop the code markers of each stateless read whose markers `fall_back` returns true for.
@@ -448,54 +451,71 @@ pub(crate) fn dedupe_checks(updates: &mut Vec<StateUpdate>) {
                 && updates.get(i + 1).is_some_and(is_code_marker)
         })
         .collect();
-    let mut reads: Vec<(StateUpdate, bool)> = Vec::new();
+    let mut out: Vec<StateUpdate> = Vec::with_capacity(updates.len());
+    // The reads kept since the last write: the check, whether it's stateless, and where it is.
+    let mut reads: Vec<(StateUpdate, bool, usize)> = Vec::new();
     let mut accounts: Vec<StateUpdate> = Vec::new();
-    // Whether the last `STATICCALL_CHECK` was dropped, which its markers follow.
-    let mut read_dropped = false;
-    let mut at = 0;
-    updates.retain(|update| {
-        let i = at;
-        at += 1;
-        if is_code_marker(update) {
-            return !read_dropped;
-        }
-        match update {
-            StateUpdate::StaticCallCheck(_) => {
-                let repeated = reads
-                    .iter()
-                    .any(|(earlier, s)| *s == stateless[i] && same_check(earlier, update));
-                read_dropped = repeated;
-                if !repeated {
-                    reads.push((update.clone(), stateless[i]));
+    // The kept twin of the last `STATICCALL_CHECK`, if that one was dropped: its markers go
+    // too, the first's gas onto the twin's, since pinning the twin by code spares both runs.
+    let mut dropped_into: Option<Option<usize>> = None;
+    for (i, update) in std::mem::take(updates).into_iter().enumerate() {
+        if is_code_marker(&update) {
+            match dropped_into {
+                None => out.push(update),
+                Some(twin) => {
+                    if let Some(twin) = twin
+                        && matches!(out.get(twin), Some(StateUpdate::StaticCallCheck(_)))
+                    {
+                        let gas = read_gas(&update);
+                        let kept = read_gas(&out[twin + 1]);
+                        charge_stateless_read(&mut out, twin, kept.saturating_add(gas));
+                    }
+                    // Only the first marker carries gas.
+                    dropped_into = Some(None);
                 }
-                !repeated
+            }
+            continue;
+        }
+        match &update {
+            StateUpdate::StaticCallCheck(_) => {
+                let twin = reads
+                    .iter()
+                    .find(|(earlier, s, _)| *s == stateless[i] && same_check(earlier, &update))
+                    .map(|(_, _, at)| *at);
+                match twin {
+                    Some(at) => dropped_into = Some(Some(at)),
+                    None => {
+                        dropped_into = None;
+                        reads.push((update.clone(), stateless[i], out.len()));
+                        out.push(update);
+                    }
+                }
+                continue;
             }
             StateUpdate::BalanceCheck(_) | StateUpdate::CodehashCheck(_) => {
-                let repeated = accounts.iter().any(|earlier| same_check(earlier, update));
-                if !repeated {
-                    accounts.push(update.clone());
+                if accounts.iter().any(|earlier| same_check(earlier, &update)) {
+                    continue;
                 }
-                !repeated
+                accounts.push(update.clone());
             }
             StateUpdate::Store(_)
             | StateUpdate::Log0(_)
             | StateUpdate::Log1(_)
             | StateUpdate::Log2(_)
             | StateUpdate::Log3(_)
-            | StateUpdate::Log4(_) => {
-                reads.clear();
-                true
-            }
+            | StateUpdate::Log4(_) => reads.clear(),
             StateUpdate::Call(_)
             | StateUpdate::Create(_)
             | StateUpdate::Create2(_)
             | StateUpdate::Nested(_) => {
                 reads.clear();
                 accounts.clear();
-                true
             }
         }
-    });
+        dropped_into = None;
+        out.push(update);
+    }
+    *updates = out;
 }
 
 fn same_check(a: &StateUpdate, b: &StateUpdate) -> bool {
@@ -563,6 +583,12 @@ pub fn unresolved_code_accounts(updates: &[StateUpdate]) -> Vec<Address> {
     out
 }
 
+/// Whether `code`'s hash pins the code that ran from its account: there is some, and it isn't
+/// an EIP-7702 delegation designator (`0xef0100 ‖ delegate`), whose delegate's code ran instead.
+fn pins_code(code: &Bytes) -> bool {
+    !code.is_empty() && !code.starts_with(&[0xef, 0x01, 0x00])
+}
+
 /// Replace every code marker in `updates` with the account's code hash, from `code`: each
 /// account's code as of the state the trace ran on (the caller vouches for that), for the
 /// accounts [`unresolved_code_accounts`] names. Then drop the checks that repeat.
@@ -585,10 +611,7 @@ pub fn resolve_code_sizes(
     // An EIP-7702 delegation designator (`0xef0100 ‖ delegate`) isn't the code that ran: the
     // delegate's was, which the trace doesn't name, and which the trace may even have deployed.
     // A read that ran one is checked by running it.
-    let has_code = |account: &Address| {
-        code.get(account)
-            .is_some_and(|bytes| !bytes.is_empty() && !bytes.starts_with(&[0xef, 0x01, 0x00]))
-    };
+    let has_code = |account: &Address| code.get(account).is_some_and(pins_code);
     unpin_reads_where(updates, |markers| {
         !markers.iter().all(|marker| match marker {
             StateUpdate::CodehashCheck(check) => has_code(&check.account),
@@ -609,7 +632,7 @@ pub fn resolve_code_sizes(
         if is_code_marker_hash(check.codehash) {
             // A marker outside a read (a caller moved it from its check) has nothing to stand
             // for; never index on it.
-            let Some(bytes) = code.get(&check.account).filter(|bytes| !bytes.is_empty()) else {
+            let Some(bytes) = code.get(&check.account).filter(|bytes| pins_code(bytes)) else {
                 bail!(
                     "no code fetched for {}, whose code a stateless read ran",
                     check.account
@@ -1035,13 +1058,36 @@ mod tests {
         dedupe_checks(&mut updates);
         assert_eq!(updates.len(), 3, "both reads stay: {updates:?}");
 
-        let mut updates = vec![check(), marker.clone(), check(), marker];
+        let mut updates = vec![check(), marker.clone(), check(), marker.clone()];
+        charge_stateless_read(&mut updates, 0, 200_000);
+        charge_stateless_read(&mut updates, 2, 150_000);
         dedupe_checks(&mut updates);
         assert_eq!(
             updates.len(),
             2,
             "a repeated stateless read goes, markers and all"
         );
+        // Pinning the kept read by code spares both runs, so it hands back both reads' gas.
+        let code = HashMap::from([(Address::repeat_byte(0xcc), Bytes::from_static(&[0xfe]))]);
+        assert_eq!(resolve_code_sizes(&mut updates, &code).unwrap(), 350_000);
+
+        // Falling back leaves the stateful read as the stateless one's repeat.
+        let mut updates = vec![check(), marker, check()];
+        unpin_stateless_reads(&mut updates).unwrap();
+        assert!(
+            matches!(updates.as_slice(), [StateUpdate::StaticCallCheck(_)]),
+            "{updates:?}"
+        );
+    }
+
+    /// A marker moved off its read isn't pinned to a delegation designator either.
+    #[test]
+    fn an_orphaned_marker_of_a_delegated_account_is_an_error() {
+        let eoa = Address::repeat_byte(0xe0);
+        let mut designator = vec![0xef, 0x01, 0x00];
+        designator.extend_from_slice(Address::repeat_byte(0xde).as_slice());
+        let code = HashMap::from([(eoa, Bytes::from(designator))]);
+        assert!(resolve_code_sizes(&mut vec![code_check(eoa)], &code).is_err());
     }
 
     /// An EIP-7702 delegated account's code is a designator, not the code that ran: its read is
