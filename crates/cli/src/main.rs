@@ -348,10 +348,13 @@ async fn execute_command(cli_args: CliArgs) -> Result<()> {
                 // Get trace and compute state updates
                 let trace = get_tx_trace(&provider, tx_hash, original_status).await?;
                 let gas_analyzer_core::TraceExtract {
-                    state_updates,
+                    mut state_updates,
                     skipped_opcodes,
                     ..
                 } = compute_state_updates(trace, Some(to))?;
+                // A mined transaction's code can't be fetched as it ran: check every stateless
+                // read by running it, as the report below does.
+                gas_analyzer_core::observe::unpin_stateless_reads(&mut state_updates)?;
 
                 // Print state updates
                 println!("\n{}", "=== State Updates ===".green().bold());

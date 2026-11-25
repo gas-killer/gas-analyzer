@@ -21,8 +21,8 @@ use sha2::{Digest, Sha256};
 pub use crate::encoding::encode_state_updates_to_abi as encoded_program;
 use crate::heuristic::BASE_TX_COST;
 use crate::observe::{
-    Await, ExitData, PendingRead, call_pin, code_check, dedupe_checks, is_precompile, stack_top,
-    static_check,
+    Await, ExitData, PendingRead, call_pin, charge_stateless_read, code_check, dedupe_checks,
+    is_precompile, stack_top, static_check,
 };
 use crate::sim_profile::STATE_TRACKER_SLOT;
 use crate::stateless::StatelessReads;
@@ -874,6 +874,13 @@ fn split_frame_tree(
             if frame.emitted_create && !success {
                 bail!(failed_create(depth));
             }
+            let read = match frame.pin {
+                Some(Await::Static {
+                    index,
+                    stateless: true,
+                }) => Some(index),
+                _ => None,
+            };
             if let Some(pin) = frame.pin {
                 let top = *stack.last().expect("checked above");
                 let returndata = exits.take(closing_depth);
@@ -896,6 +903,9 @@ fn split_frame_tree(
                     caller.call_gas += gas;
                     caller.callee_gas +=
                         callee_gas(gas, frame.call_gas_cost, Some(frame.entry_gas));
+                    if let Some(index) = read {
+                        charge_stateless_read(&mut caller.out, index, gas);
+                    }
                 }
                 if let Some(parent) = parent_program {
                     programs[parent].child_call_gas += gas;
@@ -1297,8 +1307,17 @@ fn prune_unprofitable(programs: &mut [ProgramState], cost: &NestingCostModel) {
         if programs[id].dropped {
             continue;
         }
-        let program_bytes =
-            encoded_program(programs[id].updates.as_deref().unwrap_or_default()).len();
+        // Sized as the program settles with each stateless read checked by running it: its
+        // code markers stand in for the check, never beside it.
+        let program: Vec<StateUpdate> = programs[id]
+            .updates
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|update| !crate::observe::is_code_marker(update))
+            .cloned()
+            .collect();
+        let program_bytes = encoded_program(&program).len();
         let children_bytes: usize = programs[id]
             .children
             .iter()

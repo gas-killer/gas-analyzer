@@ -835,7 +835,9 @@ impl<P: Provider + DebugApi> TxStateExtractor<P> {
         let block = receipt
             .block_number
             .map_or(BlockId::latest(), BlockId::number);
-        resolve_code_hashes(&self.provider, block, updates).await
+        // Unpinned above, so no read is pinned by code and no call gas comes back.
+        resolve_code_hashes(&self.provider, block, updates).await?;
+        Ok(())
     }
 
     /// Extract state updates from a transaction hash

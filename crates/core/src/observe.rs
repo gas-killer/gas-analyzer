@@ -238,8 +238,10 @@ pub(crate) fn static_check(log: &StructLog) -> Result<Option<StateUpdate>> {
 const CODE_SIZE_MARKER: [u8; 24] = *b"gaskiller.extcodesize\0\0\0";
 
 /// The marker a `CODEHASH_CHECK` pinning code a stateless `STATICCALL` ran carries until
-/// [`resolve_code_sizes`] replaces it: the trace shows neither the code nor its size.
-const CODE_MARKER: [u8; 32] = *b"gaskiller.statelesscode\0\0\0\0\0\0\0\0\0";
+/// [`resolve_code_sizes`] replaces it: the trace shows neither the code nor its size. The low 8
+/// bytes of a read's first marker hold the gas the read cost in the trace (see
+/// [`charge_stateless_read`]).
+const CODE_MARKER: [u8; 24] = *b"gaskiller.statelesscode\0";
 
 /// The result hash a stateless read's `STATICCALL_CHECK` carries when the read failed without
 /// data: settlement rejects such a failure when it runs the read again, so only the read's code
@@ -260,7 +262,7 @@ fn marked_size(codehash: B256) -> Option<u64> {
 
 /// Whether `codehash` is still a marker waiting for the account's code.
 fn is_marker(codehash: B256) -> bool {
-    codehash == B256::from(CODE_MARKER) || marked_size(codehash).is_some()
+    is_code_marker_hash(codehash) || marked_size(codehash).is_some()
 }
 
 /// A `CODEHASH_CHECK` marker for `account`'s code, which a stateless `STATICCALL` ran (see the
@@ -274,13 +276,48 @@ fn is_marker(codehash: B256) -> bool {
 pub(crate) fn code_check(account: Address) -> StateUpdate {
     StateUpdate::CodehashCheck(IStateUpdateTypes::CodehashCheck {
         account,
-        codehash: B256::from(CODE_MARKER),
+        codehash: code_marker(0),
     })
+}
+
+fn code_marker(gas: u64) -> B256 {
+    let mut word = [0u8; 32];
+    word[..24].copy_from_slice(&CODE_MARKER);
+    word[24..].copy_from_slice(&gas.to_be_bytes());
+    B256::from(word)
+}
+
+fn is_code_marker_hash(codehash: B256) -> bool {
+    codehash[..24] == CODE_MARKER
 }
 
 /// Whether `update` is a stateless read's code marker, still waiting for its hash.
 pub fn is_code_marker(update: &StateUpdate) -> bool {
-    matches!(update, StateUpdate::CodehashCheck(check) if check.codehash == B256::from(CODE_MARKER))
+    matches!(update, StateUpdate::CodehashCheck(check) if is_code_marker_hash(check.codehash))
+}
+
+/// Record `gas`, what the read whose `STATICCALL_CHECK` is at `check` cost in the trace, on its
+/// first code marker, if it has one. The walks count that gas as settlement running the read
+/// again; a caller that pins the read by its code instead gets it back from
+/// [`resolve_code_sizes`], since settlement then never runs it.
+pub(crate) fn charge_stateless_read(updates: &mut [StateUpdate], check: usize, gas: u64) {
+    if !matches!(updates.get(check), Some(StateUpdate::StaticCallCheck(_))) {
+        return;
+    }
+    if let Some(StateUpdate::CodehashCheck(marker)) = updates.get_mut(check + 1)
+        && is_code_marker_hash(marker.codehash)
+    {
+        marker.codehash = code_marker(gas);
+    }
+}
+
+fn read_gas(marker: &StateUpdate) -> u64 {
+    match marker {
+        StateUpdate::CodehashCheck(check) if is_code_marker_hash(check.codehash) => {
+            u64::from_be_bytes(check.codehash[24..].try_into().expect("8 bytes"))
+        }
+        _ => 0,
+    }
 }
 
 /// The stateless reads in `updates`: each `STATICCALL_CHECK`'s index, and the range of the code
@@ -518,10 +555,13 @@ pub fn unresolved_code_accounts(updates: &[StateUpdate]) -> Vec<Address> {
 /// Fails if an `EXTCODESIZE` read's account has no code in `code`, or not of the size the trace
 /// saw (code deployed earlier in the same transaction, say), since the program would then pin
 /// the wrong code.
+///
+/// Returns the gas the pinned reads cost in the trace: the walks counted it in the program's
+/// call gas as settlement running them again, which it no longer does.
 pub fn resolve_code_sizes(
     updates: &mut Vec<StateUpdate>,
     code: &HashMap<Address, Bytes>,
-) -> Result<()> {
+) -> Result<u64> {
     let has_code = |account: &Address| code.get(account).is_some_and(|bytes| !bytes.is_empty());
     unpin_reads_where(updates, |markers| {
         !markers.iter().all(|marker| match marker {
@@ -531,15 +571,25 @@ pub fn resolve_code_sizes(
     })?;
     // The reads left with markers are pinned by them, so their checks go.
     let mut pinned = vec![false; updates.len()];
-    for (check, _) in stateless_reads(updates) {
+    let mut pinned_gas = 0u64;
+    for (check, markers) in stateless_reads(updates) {
         pinned[check] = true;
+        pinned_gas = pinned_gas.saturating_add(read_gas(&updates[markers.start]));
     }
     for update in updates.iter_mut() {
         let StateUpdate::CodehashCheck(check) = update else {
             continue;
         };
-        if check.codehash == B256::from(CODE_MARKER) {
-            check.codehash = keccak256(&code[&check.account]);
+        if is_code_marker_hash(check.codehash) {
+            // A marker outside a read (a caller moved it from its check) has nothing to stand
+            // for; never index on it.
+            let Some(bytes) = code.get(&check.account).filter(|bytes| !bytes.is_empty()) else {
+                bail!(
+                    "no code fetched for {}, whose code a stateless read ran",
+                    check.account
+                );
+            };
+            check.codehash = keccak256(bytes);
             continue;
         }
         let Some(size) = marked_size(check.codehash) else {
@@ -563,7 +613,7 @@ pub fn resolve_code_sizes(
         !pinned[at - 1]
     });
     dedupe_checks(updates);
-    Ok(())
+    Ok(pinned_gas)
 }
 
 #[cfg(test)]
@@ -933,5 +983,13 @@ mod tests {
         let ecrecover = address!("0x0000000000000000000000000000000000000001");
         assert!(PendingRead::Codehash(ecrecover).check(U256::ZERO).is_none());
         assert!(PendingRead::Balance(ecrecover).check(U256::ZERO).is_some());
+    }
+
+    /// A marker a caller moved away from its read names code that wasn't fetched: an error, not
+    /// a panic.
+    #[test]
+    fn an_orphaned_code_marker_is_an_error() {
+        let mut updates = vec![code_check(Address::repeat_byte(0xab))];
+        assert!(resolve_code_sizes(&mut updates, &HashMap::new()).is_err());
     }
 }

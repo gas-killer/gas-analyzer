@@ -11,7 +11,8 @@ use alloy_rpc_types::trace::geth::{DefaultFrame, StructLog};
 use anyhow::{Result, bail};
 
 use crate::observe::{
-    Await, ExitData, PendingRead, code_check, dedupe_checks, is_precompile, stack_top, static_check,
+    Await, ExitData, PendingRead, charge_stateless_read, code_check, dedupe_checks, is_precompile,
+    stack_top, static_check,
 };
 use crate::stateless::StatelessReads;
 use crate::taint::Usage;
@@ -432,6 +433,7 @@ pub fn compute_state_updates(trace: DefaultFrame, origin: Option<Address>) -> Re
                     if let Some(call) = call_gas_tracking.remove(&idx) {
                         let gas_used = call.gas.saturating_sub(struct_log.gas);
                         total_call_gas += gas_used;
+                        charge_stateless_read(&mut state_updates, idx - 1, gas_used);
                         callee_gas_total += callee_gas(gas_used, call.gas_cost, call.entry_gas);
                     }
                     call_stack.pop();
@@ -905,12 +907,16 @@ mod tests {
         assert_eq!(describe(&tree), describe(&legacy), "the walks differ");
         let mut program = legacy;
         match code {
-            Some(code) => resolve_code_sizes(&mut program, code).unwrap(),
+            Some(code) => {
+                resolve_code_sizes(&mut program, code).unwrap();
+            }
             None => crate::observe::unpin_stateless_reads(&mut program).unwrap(),
         }
         let mut tree = tree;
         match code {
-            Some(code) => resolve_code_sizes(&mut tree, code).unwrap(),
+            Some(code) => {
+                resolve_code_sizes(&mut tree, code).unwrap();
+            }
             None => crate::observe::unpin_stateless_reads(&mut tree).unwrap(),
         }
         assert_eq!(
@@ -973,6 +979,51 @@ mod tests {
             both_programs(logs, None),
             stores_around(&[format!("STATICCALL {CALLEE}")])
         );
+    }
+
+    /// The read's gas is in the program's call gas, as settlement running it again; pinning it by
+    /// its code hands that gas back.
+    #[test]
+    fn pinning_a_read_by_its_code_returns_its_gas() {
+        let mut logs = branching_on_a_read(vec![
+            at("CALLDATALOAD", 2, &[U256::ZERO]),
+            returning("RETURN", 2, 0x01),
+        ]);
+        let call = logs
+            .iter()
+            .position(|l| l.op.as_ref() == "STATICCALL")
+            .expect("the read");
+        for (i, log) in logs.iter_mut().enumerate() {
+            log.gas = if i <= call { 100_000 } else { 70_000 };
+        }
+
+        let extract = compute_state_updates(trace_of(logs.clone()), Some(ORIGIN)).unwrap();
+        assert_eq!(extract.call_gas_total, 30_000);
+        let mut flat = extract.state_updates;
+        assert_eq!(resolve_code_sizes(&mut flat, &code()).unwrap(), 30_000);
+
+        let tree = crate::nested::compute_frame_tree_canonical(
+            trace_of(logs.clone()),
+            ORIGIN,
+            &|_| false,
+            &crate::nested::NESTING_COST_MODEL_V1,
+        )
+        .expect("frame tree");
+        assert_eq!(tree.call_gas_total, 30_000);
+        let mut root = tree.frames[0].updates.clone();
+        assert_eq!(resolve_code_sizes(&mut root, &code()).unwrap(), 30_000);
+        assert_eq!(
+            encode_state_updates_to_abi(&flat),
+            encode_state_updates_to_abi(&root),
+            "both walks resolve to the same program"
+        );
+
+        // Falling back keeps the read, and its gas.
+        let mut checked = compute_state_updates(trace_of(logs), Some(ORIGIN))
+            .unwrap()
+            .state_updates;
+        crate::observe::unpin_stateless_reads(&mut checked).unwrap();
+        assert_eq!(resolve_code_sizes(&mut checked, &code()).unwrap(), 0);
     }
 
     #[test]

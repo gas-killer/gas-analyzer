@@ -11,6 +11,13 @@
 //! into code that is itself stateless, and succeeded. Everything else, from an `SLOAD` or
 //! `TIMESTAMP` to an op this module doesn't know, leaves the read checked by running it again.
 //!
+//! A read of an EIP-7702 delegated account pins the account's code, which is its delegation
+//! designator (`0xef0100 ‖ delegate`). That fixes the delegate's address, and the delegate's own
+//! code can't change between the trace and settlement: since Cancun, code leaves an account only
+//! in the transaction that created it, and code deployed in the trace is never pinned (below). A
+//! delegate that is itself delegated, or has no code, runs no frame of its own, which leaves the
+//! read checked.
+//!
 //! Code deployed in the trace itself can't be pinned by its hash: the code a caller fetches
 //! from the state the trace ran on isn't there yet. A read that ran such code is left checked.
 //!
@@ -207,7 +214,9 @@ fn is_call(op: &str) -> bool {
 /// the result the trace saw. A `STATICCALL_CHECK` would have run it again with settlement's gas
 /// and reverted on a different result; pinned by code, the trace's result stands. A transition
 /// is defined by the trace at its reference block, gas included, so that result is the one the
-/// operators signed.
+/// operators signed. That covers a read that fails on purpose (`revert()` with no data after a
+/// `gasleft()` check), which the walks pin by its code too; a failure the EVM itself causes (out
+/// of gas, the call depth) shows as an error on the log and leaves the read checked.
 ///
 /// Not listed, and so stateful: storage and transient storage (`SLOAD`, `TLOAD`), other
 /// accounts (`BALANCE`, `SELFBALANCE`, `EXTCODESIZE`, `EXTCODEHASH`, `EXTCODECOPY`), the block and

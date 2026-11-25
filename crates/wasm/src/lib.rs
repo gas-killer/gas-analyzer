@@ -967,7 +967,11 @@ pub fn estimate_gas_heuristic_inner(
     trace_json: &str,
     origin_address: Option<&str>,
 ) -> Result<EstimateGasResult, String> {
-    let (extract, _) = parse_and_compute(trace_json, parse_origin(origin_address)?)?;
+    let (mut extract, _) = parse_and_compute(trace_json, parse_origin(origin_address)?)?;
+    // No code to pin by here: every stateless read is checked by running it, as the program
+    // this estimates would.
+    gas_analyzer_core::observe::unpin_stateless_reads(&mut extract.state_updates)
+        .map_err(|e| format!("Failed to compute state updates: {e}"))?;
 
     let gas = estimate_gas_from_state_updates(&extract);
 

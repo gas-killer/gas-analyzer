@@ -1398,7 +1398,7 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
     let Extracted {
         mut state_updates,
         skipped_opcodes,
-        call_gas_total,
+        mut call_gas_total,
         extraction,
         trace_fetch,
         parse,
@@ -1408,7 +1408,9 @@ pub async fn call_to_encoded_state_updates_with_evmsketch_profiled(
     if sets_code {
         unpin_stateless_reads(&mut state_updates)?;
     }
-    resolve_code_hashes(&provider, block_id, &mut state_updates).await?;
+    // A read pinned by its code is never run at settlement: its gas leaves the call gas.
+    let pinned_gas = resolve_code_hashes(&provider, block_id, &mut state_updates).await?;
+    call_gas_total = call_gas_total.saturating_sub(pinned_gas);
     tracing::Span::current().record("state_update_count", state_updates.len());
 
     // The unbounded profile's whole bargain: compute may be unbounded, the payload that lands
@@ -2075,7 +2077,9 @@ pub async fn call_to_frame_tree_with_evmsketch(
         if sets_code {
             unpin_stateless_reads(&mut frame.updates)?;
         }
-        resolve_code_hashes(&provider, block, &mut frame.updates).await?;
+        // A read pinned by its code is never run at settlement: its gas leaves the call gas.
+        let pinned_gas = resolve_code_hashes(&provider, block, &mut frame.updates).await?;
+        tree.call_gas_total = tree.call_gas_total.saturating_sub(pinned_gas);
     }
 
     // The whole tree lands in one transaction, so the unbounded profile's payload budget covers

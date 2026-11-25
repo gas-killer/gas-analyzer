@@ -765,9 +765,13 @@ pub fn sets_code(tx: &alloy::rpc::types::TransactionRequest) -> bool {
 ///   rather than run again at settlement. A read that ran an account with no code at `block`
 ///   falls back to its `STATICCALL_CHECK`.
 ///
-/// The accounts are fetched concurrently, and any fetch that fails fails the call: falling back
-/// on an RPC error would make the program depend on the node's luck, not just on the trace, and
-/// operators signing the same call would disagree.
+/// The accounts are fetched a few at a time, and any fetch that fails fails the call: falling
+/// back on an RPC error would make the program depend on the node's luck, not just on the trace,
+/// and operators signing the same call would disagree.
+///
+/// Returns the gas the reads pinned by code cost in the trace, which the program's call gas
+/// counted as settlement running them again (see
+/// [`gas_analyzer_core::observe::resolve_code_sizes`]).
 ///
 /// `block` must be the state the trace ran on (for a call traced at a block, that block), or a
 /// stateless read could be pinned to code other than what ran. A caller that can't promise that
@@ -777,19 +781,23 @@ pub async fn resolve_code_hashes<P: Provider>(
     provider: &P,
     block: BlockId,
     updates: &mut Vec<StateUpdate>,
-) -> Result<()> {
+) -> Result<u64> {
+    use futures::{StreamExt, TryStreamExt};
+    /// Enough to overlap round trips without tripping a node's rate limit.
+    const CONCURRENT_FETCHES: usize = 8;
     let accounts = gas_analyzer_core::observe::unresolved_code_accounts(updates);
-    let code = futures::future::try_join_all(accounts.into_iter().map(|account| async move {
-        provider
-            .get_code_at(account)
-            .block_id(block)
-            .await
-            .map(|bytes| (account, bytes))
-            .map_err(|e| anyhow!("fetching the code of {account} at {block}: {e}"))
-    }))
-    .await?
-    .into_iter()
-    .collect();
+    let code = futures::stream::iter(accounts)
+        .map(|account| async move {
+            provider
+                .get_code_at(account)
+                .block_id(block)
+                .await
+                .map(|bytes| (account, bytes))
+                .map_err(|e| anyhow!("fetching the code of {account} at {block}: {e}"))
+        })
+        .buffer_unordered(CONCURRENT_FETCHES)
+        .try_collect()
+        .await?;
     gas_analyzer_core::observe::resolve_code_sizes(updates, &code)
 }
 
