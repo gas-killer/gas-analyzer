@@ -50,6 +50,24 @@ impl Usage {
         self.0.as_ref().is_none_or(|used| used.contains(&step))
     }
 
+    /// Whether any observation that reaches an effect is a `STATICCALL`: only the used steps are
+    /// looked at, unless the tracker gave up and every step counts.
+    pub(crate) fn any_used_staticcall(&self, logs: &[StructLog]) -> bool {
+        let is_static = |log: &StructLog| log.op.as_ref() == "STATICCALL";
+        match &self.0 {
+            Some(used) => used
+                .iter()
+                .any(|&step| logs.get(step).is_some_and(is_static)),
+            None => logs.iter().any(is_static),
+        }
+    }
+
+    /// Usage in which only the observations at `steps` reach an effect.
+    #[cfg(test)]
+    pub(crate) fn only(steps: &[usize]) -> Self {
+        Self(Some(steps.iter().copied().collect()))
+    }
+
     /// Whether the tracker followed the trace at all.
     #[cfg(test)]
     pub(crate) fn followed(&self) -> bool {
@@ -1029,6 +1047,8 @@ pub(crate) mod tests {
             }
         }
 
+        /// The callee only writes memory and returns, which is stateless: unused, it pins
+        /// nothing, not even its code.
         #[test]
         fn a_staticcall_whose_result_is_dropped_is_not_checked() {
             let mut steps = call6_steps(1, "STATICCALL");
@@ -1036,6 +1056,30 @@ pub(crate) mod tests {
             steps.extend([(1, "POP", &[1][..]), (1, "STOP", &[])]);
             for updates in both(&steps) {
                 assert_eq!(checks(&updates), 0, "{updates:?}");
+            }
+        }
+
+        /// The same stateless read, branched on: its check, with its callee's code marked to pin
+        /// it instead once a caller fetches the code.
+        #[test]
+        fn a_used_stateless_staticcall_is_pinned_by_its_code() {
+            let mut steps = call6_steps(1, "STATICCALL");
+            steps.extend(returning(2));
+            steps.extend([
+                (1, "PUSH1", &[1][..]),
+                (1, "JUMPI", &[9, 1]),
+                (1, "STOP", &[]),
+            ]);
+            let callee = Address::left_padding_from(&[0x12, 0x34]);
+            for updates in both(&steps) {
+                assert!(
+                    matches!(
+                        updates.as_slice(),
+                        [StateUpdate::StaticCallCheck(read), StateUpdate::CodehashCheck(c)]
+                            if read.target == callee && c.account == callee
+                    ),
+                    "the check, and the marker of the code that may pin it instead: {updates:?}"
+                );
             }
         }
     }

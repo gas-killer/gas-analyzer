@@ -3895,6 +3895,7 @@ dependencies = [
  "alloy-rpc-types",
  "alloy-transport",
  "anyhow",
+ "futures",
  "gas-analyzer-core",
  "gas-analyzer-estimator",
  "revm 31.0.2",
