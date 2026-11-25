@@ -269,7 +269,10 @@ pub struct TraceExtract {
     /// Total gas consumed by the extracted depth-1 CALLs (gross, pre-refund).
     pub call_gas_total: u64,
     /// The part of `call_gas_total` spent inside the callees, without the `CALL` opcodes' own
-    /// cost: what a simulation that runs those `CALL`s into code-less accounts misses.
+    /// cost: what a simulation that runs those `CALL`s into code-less accounts misses. As walked:
+    /// a caller that pins stateless reads by code takes their gas off `call_gas_total` only (see
+    /// `observe::resolve_code_sizes`), so this keeps it. Only pricers that check every read by
+    /// running it use this.
     pub callee_gas_total: u64,
     /// Total gas consumed by the extracted CREATE/CREATE2s (gross, pre-refund): the opcode, its
     /// initcode's execution and the code deposit.

@@ -11,12 +11,10 @@
 //! into code that is itself stateless, and succeeded. Everything else, from an `SLOAD` or
 //! `TIMESTAMP` to an op this module doesn't know, leaves the read checked by running it again.
 //!
-//! A read of an EIP-7702 delegated account pins the account's code, which is its delegation
-//! designator (`0xef0100 ‖ delegate`). That fixes the delegate's address, and the delegate's own
-//! code can't change between the trace and settlement: since Cancun, code leaves an account only
-//! in the transaction that created it, and code deployed in the trace is never pinned (below). A
-//! delegate that is itself delegated, or has no code, runs no frame of its own, which leaves the
-//! read checked.
+//! A read of an EIP-7702 delegated account runs its delegate's code, which the trace doesn't
+//! name (and may have deployed earlier on). The account's own code is just the designator, so
+//! such a read is never pinned by code: resolving it falls back to its check (see
+//! `observe::resolve_code_sizes`).
 //!
 //! Code deployed in the trace itself can't be pinned by its hash: the code a caller fetches
 //! from the state the trace ran on isn't there yet. A read that ran such code is left checked.
@@ -139,8 +137,12 @@ fn follow(logs: &[StructLog]) -> HashMap<usize, Vec<Address>> {
 
         let op = log.op.as_ref();
         let inside = open.len().checked_sub(1);
+        // Clients differ on whether a `REVERT` step carries an error (reth's tracer sets one,
+        // geth's doesn't), and every operator must reach the same verdict: a revert is the
+        // callee's own result, which the call's success flag already records.
+        let failed = log.error.is_some() && op != "REVERT";
         if let Some(at) = inside
-            && (log.error.is_some() || !(pure(op) || is_call(op)))
+            && (failed || !(pure(op) || is_call(op)))
         {
             open[at].stateless = false;
         }
@@ -473,6 +475,16 @@ mod tests {
             ];
             assert_eq!(verdict(&logs), None, "{precompile}");
         }
+    }
+
+    /// A tracer that marks the `REVERT` step with an error (as reth's does) gets the same verdict
+    /// as one that doesn't.
+    #[test]
+    fn a_revert_marked_as_an_error_is_still_stateless() {
+        let mut revert = log("REVERT", 2, &[U256::ZERO, U256::from(32)]);
+        revert.error = Some("Reverted".into());
+        let logs = [call("STATICCALL", 1, A), revert, resume(1, false)];
+        assert_eq!(verdict(&logs), Some(vec![A]));
     }
 
     /// The callee's own revert is its result, which the walks pin like a success.

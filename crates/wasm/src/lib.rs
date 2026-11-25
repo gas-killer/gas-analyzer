@@ -663,7 +663,12 @@ fn analyze_extract(
     with_code: &BTreeSet<Address>,
     replay: Option<(&Replay, Address)>,
 ) -> Result<AnalyzeTraceResult, String> {
-    let state_updates: &[StateUpdate] = &extract.state_updates;
+    // Priced as encoded: each stateless read checked by running it, without its code markers.
+    // (Size checks still waiting for code stay in, as the pricer leaves checks out anyway.)
+    let mut priced = extract.state_updates.clone();
+    gas_analyzer_core::observe::unpin_stateless_reads(&mut priced)
+        .map_err(|e| format!("Failed to compute state updates: {e}"))?;
+    let state_updates: &[StateUpdate] = &priced;
 
     let mut program = state_updates.to_vec();
     let unpinned_code_reads = addresses(

@@ -227,7 +227,10 @@ pub struct FrameTreeExtract {
     /// Gas of every `CALL` op that replays natively, across all frames.
     pub call_gas_total: u64,
     /// The part of `call_gas_total` spent inside the callees, without the `CALL` opcodes' own
-    /// cost: what a simulation that runs those `CALL`s into code-less accounts misses.
+    /// cost: what a simulation that runs those `CALL`s into code-less accounts misses. As walked:
+    /// a caller that pins stateless reads by code takes their gas off `call_gas_total` only (see
+    /// `observe::resolve_code_sizes`), so this keeps it. Only pricers that check every read by
+    /// running it use this.
     pub callee_gas_total: u64,
     /// Gas of every `CREATE`/`CREATE2` op the kept programs replay, initcode execution and code
     /// deposit included. Kept apart from `call_gas_total`, as in [`TraceExtract`], so creates are
