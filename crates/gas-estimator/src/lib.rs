@@ -83,6 +83,9 @@ pub struct SimEnvOpts {
     pub basefee: u64,
     pub difficulty: U256,
     pub spec: SpecId,
+    /// The chain the call runs on: what `CHAINID` returns to code the simulation runs, and the chain
+    /// EIP-7702 authorizations in replayed transactions must name. revm defaults to 1.
+    pub chain_id: u64,
     pub value: U256,
     pub verify_observations: bool,
 }
@@ -560,6 +563,7 @@ where
             cfg.disable_base_fee = true;
             cfg.disable_fee_charge = true;
             cfg.spec = sim_env.spec;
+            cfg.chain_id = sim_env.chain_id;
         })
         .modify_block_chained(|block| {
             block.number = U256::from(sim_env.number);
@@ -581,6 +585,7 @@ fn estimator_tx(
     sim_env: &SimEnvOpts,
 ) -> Result<TxEnv> {
     TxEnv::builder()
+        .chain_id(Some(sim_env.chain_id))
         .caller(caller_address)
         .kind(TxKind::Call(contract_address))
         .data(calldata)
@@ -1204,6 +1209,7 @@ where
             cfg.disable_base_fee = true;
             cfg.disable_fee_charge = true;
             cfg.spec = sim_env.spec;
+            cfg.chain_id = sim_env.chain_id;
         })
         .modify_block_chained(|block| {
             block.number = U256::from(sim_env.number);
@@ -1225,6 +1231,7 @@ where
         // the nonce — silently corrupting the CacheDB state seen by every
         // subsequent replay and by the analyzed tx itself.
         let revm_tx = TxEnv::builder()
+            .chain_id(Some(sim_env.chain_id))
             .caller(tx.from)
             .kind(tx.kind)
             .data(tx.input.clone())
@@ -1343,6 +1350,7 @@ mod tests {
                 cfg.disable_base_fee = true;
                 cfg.disable_fee_charge = true;
                 cfg.spec = sim_env.spec;
+                cfg.chain_id = sim_env.chain_id;
             })
             .modify_block_chained(|block| {
                 block.number = U256::from(sim_env.number);
@@ -1357,6 +1365,7 @@ mod tests {
         let mut evm = ctx.build_mainnet();
 
         let deploy_tx = TxEnv::builder()
+            .chain_id(Some(sim_env.chain_id))
             .caller(caller)
             .kind(revm::primitives::TxKind::Create)
             .data(deploy_data.into())
@@ -1403,6 +1412,7 @@ mod tests {
             basefee: 25_000_000_000,
             difficulty: U256::ZERO,
             spec: SpecId::OSAKA,
+            chain_id: 1,
             value: U256::ZERO,
             verify_observations: false,
         };
@@ -1454,6 +1464,7 @@ mod tests {
             basefee: 25_000_000_000,
             difficulty: U256::ZERO,
             spec: SpecId::OSAKA,
+            chain_id: 1,
             value: U256::ZERO,
             verify_observations: false,
         };
@@ -1504,6 +1515,7 @@ mod tests {
             basefee: 25_000_000_000,
             difficulty: U256::ZERO,
             spec: SpecId::OSAKA,
+            chain_id: 1,
             value: U256::ZERO,
             verify_observations: false,
         };
@@ -1554,6 +1566,7 @@ mod tests {
             basefee: 25_000_000_000,
             difficulty: U256::ZERO,
             spec: SpecId::OSAKA,
+            chain_id: 1,
             value: U256::ZERO,
             verify_observations: false,
         };
@@ -1591,6 +1604,66 @@ mod tests {
         );
     }
 
+    /// Code the simulation runs natively sees the call's chain: a consumer whose settlement calls code that
+    /// hashes `block.chainid` (a privacy pool binding its external data to the chain, say) must not be
+    /// estimated as if it ran on mainnet.
+    #[test]
+    fn test_simulated_code_sees_the_chain_id() {
+        let caller = address!("0x000000000000000000000000000000000000c411");
+        let callee = address!("0x00000000000000000000000000000000000c4a1d");
+        // CHAINID PUSH3 11155111 EQ PUSH1 0x0c JUMPI PUSH0 PUSH0 REVERT JUMPDEST STOP
+        let code = revm::state::Bytecode::new_raw(Bytes::from(
+            hex::decode("4662aa36a714600c575f5ffd5b00").unwrap(),
+        ));
+        let program = vec![StateUpdate::Call(IStateUpdateTypes::Call {
+            target: callee,
+            value: U256::ZERO,
+            callargs: Bytes::new(),
+            resultHash: B256::ZERO,
+            gasLimit: U256::MAX,
+        })];
+        let estimate = |chain_id: u64| {
+            let mut cache_db = CacheDB::new(EmptyDB::default());
+            fund(&mut cache_db, caller);
+            cache_db.insert_account_info(
+                callee,
+                AccountInfo {
+                    code_hash: code.hash_slow(),
+                    code: Some(code.clone()),
+                    ..Default::default()
+                },
+            );
+            let sim_env = SimEnvOpts {
+                chain_id,
+                verify_observations: false,
+                ..sim_env_with_spec(SpecId::OSAKA)
+            };
+            estimate_state_changes_gas(
+                &mut cache_db,
+                address!("0x000000000000000000000000000000000000E570"),
+                caller,
+                &program,
+                &sim_env,
+            )
+        };
+        let sepolia = estimate(11_155_111);
+        assert!(
+            sepolia.is_ok(),
+            "Sepolia's id reaches the callee: {}",
+            format_sim_env_error(&sepolia.unwrap_err())
+        );
+        // On any other chain the callee itself reverts, and the program's CALL reports it.
+        let mainnet = estimate(1).expect_err("the callee reverts on any other chain");
+        let reverted = reverting_context(&mainnet).unwrap_or_else(|| {
+            panic!(
+                "not the callee's revert: {}",
+                format_sim_env_error(&mainnet)
+            )
+        });
+        assert_eq!(reverted.target, callee);
+        assert_eq!(reverted.index, U256::ZERO);
+    }
+
     /// Convenience: SimEnvOpts with sensible defaults at a chosen spec.
     fn sim_env_with_spec(spec: SpecId) -> SimEnvOpts {
         SimEnvOpts {
@@ -1603,6 +1676,7 @@ mod tests {
             basefee: 0,
             difficulty: U256::ZERO,
             spec,
+            chain_id: 1,
             value: U256::ZERO,
             // The estimator's own tests run on the state their programs were written for.
             verify_observations: true,
@@ -1742,6 +1816,7 @@ mod tests {
                 cfg.disable_base_fee = true;
                 cfg.disable_fee_charge = true;
                 cfg.spec = sim_env.spec;
+                cfg.chain_id = sim_env.chain_id;
             })
             .modify_block_chained(|block| {
                 block.number = U256::from(sim_env.number);
@@ -1754,6 +1829,7 @@ mod tests {
             .build_mainnet();
 
         let tx = TxEnv::builder()
+            .chain_id(Some(sim_env.chain_id))
             .caller(sender)
             .kind(TxKind::Call(target))
             .gas_limit(1_000_000)
@@ -1861,10 +1937,12 @@ mod tests {
         let authority: Address = signer.address();
         let delegated = address!("0x00000000000000000000000000000000de1e6a7e");
 
-        // EIP-7702 requires chain_id == tx.chain_id || 0. revm's
-        // mainnet config defaults to chain_id 1. Sign for chain 1.
+        // EIP-7702 applies an authorization only if it names the chain the
+        // replay runs on (or 0). Sign for Sepolia, not revm's default of 1, so
+        // the replay must carry `sim_env.chain_id` for the delegation to apply.
+        const SEPOLIA: u64 = 11_155_111;
         let auth = Authorization {
-            chain_id: U256::from(1u64),
+            chain_id: U256::from(SEPOLIA),
             address: delegated,
             nonce: 0,
         };
@@ -1894,7 +1972,10 @@ mod tests {
             authorization_list: vec![signed],
         };
 
-        let sim_env = sim_env_with_spec(SpecId::PRAGUE); // 7702 active
+        let sim_env = SimEnvOpts {
+            chain_id: SEPOLIA,
+            ..sim_env_with_spec(SpecId::PRAGUE) // 7702 active
+        };
 
         replay_preceding_transactions(&mut cache_db, &[tx], &sim_env).expect("replay");
 

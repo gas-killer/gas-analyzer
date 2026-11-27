@@ -50,6 +50,7 @@ struct SimEnvJson {
     basefee: u64,
     difficulty: U256,
     spec: SpecId,
+    chain_id: u64,
 }
 
 impl From<SimEnvOpts> for SimEnvJson {
@@ -64,6 +65,7 @@ impl From<SimEnvOpts> for SimEnvJson {
             basefee: e.basefee,
             difficulty: e.difficulty,
             spec: e.spec,
+            chain_id: e.chain_id,
         }
     }
 }

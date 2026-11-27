@@ -26,6 +26,11 @@ fn default_spec() -> SpecId {
     SpecId::CANCUN
 }
 
+/// The fixture is recorded from Sepolia blocks.
+fn default_chain_id() -> u64 {
+    11_155_111
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct SimEnvJson {
     pub number: u64,
@@ -44,6 +49,9 @@ pub struct SimEnvJson {
     /// Regenerate with `make replay-fixture` to capture the real block spec.
     #[serde(default = "default_spec")]
     pub spec: SpecId,
+    /// Defaults to Sepolia, which fixtures generated before this field was added were recorded on.
+    #[serde(default = "default_chain_id")]
+    pub chain_id: u64,
 }
 
 impl From<SimEnvJson> for SimEnvOpts {
@@ -58,6 +66,7 @@ impl From<SimEnvJson> for SimEnvOpts {
             basefee: e.basefee,
             difficulty: e.difficulty,
             spec: e.spec,
+            chain_id: e.chain_id,
             value: U256::ZERO,
             verify_observations: false,
         }

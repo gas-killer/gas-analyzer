@@ -57,6 +57,7 @@ fn sim_env() -> SimEnvOpts {
         basefee: 10_000_000,
         difficulty: U256::ZERO,
         spec: SpecId::CANCUN,
+        chain_id: 1,
         value: U256::ZERO,
         verify_observations: false,
     }

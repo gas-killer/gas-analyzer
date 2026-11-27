@@ -198,6 +198,7 @@ mod tests {
             basefee: 0,
             difficulty: U256::ZERO,
             spec: SpecId::PRAGUE,
+            chain_id: 1,
             value: U256::ZERO,
             verify_observations: false,
         }
