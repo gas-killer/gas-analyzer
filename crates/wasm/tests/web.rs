@@ -24,6 +24,7 @@ fn test_wasm_analyze_trace_returns_jsvalue() {
         None,
         None,
         None,
+        None,
     );
     assert!(
         result.is_ok(),
@@ -48,6 +49,7 @@ fn test_wasm_analyze_trace_invalid_json_returns_error() {
         None,
         None,
         None,
+        None,
     );
     assert!(result.is_err());
 }
@@ -58,6 +60,7 @@ fn test_wasm_analyze_trace_invalid_address_returns_error() {
         &valid_sstore_trace(),
         "not-an-address",
         &test_caller_address(),
+        None,
         None,
         None,
         None,
@@ -118,6 +121,7 @@ fn test_wasm_analyze_trace_response_fields() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
     let json: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
@@ -161,6 +165,7 @@ fn test_wasm_analyze_trace_bytes_unwraps_the_envelope() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
     let json: serde_json::Value = serde_wasm_bindgen::from_value(result).unwrap();
@@ -176,6 +181,7 @@ fn test_wasm_analyze_trace_bytes_names_rpc_errors() {
             response.to_string().as_bytes(),
             &test_estimator_address(),
             &test_caller_address(),
+            None,
             None,
             None,
             None,
@@ -204,6 +210,7 @@ fn test_wasm_analyze_frame_tree_returns_both_totals() {
         &test_caller_address(),
         None,
         Some("0".to_string()),
+        None,
         None,
         None,
         None,
