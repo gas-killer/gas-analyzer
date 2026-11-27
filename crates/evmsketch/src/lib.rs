@@ -724,6 +724,7 @@ impl DefaultEvmSketchExecutor {
             basefee: header.base_fee_per_gas.unwrap_or(0),
             difficulty: header.difficulty,
             spec: self.spec,
+            chain_id: self.chain_id,
             value: U256::ZERO,
             verify_observations: false,
         }

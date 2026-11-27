@@ -768,6 +768,8 @@ fn sim_env(block_number: Option<u64>, value: U256) -> SimEnvOpts {
         // WASM runs against EmptyDB with no real chain state; pick the newest
         // spec so post-Pectra opcodes don't halt with `NotActivated`.
         spec: SpecId::OSAKA,
+        // Traces handed to the package carry no chain; the code it simulates sees mainnet's id.
+        chain_id: 1,
         value,
         verify_observations: false,
     }

@@ -58,6 +58,7 @@ impl From<SimEnvJson> for SimEnvOpts {
             basefee: e.basefee,
             difficulty: e.difficulty,
             spec: e.spec,
+            chain_id: 1,
             value: U256::ZERO,
             verify_observations: false,
         }
