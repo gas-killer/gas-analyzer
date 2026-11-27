@@ -53,8 +53,8 @@ pub struct AnalyzeTraceResult {
     /// The callees ran their own code over the state from `prestate`, so `gas_estimate` measures
     /// what they cost in the settlement instead of taking it from the trace.
     pub callees_executed: bool,
-    /// Why a replay over `prestate` failed and the estimate fell back, so a missing `timestamp` or
-    /// block can be told from a callee that reverts in the settlement.
+    /// Why a replay over `prestate` failed and the estimate fell back, so a missing `timestamp`,
+    /// block or chain id can be told from a callee that reverts in the settlement.
     pub replay_error: Option<String>,
     /// See [`SIGNATURE_VERIFICATION_GAS`]; not included in `gas_estimate`.
     pub signature_verification_gas: u64,
@@ -1063,7 +1063,8 @@ fn addresses(accounts: Vec<Address>) -> Vec<String> {
 /// `gas_price` (wei, as for `value`), `block_timestamp` and `chain_id` (1 when absent). With it the
 /// program runs at `origin_address` over the state the transaction started from, so each callee
 /// runs its own code and sees that chain id; see [`Replay`]. When that reverts, the estimate falls
-/// back to the empty state.
+/// back to the empty state. Without `prestate_json`, `gas_price`, `block_timestamp` and `chain_id`
+/// are ignored.
 ///
 /// Returns a JS object with: `encoded_updates`, `gas_estimate`, `is_heuristic`,
 /// `state_update_count`, `skipped_opcodes`, `reentered`, `native_call_gas`, `callees_executed`,
@@ -2862,6 +2863,41 @@ mod tests {
         assert_eq!(
             (reverting.root_only_gas, reverting.nested_gas),
             (empty.root_only_gas, empty.nested_gas)
+        );
+    }
+
+    #[test]
+    fn test_a_frame_tree_replay_runs_on_the_transactions_chain_id() {
+        let trace = root_calls_vault(1_000_000, 100_000);
+        let owned = vec![VAULT.to_string()];
+        // Reverts unless CHAINID is Sepolia's.
+        let gate = "0x4662aa36a714600d57600080fd5b00";
+        let prestate = serde_json::json!({ VAULT: { "code": gate, "nonce": 1 } }).to_string();
+        let analyze = |chain_id| {
+            let replay = Replay::parse(&prestate, None, None, chain_id).unwrap();
+            analyze_frame_tree_inner(
+                &trace,
+                ROOT,
+                &owned,
+                &test_caller_address(),
+                None,
+                None,
+                None,
+                Some(&replay),
+            )
+            .unwrap()
+        };
+        let sepolia = analyze(Some(11_155_111));
+        assert!(sepolia.callees_executed, "{:?}", sepolia.replay_error);
+        let mainnet = analyze(None);
+        assert!(!mainnet.callees_executed);
+        assert!(
+            mainnet
+                .replay_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("root-only: ")),
+            "{:?}",
+            mainnet.replay_error
         );
     }
 
