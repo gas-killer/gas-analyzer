@@ -1652,10 +1652,16 @@ mod tests {
             "Sepolia's id reaches the callee: {}",
             format_sim_env_error(&sepolia.unwrap_err())
         );
-        assert!(
-            estimate(1).is_err(),
-            "the callee reverts on any other chain"
-        );
+        // On any other chain the callee itself reverts, and the program's CALL reports it.
+        let mainnet = estimate(1).expect_err("the callee reverts on any other chain");
+        let reverted = reverting_context(&mainnet).unwrap_or_else(|| {
+            panic!(
+                "not the callee's revert: {}",
+                format_sim_env_error(&mainnet)
+            )
+        });
+        assert_eq!(reverted.target, callee);
+        assert_eq!(reverted.index, U256::ZERO);
     }
 
     /// Convenience: SimEnvOpts with sensible defaults at a chosen spec.
@@ -1931,10 +1937,12 @@ mod tests {
         let authority: Address = signer.address();
         let delegated = address!("0x00000000000000000000000000000000de1e6a7e");
 
-        // EIP-7702 requires chain_id == tx.chain_id || 0. revm's
-        // mainnet config defaults to chain_id 1. Sign for chain 1.
+        // EIP-7702 applies an authorization only if it names the chain the
+        // replay runs on (or 0). Sign for Sepolia, not revm's default of 1, so
+        // the replay must carry `sim_env.chain_id` for the delegation to apply.
+        const SEPOLIA: u64 = 11_155_111;
         let auth = Authorization {
-            chain_id: U256::from(1u64),
+            chain_id: U256::from(SEPOLIA),
             address: delegated,
             nonce: 0,
         };
@@ -1964,7 +1972,10 @@ mod tests {
             authorization_list: vec![signed],
         };
 
-        let sim_env = sim_env_with_spec(SpecId::PRAGUE); // 7702 active
+        let sim_env = SimEnvOpts {
+            chain_id: SEPOLIA,
+            ..sim_env_with_spec(SpecId::PRAGUE) // 7702 active
+        };
 
         replay_preceding_transactions(&mut cache_db, &[tx], &sim_env).expect("replay");
 
