@@ -53,8 +53,8 @@ pub struct AnalyzeTraceResult {
     /// The callees ran their own code over the state from `prestate`, so `gas_estimate` measures
     /// what they cost in the settlement instead of taking it from the trace.
     pub callees_executed: bool,
-    /// Why a replay over `prestate` failed and the estimate fell back, so a missing `timestamp` or
-    /// block can be told from a callee that reverts in the settlement.
+    /// Why a replay over `prestate` failed and the estimate fell back, so a missing `timestamp`,
+    /// block or chain id can be told from a callee that reverts in the settlement.
     pub replay_error: Option<String>,
     /// See [`SIGNATURE_VERIFICATION_GAS`]; not included in `gas_estimate`.
     pub signature_verification_gas: u64,
@@ -235,13 +235,14 @@ fn parse_origin(origin_address: Option<&str>) -> Result<Option<Address>, String>
 }
 
 /// What lets the callees of a replayed `CALL` run their own code: the state the transaction started
-/// from, and the gas price and timestamp they may check.
+/// from, and the gas price, timestamp and chain id they may check.
 pub struct Replay {
     /// From `prestateTracer` in its default mode: every account the transaction touched, with its
     /// code, balance, nonce and every slot it touched, as they were before the transaction.
     seeds: Seeds,
     gas_price: u128,
     timestamp: u64,
+    chain_id: u64,
 }
 
 impl Replay {
@@ -249,6 +250,7 @@ impl Replay {
         prestate_json: &str,
         gas_price: Option<&str>,
         timestamp: Option<u64>,
+        chain_id: Option<u64>,
     ) -> Result<Replay, String> {
         let state: BTreeMap<Address, AccountState> = serde_json::from_str(prestate_json)
             .map_err(|e| format!("Failed to parse prestate: {}", e))?;
@@ -262,6 +264,7 @@ impl Replay {
             seeds: Self::seeds(state)?,
             gas_price,
             timestamp: timestamp.unwrap_or_default(),
+            chain_id: chain_id.unwrap_or(1),
         })
     }
 
@@ -294,6 +297,7 @@ impl Replay {
         SimEnvOpts {
             gas_price: self.gas_price,
             timestamp: self.timestamp,
+            chain_id: self.chain_id,
             ..sim_env(block_number, value)
         }
     }
@@ -768,7 +772,8 @@ fn sim_env(block_number: Option<u64>, value: U256) -> SimEnvOpts {
         // WASM runs against EmptyDB with no real chain state; pick the newest
         // spec so post-Pectra opcodes don't halt with `NotActivated`.
         spec: SpecId::OSAKA,
-        // Traces handed to the package carry no chain; the code it simulates sees mainnet's id.
+        // Against `EmptyDB` only the program runs, and it reads no chain id. A [`Replay`], whose
+        // callees run their own code, sets the transaction's.
         chain_id: 1,
         value,
         verify_observations: false,
@@ -1055,9 +1060,11 @@ fn addresses(accounts: Vec<Address>) -> Vec<String> {
 /// write is priced as one to an empty slot, and every ETH transfer as one to a new account.
 ///
 /// `prestate_json` is the transaction's `prestateTracer` output in its default mode, with
-/// `gas_price` (wei, as for `value`) and `block_timestamp`. With it the program runs at
-/// `origin_address` over the state the transaction started from, so each callee runs its own code;
-/// see [`Replay`]. When that reverts, the estimate falls back to the empty state.
+/// `gas_price` (wei, as for `value`), `block_timestamp` and `chain_id` (1 when absent). With it the
+/// program runs at `origin_address` over the state the transaction started from, so each callee
+/// runs its own code and sees that chain id; see [`Replay`]. When that reverts, the estimate falls
+/// back to the empty state. Without `prestate_json`, `gas_price`, `block_timestamp` and `chain_id`
+/// are ignored.
 ///
 /// Returns a JS object with: `encoded_updates`, `gas_estimate`, `is_heuristic`,
 /// `state_update_count`, `skipped_opcodes`, `reentered`, `native_call_gas`, `callees_executed`,
@@ -1074,9 +1081,10 @@ pub fn analyze_trace(
     prestate_json: Option<String>,
     gas_price: Option<String>,
     block_timestamp: Option<u64>,
+    chain_id: Option<u64>,
 ) -> Result<JsValue, JsError> {
     let replay = prestate_json
-        .map(|json| Replay::parse(&json, gas_price.as_deref(), block_timestamp))
+        .map(|json| Replay::parse(&json, gas_price.as_deref(), block_timestamp, chain_id))
         .transpose()
         .map_err(|e| JsError::new(&e))?;
     let result = analyze_trace_inner(
@@ -1111,9 +1119,10 @@ pub fn analyze_trace_bytes(
     prestate_json: Option<String>,
     gas_price: Option<String>,
     block_timestamp: Option<u64>,
+    chain_id: Option<u64>,
 ) -> Result<JsValue, JsValue> {
     let replay = prestate_json
-        .map(|json| Replay::parse(&json, gas_price.as_deref(), block_timestamp))
+        .map(|json| Replay::parse(&json, gas_price.as_deref(), block_timestamp, chain_id))
         .transpose()
         .map_err(|e| JsValue::from(JsError::new(&e)))?;
     let result = analyze_trace_bytes_inner(
@@ -1197,7 +1206,7 @@ pub fn analyze_prestate(
 /// a simulation failure throws.
 ///
 /// `caller_address`, `estimate_state_changes_block_number`, `value`, `prestate_diff_json`,
-/// `prestate_json`, `gas_price` and `block_timestamp` are as for [`analyze_trace`].
+/// `prestate_json`, `gas_price`, `block_timestamp` and `chain_id` are as for [`analyze_trace`].
 ///
 /// Returns a JS object with `root_only_gas`, `nested_gas`, `frame_overhead_gas`, `frames`,
 /// `not_nested` and `skipped_opcodes`.
@@ -1213,9 +1222,10 @@ pub fn analyze_frame_tree(
     prestate_json: Option<String>,
     gas_price: Option<String>,
     block_timestamp: Option<u64>,
+    chain_id: Option<u64>,
 ) -> Result<JsValue, JsError> {
     let replay = prestate_json
-        .map(|json| Replay::parse(&json, gas_price.as_deref(), block_timestamp))
+        .map(|json| Replay::parse(&json, gas_price.as_deref(), block_timestamp, chain_id))
         .transpose()
         .map_err(|e| JsError::new(&e))?;
     let result = analyze_frame_tree_inner(
@@ -1246,9 +1256,10 @@ pub fn analyze_frame_tree_bytes(
     prestate_json: Option<String>,
     gas_price: Option<String>,
     block_timestamp: Option<u64>,
+    chain_id: Option<u64>,
 ) -> Result<JsValue, JsValue> {
     let replay = prestate_json
-        .map(|json| Replay::parse(&json, gas_price.as_deref(), block_timestamp))
+        .map(|json| Replay::parse(&json, gas_price.as_deref(), block_timestamp, chain_id))
         .transpose()
         .map_err(|e| JsValue::from(JsError::new(&e)))?;
     let result = analyze_frame_tree_bytes_inner(
@@ -2554,7 +2565,7 @@ mod tests {
 
     fn replay_with_code(code: &str, gas_price: Option<&str>) -> Replay {
         let prestate = serde_json::json!({ CALLEE: { "code": code, "nonce": 1 } }).to_string();
-        Replay::parse(&prestate, gas_price, Some(1_700_000_000)).unwrap()
+        Replay::parse(&prestate, gas_price, Some(1_700_000_000), None).unwrap()
     }
 
     fn analyze_with(replay: Option<&Replay>) -> AnalyzeTraceResult {
@@ -2582,9 +2593,11 @@ mod tests {
 
     #[test]
     fn test_a_malformed_gas_price_is_named_in_the_error() {
-        let err = Replay::parse("{}", Some("1.5 gwei"), None).err().unwrap();
+        let err = Replay::parse("{}", Some("1.5 gwei"), None, None)
+            .err()
+            .unwrap();
         assert!(err.starts_with("Invalid gas price \"1.5 gwei\""), "{err}");
-        let err = Replay::parse("{}", Some(&format!("0x1{}", "0".repeat(32))), None)
+        let err = Replay::parse("{}", Some(&format!("0x1{}", "0".repeat(32))), None, None)
             .err()
             .unwrap();
         assert!(
@@ -2596,7 +2609,7 @@ mod tests {
     #[test]
     fn test_a_prestate_with_a_malformed_delegation_is_an_error_not_a_trap() {
         let prestate = serde_json::json!({ CALLEE: { "code": "0xef0100", "nonce": 1 } });
-        let err = Replay::parse(&prestate.to_string(), None, None)
+        let err = Replay::parse(&prestate.to_string(), None, None, None)
             .err()
             .unwrap();
         assert!(err.contains("Invalid code for"), "{err}");
@@ -2612,7 +2625,7 @@ mod tests {
             CONSUMER: { "code": "0x00", "nonce": 1 },
             CALLEE: { "code": gate, "nonce": 1 },
         });
-        let replay = Replay::parse(&prestate.to_string(), None, None).unwrap();
+        let replay = Replay::parse(&prestate.to_string(), None, None, None).unwrap();
         let result = analyze_with(Some(&replay));
         assert!(result.callees_executed, "{:?}", result.replay_error);
     }
@@ -2630,6 +2643,21 @@ mod tests {
         );
         assert!(paid.replay_error.is_none() && free.replay_error.is_some());
         assert_eq!(free.gas_estimate, analyze_with(None).gas_estimate);
+    }
+
+    #[test]
+    fn test_a_callee_checking_the_chain_id_runs_on_the_transactions() {
+        // Reverts unless CHAINID is Sepolia's, as a proof bound to the chain would.
+        let gate = "0x4662aa36a714600d57600080fd5b00";
+        let prestate = serde_json::json!({ CALLEE: { "code": gate, "nonce": 1 } }).to_string();
+        let replay = |chain_id| Replay::parse(&prestate, None, None, chain_id).unwrap();
+        let sepolia = analyze_with(Some(&replay(Some(11_155_111))));
+        assert!(sepolia.callees_executed, "{:?}", sepolia.replay_error);
+        let mainnet = analyze_with(Some(&replay(None)));
+        assert!(
+            !mainnet.callees_executed && mainnet.replay_error.is_some(),
+            "without a chain id the callee sees mainnet's, reverts, and the replay falls back"
+        );
     }
 
     #[test]
@@ -2800,7 +2828,7 @@ mod tests {
         let analyze = |code: Option<&str>| {
             let replay = code.map(|code| {
                 let prestate = serde_json::json!({ VAULT: { "code": code, "nonce": 1 } });
-                Replay::parse(&prestate.to_string(), None, None).unwrap()
+                Replay::parse(&prestate.to_string(), None, None, None).unwrap()
             });
             analyze_frame_tree_inner(
                 &trace,
@@ -2835,6 +2863,41 @@ mod tests {
         assert_eq!(
             (reverting.root_only_gas, reverting.nested_gas),
             (empty.root_only_gas, empty.nested_gas)
+        );
+    }
+
+    #[test]
+    fn test_a_frame_tree_replay_runs_on_the_transactions_chain_id() {
+        let trace = root_calls_vault(1_000_000, 100_000);
+        let owned = vec![VAULT.to_string()];
+        // Reverts unless CHAINID is Sepolia's.
+        let gate = "0x4662aa36a714600d57600080fd5b00";
+        let prestate = serde_json::json!({ VAULT: { "code": gate, "nonce": 1 } }).to_string();
+        let analyze = |chain_id| {
+            let replay = Replay::parse(&prestate, None, None, chain_id).unwrap();
+            analyze_frame_tree_inner(
+                &trace,
+                ROOT,
+                &owned,
+                &test_caller_address(),
+                None,
+                None,
+                None,
+                Some(&replay),
+            )
+            .unwrap()
+        };
+        let sepolia = analyze(Some(11_155_111));
+        assert!(sepolia.callees_executed, "{:?}", sepolia.replay_error);
+        let mainnet = analyze(None);
+        assert!(!mainnet.callees_executed);
+        assert!(
+            mainnet
+                .replay_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("root-only: ")),
+            "{:?}",
+            mainnet.replay_error
         );
     }
 
