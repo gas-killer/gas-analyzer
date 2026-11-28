@@ -146,7 +146,8 @@ pub use gas_analyzer_core::trace::EvmFailure;
 
 pub use gas_analyzer_core::nested::frame_tree_total;
 use gas_analyzer_core::nested::{
-    FrameProgram, NestingCostModel, compute_frame_tree_canonical, without_nested_ops,
+    FrameProgram, NestingCostModel, compute_frame_tree_canonical,
+    compute_frame_tree_canonical_running_reads, without_nested_ops,
 };
 use gas_analyzer_core::observe::unpin_stateless_reads;
 use gas_analyzer_core::sim_profile::STATE_TRACKER_SLOT;
@@ -2070,14 +2071,17 @@ pub async fn call_to_frame_tree_with_evmsketch(
     trace_fetch += started.elapsed();
 
     let started = Instant::now();
-    let mut tree = compute_frame_tree_canonical(trace, root, &|a| nestable.contains(&a), cost)?;
+    // As for a flat program: authorizations change code before the call runs, so its reads are
+    // checked by running them, and the split prices nesting that way.
+    let split = if sets_code {
+        compute_frame_tree_canonical_running_reads
+    } else {
+        compute_frame_tree_canonical
+    };
+    let mut tree = split(trace, root, &|a| nestable.contains(&a), cost)?;
     let parse = started.elapsed();
     tracing::Span::current().record("frame_count", tree.frames.len());
     for frame in &mut tree.frames {
-        // As for a flat program: authorizations change code before the call runs.
-        if sets_code {
-            unpin_stateless_reads(&mut frame.updates)?;
-        }
         // A read pinned by its code is never run at settlement: its gas leaves the call gas.
         let pinned_gas = resolve_code_hashes(&provider, block, &mut frame.updates).await?;
         tree.call_gas_total = tree.call_gas_total.saturating_sub(pinned_gas);
