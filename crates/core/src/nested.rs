@@ -466,6 +466,9 @@ struct ProgramState {
     effect_gas: u64,
     /// Native gas of calls and creates made from this frame, nested or not.
     child_call_gas: u64,
+    /// The part of `child_call_gas` spent in stateless reads, which a program resolved against
+    /// the traced state pins by code instead of running.
+    stateless_read_gas: u64,
     /// Native gas of the `CALL` ops in this frame's own program.
     direct_call_gas: u64,
     /// What `native_gas` and `direct_call_gas` spent inside the callees.
@@ -743,6 +746,7 @@ fn split_frame_tree(
         native_gas: 0,
         effect_gas: 0,
         child_call_gas: 0,
+        stateless_read_gas: 0,
         direct_call_gas: 0,
         native_callee_gas: 0,
         direct_callee_gas: 0,
@@ -912,6 +916,9 @@ fn split_frame_tree(
                 }
                 if let Some(parent) = parent_program {
                     programs[parent].child_call_gas += gas;
+                    if read.is_some() {
+                        programs[parent].stateless_read_gas += gas;
+                    }
                 }
             }
 
@@ -1142,6 +1149,7 @@ fn split_frame_tree(
                                 native_gas: 0,
                                 effect_gas: 0,
                                 child_call_gas: 0,
+                                stateless_read_gas: 0,
                                 direct_call_gas: 0,
                                 native_callee_gas: 0,
                                 direct_callee_gas: 0,
@@ -1257,7 +1265,10 @@ fn split_frame_tree(
     for program in &mut programs {
         program.children.retain(|c| !dropped[*c]);
     }
-    prune_unprofitable(&mut programs, cost);
+    // Only a consumer split is signed, and resolved against the state it was traced on; a
+    // hypothetical one checks every stateless read by running it.
+    let reads_pinned = matches!(eligibility, Eligibility::Consumers(_));
+    prune_unprofitable(&mut programs, cost, reads_pinned);
     let call_gas_total = native_call_gas(&programs, |p| (p.direct_call_gas, p.native_gas));
     let callee_gas_total =
         native_call_gas(&programs, |p| (p.direct_callee_gas, p.native_callee_gas));
@@ -1303,7 +1314,11 @@ fn depth_of(programs: &[ProgramState], mut id: usize) -> u64 {
 /// A frame's benefit is its own computation plus the net savings of the children it keeps
 /// nested, because turning a frame back into a `CALL` runs its whole subtree natively. A cheap
 /// frame in front of an expensive one therefore stays nested when the pair pays for itself.
-fn prune_unprofitable(programs: &mut [ProgramState], cost: &NestingCostModel) {
+///
+/// With `reads_pinned`, the frame's stateless reads count as computation it saves: its program
+/// pins them by code, where its native `CALL` would run them. A read that can't be pinned after
+/// all (an EIP-7702 account, say) then runs in the frame too, which costs at most the overhead.
+fn prune_unprofitable(programs: &mut [ProgramState], cost: &NestingCostModel, reads_pinned: bool) {
     let mut witness_bytes = vec![0usize; programs.len()];
     let mut net_savings = vec![0u64; programs.len()];
     for id in (1..programs.len()).rev() {
@@ -1334,10 +1349,16 @@ fn prune_unprofitable(programs: &mut [ProgramState], cost: &NestingCostModel) {
         let overhead = cost
             .frame_overhead_gas
             .saturating_add((witness_bytes[id] as u64).saturating_mul(per_byte));
+        let pinned_read_gas = if reads_pinned {
+            programs[id].stateless_read_gas
+        } else {
+            0
+        };
+        let calls_run = programs[id].child_call_gas.saturating_sub(pinned_read_gas);
         let computation = programs[id]
             .native_gas
             .saturating_sub(programs[id].effect_gas)
-            .saturating_sub(programs[id].child_call_gas);
+            .saturating_sub(calls_run);
         let children_savings: u64 = programs[id].children.iter().map(|c| net_savings[*c]).sum();
         let benefit = computation.saturating_add(children_savings);
         if benefit > overhead {
@@ -1956,6 +1977,55 @@ mod tests {
             ),
             "{updates:?}"
         );
+    }
+
+    /// B bumps and makes one 300k stateless read, so all but 20k of its 320k native gas is the
+    /// read: a proof verifier, say.
+    fn root_calls_a_reader() -> Vec<StructLog> {
+        let mut read = staticcall(2, C);
+        read.gas = 990_000;
+        vec![
+            bump(1, 1),
+            call(1, 1_000_000, B),
+            bump(2, 1),
+            read,
+            log("CALLDATALOAD", 3, 980_000, &[U256::ZERO], 0),
+            exit("RETURN", 3),
+            resume(2, 690_000, true),
+            resume(1, 680_000, true),
+        ]
+    }
+
+    /// A signed frame pins its stateless reads by code, so nesting saves running them, and a
+    /// frame that is mostly one such read nests where a native `CALL` would run it.
+    #[test]
+    fn a_frame_nests_for_the_stateless_read_it_pins() {
+        let tree = split(root_calls_a_reader(), &[B]);
+        assert_eq!(tree.frames.len(), 2, "{:?}", tree.frames[0].updates);
+        assert_eq!(kinds(&tree.frames[0].updates), ["STORE", "NESTED"]);
+        assert!(
+            tree.frames[1]
+                .updates
+                .iter()
+                .any(|u| matches!(u, StateUpdate::CodehashCheck(c) if c.account == C)),
+            "{:?}",
+            tree.frames[1].updates
+        );
+    }
+
+    /// A hypothetical tree runs every stateless read, nested or not, so the read saves nothing
+    /// and the frame doesn't pay for its overhead.
+    #[test]
+    fn a_hypothetical_frame_does_not_nest_for_a_read_it_runs() {
+        let tree = compute_frame_tree_hypothetical(
+            trace(root_calls_a_reader()),
+            ROOT,
+            &BTreeSet::from([B]),
+            &NESTING_COST_MODEL_V1,
+        )
+        .expect("frame tree");
+        assert_eq!(tree.frames.len(), 1, "{:?}", tree.frames[0].updates);
+        assert_eq!(kinds(&tree.frames[0].updates), ["STORE", "CALL"]);
     }
 
     /// A historical transaction's code can't be fetched as it ran, so a hypothetical tree
