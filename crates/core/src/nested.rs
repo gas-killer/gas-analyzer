@@ -19,7 +19,7 @@ use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 
 pub use crate::encoding::encode_state_updates_to_abi as encoded_program;
-use crate::heuristic::BASE_TX_COST;
+use crate::heuristic::{BASE_TX_COST, COLD_ACCOUNT_ACCESS_COST};
 use crate::observe::{
     Await, ExitData, PendingRead, call_pin, charge_stateless_read, code_check, dedupe_checks,
     is_precompile, stack_top, static_check,
@@ -466,6 +466,9 @@ struct ProgramState {
     effect_gas: u64,
     /// Native gas of calls and creates made from this frame, nested or not.
     child_call_gas: u64,
+    /// The part of `child_call_gas` spent in stateless reads, which a program resolved against
+    /// the traced state pins by code instead of running.
+    stateless_read_gas: u64,
     /// Native gas of the `CALL` ops in this frame's own program.
     direct_call_gas: u64,
     /// What `native_gas` and `direct_call_gas` spent inside the callees.
@@ -587,7 +590,29 @@ pub fn compute_frame_tree_canonical(
     is_nestable: &dyn Fn(Address) -> bool,
     cost: &NestingCostModel,
 ) -> Result<FrameTreeExtract> {
-    split_frame_tree(trace, root, Eligibility::Consumers(is_nestable), cost)
+    split_frame_tree(trace, root, Eligibility::Consumers(is_nestable), cost, true)
+}
+
+/// [`compute_frame_tree_canonical`] for a call whose stateless reads can't be pinned by code: one
+/// carrying EIP-7702 authorizations, which change code before it runs. Every read is checked by
+/// running it, and nesting is priced that way, so a frame never nests for a read it then runs.
+pub fn compute_frame_tree_canonical_running_reads(
+    trace: DefaultFrame,
+    root: Address,
+    is_nestable: &dyn Fn(Address) -> bool,
+    cost: &NestingCostModel,
+) -> Result<FrameTreeExtract> {
+    let mut tree = split_frame_tree(
+        trace,
+        root,
+        Eligibility::Consumers(is_nestable),
+        cost,
+        false,
+    )?;
+    for frame in &mut tree.frames {
+        crate::observe::unpin_stateless_reads(&mut frame.updates)?;
+    }
+    Ok(tree)
 }
 
 /// [`compute_frame_tree_canonical`] for code that never integrated the SDK: what a historical
@@ -610,7 +635,7 @@ pub fn compute_frame_tree_hypothetical(
     owned: &BTreeSet<Address>,
     cost: &NestingCostModel,
 ) -> Result<FrameTreeExtract> {
-    let mut tree = split_frame_tree(trace, root, Eligibility::Hypothetical(owned), cost)?;
+    let mut tree = split_frame_tree(trace, root, Eligibility::Hypothetical(owned), cost, false)?;
     for frame in &mut tree.frames {
         crate::observe::unpin_stateless_reads(&mut frame.updates)?;
     }
@@ -724,6 +749,7 @@ fn split_frame_tree(
     root: Address,
     eligibility: Eligibility<'_>,
     cost: &NestingCostModel,
+    reads_pinned: bool,
 ) -> Result<FrameTreeExtract> {
     let (candidates, root_index) = scan_candidates(&trace.struct_logs, root)?;
     let mut skipped_opcodes = HashSet::new();
@@ -743,6 +769,7 @@ fn split_frame_tree(
         native_gas: 0,
         effect_gas: 0,
         child_call_gas: 0,
+        stateless_read_gas: 0,
         direct_call_gas: 0,
         native_callee_gas: 0,
         direct_callee_gas: 0,
@@ -912,6 +939,9 @@ fn split_frame_tree(
                 }
                 if let Some(parent) = parent_program {
                     programs[parent].child_call_gas += gas;
+                    if read.is_some() {
+                        programs[parent].stateless_read_gas += gas;
+                    }
                 }
             }
 
@@ -1142,6 +1172,7 @@ fn split_frame_tree(
                                 native_gas: 0,
                                 effect_gas: 0,
                                 child_call_gas: 0,
+                                stateless_read_gas: 0,
                                 direct_call_gas: 0,
                                 native_callee_gas: 0,
                                 direct_callee_gas: 0,
@@ -1257,7 +1288,7 @@ fn split_frame_tree(
     for program in &mut programs {
         program.children.retain(|c| !dropped[*c]);
     }
-    prune_unprofitable(&mut programs, cost);
+    prune_unprofitable(&mut programs, cost, reads_pinned);
     let call_gas_total = native_call_gas(&programs, |p| (p.direct_call_gas, p.native_gas));
     let callee_gas_total =
         native_call_gas(&programs, |p| (p.direct_callee_gas, p.native_callee_gas));
@@ -1274,6 +1305,25 @@ fn split_frame_tree(
         create_gas_total,
         counter_moves,
     })
+}
+
+/// `updates` as a program settles. With `reads_pinned`, each stateless read keeps its code
+/// markers, which become code checks, and drops the `STATICCALL_CHECK` they replace; otherwise
+/// it keeps the check and drops the markers.
+fn settled_program(updates: &[StateUpdate], reads_pinned: bool) -> Vec<StateUpdate> {
+    let marker = |i: usize| updates.get(i).is_some_and(crate::observe::is_code_marker);
+    updates
+        .iter()
+        .enumerate()
+        .filter(|(i, update)| {
+            if reads_pinned {
+                !(matches!(update, StateUpdate::StaticCallCheck(_)) && marker(i + 1))
+            } else {
+                !marker(*i)
+            }
+        })
+        .map(|(_, update)| update.clone())
+        .collect()
 }
 
 /// Pre-order puts every parent before its children, so one forward pass reaches a whole
@@ -1303,23 +1353,27 @@ fn depth_of(programs: &[ProgramState], mut id: usize) -> u64 {
 /// A frame's benefit is its own computation plus the net savings of the children it keeps
 /// nested, because turning a frame back into a `CALL` runs its whole subtree natively. A cheap
 /// frame in front of an expensive one therefore stays nested when the pair pays for itself.
-fn prune_unprofitable(programs: &mut [ProgramState], cost: &NestingCostModel) {
+///
+/// With `reads_pinned`, the frame's stateless reads count as computation it saves: its program
+/// pins them by code, where its native `CALL` would run them. A read that can't be pinned after
+/// all (an EIP-7702 account, say) then runs in the frame too, which costs at most the overhead.
+fn prune_unprofitable(programs: &mut [ProgramState], cost: &NestingCostModel, reads_pinned: bool) {
     let mut witness_bytes = vec![0usize; programs.len()];
     let mut net_savings = vec![0u64; programs.len()];
     for id in (1..programs.len()).rev() {
         if programs[id].dropped {
             continue;
         }
-        // Sized as the program settles with each stateless read checked by running it: its
-        // code markers stand in for the check, never beside it.
-        let program: Vec<StateUpdate> = programs[id]
-            .updates
-            .as_deref()
-            .unwrap_or_default()
+        // Sized as the program settles: each stateless read either pinned by its code markers
+        // or checked by running it, never both.
+        let program = settled_program(
+            programs[id].updates.as_deref().unwrap_or_default(),
+            reads_pinned,
+        );
+        let code_checks = program
             .iter()
-            .filter(|update| !crate::observe::is_code_marker(update))
-            .cloned()
-            .collect();
+            .filter(|update| crate::observe::is_code_marker(update))
+            .count() as u64;
         let program_bytes = encoded_program(&program).len();
         let children_bytes: usize = programs[id]
             .children
@@ -1334,10 +1388,21 @@ fn prune_unprofitable(programs: &mut [ProgramState], cost: &NestingCostModel) {
         let overhead = cost
             .frame_overhead_gas
             .saturating_add((witness_bytes[id] as u64).saturating_mul(per_byte));
+        // A pinned read isn't free: each account whose code it ran is checked instead.
+        let pinned_read_saving = if reads_pinned {
+            programs[id]
+                .stateless_read_gas
+                .saturating_sub(code_checks.saturating_mul(COLD_ACCOUNT_ACCESS_COST))
+        } else {
+            0
+        };
+        let calls_run = programs[id]
+            .child_call_gas
+            .saturating_sub(pinned_read_saving);
         let computation = programs[id]
             .native_gas
             .saturating_sub(programs[id].effect_gas)
-            .saturating_sub(programs[id].child_call_gas);
+            .saturating_sub(calls_run);
         let children_savings: u64 = programs[id].children.iter().map(|c| net_savings[*c]).sum();
         let benefit = computation.saturating_add(children_savings);
         if benefit > overhead {
@@ -1956,6 +2021,83 @@ mod tests {
             ),
             "{updates:?}"
         );
+    }
+
+    /// B bumps and makes one 300k stateless read, so all but 20k of its 320k native gas is the
+    /// read: a proof verifier, say.
+    fn root_calls_a_reader() -> Vec<StructLog> {
+        let mut read = staticcall(2, C);
+        read.gas = 990_000;
+        vec![
+            bump(1, 1),
+            call(1, 1_000_000, B),
+            bump(2, 1),
+            read,
+            log("CALLDATALOAD", 3, 980_000, &[U256::ZERO], 0),
+            exit("RETURN", 3),
+            resume(2, 690_000, true),
+            resume(1, 680_000, true),
+        ]
+    }
+
+    /// A signed frame pins its stateless reads by code, so nesting saves running them, and a
+    /// frame that is mostly one such read nests where a native `CALL` would run it.
+    #[test]
+    fn a_frame_nests_for_the_stateless_read_it_pins() {
+        let tree = split(root_calls_a_reader(), &[B]);
+        assert_eq!(tree.frames.len(), 2, "{:?}", tree.frames[0].updates);
+        assert_eq!(kinds(&tree.frames[0].updates), ["STORE", "NESTED"]);
+        // Resolved, the read is pinned by C's code and its 300k leaves the call gas.
+        let mut updates = tree.frames[1].updates.clone();
+        let code = HashMap::from([(C, Bytes::from_static(&[0xfe]))]);
+        let pinned = crate::observe::resolve_code_sizes(&mut updates, &code).unwrap();
+        assert_eq!(pinned, 300_000);
+        assert!(
+            matches!(
+                updates.as_slice(),
+                [StateUpdate::Store(_), StateUpdate::CodehashCheck(c)]
+                    if c.account == C && c.codehash == keccak256([0xfeu8])
+            ),
+            "{updates:?}"
+        );
+    }
+
+    /// A call whose reads can't be pinned (it carries authorizations) runs them nested or not,
+    /// so the frame doesn't nest for them.
+    #[test]
+    fn a_frame_does_not_nest_for_a_read_it_cannot_pin() {
+        let tree = compute_frame_tree_canonical_running_reads(
+            trace(root_calls_a_reader()),
+            ROOT,
+            &|a| a == B,
+            &NESTING_COST_MODEL_V1,
+        )
+        .expect("frame tree");
+        assert_eq!(tree.frames.len(), 1, "{:?}", tree.frames[0].updates);
+        assert_eq!(kinds(&tree.frames[0].updates), ["STORE", "CALL"]);
+        assert!(
+            !tree.frames[0]
+                .updates
+                .iter()
+                .any(crate::observe::is_code_marker),
+            "{:?}",
+            tree.frames[0].updates
+        );
+    }
+
+    /// A hypothetical tree runs every stateless read, nested or not, so the read saves nothing
+    /// and the frame doesn't pay for its overhead.
+    #[test]
+    fn a_hypothetical_frame_does_not_nest_for_a_read_it_runs() {
+        let tree = compute_frame_tree_hypothetical(
+            trace(root_calls_a_reader()),
+            ROOT,
+            &BTreeSet::from([B]),
+            &NESTING_COST_MODEL_V1,
+        )
+        .expect("frame tree");
+        assert_eq!(tree.frames.len(), 1, "{:?}", tree.frames[0].updates);
+        assert_eq!(kinds(&tree.frames[0].updates), ["STORE", "CALL"]);
     }
 
     /// A historical transaction's code can't be fetched as it ran, so a hypothetical tree
